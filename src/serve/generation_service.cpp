@@ -402,7 +402,8 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     bool is_tool_call_response = false;
     if (prepared.tool_capable) {
         ParsedToolCallOutput parsed =
-            parse_qwen_tool_call_output(outcome.text, prepared.tool_name_max_length);
+            parse_qwen_tool_call_output(outcome.text, prepared.tool_name_max_length,
+                                        options_.tolerant_tool_calls);
         outcome.text          = std::move(parsed.content);
         is_tool_call_response = parsed.is_tool_call_response;
         if (is_tool_call_response) { outcome.tool_calls = std::move(parsed.tool_calls); }

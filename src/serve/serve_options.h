@@ -48,6 +48,8 @@ struct ServeOptions {
     bool enable_thinking =
         true; // default thinking mode for the generation prompt (--no-thinking opts out)
     bool preserve_thinking = false;
+    bool tolerant_tool_calls =
+        false; // recover complete Qwen calls with malformed wrapper/suffix output
     int default_max_tokens = kDefaultMaxTokens;
     bool enable_cors       = false; // send permissive CORS headers for browser UIs
     // Process-level explicit overrides layered between registered model/mode defaults and request

@@ -562,7 +562,15 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
         const bool keep_thinking = (preserve_thinking || (static_cast<long>(i) > last_query_index)) &&
                                    (!froggeric || !reasoning.empty() || !options.enable_thinking);
         rendered += "<|im_start|>assistant\n";
-        if (!preserve_thinking && !rewrite_checkpoint && static_cast<long>(i) > last_query_index) {
+        // Anchor the turn-closure checkpoint at the LAST reasoning-stripped assistant
+        // turn rather than the first. Every turn past last_query_index has its
+        // reasoning dropped when preserve_thinking is false, so each one is an
+        // equally valid restore point - but keeping only the earliest means the
+        // checkpoint never advances, and a later history rewrite has to replay
+        // everything after it (measured: ttft grew 750ms -> 2.3s over 8 turns, and
+        // up to 12s at 28k drift). Taking the latest keeps the anchor near the
+        // frontier so the restore path stays cheap.
+        if (!preserve_thinking && static_cast<long>(i) > last_query_index) {
             rewrite_checkpoint = RewriteCheckpointByteSpec{
                 .kind = RewriteCheckpointKind::TurnClosure, .offset = rendered.size()};
         }

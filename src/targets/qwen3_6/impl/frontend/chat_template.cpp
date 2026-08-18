@@ -182,6 +182,8 @@ constexpr std::string_view kFroggericToolInstructions =
     "must be nested within <tool_call></tool_call> XML tags\n"
     "- If you choose to call a tool, you MUST output the <tool_call> block IMMEDIATELY after "
     "thinking, with NO conversational text before it.\n"
+    "- Never end a turn with a statement of intent (e.g. \"Let me check X\"). Either execute it "
+    "now with a tool call, or state explicitly that the task is complete.\n"
     "- The <tool_call> and <function> tags MUST be at the very beginning of a new line, with NO "
     "spaces or indentation before them.\n"
     "- To call multiple functions, output a separate, completely closed <tool_call></tool_call> "

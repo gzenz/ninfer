@@ -68,6 +68,8 @@ int main() {
                           "think-first tool example missing");
         failures += check(out.find("IMMEDIATELY after thinking") != std::string::npos,
                           "stricter IMPORTANT block missing");
+        failures += check(out.find("Never end a turn with a statement of intent") != std::string::npos,
+                          "no-dangling-intent rule missing");
         failures += check(out.find("Do NOT nest <tool_call> blocks") != std::string::npos,
                           "no-nest rule missing");
         failures += check(out.find("do not tell the user about function calls") == std::string::npos,

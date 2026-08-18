@@ -92,14 +92,12 @@ Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentit
     if (identity.model_id == model_id && identity.weights_id == "nvfp4") {
         return WeightsProfile::Qwen36Nvfp4;
     }
+    // Local: the Ostfralla-derived qwen3.8 nvfp4 artifact carries the Qwen3.6 NVFP4
+    // object layout (W8G32_F16S endpoints, bind_nvfp4_text_layers), not upstream's
+    // FP8 profile. Route it to Qwen36Nvfp4; Qwen38Nvfp4 stays intact for the official
+    // artifact, so adopting that later is reverting this one return value.
     if (identity.model_id == qwen3_8_model_id && identity.weights_id == "nvfp4") {
-        return WeightsProfile::Qwen38Nvfp4;
-    }
-    // Qwen3.8 reuses the Qwen3.6 NVFP4 profile unchanged: that profile already
-    // holds the vocabulary endpoints in W8, which is the only place the two
-    // groupwise artifacts differ, so the object layouts are identical.
-    if (identity.model_id == qwen3_8_model_id && identity.weights_id == "nvfp4") {
-        return WeightsProfile::Nvfp4;
+        return WeightsProfile::Qwen36Nvfp4;
     }
     throw std::runtime_error("artifact identity '" + identity.model_id + "/" + identity.weights_id +
                              "' is not supported by target '" + std::string(target_key) + "'");

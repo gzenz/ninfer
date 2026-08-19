@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace ninfer::serve {
@@ -15,8 +16,31 @@ struct ParsedToolCallOutput {
     std::vector<ToolCall> tool_calls;
 };
 
+// Per-tool parameter deserialization allow-list distilled from the request
+// ToolDefinition list. Outer key: tool name. Inner key: parameter name. Only
+// parameters whose JSON Schema "type" is a valid non-string type (or an array
+// of valid non-string types) are recorded; the parser tests membership only,
+// it never reads the inner value. A parameter absent from the inner map (and
+// a tool absent from the outer map) has no schema permission to deserialize:
+// the parser preserves raw text and the client owns type interpretation.
+using ToolParamTypeMap =
+    std::unordered_map<std::string, std::unordered_map<std::string, std::string>>;
+
+// Distill the request ToolDefinition list into a per-tool parameter
+// deserialization allow-list. Each ToolDefinition::parameters_json is a JSON
+// Schema object; its "properties" object maps each parameter name to an
+// object whose "type" field (a string or an array of strings) declares the
+// schema type(s). A parameter is recorded only when every declared type is
+// one of the valid non-string JSON Schema types {integer, number, boolean,
+// array, object, null}; otherwise (string allowed, unknown/invalid type, or
+// absent "type") it is omitted so the parser preserves raw text. A tool
+// name seen again replaces its entry so a redefinition cannot leak stale
+// non-string permissions from a prior definition.
+ToolParamTypeMap build_tool_param_type_map(const std::vector<ToolDefinition>& tools);
+
 ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
-                                                 std::size_t max_tool_name_length);
+                                                 std::size_t max_tool_name_length,
+                                                 const ToolParamTypeMap& param_types);
 
 // Incrementally publishes text that is provably outside a possible Qwen
 // <tool_call> suffix. At terminal time, a valid tool response discards the

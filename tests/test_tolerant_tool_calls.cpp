@@ -19,8 +19,8 @@ int main() {
     {
         const std::string good =
             "<tool_call>\n<function=bash>\n<parameter=command>\nls\n</parameter>\n</function>\n</tool_call>";
-        auto strict = parse_qwen_tool_call_output(good, kMaxName, false);
-        auto tol    = parse_qwen_tool_call_output(good, kMaxName, true);
+        auto strict = parse_qwen_tool_call_output(good, kMaxName, ninfer::serve::ToolParamTypeMap{}, false);
+        auto tol    = parse_qwen_tool_call_output(good, kMaxName, ninfer::serve::ToolParamTypeMap{}, true);
         f += check(strict.is_tool_call_response && strict.tool_calls.size() == 1, "strict: good call");
         f += check(tol.is_tool_call_response && tol.tool_calls.size() == 1, "tolerant: good call");
         f += check(tol.tool_calls[0].name == "bash", "tolerant: name parsed");
@@ -31,8 +31,8 @@ int main() {
         const std::string drift =
             "<tool_call>\n<function=bash>\n<parameter=command>\nls\n</parameter>\n</function>\n"
             "</function>\n</tool_call>";
-        auto strict = parse_qwen_tool_call_output(drift, kMaxName, false);
-        auto tol    = parse_qwen_tool_call_output(drift, kMaxName, true);
+        auto strict = parse_qwen_tool_call_output(drift, kMaxName, ninfer::serve::ToolParamTypeMap{}, false);
+        auto tol    = parse_qwen_tool_call_output(drift, kMaxName, ninfer::serve::ToolParamTypeMap{}, true);
         f += check(!strict.is_tool_call_response, "strict: rejects duplicate closer");
         f += check(tol.is_tool_call_response && tol.tool_calls.size() == 1,
                    "tolerant: RECOVERS duplicate closer");
@@ -42,8 +42,8 @@ int main() {
     {
         const std::string unclosed =
             "<tool_call>\n<function=bash>\n<parameter=command>\nls -la\n</parameter>\n</function>";
-        auto strict = parse_qwen_tool_call_output(unclosed, kMaxName, false);
-        auto tol    = parse_qwen_tool_call_output(unclosed, kMaxName, true);
+        auto strict = parse_qwen_tool_call_output(unclosed, kMaxName, ninfer::serve::ToolParamTypeMap{}, false);
+        auto tol    = parse_qwen_tool_call_output(unclosed, kMaxName, ninfer::serve::ToolParamTypeMap{}, true);
         f += check(!strict.is_tool_call_response, "strict: rejects unclosed");
         f += check(tol.is_tool_call_response && tol.tool_calls.size() == 1,
                    "tolerant: RECOVERS unclosed");
@@ -54,7 +54,7 @@ int main() {
         const std::string chatty =
             "<tool_call>\n<function=bash>\n<parameter=command>\nls\n</parameter>\n</function>\n</tool_call>"
             "\nI will now list the files.";
-        auto tol = parse_qwen_tool_call_output(chatty, kMaxName, true);
+        auto tol = parse_qwen_tool_call_output(chatty, kMaxName, ninfer::serve::ToolParamTypeMap{}, true);
         f += check(tol.is_tool_call_response && tol.tool_calls.size() == 1,
                    "tolerant: recovers despite trailing prose");
     }
@@ -62,14 +62,14 @@ int main() {
     // 5. genuinely unparseable text must still fall back in tolerant mode
     {
         const std::string junk = "<tool_call>\nthis is not a function at all\n</tool_call>";
-        auto tol = parse_qwen_tool_call_output(junk, kMaxName, true);
+        auto tol = parse_qwen_tool_call_output(junk, kMaxName, ninfer::serve::ToolParamTypeMap{}, true);
         f += check(!tol.is_tool_call_response, "tolerant: still falls back on junk");
     }
 
     // 6. plain prose with no tool call is untouched
     {
         const std::string prose = "Here are the files you asked about.";
-        auto tol = parse_qwen_tool_call_output(prose, kMaxName, true);
+        auto tol = parse_qwen_tool_call_output(prose, kMaxName, ninfer::serve::ToolParamTypeMap{}, true);
         f += check(!tol.is_tool_call_response && tol.content == prose, "tolerant: prose untouched");
     }
 

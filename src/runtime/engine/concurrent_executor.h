@@ -192,6 +192,15 @@ public:
         return out;
     }
 
+    // Live paged-KV + host-cache occupancy. Takes execution_mutex_ (like
+    // memory_summary) because the PagedKVPool page counters are plain members
+    // mutated only on the worker thread, which holds that lock across every GPU
+    // unit; sampling without it would race the counters.
+    [[nodiscard]] KvCacheStats kv_cache_stats() const {
+        std::scoped_lock lock(execution_mutex_);
+        return instance_.program->kv_cache_stats();
+    }
+
     [[nodiscard]] RuntimeStats runtime_stats() const {
         std::lock_guard lock(stats_mutex_);
         return published_stats_;

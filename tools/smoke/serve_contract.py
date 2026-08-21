@@ -91,6 +91,38 @@ def require_usage(usage: Any, prompt_key: str, completion_key: str) -> tuple[int
     return prompt, completion
 
 
+def stats(base_url: str) -> dict[str, Any]:
+    """Assert the read-only /stats endpoint returns a well-formed snapshot."""
+    doc = json_response(base_url, "GET", "/stats")
+    for key in ("schema", "schema_version", "timestamp_unix_ms", "scheduler", "counters",
+                "http", "kv_cache", "memory", "load"):
+        if key not in doc:
+            raise ContractError(f"/stats response is missing top-level key {key!r}")
+    if doc["schema"] != "ninfer_serve_stats":
+        raise ContractError(f"/stats schema is {doc['schema']!r}, not ninfer_serve_stats")
+    for key in ("running", "prefilling", "decode_ready", "waiting"):
+        if not isinstance(doc["scheduler"].get(key), int):
+            raise ContractError(f"/stats scheduler.{key} is not an integer")
+    for key in ("computed_prefill_tokens", "committed_decode_tokens", "decode_rounds",
+                "decode_row_rounds"):
+        if not isinstance(doc["counters"].get(key), int):
+            raise ContractError(f"/stats counters.{key} is not an integer")
+    text = doc["kv_cache"].get("text")
+    if not isinstance(text, dict) or not isinstance(text.get("page_groups"), int) or \
+            text["page_groups"] <= 0:
+        raise ContractError("/stats kv_cache.text.page_groups is not a positive integer")
+    for pool in ("text", "mtp"):
+        for key in ("entitled_pages", "mapped_pages", "free_pages"):
+            if not isinstance(doc["kv_cache"].get(pool, {}).get(key), int):
+                raise ContractError(f"/stats kv_cache.{pool}.{key} is not an integer")
+    host = doc["kv_cache"].get("host")
+    if not isinstance(host, dict) or not isinstance(host.get("enabled"), bool):
+        raise ContractError("/stats kv_cache.host.enabled is not a boolean")
+    if not isinstance(doc["http"].get("in_flight"), int):
+        raise ContractError("/stats http.in_flight is not an integer")
+    return doc
+
+
 def openai_nonstream(base_url: str, model: str, messages: list[dict[str, Any]], *, max_tokens: int,
                      stop: list[str] | None = None) -> dict[str, Any]:
     payload: dict[str, Any] = {
@@ -334,6 +366,8 @@ def exercise(base_url: str, model: str) -> dict[str, Any]:
     if single_model.get("id") != model:
         raise ContractError("single-model response has the wrong id")
 
+    stats_snapshot = stats(base_url)
+
     anthropic_prompt = {
         "model": model,
         "max_tokens": 4,
@@ -496,6 +530,11 @@ def exercise(base_url: str, model: str) -> dict[str, Any]:
         "responses_output_tokens": response_output_tokens,
         "image_prompt_tokens": image_prompt_tokens,
         "anthropic_stop_reason": anthropic["stop_reason"],
+        "stats": {
+            "kv_text_page_groups": stats_snapshot["kv_cache"]["text"]["page_groups"],
+            "kv_host_enabled": stats_snapshot["kv_cache"]["host"]["enabled"],
+            "scheduler": stats_snapshot["scheduler"],
+        },
     }
 
 

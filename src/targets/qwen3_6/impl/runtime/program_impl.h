@@ -2502,6 +2502,30 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
     return out;
 }
 
+ninfer::KvCacheStats ProgramImplCore::kv_cache_stats() const noexcept {
+    ninfer::KvCacheStats out;
+    const auto& text_pool = decoder->text_kv.pool();
+    out.text_page_groups    = text_pool.page_group_count();
+    out.text_entitled_pages = text_pool.entitled_pages();
+    out.text_mapped_pages   = text_pool.mapped_pages();
+    out.text_free_pages     = text_pool.free_pages();
+    if (decoder->mtp_kv.has_value()) {
+        const auto& mtp_pool = decoder->mtp_kv->pool();
+        out.mtp_page_groups    = mtp_pool.page_group_count();
+        out.mtp_entitled_pages = mtp_pool.entitled_pages();
+        out.mtp_mapped_pages   = mtp_pool.mapped_pages();
+        out.mtp_free_pages     = mtp_pool.free_pages();
+    }
+    if (host_kv_ != nullptr) {
+        out.host_enabled    = true;
+        out.host_slabs      = host_kv_->slab_count();
+        out.host_free_slabs = host_kv_->free_slabs();
+        out.host_entries    = host_kv_->size();
+        out.host_slab_bytes = host_kv_->slab_bytes();
+    }
+    return out;
+}
+
 void ProgramImplCore::reset_memory_peaks() noexcept {
     model.weights_arena->reset_peak();
     persistent.reset_peak();

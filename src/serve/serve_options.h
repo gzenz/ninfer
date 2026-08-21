@@ -26,6 +26,11 @@ struct ServeOptions {
     std::string api_key;                          // empty => no auth
     std::optional<std::string> model_id_override; // unset => artifact identity.model_id
     std::string request_log_jsonl;                // empty => structured request logging disabled
+    // Size-based rotation of the JSONL request log. max_mib=0 disables rotation
+    // (unbounded, the historical behaviour); keep is how many rotated files
+    // (<path>.1 .. <path>.keep) to retain, oldest dropped.
+    std::uint32_t request_log_max_mib = 0;
+    std::uint32_t request_log_keep    = 4;
     std::uint32_t max_context              = 8192;
     KvCapacityPolicy kv_capacity           = KvCapacityPolicy::explicit_capacity(8192);
     std::uint32_t max_concurrency          = 1;

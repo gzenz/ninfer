@@ -322,6 +322,20 @@ MemorySummary Engine::memory_summary() const {
         impl_->executor);
 }
 
+KvCacheStats Engine::kv_cache_stats() const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return std::visit(
+        [](const auto& executor) -> KvCacheStats {
+            using Executor = std::remove_cvref_t<decltype(executor)>;
+            if constexpr (std::is_same_v<Executor, std::monostate>) {
+                throw std::logic_error("concurrent Engine executor is unavailable");
+            } else {
+                return executor->kv_cache_stats();
+            }
+        },
+        impl_->executor);
+}
+
 MediaCacheSummary Engine::media_cache_summary() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     return std::visit(

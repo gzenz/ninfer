@@ -4,6 +4,7 @@
 #include "serve/console_log.h"
 #include "serve/openai_schema.h"
 #include "serve/request_log.h"
+#include "serve/stats_json.h"
 #include "serve/translate.h"
 
 #include <nlohmann/json.hpp>
@@ -127,7 +128,8 @@ httplib::Server::HandlerResponse handle_unrendered_http_error(const ServeOptions
 HttpServer::HttpServer(ServeOptions options)
     : options_(std::move(options)),
       response_store_(options_.response_store_max_records, options_.response_store_max_bytes),
-      request_jsonl_(options_.request_log_jsonl, options_.artifact_path) {
+      request_jsonl_(options_.request_log_jsonl, options_.artifact_path,
+               options_.request_log_max_mib, options_.request_log_keep) {
     const std::size_t queued_requests =
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests;
     const std::size_t worker_count = queued_requests + 1;
@@ -225,7 +227,8 @@ void HttpServer::register_routes() {
     }
 
     server_.set_pre_routing_handler([this](const httplib::Request& req, httplib::Response& res) {
-        if (options_.api_key.empty() || req.path == "/health" || req.method == "OPTIONS") {
+        if (options_.api_key.empty() || req.path == "/health" || req.path == "/stats" ||
+            req.method == "OPTIONS") {
             return httplib::Server::HandlerResponse::Unhandled;
         }
         // Accept both the OpenAI-style bearer token and the Anthropic-style
@@ -268,6 +271,9 @@ void HttpServer::register_routes() {
 
     server_.Get("/health", [](const httplib::Request&, httplib::Response& res) {
         res.set_content(nlohmann::json{{"status", "ok"}}.dump(), "application/json");
+    });
+    server_.Get("/stats", [this](const httplib::Request& req, httplib::Response& res) {
+        handle_stats(req, res);
     });
     server_.Get("/v1/models", [this](const httplib::Request& req, httplib::Response& res) {
         handle_models(req, res);
@@ -331,6 +337,33 @@ void HttpServer::handle_model(const httplib::Request& req, httplib::Response& re
         return;
     }
     res.set_content(make_model_object(public_model_id_, unix_time_now()), "application/json");
+}
+
+void HttpServer::handle_stats(const httplib::Request&, httplib::Response& res) const {
+    if (service_ == nullptr) {
+        // Unreachable in practice: the socket only accepts after attach(), but a
+        // defensive 503 keeps the handler total.
+        ApiError error;
+        error.status  = 503;
+        error.type    = "api_error";
+        error.code    = "server_not_ready";
+        error.message = "engine is not attached";
+        write_error(res, error);
+        return;
+    }
+    StatsSnapshot snapshot;
+    snapshot.timestamp_unix_ms =
+        static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch())
+                .count());
+    snapshot.scheduler     = service_->runtime_stats();
+    snapshot.in_flight    = service_->in_flight_requests();
+    snapshot.max_in_flight = service_->max_in_flight_requests();
+    snapshot.kv_cache     = service_->kv_cache_stats();
+    snapshot.memory       = service_->memory_summary();
+    snapshot.load         = service_->load_summary();
+    res.set_content(format_stats_json(snapshot), "application/json");
 }
 
 void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::Response& res) {

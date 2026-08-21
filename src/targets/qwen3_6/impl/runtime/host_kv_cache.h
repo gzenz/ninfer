@@ -33,7 +33,8 @@ public:
         : arena_(slab_count, slab_bytes) {}
 
     [[nodiscard]] std::size_t size() const noexcept override { return entries_.size(); }
-    [[nodiscard]] std::size_t free_slabs() const noexcept { return arena_.free_slabs(); }
+    [[nodiscard]] std::size_t free_slabs() const noexcept override { return arena_.free_slabs(); }
+    [[nodiscard]] std::size_t slab_count() const noexcept override { return arena_.slab_count(); }
     [[nodiscard]] std::size_t slab_bytes() const noexcept override { return arena_.slab_bytes(); }
 
     [[nodiscard]] HostKvEntry& entry(std::size_t index) override { return *entries_[index]; }

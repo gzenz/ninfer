@@ -271,6 +271,15 @@ std::shared_ptr<RequestLifetime> GenerationService::acquire_request_lifetime() c
     }
 }
 
+std::size_t GenerationService::in_flight_requests() const {
+    std::lock_guard lock(request_capacity_->mutex);
+    return request_capacity_->active;
+}
+
+std::size_t GenerationService::max_in_flight_requests() const {
+    return request_capacity_->maximum;
+}
+
 PreparedRequest GenerationService::prepare(const GenerationRequest& request,
                                            std::function<bool()> is_cancelled) const {
     PreparedRequest prepared;

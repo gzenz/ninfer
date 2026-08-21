@@ -453,6 +453,30 @@ struct RuntimeStats {
     std::uint32_t waiting_requests      = 0;
 };
 
+// Live paged-KV occupancy plus host-KV-cache state, sampled under the executor's
+// execution lock. Page counters are physical page groups (a group is the
+// per-token unit the planner reserves); "entitled" is reserved for active
+// sequences, "mapped" holds live data, "free" is unallocated. The host cache
+// fields are zero and host_enabled=false when --host-kv-cache is off.
+struct KvCacheStats {
+    // Main (text) paged KV pool.
+    std::uint32_t text_page_groups    = 0; // physical capacity
+    std::uint32_t text_entitled_pages = 0; // entitled to active sequences
+    std::uint32_t text_mapped_pages   = 0; // holding data
+    std::uint32_t text_free_pages     = 0; // unallocated
+    // MTP (draft) pool; zeros when speculative decoding is disabled.
+    std::uint32_t mtp_page_groups    = 0;
+    std::uint32_t mtp_entitled_pages = 0;
+    std::uint32_t mtp_mapped_pages   = 0;
+    std::uint32_t mtp_free_pages     = 0;
+    // Host KV cache (--host-kv-cache); host_enabled=false + zeros when off.
+    bool        host_enabled      = false;
+    std::size_t host_slabs        = 0;
+    std::size_t host_free_slabs   = 0;
+    std::size_t host_entries      = 0; // parked sequences
+    std::size_t host_slab_bytes   = 0;
+};
+
 struct LoadSummary {
     std::string target;
     std::string model_id;

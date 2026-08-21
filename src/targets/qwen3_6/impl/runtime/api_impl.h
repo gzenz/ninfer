@@ -252,6 +252,11 @@ MemorySummary Program<Variant>::memory_summary() const noexcept {
 }
 
 template <>
+KvCacheStats Program<Variant>::kv_cache_stats() const noexcept {
+    return impl_->kv_cache_stats();
+}
+
+template <>
 void Program<Variant>::reset_memory_peaks() noexcept {
     impl_->reset_memory_peaks();
 }

@@ -92,7 +92,14 @@ public:
 
     [[nodiscard]] ninfer::MemorySummary memory_summary() const { return engine_->memory_summary(); }
 
+    [[nodiscard]] ninfer::KvCacheStats kv_cache_stats() const { return engine_->kv_cache_stats(); }
+
     [[nodiscard]] ninfer::RuntimeStats runtime_stats() const { return engine_->runtime_stats(); }
+
+    // HTTP-layer admission depth: in-flight requests (in flight + queued) and the
+    // admission ceiling (max_concurrency + max_pending_requests).
+    [[nodiscard]] std::size_t in_flight_requests() const;
+    [[nodiscard]] std::size_t max_in_flight_requests() const;
 
     [[nodiscard]] ninfer::MediaCacheSummary media_cache_summary() const {
         return engine_->media_cache_summary();

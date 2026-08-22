@@ -458,7 +458,7 @@ struct RuntimeStats {
 // execution lock. Page counters are physical page groups (a group is the
 // per-token unit the planner reserves); "entitled" is reserved for active
 // sequences, "mapped" holds live data, "free" is unallocated. The host cache
-// fields are zero and host_enabled=false when --host-kv-cache is off.
+// fields are zero and host_enabled=false when --host-kv-cache-mib is off.
 struct KvCacheStats {
     // Main (text) paged KV pool.
     std::uint32_t text_page_groups    = 0; // physical capacity
@@ -470,12 +470,12 @@ struct KvCacheStats {
     std::uint32_t mtp_entitled_pages = 0;
     std::uint32_t mtp_mapped_pages   = 0;
     std::uint32_t mtp_free_pages     = 0;
-    // Host KV cache (--host-kv-cache); host_enabled=false + zeros when off.
-    bool        host_enabled      = false;
-    std::size_t host_slabs        = 0;
-    std::size_t host_free_slabs   = 0;
-    std::size_t host_entries      = 0; // parked sequences
-    std::size_t host_slab_bytes   = 0;
+    // Host KV cache (--host-kv-cache-mib); host_enabled=false + zeros when off.
+    bool        host_enabled             = false;
+    std::size_t host_budget_bytes        = 0;
+    std::size_t host_used_bytes          = 0;
+    std::size_t host_entries             = 0; // parked sequences
+    std::size_t host_largest_free_range  = 0;
 };
 
 struct LoadSummary {

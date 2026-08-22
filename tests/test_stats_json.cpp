@@ -40,11 +40,11 @@ StatsSnapshot make_snapshot(bool host_enabled) {
     s.kv_cache.mtp_entitled_pages = 476;
     s.kv_cache.mtp_mapped_pages   = 450;
     s.kv_cache.mtp_free_pages     = 62;
-    s.kv_cache.host_enabled    = host_enabled;
-    s.kv_cache.host_slabs      = host_enabled ? 3 : 0;
-    s.kv_cache.host_free_slabs = host_enabled ? 1 : 0;
-    s.kv_cache.host_entries    = host_enabled ? 2 : 0;
-    s.kv_cache.host_slab_bytes = host_enabled ? 3100000000ULL : 0;
+    s.kv_cache.host_enabled             = host_enabled;
+    s.kv_cache.host_budget_bytes        = host_enabled ? 31085035520ULL : 0;
+    s.kv_cache.host_used_bytes          = host_enabled ? 15542517760ULL : 0;
+    s.kv_cache.host_entries             = host_enabled ? 2 : 0;
+    s.kv_cache.host_largest_free_range  = host_enabled ? 15542517760ULL : 0;
     s.memory.kv_capacity_page_groups = 4096;
     s.memory.kv_payload_bytes        = 1234567890ULL;
     s.memory.planned_slack_bytes     = 98765432ULL;
@@ -84,14 +84,15 @@ void assert_common(const Json& doc, bool host_enabled) {
     // kv_cache host
     check(doc["kv_cache"]["host"]["enabled"] == host_enabled, "kv.host.enabled");
     if (host_enabled) {
-        check(doc["kv_cache"]["host"]["slabs"] == 3, "kv.host.slabs");
-        check(doc["kv_cache"]["host"]["free_slabs"] == 1, "kv.host.free_slabs");
+        check(doc["kv_cache"]["host"]["budget_bytes"] == 31085035520ULL, "kv.host.budget_bytes");
+        check(doc["kv_cache"]["host"]["used_bytes"] == 15542517760ULL, "kv.host.used_bytes");
         check(doc["kv_cache"]["host"]["entries"] == 2, "kv.host.entries");
-        check(doc["kv_cache"]["host"]["slab_bytes"] == 3100000000ULL, "kv.host.slab_bytes");
+        check(doc["kv_cache"]["host"]["largest_free_range"] == 15542517760ULL, "kv.host.largest_free_range");
     } else {
-        check(doc["kv_cache"]["host"]["slabs"] == 0, "kv.host.slabs zero when disabled");
+        check(doc["kv_cache"]["host"]["budget_bytes"] == 0, "kv.host.budget_bytes zero when disabled");
+        check(doc["kv_cache"]["host"]["used_bytes"] == 0, "kv.host.used_bytes zero when disabled");
         check(doc["kv_cache"]["host"]["entries"] == 0, "kv.host.entries zero when disabled");
-        check(doc["kv_cache"]["host"]["slab_bytes"] == 0, "kv.host.slab_bytes zero when disabled");
+        check(doc["kv_cache"]["host"]["largest_free_range"] == 0, "kv.host.largest_free_range zero when disabled");
     }
     // memory
     check(doc["memory"]["kv_capacity_page_groups"] == 4096, "memory.page_groups");

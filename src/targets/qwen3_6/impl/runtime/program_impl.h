@@ -2571,11 +2571,11 @@ ninfer::KvCacheStats ProgramImplCore::kv_cache_stats() const noexcept {
         out.mtp_free_pages     = mtp_pool.free_pages();
     }
     if (host_kv_ != nullptr) {
-        out.host_enabled    = true;
-        out.host_slabs      = host_kv_->slab_count();
-        out.host_free_slabs = host_kv_->free_slabs();
-        out.host_entries    = host_kv_->size();
-        out.host_slab_bytes = host_kv_->slab_bytes();
+        out.host_enabled            = true;
+        out.host_budget_bytes       = host_kv_->budget_bytes();
+        out.host_used_bytes         = host_kv_->used_bytes();
+        out.host_largest_free_range = host_kv_->largest_free_range();
+        out.host_entries            = host_kv_->size();
     }
     return out;
 }

@@ -80,11 +80,6 @@ public:
     // Largest single contiguous free range; 0 for providers that don't track it.
     [[nodiscard]] virtual std::size_t largest_free_range() const { return 0; }
     [[nodiscard]] virtual std::size_t size() const = 0;
-    // Total slab count and currently free slabs. Defaulted so providers that do
-    // not preallocate a fixed slab pool (e.g. a future external/LMCache backend)
-    // report 0; the in-process pinned-RAM cache overrides both.
-    [[nodiscard]] virtual std::size_t slab_count() const { return 0; }
-    [[nodiscard]] virtual std::size_t free_slabs() const { return 0; }
     [[nodiscard]] virtual HostKvEntry& entry(std::size_t index) = 0;
     [[nodiscard]] virtual const HostKvEntry& entry(std::size_t index) const = 0;
 

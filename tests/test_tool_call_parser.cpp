@@ -545,6 +545,33 @@ int test_duplicate_tool_definition_replaced() {
     return failures;
 }
 
+int test_nested_markers_in_value() {
+    // A parameter value that quotes a full balanced tool-call block
+    // must not fool the parser into stopping at the inner close
+    // marker. The old first-occurrence scan truncated the value at the
+    // inner close; the depth-matching scan recovers the full value.
+    const ninfer::serve::ToolParamTypeMap empty_map;
+    const ninfer::serve::ParsedToolCallOutput parsed =
+        ninfer::serve::parse_qwen_tool_call_output(
+            "<tool_call>\n"
+            "<function=edit>\n"
+            "<parameter=code>\n"
+            "auto x = \"<function=inner><parameter=x>v</parameter></function>\";\n"
+            "</parameter>\n"
+            "</function>\n"
+            "</tool_call>",
+            64, empty_map);
+
+    int failures = 0;
+    failures += check(parsed.is_tool_call_response, "nested markers parsed as tool response");
+    failures += check(parsed.tool_calls.size() == 1, "one parsed call with nested markers");
+    failures += check(parsed.tool_calls[0].name == "edit", "outer function name parsed");
+    const Json args = Json::parse(parsed.tool_calls[0].arguments_json);
+    const std::string expected =
+        "auto x = \"<function=inner><parameter=x>v</parameter></function>\";";
+    failures += check(args.at("code") == expected, "value preserves balanced nested markers");
+    return failures;
+}
 } // namespace
 
 int main() {
@@ -571,6 +598,7 @@ int main() {
     failures += test_schema_non_string_non_array_type_preserves_raw();
     failures += test_duplicate_tool_definition_no_properties_replaces();
     failures += test_duplicate_tool_definition_replaced();
+    failures += test_nested_markers_in_value();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

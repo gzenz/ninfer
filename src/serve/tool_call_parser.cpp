@@ -170,6 +170,69 @@ ToolParamTypeMap build_tool_param_type_map(const std::vector<ToolDefinition>& to
 
 namespace {
 
+// The six tool-call markers with their open/close polarity. In the well-formed
+// format they are strictly nested (call > function > param), so a single depth
+// counter tracks all three levels. Markers that appear inside a parameter value
+// (e.g. code that quotes the tool-call format) are balanced, so they do not
+// disturb the top-level depth.
+struct ToolCallMarker {
+    std::string_view text;
+    bool is_open;
+};
+constexpr ToolCallMarker kToolCallMarkers[] = {
+    {"<tool_call>", true},
+    {"<function=", true},
+    {"<parameter=", true},
+    {"</parameter>", false},
+    {"</function>", false},
+    {"</tool_call>", false},
+};
+
+// Find the earliest tool-call marker at or after `from`. Returns its position
+// and sets `is_open` and `marker_len`; returns npos if no marker remains.
+std::size_t find_next_marker(std::string_view text, std::size_t from,
+                             bool& is_open, std::size_t& marker_len) {
+    std::size_t next = std::string_view::npos;
+    bool next_is_open = false;
+    std::size_t next_len = 0;
+    for (const ToolCallMarker& m : kToolCallMarkers) {
+        const std::size_t found = text.find(m.text, from);
+        if (found != std::string_view::npos &&
+            (next == std::string_view::npos || found < next)) {
+            next = found;
+            next_is_open = m.is_open;
+            next_len = m.text.size();
+        }
+    }
+    is_open  = next_is_open;
+    marker_len = next_len;
+    return next;
+}
+
+// Scan `text` from `from`, tracking a depth counter (open markers increment,
+// close markers decrement) that starts at `start_depth`. Return the position
+// of the close marker that returns the depth to `target_depth`, or npos if the
+// depth never reaches it (unbalanced). Used to locate a region's true closing
+// marker when its value may contain balanced nested markers.
+std::size_t find_matching_close(std::string_view text, std::size_t from,
+                                int start_depth, int target_depth) {
+    int depth = start_depth;
+    std::size_t pos = from;
+    while (pos < text.size()) {
+        bool is_open = false;
+        std::size_t marker_len = 0;
+        const std::size_t next = find_next_marker(text, pos, is_open, marker_len);
+        if (next == std::string_view::npos) { return std::string_view::npos; }
+        if (is_open) {
+            ++depth;
+        } else {
+            --depth;
+            if (depth == target_depth) { return next; }
+        }
+        pos = next + marker_len;
+    }
+    return std::string_view::npos;
+}
 bool parse_parameter(std::string_view inner, std::size_t& pos, Json& args,
                      const std::string& tool_name, const ToolParamTypeMap& param_types) {
     constexpr std::string_view kParamOpen  = "<parameter=";
@@ -180,7 +243,10 @@ bool parse_parameter(std::string_view inner, std::size_t& pos, Json& args,
     if (name_end == std::string_view::npos || name_end == name_begin) { return false; }
     const std::string key       = std::string(inner.substr(name_begin, name_end - name_begin));
     pos                         = name_end + 1;
-    const std::size_t value_end = inner.find(kParamClose, pos);
+    // The value may contain balanced nested markers (e.g. code that quotes the
+    // tool-call format), so locate the matching close by depth rather than the
+    // first occurrence.
+    const std::size_t value_end = find_matching_close(inner, pos, 1, 0);
     if (value_end == std::string_view::npos) { return false; }
     const std::string raw_value = trim_ascii(inner.substr(pos, value_end - pos));
     // Only adopt the deserialized JSON type when the schema explicitly
@@ -209,7 +275,10 @@ bool parse_one_tool_call(std::string_view block, std::size_t max_name_length,
     if (!valid_function_name(name, max_name_length)) { return false; }
     pos = name_end + 1;
 
-    const std::size_t function_end = block.find(kFunctionClose, pos);
+    // The function body may contain balanced nested markers (e.g. a parameter
+    // value quoting the tool-call format), so locate the matching close by
+    // depth rather than the first occurrence.
+    const std::size_t function_end = find_matching_close(block, pos, 1, 0);
     if (function_end == std::string_view::npos) { return false; }
     const std::string_view params = block.substr(pos, function_end - pos);
     Json args                     = Json::object();
@@ -265,7 +334,10 @@ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
             return fallback(text);
         }
         const std::size_t inner_begin = pos + kToolOpen.size();
-        const std::size_t close       = text.find(kToolClose, inner_begin);
+        // The call may contain balanced nested markers (e.g. a parameter value
+        // quoting the tool-call format), so locate the matching close by depth
+        // rather than the first occurrence.
+        const std::size_t close = find_matching_close(text, inner_begin, 1, 0);
         if (close == std::string::npos && !tolerant) { return fallback(text); }
         const std::size_t block_end = close == std::string::npos ? text.size() : close;
         ToolCall call;

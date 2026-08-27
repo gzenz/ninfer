@@ -1014,6 +1014,25 @@ private:
             const bool cancel_at_boundary = request->cancelled.load(std::memory_order_acquire);
             resolve_prefill_step(request, first, cancel_at_boundary);
             publish_runtime_stats();
+        } catch (const RequestError& admission_failure) {
+            if (admission_failure.kind() != RequestErrorKind::Overloaded) { throw; }
+            // A transient entitlement shortage (a concurrent restore consumed
+            // the pages between the admission check and the reservation) is
+            // retryable: roll the lane back, put the request at the head of
+            // the pending queue, and let a later scheduling pass admit it once
+            // the active lanes drain. Nothing is failed and the engine lives.
+            if (target_started) { instance_.program->abort_lane(lane); }
+            if (prefill_lane_ && *prefill_lane_ == lane) {
+                instance_.request_memory.deactivate();
+                prefill_lane_.reset();
+            }
+            slots_[lane].reset();
+            invalidate_lane_plans(lane);
+            {
+                std::lock_guard lock(queue_mutex_);
+                pending_.push_front(request);
+            }
+            return AdmissionProgress::ControlProgress;
         } catch (...) {
             const std::exception_ptr error = std::current_exception();
             if (target_started) { instance_.program->abort_lane(lane); }

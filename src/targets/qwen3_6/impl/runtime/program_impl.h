@@ -554,6 +554,23 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
     sequence.retained = false;
     try {
         if (request_plan.reuse == ReusePath::FullReset) {
+            // Preflight the reservation before any state mutation: a concurrent
+            // restore can consume the entitlement between can_admit_lane's
+            // check and this reserve, and reserve_sequence_kv would throw
+            // std::bad_alloc - which the executor treats as a fatal engine
+            // invariant. A transient shortage is an admission failure, not an
+            // engine failure: reject with Overloaded so the request waits and
+            // retries once the active lanes drain.
+            if (!decoder->text_kv.pool().can_reserve(
+                    request_plan.text_kv_page_entitlement) ||
+                (backend_kv_cache() != nullptr &&
+                 !backend_kv_cache()->pool().can_reserve(
+                     request_plan.backend_kv_page_entitlement))) {
+                throw RequestError(
+                    RequestErrorKind::Overloaded,
+                    "KV page entitlement is temporarily exhausted; retry after "
+                    "active requests drain");
+            }
             sequence.kv.reset();
             ordered_reset(sequence);
             sequence.ledger.clear();

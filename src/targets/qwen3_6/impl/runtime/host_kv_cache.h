@@ -95,15 +95,11 @@ public:
         // scan, so a caller must not hold such a slab across another
         // acquire_slab (park_lane is the only caller today, and it runs
         // single-threaded).
-        std::size_t protected_offset = 0, protected_bytes = 0;
-        for (const auto& e : entries_) {
-            if (e->id == protect_id) {
-                protected_offset = budget_.slab_offset(e->slab);
-                protected_bytes  = e->slab->bytes();
-                break;
-            }
-        }
-        if (!budget_.can_satisfy(needed_bytes, protected_offset, protected_bytes)) {
+        // Chunked parks never call acquire_slab directly (acquire_slabs loops
+        // it), so no entry-level protection of a contiguous range is needed
+        // here: each chunk request protects nothing but respects the caller's
+        // protect_id via the eviction scan below.
+        if (!budget_.can_satisfy(needed_bytes, 0, 0)) {
             return nullptr;
         }
         // No single free range fits yet: evict LRU entries (skipping the
@@ -134,6 +130,33 @@ public:
     // happen. Without this a failed park would leak the slab.
     void release_slab(HostKvSlab* slab) override { budget_.release(slab); }
 
+    // Chunked park allocation: acquires chunks one at a time, evicting LRU
+    // entries when a chunk does not fit. Each acquire re-runs the eviction
+    // scan, so a fragmented free set is drained chunk-by-chunk instead of
+    // triggering the whole-cache cascade a single large request would cause.
+    [[nodiscard]] std::vector<HostKvSlab*> acquire_slabs(std::uint64_t protect_id,
+                                                         std::size_t bytes,
+                                                         std::size_t chunk) override {
+        if (chunk == 0) { return {}; }
+        std::vector<HostKvSlab*> slabs;
+        std::size_t remaining = bytes;
+        while (remaining != 0) {
+            const std::size_t take = remaining < chunk ? remaining : chunk;
+            HostKvSlab* slab = acquire_slab(protect_id, take);
+            if (slab == nullptr) {
+                release_slabs(slabs);
+                return {};
+            }
+            slabs.push_back(slab);
+            remaining -= take;
+        }
+        return slabs;
+    }
+
+    void release_slabs(const std::vector<HostKvSlab*>& slabs) noexcept override {
+        for (HostKvSlab* slab : slabs) { release_slab(slab); }
+    }
+
     void insert(std::unique_ptr<HostKvEntry> entry) override {
         entry->id        = ++id_clock_;
         entry->last_used = ++clock_;
@@ -144,7 +167,7 @@ public:
     // eviction and after a successful restore.
     void drop(std::size_t index) override {
         if (index >= entries_.size()) { return; }
-        budget_.release(entries_[index]->slab);
+        budget_.release_chunked(entries_[index]->slabs);
         entries_.erase(entries_.begin() + static_cast<std::ptrdiff_t>(index));
     }
 

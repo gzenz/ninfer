@@ -179,4 +179,27 @@ void HostKvBudget::release(HostKvSlab* slab) noexcept {
     free_.insert(it, inserted);
 }
 
+std::vector<HostKvSlab*> HostKvBudget::acquire_chunked(std::size_t bytes, std::size_t chunk) {
+    std::vector<HostKvSlab*> slabs;
+    if (chunk == 0) { chunk = bytes == 0 ? 1 : bytes; }
+    std::size_t remaining = bytes;
+    while (remaining != 0) {
+        const std::size_t take = remaining < chunk ? remaining : chunk;
+        HostKvSlab* slab = acquire(take);
+        if (slab == nullptr) {
+            // Roll back what was taken: partial chunked parks would corrupt the
+            // free-range accounting on the restore path.
+            release_chunked(slabs);
+            return {};
+        }
+        slabs.push_back(slab);
+        remaining -= take;
+    }
+    return slabs;
+}
+
+void HostKvBudget::release_chunked(const std::vector<HostKvSlab*>& slabs) noexcept {
+    for (HostKvSlab* slab : slabs) { release(slab); }
+}
+
 }  // namespace ninfer

@@ -959,13 +959,14 @@ bool ProgramImplCore::park_lane(std::uint32_t lane, std::uint64_t protect_id) {
     // Size the region from the lane's actual page count before asking the
     // budget for it, so the entry takes only the bytes it needs.
     const std::size_t needed = parked_lane_bytes(lane);
-    HostKvSlab* slab = host_kv_->acquire_slab(protect_id, needed);
-    if (slab == nullptr) {
-        // The one park failure that can happen in production: the budget could
-        // not make room (a session larger than the budget, or a fragmented free
-        // set). Log it so the operator can tell whether the budget was sized
-        // right - this is the line that says "29645 MiB was too small for this
-        // session". The resident is then discarded by the caller.
+    // Chunk the park: each chunk is a modest contiguous range, so scattered
+    // free ranges serve the park without evicting other sessions' entries.
+    // 512 MiB keeps the chunk count (and slab-view overhead) small while
+    // bounding any single contiguous requirement.
+    static constexpr std::size_t kParkChunkBytes = 512U << 20U;
+    std::vector<HostKvSlab*> slabs = host_kv_->acquire_slabs(protect_id, needed,
+                                                             kParkChunkBytes);
+    if (slabs.empty()) {
         host_kv_log("park lane " + std::to_string(lane) +
                     " FAILED: no budget room for " + std::to_string(needed) +
                     " bytes (largest free range " +
@@ -974,17 +975,18 @@ bool ProgramImplCore::park_lane(std::uint32_t lane, std::uint64_t protect_id) {
     }
     // The slab is owned by the park until the entry is committed; a throw in
     // between (allocation, metadata) must not leak it.
-    struct SlabLease {
+    struct SlabsLease {
         HostKvProvider* provider;
-        HostKvSlab* slab;
+        std::vector<HostKvSlab*> slabs;
         bool committed = false;
-        ~SlabLease() {
-            if (!committed && slab != nullptr) { provider->release_slab(slab); }
+        ~SlabsLease() {
+            if (!committed) { provider->release_slabs(slabs); }
         }
-    } lease{host_kv_.get(), slab};
+    } lease{host_kv_.get(), slabs};
 
-    auto entry  = std::make_unique<HostKvEntry>();
-    entry->slab = slab;
+    auto entry          = std::make_unique<HostKvEntry>();
+    entry->slabs        = std::move(slabs);
+    entry->chunk_bytes  = kParkChunkBytes;
     if (!park_lane_to_host(lane, *entry, needed, device.stream)) {
         host_kv_log("park lane " + std::to_string(lane) + " FAILED (needed more than slab)");
         return false;  // the lease releases the slab; the lane is untouched
@@ -1146,7 +1148,10 @@ std::size_t ProgramImplCore::parked_lane_bytes(std::uint32_t lane) const {
 
 bool ProgramImplCore::park_lane_to_host(std::uint32_t lane, HostKvEntry& entry, std::size_t needed,
                                         cudaStream_t stream) {
-    if (!has_retained_lane(lane) || !sequences[lane].kv || entry.slab == nullptr) { return false; }
+    if (!has_retained_lane(lane) || !sequences[lane].kv || entry.slabs.empty() ||
+        entry.chunk_bytes == 0) {
+        return false;
+    }
     SequenceState& sequence = sequences[lane];
 
     // page_ids() is the mapped pages, which is the data; entitlement is only a
@@ -1161,36 +1166,42 @@ bool ProgramImplCore::park_lane_to_host(std::uint32_t lane, HostKvEntry& entry, 
     // `needed` was sized by the caller (parked_lane_bytes) to exactly this
     // lane's page count, so the region it was handed fits; keep the check as a
     // guard against a mis-sized region.
-    if (needed > entry.slab->bytes()) {
+    if (needed > entry.slabs.size() * entry.chunk_bytes) {
         return false;
     }
 
-    entry.meta.text_bytes = text_pool.park_pages(text_ids, *entry.slab, stream);
+    // The sequence's host image spans entry.slabs in kParkChunkBytes windows.
+    // The low-level copy functions take the chunk list and resolve each page
+    // run's destination through the chunk index, so no contiguous staging
+    // region is needed and chunk-boundary-crossing runs are handled by the
+    // per-run split inside host_kv_park itself.
+    const ChunkedImage image{std::span<HostKvSlab* const>(entry.slabs), entry.chunk_bytes};
+    entry.meta.text_bytes =
+        host_kv_park_chunked(text_pool.host_kv_plane_views(), text_ids, entry.slabs,
+                             entry.chunk_bytes, stream, 0);
     if (has_backend) {
-        // park_pages() rewrites filled(); accumulate across both pools by hand.
-        HostKvSlab tail_view(static_cast<unsigned char*>(entry.slab->base()) + entry.meta.text_bytes,
-                             entry.slab->bytes() - entry.meta.text_bytes);
-        tail_view.set_filled(entry.slab->bytes() - entry.meta.text_bytes);
-        entry.meta.backend_bytes = backend_cache->pool().park_pages(backend_ids, tail_view, stream);
+        entry.meta.backend_bytes =
+            host_kv_park_chunked(backend_cache->pool().host_kv_plane_views(), backend_ids,
+                                 entry.slabs, entry.chunk_bytes, stream, entry.meta.text_bytes);
     }
+    // Hidden tensors and GDN state ride after the pages; chunked_copy resolves
+    // their single cursor through the chunk mapping.
     entry.meta.hidden_bytes =
-        park_hidden(sequence.tail_hidden, sequence.rewrite_checkpoint_hidden, *entry.slab,
-                    entry.meta.text_bytes + entry.meta.backend_bytes, stream);
+        park_hidden_chunked(sequence.tail_hidden, sequence.rewrite_checkpoint_hidden, image,
+                            entry.meta.text_bytes + entry.meta.backend_bytes, stream);
     // The GDN conv+recurrent state is lane-affine and is NOT in the KV pages:
     // a side request that runs in this lane zeroes the current slot, so it must
     // ride in the slab or the restored sequence continues from a zeroed state.
     // Both the current and the rewrite-checkpoint slot are parked.
     const std::size_t gdn_offset = entry.meta.text_bytes + entry.meta.backend_bytes +
                                    entry.meta.hidden_bytes;
-    entry.meta.gdn_bytes = park_gdn_slot(
+    entry.meta.gdn_bytes = park_gdn_slot_chunked(
         decoder->linear_attention,
-        LinearStateSlots::current_state_slot(lane, max_concurrency), *entry.slab, gdn_offset,
-        stream);
-    entry.meta.gdn_bytes += park_gdn_slot(
+        LinearStateSlots::current_state_slot(lane, max_concurrency), image, gdn_offset, stream);
+    entry.meta.gdn_bytes += park_gdn_slot_chunked(
         decoder->linear_attention,
-        LinearStateSlots::rewrite_checkpoint_state_slot(lane, max_concurrency), *entry.slab,
+        LinearStateSlots::rewrite_checkpoint_state_slot(lane, max_concurrency), image,
         gdn_offset + entry.meta.gdn_bytes, stream);
-    entry.slab->set_filled(gdn_offset + entry.meta.gdn_bytes);
 
     entry.meta.text_page_ids.assign(text_ids.begin(), text_ids.end());
     entry.meta.backend_page_ids.assign(backend_ids.begin(), backend_ids.end());
@@ -1237,24 +1248,24 @@ void ProgramImplCore::restore_lane_from_host(std::uint32_t lane, const HostKvEnt
                             entry.meta.backend_page_entitlement);
         sequence.kv->text.materialize_pages(text_pages, stream);
         const std::span<const std::int32_t> text_ids = sequence.kv->text.page_ids();
-        decoder->text_kv.pool().restore_pages(text_ids, entry.meta.text_page_ids.size(),
-                                              *entry.slab, stream);
+        const ChunkedImage image{std::span<HostKvSlab* const>(const_cast<HostKvEntry&>(entry).slabs),
+                                 entry.chunk_bytes};
+        host_kv_restore_chunked(decoder->text_kv.pool().host_kv_plane_views(), text_ids,
+                                entry.meta.text_page_ids.size(), image.slabs, image.chunk, stream,
+                                0);
 
         if (entry.meta.has_backend && sequence.kv->backend) {
             const std::uint32_t backend_pages =
                 static_cast<std::uint32_t>(entry.meta.backend_page_ids.size());
             sequence.kv->backend->materialize_pages(backend_pages, stream);
-            HostKvSlab tail_view(
-                static_cast<unsigned char*>(entry.slab->base()) + entry.meta.text_bytes,
-                entry.meta.backend_bytes);
-            tail_view.set_filled(entry.meta.backend_bytes);
-            backend_kv_cache()->pool().restore_pages(sequence.kv->backend->page_ids(),
-                                                     entry.meta.backend_page_ids.size(), tail_view,
-                                                     stream);
+            host_kv_restore_chunked(backend_kv_cache()->pool().host_kv_plane_views(),
+                                    sequence.kv->backend->page_ids(),
+                                    entry.meta.backend_page_ids.size(), image.slabs, image.chunk,
+                                    stream, entry.meta.text_bytes);
         }
 
-        restore_hidden(sequence.tail_hidden, sequence.rewrite_checkpoint_hidden, *entry.slab,
-                       entry.meta.text_bytes + entry.meta.backend_bytes, stream);
+        restore_hidden_chunked(sequence.tail_hidden, sequence.rewrite_checkpoint_hidden, image,
+                               entry.meta.text_bytes + entry.meta.backend_bytes, stream);
 
         // The GDN conv+recurrent state was zeroed by any side request that ran
         // in this lane, so it must be reinstated from the slab or the restored
@@ -1265,12 +1276,12 @@ void ProgramImplCore::restore_lane_from_host(std::uint32_t lane, const HostKvEnt
         const std::size_t gdn_offset = entry.meta.text_bytes + entry.meta.backend_bytes +
                                        entry.meta.hidden_bytes;
         const std::size_t gdn_slot   = decoder->linear_attention.slot_bytes();
-        restore_gdn_slot(decoder->linear_attention,
-                         LinearStateSlots::current_state_slot(lane, max_concurrency), *entry.slab,
-                         gdn_offset, stream);
-        restore_gdn_slot(decoder->linear_attention,
-                         LinearStateSlots::rewrite_checkpoint_state_slot(lane, max_concurrency),
-                         *entry.slab, gdn_offset + gdn_slot, stream);
+        restore_gdn_slot_chunked(decoder->linear_attention,
+                                 LinearStateSlots::current_state_slot(lane, max_concurrency), image,
+                                 gdn_offset, stream);
+        restore_gdn_slot_chunked(decoder->linear_attention,
+                                 LinearStateSlots::rewrite_checkpoint_state_slot(lane, max_concurrency),
+                                 image, gdn_offset + gdn_slot, stream);
 
         sequence.ledger                    = entry.ledger;
         sequence.prefix_identity           = entry.prefix_identity;

@@ -82,6 +82,17 @@ public:
     // free ranges. The view object itself stays in the pool (not recycled).
     void release(HostKvSlab* slab) noexcept;
 
+    // Chunked allocation for one parked sequence: acquires ceil(bytes/chunk)
+    // independent slabs of at most `chunk` bytes each. A chunked park tolerates
+    // fragmentation - each chunk only needs a small contiguous range, so the
+    // total free bytes (not the largest range) bound the park. Returns an
+    // empty vector (releasing any chunks already taken) when any chunk cannot
+    // be satisfied. The caller releases the returned slabs via release().
+    [[nodiscard]] std::vector<HostKvSlab*> acquire_chunked(std::size_t bytes,
+                                                           std::size_t chunk);
+    // Releases every slab in a chunked allocation.
+    void release_chunked(const std::vector<HostKvSlab*>& slabs) noexcept;
+
 private:
     // Sum of the free ranges (the budget minus what is handed out).
     [[nodiscard]] std::size_t free_total() const noexcept;

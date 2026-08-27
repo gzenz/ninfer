@@ -51,4 +51,18 @@ void host_kv_restore(std::span<const HostKvPlaneView> planes,
                      std::span<const std::int32_t> page_ids, std::size_t parked_pages,
                      const HostKvSlab& slab, cudaStream_t stream);
 
+// Chunked variants: the sequence's host image spans several independently
+// allocated slabs, chunk k covering global byte range
+// [k*chunk_bytes, min((k+1)*chunk_bytes, total)). Runs that cross a chunk
+// boundary are split per destination slab. Same ordering and layout as the
+// single-slab variants within each chunk.
+std::size_t host_kv_park_chunked(std::span<const HostKvPlaneView> planes,
+                                 std::span<const std::int32_t> page_ids,
+                                 std::span<HostKvSlab* const> slabs, std::size_t chunk_bytes,
+                                 cudaStream_t stream, std::size_t base_offset = 0);
+void host_kv_restore_chunked(std::span<const HostKvPlaneView> planes,
+                             std::span<const std::int32_t> page_ids, std::size_t parked_pages,
+                             std::span<const HostKvSlab* const> slabs, std::size_t chunk_bytes,
+                             cudaStream_t stream, std::size_t base_offset = 0);
+
 }  // namespace ninfer

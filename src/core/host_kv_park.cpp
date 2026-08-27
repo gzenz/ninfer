@@ -175,4 +175,166 @@ void host_kv_restore(std::span<const HostKvPlaneView> planes,
     }
 }
 
+namespace {
+
+// Resolves the chunk containing a global byte offset. Returns (slab base,
+// offset within that slab). Callers guarantee chunk_bytes > 0 and the offset
+// lies within the chunked allocation.
+[[nodiscard]] std::pair<unsigned char*, std::size_t>
+chunk_at(std::span<HostKvSlab* const> slabs, std::size_t chunk_bytes, std::size_t offset) {
+    const std::size_t index = offset / chunk_bytes;
+    const std::size_t within = offset - index * chunk_bytes;
+    return {static_cast<unsigned char*>(slabs[index]->base()) + within,
+            chunk_bytes - within};
+}
+
+[[nodiscard]] std::pair<const unsigned char*, std::size_t>
+chunk_at(std::span<const HostKvSlab* const> slabs, std::size_t chunk_bytes, std::size_t offset) {
+    const std::size_t index = offset / chunk_bytes;
+    const std::size_t within = offset - index * chunk_bytes;
+    return {static_cast<const unsigned char*>(slabs[index]->base()) + within,
+            chunk_bytes - within};
+}
+
+}  // namespace
+
+std::size_t host_kv_park_chunked(std::span<const HostKvPlaneView> planes,
+                                 std::span<const std::int32_t> page_ids,
+                                 std::span<HostKvSlab* const> slabs, std::size_t chunk_bytes,
+                                 cudaStream_t stream, std::size_t base_offset) {
+    if (page_ids.empty()) { return 0; }
+    if (slabs.empty() || chunk_bytes == 0) {
+        throw std::invalid_argument("host KV chunked park has no chunks");
+    }
+
+    const std::size_t parked_pages = page_ids.size();
+    const std::size_t required = host_kv_bytes_per_page(planes) * parked_pages;
+    if (base_offset + required > slabs.size() * chunk_bytes) {
+        throw std::invalid_argument("host KV chunks are too small for the requested pages");
+    }
+
+    const std::int32_t page_count = planes.empty() ? 0 : planes[0].page_count;
+    const auto runs = logical_runs(page_ids, page_count);
+
+    for (std::size_t p = 0; p < planes.size(); ++p) {
+        const HostKvPlaneView& plane = planes[p];
+        auto* device                 = static_cast<unsigned char*>(plane.base);
+        const std::size_t offset     = base_offset + plane_offset(planes, p, parked_pages);
+        const std::size_t page_bytes = static_cast<std::size_t>(plane.page_stride);
+        if (plane.page_major) {
+            for (const Run& run : runs) {
+                std::size_t pages_done = 0;
+                while (pages_done < run.count) {
+                    const std::size_t global =
+                        offset + static_cast<std::size_t>(run.logical_start + pages_done) * page_bytes;
+                    auto [base, room] = chunk_at(slabs, chunk_bytes, global);
+                    const std::size_t pages_here =
+                        std::min<std::size_t>(run.count - pages_done, room / page_bytes);
+                    const std::size_t n = pages_here == 0 ? 1 : pages_here;
+                    const std::size_t run_bytes = n * page_bytes;
+                    const auto* src =
+                        device + static_cast<std::int64_t>(run.first_phys + pages_done) *
+                                     plane.page_stride;
+                    CUDA_CHECK(cudaMemcpyAsync(base, src, run_bytes, cudaMemcpyDeviceToHost,
+                                               stream));
+                    pages_done += n;
+                }
+            }
+        } else {
+            const std::size_t head_row = parked_pages * page_bytes;
+            for (const Run& run : runs) {
+                std::size_t pages_done = 0;
+                while (pages_done < run.count) {
+                    const std::size_t global =
+                        offset + static_cast<std::size_t>(run.logical_start + pages_done) * page_bytes;
+                    auto [base, room] = chunk_at(slabs, chunk_bytes, global);
+                    const std::size_t pages_here =
+                        std::min<std::size_t>(run.count - pages_done, room / page_bytes);
+                    const std::size_t n = pages_here == 0 ? 1 : pages_here;
+                    const std::size_t run_bytes = n * page_bytes;
+                    const auto* src =
+                        device + static_cast<std::int64_t>(run.first_phys + pages_done) *
+                                     plane.page_stride;
+                    CUDA_CHECK(cudaMemcpy2DAsync(base, head_row, src,
+                                                 static_cast<std::size_t>(plane.head_stride),
+                                                 run_bytes,
+                                                 static_cast<std::size_t>(plane.head_extent),
+                                                 cudaMemcpyDeviceToHost, stream));
+                    pages_done += n;
+                }
+            }
+        }
+    }
+
+    return required;
+}
+
+void host_kv_restore_chunked(std::span<const HostKvPlaneView> planes,
+                             std::span<const std::int32_t> page_ids, std::size_t parked_pages,
+                             std::span<const HostKvSlab* const> slabs, std::size_t chunk_bytes,
+                             cudaStream_t stream, std::size_t base_offset) {
+    if (page_ids.empty()) { return; }
+    if (page_ids.size() > parked_pages) {
+        throw std::invalid_argument("host KV restore asks for more pages than were parked");
+    }
+    if (slabs.empty() || chunk_bytes == 0) {
+        throw std::invalid_argument("host KV chunked restore has no chunks");
+    }
+    if (base_offset + host_kv_bytes_per_page(planes) * parked_pages >
+        slabs.size() * chunk_bytes) {
+        throw std::invalid_argument("host KV parked region exceeds the chunks");
+    }
+
+    const std::int32_t page_count = planes.empty() ? 0 : planes[0].page_count;
+    const auto runs = logical_runs(page_ids, page_count);
+
+    for (std::size_t p = 0; p < planes.size(); ++p) {
+        const HostKvPlaneView& plane = planes[p];
+        auto* device                 = static_cast<unsigned char*>(plane.base);
+        const std::size_t offset     = base_offset + plane_offset(planes, p, parked_pages);
+        const std::size_t page_bytes = static_cast<std::size_t>(plane.page_stride);
+        if (plane.page_major) {
+            for (const Run& run : runs) {
+                std::size_t pages_done = 0;
+                while (pages_done < run.count) {
+                    const std::size_t global =
+                        offset + static_cast<std::size_t>(run.logical_start + pages_done) * page_bytes;
+                    auto [base, room] = chunk_at(slabs, chunk_bytes, global);
+                    const std::size_t pages_here =
+                        std::min<std::size_t>(run.count - pages_done, room / page_bytes);
+                    const std::size_t n = pages_here == 0 ? 1 : pages_here;
+                    const std::size_t run_bytes = n * page_bytes;
+                    auto* dst =
+                        device + static_cast<std::int64_t>(run.first_phys + pages_done) *
+                                     plane.page_stride;
+                    CUDA_CHECK(cudaMemcpyAsync(dst, base, run_bytes, cudaMemcpyHostToDevice,
+                                               stream));
+                    pages_done += n;
+                }
+            }
+        } else {
+            const std::size_t head_row = parked_pages * page_bytes;
+            for (const Run& run : runs) {
+                std::size_t pages_done = 0;
+                while (pages_done < run.count) {
+                    const std::size_t global =
+                        offset + static_cast<std::size_t>(run.logical_start + pages_done) * page_bytes;
+                    auto [base, room] = chunk_at(slabs, chunk_bytes, global);
+                    const std::size_t pages_here =
+                        std::min<std::size_t>(run.count - pages_done, room / page_bytes);
+                    const std::size_t n = pages_here == 0 ? 1 : pages_here;
+                    const std::size_t run_bytes = n * page_bytes;
+                    auto* dst =
+                        device + static_cast<std::int64_t>(run.first_phys + pages_done) *
+                                     plane.page_stride;
+                    CUDA_CHECK(cudaMemcpy2DAsync(dst, head_row, base, head_row, run_bytes,
+                                                 static_cast<std::size_t>(plane.head_extent),
+                                                 cudaMemcpyHostToDevice, stream));
+                    pages_done += n;
+                }
+            }
+        }
+    }
+}
+
 }  // namespace ninfer

@@ -35,7 +35,24 @@ namespace ninfer::targets::qwen3_6::detail {
 // would restore a sequence the planner then treats as empty.
 struct HostKvEntry {
     ParkedSequenceMeta meta;
-    HostKvSlab* slab = nullptr;
+    // Chunked park: the sequence's host bytes span several independently
+    // allocated slabs (each a small contiguous range), so fragmentation of the
+    // pinned budget cannot force whole-cache evictions. Chunks are consumed in
+    // order: chunk k covers global byte range [k*chunk_bytes,
+    // min((k+1)*chunk_bytes, total)). chunk_bytes is stored on the entry.
+    std::vector<HostKvSlab*> slabs;
+    std::size_t chunk_bytes = 0;
+
+    // Maps a global byte offset of the sequence's host image to its owning
+    // chunk. Returns (slab, within-slab offset).
+    [[nodiscard]] std::pair<const HostKvSlab*, std::size_t> locate(std::size_t offset) const {
+        const std::size_t index = offset / chunk_bytes;
+        return {slabs[index], offset - index * chunk_bytes};
+    }
+    [[nodiscard]] HostKvSlab* locate_mutable(std::size_t offset) const {
+        const std::size_t index = offset / chunk_bytes;
+        return slabs[index];
+    }
 
     std::vector<TokenId> ledger;
     ResidentPrefixIdentity prefix_identity;
@@ -122,6 +139,18 @@ public:
     // consume from being sacrificed to the park that precedes it. Returns
     // nullptr only if no buffer can be made available (every entry is
     // protected, or the budget cannot hold `needed_bytes`).
+    // Chunked variant: acquires ceil(bytes/chunk) slabs for one parked
+    // sequence. Each chunk only needs a small contiguous range, so a fragmented
+    // free set no longer forces whole-cache evictions. LRU eviction inside
+    // protects `protect_id` across all chunk acquisitions. Returns an empty
+    // vector when the park cannot be satisfied (any chunk unfillable).
+    [[nodiscard]] virtual std::vector<HostKvSlab*> acquire_slabs(std::uint64_t protect_id,
+                                                                 std::size_t bytes,
+                                                                 std::size_t chunk) {
+        return {};
+    }
+    // Releases a chunked allocation (no-op on providers without chunking).
+    virtual void release_slabs(const std::vector<HostKvSlab*>& slabs) noexcept {}
     [[nodiscard]] virtual HostKvSlab* acquire_slab(std::uint64_t protect_id,
                                                    std::size_t needed_bytes) = 0;
 

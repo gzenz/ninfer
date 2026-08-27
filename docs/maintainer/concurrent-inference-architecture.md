@@ -740,12 +740,23 @@ retained entries。Planner 不复制或迁移 retained physical state，而是�
 `--host-kv-cache-mib` 时例外，被驱逐的 retained state 可以停放到 pinned host RAM 并恢复到另一 lane。
 只有在 slot/lane 和完整 entitlement 都已满足后才能 claim cache ownership。
 
-当 device pool 已饱和、停放 entry 的 entitlement 无法 reserve 时，probe 先做 `can_restore_lane`
-检查（该 entry 的 entitlement 是否在「停放本 lane resident 后」的 free pages 内）：检查失败时 probe
-**不停放** resident（保持 pool 饱和）并 defer，记录该 entry 的 id（而非布尔），entry 保留在 host
-cache，plan 仍按 resident 计算（resident 共享前缀时是非零 reuse 的 append，否则 full reset）。
-不提前停放是关键：`find_admission_lane` 会探测每个 free lane，若 probe 逐 lane 停放 resident，
-累计释放的 pages 会让后续 lane 的 restore 直接成功，evicting-restore 便失去意义。
+probe 由 `allow_destructive_restore` 分两类：head request 的 admission 即将发生，probe 是**破坏性**的；
+backfill candidate 现在不会被 admit，probe 是**非破坏性**的。
+
+- 破坏性 probe（head）：`cached > resident` 时先做 `can_restore_lane` 检查（该 entry 的 entitlement
+  是否在「停放本 lane resident 后」的 free pages 内）。检查通过时**就地**停放 resident 并 restore
+  该 entry（这是唯一值得付这份 D2H/H2D 的时机，head 马上会跑）；检查失败时**不停放** resident
+  （保持 pool 饱和）并 defer，记录该 entry 的 id（而非布尔），entry 保留在 host cache，plan 仍按
+  resident 计算（resident 共享前缀时是非零 reuse 的 append，否则 full reset）。
+- 非破坏性 probe（backfill candidate）：`cached > resident` 时**一律** defer（记录 entry id），
+  绝不停放 resident、不 restore。plan 按 resident 计算；admission 的 evicting-restore 事务会在该
+  candidate 真正被 admit 时重做 restore。
+
+不提前停放是关键：`find_admission_lane` 会探测每个 free lane。若每个 queued request 的 probe 都
+逐 lane 停放 resident 再 restore，后一个 probe 会撤销前一个的拷贝（parked lane 1 → restored lane 1
+反复横跳），storm 下数千次 3GB D2H/H2D 拷贝几乎都花在从未被 admit 的 request 上，形成 livelock。
+把破坏性 probe 限制到 head 后，每个调度 pass 至多一次 restore，且 restore 的 entry 属于真正会跑的
+request；backfill probe 完全不碰 pool，livelock 消失。
 
 deferred 操作是一个跨多次 `park_lane` 的事务（`host_kv_restore_transaction.h`），admission 必须
 把它当作一个整体保护，且**绑定到记录的那个 entry id**（而非「当前最佳匹配」）：

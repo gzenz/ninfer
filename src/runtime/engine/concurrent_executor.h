@@ -716,7 +716,8 @@ private:
         }
     }
 
-    void ensure_lane_plan(const std::shared_ptr<Request>& request, std::uint32_t lane) {
+    void ensure_lane_plan(const std::shared_ptr<Request>& request, std::uint32_t lane,
+                          bool allow_destructive_restore = true) {
         if (slots_[lane] != nullptr) { return; }
         if (request->lane_plan_versions[lane] == lane_plan_versions_[lane] &&
             request->lane_plans[lane]) {
@@ -770,24 +771,39 @@ private:
                     resident = probe.summary().reusable_prompt_tokens;
                 }
                 if (cached > resident) {
-                    // Only park the resident if the restore will actually fit:
-                    // parking frees the lane's pages, but if the entry's
-                    // entitlement still exceeds the freed space (the pool is
-                    // saturated by the other lanes), the park is wasted and -
-                    // because find_admission_lane probes every free lane - the
-                    // cumulative parks free the pool so a later lane's probe
-                    // restores directly, making the admission's evicting-restore
-                    // redundant. Keep the pool saturated so the admission's
-                    // evict_retained loop can park the other retained lanes and
-                    // the evicting-restore step restores the entry.
-                    if (!instance_.program->can_restore_lane(lane, match_id)) {
-                        // The entry cannot fit even after parking this lane's
-                        // resident: defer to the admission, which parks the other
-                        // retained lanes (freeing more pages) and retries the
-                        // restore. The lane keeps its resident, so the plan below
-                        // is computed against it (a nonzero-reuse append when the
-                        // resident shares a prefix, a full reset otherwise), and
-                        // the entry id tells the admission which entry to restore.
+                    // A non-destructive probe (a backfill candidate that is not
+                    // admitted now) must not touch the pool: parking the resident
+                    // and restoring the entry inline is pure planning overhead
+                    // that the next probe (or the admission itself) will reverse,
+                    // which is the ping-pong that livelocks a queued storm. It
+                    // records the deferred entry id and computes the plan against
+                    // the resident; the admission's evicting-restore transaction
+                    // redoes the restore properly if this request is ever
+                    // admitted.
+                    //
+                    // A destructive probe (the head request, whose admission is
+                    // imminent) restores inline only when the entry fits: parking
+                    // frees the lane's pages, but if the entry's entitlement still
+                    // exceeds the freed space (the pool is saturated by the other
+                    // lanes), the park is wasted and - because find_admission_lane
+                    // probes every free lane - the cumulative parks free the pool
+                    // so a later lane's probe restores directly, making the
+                    // admission's evicting-restore redundant. Keep the pool
+                    // saturated so the admission's evict_retained loop can park
+                    // the other retained lanes and the evicting-restore step
+                    // restores the entry.
+                    const bool restore_now = allow_destructive_restore &&
+                        instance_.program->can_restore_lane(lane, match_id);
+                    if (!restore_now) {
+                        // The entry cannot be restored inline (the probe is
+                        // non-destructive, or the entry cannot fit even after
+                        // parking this lane's resident): defer to the admission,
+                        // which parks the other retained lanes (freeing more
+                        // pages) and retries the restore. The lane keeps its
+                        // resident, so the plan below is computed against it (a
+                        // nonzero-reuse append when the resident shares a prefix,
+                        // a full reset otherwise), and the entry id tells the
+                        // admission which entry to restore.
                         request->host_kv_deferred_entry[lane] = match_id;
                     } else {
                         // Park the resident to make room, protecting the entry
@@ -845,12 +861,13 @@ private:
     }
 
     [[nodiscard]] std::optional<LaneChoice>
-    find_admission_lane(const std::shared_ptr<Request>& request) {
+    find_admission_lane(const std::shared_ptr<Request>& request,
+                        bool allow_destructive_restore = true) {
         std::optional<LaneChoice> selected;
         std::uint32_t selected_reuse = 0;
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             if (slots_[lane] != nullptr) { continue; }
-            ensure_lane_plan(request, lane);
+            ensure_lane_plan(request, lane, allow_destructive_restore);
             const Plan& plan          = *request->lane_plans[lane];
             const std::uint32_t reuse = plan.summary().reusable_prompt_tokens;
             if (instance_.program->can_admit_lane(lane, plan) &&
@@ -863,7 +880,7 @@ private:
 
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             if (slots_[lane] != nullptr) { continue; }
-            ensure_lane_plan(request, lane);
+            ensure_lane_plan(request, lane, allow_destructive_restore);
             const Plan& plan          = *request->lane_plans[lane];
             const std::uint32_t reuse = plan.summary().reusable_prompt_tokens;
             if (instance_.program->can_admit_lane_after_retained_eviction(lane, plan) &&
@@ -1070,7 +1087,7 @@ private:
 
             std::optional<LaneChoice> head_lane;
             try {
-                head_lane = find_admission_lane(head);
+                head_lane = find_admission_lane(head, true);
             } catch (...) {
                 (void)remove_pending_error(head, std::current_exception());
                 control_progress = true;
@@ -1136,9 +1153,18 @@ private:
                     continue;
                 }
 
+                // Non-destructive probe: this candidate is not admitted now, so
+                // the lane plan is computed against the resident and any host-KV
+                // restore is deferred (the entry id is recorded, not performed).
+                // The admission's evicting-restore transaction redoes the
+                // restore if the candidate is actually admitted. Probing
+                // destructively here would park/restore the resident for a
+                // request that usually never runs, and each queued candidate
+                // would reverse the previous one's copy (the ping-pong that
+                // livelocks a storm).
                 std::optional<LaneChoice> candidate_lane;
                 try {
-                    candidate_lane = find_admission_lane(candidate);
+                    candidate_lane = find_admission_lane(candidate, false);
                 } catch (...) {
                     (void)remove_pending_error(candidate, std::current_exception());
                     control_progress = true;

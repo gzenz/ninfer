@@ -1,6 +1,18 @@
-# NInfer
+# NInfer (fork)
 
 > Selected checkpoints. Maximum single-GPU inference performance.
+
+This is a [gzenz](https://github.com/gzenz) fork of [Neroued/ninfer](https://github.com/Neroued/ninfer),
+maintained as a serving-oriented special build while upstream develops its own next-generation KV
+caching and resource scheduling. It exists to run a specific production workload today:
+
+- an RTX 5090 with an Ostfralla NVFP4 build of Qwen3.8-27B;
+- long-context agentic harnesses (several concurrent 100-200k-token sessions);
+- Anthropic Messages and OpenAI Responses clients with prefix caching.
+
+The fork tracks upstream and layers a self-contained host-RAM KV cache plus a set of fixes that
+came out of running that workload under sustained load. See [Fork changes](#fork-changes) below;
+everything else in this README is upstream documentation.
 
 NInfer is a from-scratch C++/CUDA inference engine for explicitly registered Qwen checkpoints on a
 single NVIDIA GeForce RTX 5090. It runs text, image, and video prompts through a local CLI or
@@ -342,6 +354,35 @@ from one to fifteen.
   startup and is not divided statically among request lanes.
 - Tool calls are parsed and returned to the client; NInfer does not execute tools.
 - The C++ headers are used by the in-tree applications and are not distributed as an installed SDK.
+
+## Fork changes
+
+Everything below diverges from upstream `master`:
+
+- **Host-RAM KV cache** (`--host-kv-cache-mib N`, supersets upstream PR #64): evicted sequences
+  park their KV pages, hidden state, and GDN state in a pinned host budget so a returning session
+  restores instead of re-prefilling. Entries are variable-size (real page count, not a fixed
+  max-size slab).
+- **Chunked parks** tolerate budget fragmentation: a parked sequence spans several independently
+  allocated 512 MiB slabs instead of one contiguous multi-GiB range, so scattered free space is
+  usable without evicting other sessions' entries.
+- **Evicting restore**: restoring a deferred entry parks other retained lanes until both the entry
+  and the new request fit, instead of giving up to a re-prefill.
+- **Head-only destructive admission probes**: the backfill scan no longer parks/restores lanes
+  just to compute a plan, which previously ping-ponged multi-GiB host copies for requests that
+  were never admitted (a livelock under queued storms).
+- **Serving hardening**: tolerant tool-call recovery for drifted Qwen tool syntax, tool arguments
+  typed by schema, text-part tool results, depth-matched tool-call close scanning, reasoning-effort
+  tier mapping, and a read-only `/stats` endpoint with request-log rotation.
+- **Froggeric v22 chat template** port with thinking-preservation semantics tuned for prefix-cache
+  identity across turns.
+- **Monitoring sidecar** (`tools/monitor/`): a stdlib-only Python dashboard that tails the
+  request/serve logs and `/stats`, serving an HTML dashboard, JSON snapshots, and Prometheus
+  metrics. `tools/monitor/run.sh` starts it (port and log paths configurable via `MONITOR_*`
+  environment variables).
+
+The host-RAM cache keeps upstream's contract: it is a cache for prefix reuse, not a general
+offload path, and it is incompatible with the DFlash speculative backend.
 
 ## Documentation
 

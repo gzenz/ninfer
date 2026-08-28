@@ -1016,12 +1016,11 @@ private:
             publish_runtime_stats();
         } catch (const RequestError& admission_failure) {
             if (admission_failure.kind() != RequestErrorKind::Overloaded) { throw; }
-            // fall through: requeue below
             // A transient entitlement shortage (a concurrent restore consumed
-            // the pages between the admission check and the reservation) is
-            // retryable: roll the lane back, put the request at the head of
-            // the pending queue, and let a later scheduling pass admit it once
-            // the active lanes drain. Nothing is failed and the engine lives.
+            // the pages between the admission check and the reservation). The
+            // prompt was already moved into start_prefill_lane, so the request
+            // cannot be requeued - complete it with a client-retryable error
+            // instead. The engine lives; the harness re-sends.
             if (target_started) { instance_.program->abort_lane(lane); }
             if (prefill_lane_ && *prefill_lane_ == lane) {
                 instance_.request_memory.deactivate();
@@ -1029,15 +1028,14 @@ private:
             }
             slots_[lane].reset();
             invalidate_lane_plans(lane);
-            {
-                std::lock_guard lock(queue_mutex_);
-                pending_.push_front(request);
-            }
+            complete_error(request, std::make_exception_ptr(admission_failure));
+            publish_runtime_stats();
             return AdmissionProgress::ControlProgress;
         } catch (const std::bad_alloc&) {
             // A reservation site not covered by a preflight (the pools grow in
-            // several places). Same retryable treatment: roll back, requeue,
-            // and let the queue drain instead of latching the engine dead.
+            // several places). The prompt is already moved, so like the
+            // Overloaded path above: fail the request cleanly rather than
+            // requeue a gutted one, and keep the engine alive.
             if (target_started) { instance_.program->abort_lane(lane); }
             if (prefill_lane_ && *prefill_lane_ == lane) {
                 instance_.request_memory.deactivate();
@@ -1045,10 +1043,8 @@ private:
             }
             slots_[lane].reset();
             invalidate_lane_plans(lane);
-            {
-                std::lock_guard lock(queue_mutex_);
-                pending_.push_front(request);
-            }
+            complete_error(request, std::make_exception_ptr(std::bad_alloc()));
+            publish_runtime_stats();
             return AdmissionProgress::ControlProgress;
         } catch (...) {
             const std::exception_ptr error = std::current_exception();

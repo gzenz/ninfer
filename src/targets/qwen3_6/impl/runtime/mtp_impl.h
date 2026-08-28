@@ -148,7 +148,8 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
                                     static_cast<std::int32_t>(state.text_cache.max_context()),
                                     state.execution.device.stream);
         card.mtp_forward_decode_batch(alignment_ids, target_hidden, target_positions, target_rope,
-                                      licensed_counts, mtp_rows, envelopes.batch, alignment_hidden);
+                                      licensed_counts, mtp_rows, envelopes.batch, alignment_hidden,
+                                      state.execution.mtp_draft_window);
         ops::speculative_select_accepted_hidden(alignment_hidden, accepted, ar_hidden,
                                                 state.execution.device.stream);
 
@@ -170,7 +171,8 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
             Tensor hidden_batch      = ar_hidden.view({TextConfig::hidden, 1, batch_size});
             Tensor next_hidden_batch = next_hidden.view({TextConfig::hidden, 1, batch_size});
             card.mtp_forward_decode_batch(previous_batch, hidden_batch, position, rope, valid,
-                                          mtp_rows, envelopes.ar[step], next_hidden_batch);
+                                          mtp_rows, envelopes.ar[step], next_hidden_batch,
+                                          state.execution.mtp_draft_window);
             card.mtp_propose_batch(next_hidden, proposal_logits, next);
             CUDA_CHECK(cudaMemcpyAsync(ar_hidden.data, next_hidden.data, ar_hidden.bytes(),
                                        cudaMemcpyDeviceToDevice, state.execution.device.stream));

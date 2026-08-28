@@ -22,7 +22,8 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
     __nv_bfloat16* cache_v, const std::int32_t* block_tables, const std::int32_t* valid_columns,
     const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t tokens,
     std::int32_t full_width, std::int32_t column_begin, std::int32_t logical_capacity, float scale,
-    __nv_bfloat16* partial_acc, float* partial_m, float* partial_l) {
+    std::int32_t window_span, std::int32_t sink_keys, __nv_bfloat16* partial_acc, float* partial_m,
+    float* partial_l) {
     static_assert(TokenTile >= 1 && TokenTile <= 6);
     static_assert(WarpsPerCta >= 1 && WarpsPerCta <= 4);
 
@@ -121,7 +122,9 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
         return;
     }
 
-    const int window = last_pos + 1;
+    // Draft-window layout: v-space partition + key remap (identity when span == 0).
+    const GqaDraftWindowLayout win = gqa_draft_window_layout(last_pos + 1, first_pos, window_span, sink_keys);
+    const int window               = win.vlen;
     const int active_split_count =
         gqa_small_t_active_splits<Geometry, false>(window, split_count, TokenTile);
     if (split >= active_split_count) { return; }
@@ -141,8 +144,15 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
     const int key_blocks = div_up(split_end - first_tile, Bc);
     const int first_page = first_tile >> kPagedKVPageShift;
     const int page_count = ((split_end - 1) >> kPagedKVPageShift) - first_page + 1;
+    // Physical pages are gathered per v-page: the entry for v-page p is the page of
+    // that page's first remapped key. The v->key map is monotone, so entries are
+    // monotone; the seam v-page (sink -> window) maps to the window side's page, and
+    // any sink-side keys in that page's first tile are covered by the per-key page
+    // lookup in the staging loop when a window is active.
     for (int page = tid; page < page_count; page += Threads) {
-        physical_pages_s[page] = block_table[first_page + page];
+        const int v_first = (first_page + page) << kPagedKVPageShift;
+        const int key_page = gqa_window_key(v_first, win) >> kPagedKVPageShift;
+        physical_pages_s[page] = block_table[key_page];
     }
 
     if constexpr (CacheInput::writes_cache) {
@@ -152,7 +162,8 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
             const int token = chunk / (D / 8);
             const int d     = (chunk - token * (D / 8)) * 8;
             const int p_tok = pos[token];
-            if (p_tok >= split_start && p_tok < split_end && p_tok >= 0 &&
+            const int v_tok = gqa_window_virtual(p_tok, win);
+            if (v_tok >= split_start && v_tok < split_end && p_tok >= 0 &&
                 p_tok < logical_capacity) {
                 const std::int64_t new_off = gqa_kv_new_index<Geometry>(kv_head, d, token);
                 const int lane             = tid & 31;
@@ -214,8 +225,16 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
 
     for (int kb = 0; kb < key_blocks; ++kb) {
         const int k0 = first_tile + kb * Bc;
+        // The staged tile's keys come from the physical page of its first real key.
+        // physical_pages_s is indexed by v-page offset (v/64 - first_page); the v->key
+        // map is monotone, so consecutive v-pages map to consecutive-or-equal key pages.
         if (kb != 0 && (k0 & kPagedKVPageMask) == 0) {
-            physical_page = physical_pages_s[(k0 >> kPagedKVPageShift) - first_page];
+            const int v_page = k0 >> kPagedKVPageShift;
+            const int key_page = gqa_window_key(k0, win) >> kPagedKVPageShift;
+            // Tiles within one v-page share the page recorded for that v-page.
+            // Cross-check: the recorded entry for this v-page IS the key page.
+            physical_page = physical_pages_s[v_page - first_page];
+            (void)key_page;
         }
         // Stage the bf16 K/V key tile with one cp.async wave (16B/thread, high MLP).
         // Current-step tokens come from k_new/v_new; tail slots are zeroed.
@@ -223,10 +242,11 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
         for (int chunk = tid; chunk < Bc * (D / 8); chunk += Threads) {
             const int key_l      = chunk / (D / 8);
             const int d          = (chunk - key_l * (D / 8)) * 8;
-            const int key        = k0 + key_l;
+            const int v_key      = k0 + key_l;
+            const int key        = gqa_window_key(v_key, win);
             __nv_bfloat16* k_dst = &k_s[key_l * D + gqa_small_t_tc_swz(key_l, d)];
             __nv_bfloat16* v_dst = &v_s[key_l * D + gqa_small_t_tc_swz(key_l, d)];
-            if (key >= split_start && key < split_end) {
+            if (v_key >= split_start && v_key < split_end) {
                 if constexpr (CacheInput::writes_cache) {
                     const int new_token = key - first_pos;
                     const bool from_new =
@@ -236,14 +256,20 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
                         ninfer::ops::cp_async<16>(k_dst, &input.k[off]);
                         ninfer::ops::cp_async<16>(v_dst, &input.v[off]);
                     } else {
-                        const std::int64_t off = gqa_cache_index<Geometry>(
-                            physical_page, kv_head, d, key & kPagedKVPageMask);
+                        const int page = window_span > 0
+                                             ? paged_kv_physical_page(block_table, key)
+                                             : physical_page;
+                        const std::int64_t off =
+                            gqa_cache_index<Geometry>(page, kv_head, d, key & kPagedKVPageMask);
                         ninfer::ops::cp_async<16>(k_dst, &cache_k[off]);
                         ninfer::ops::cp_async<16>(v_dst, &cache_v[off]);
                     }
                 } else {
-                    const std::int64_t off = gqa_cache_index<Geometry>(physical_page, kv_head, d,
-                                                                       key & kPagedKVPageMask);
+                    const int page = window_span > 0
+                                         ? paged_kv_physical_page(block_table, key)
+                                         : physical_page;
+                    const std::int64_t off =
+                        gqa_cache_index<Geometry>(page, kv_head, d, key & kPagedKVPageMask);
                     ninfer::ops::cp_async<16>(k_dst, &cache_k[off]);
                     ninfer::ops::cp_async<16>(v_dst, &cache_v[off]);
                 }
@@ -283,24 +309,30 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
         float bm0 = -CUDART_INF_F, bm1 = -CUDART_INF_F;
 #pragma unroll
         for (int nt = 0; nt < QKNt; ++nt) {
-            const int col0 = nt * 8 + 2 * lid;
-            const int col1 = col0 + 1;
-            const int key0 = k0 + col0;
-            const int key1 = col1 + k0;
+            const int col0  = nt * 8 + 2 * lid;
+            const int col1  = col0 + 1;
+            const int vkey0 = k0 + col0;
+            const int vkey1 = col1 + k0;
+            const int key0  = gqa_window_key(vkey0, win);
+            const int key1  = gqa_window_key(vkey1, win);
             score[nt][0] =
-                (row0 < row_count && key0 >= split_start && key0 < split_end && key0 <= qabs0)
+                (row0 < row_count && vkey0 >= split_start && vkey0 < split_end &&
+                 key0 <= qabs0 && gqa_key_in_row_window(key0, qabs0, win))
                     ? score[nt][0] * scale
                     : -CUDART_INF_F;
             score[nt][1] =
-                (row0 < row_count && key1 >= split_start && key1 < split_end && key1 <= qabs0)
+                (row0 < row_count && vkey1 >= split_start && vkey1 < split_end &&
+                 key1 <= qabs0 && gqa_key_in_row_window(key1, qabs0, win))
                     ? score[nt][1] * scale
                     : -CUDART_INF_F;
             score[nt][2] =
-                (row1 < row_count && key0 >= split_start && key0 < split_end && key0 <= qabs1)
+                (row1 < row_count && vkey0 >= split_start && vkey0 < split_end &&
+                 key0 <= qabs1 && gqa_key_in_row_window(key0, qabs1, win))
                     ? score[nt][2] * scale
                     : -CUDART_INF_F;
             score[nt][3] =
-                (row1 < row_count && key1 >= split_start && key1 < split_end && key1 <= qabs1)
+                (row1 < row_count && vkey1 >= split_start && vkey1 < split_end &&
+                 key1 <= qabs1 && gqa_key_in_row_window(key1, qabs1, win))
                     ? score[nt][3] * scale
                     : -CUDART_INF_F;
             bm0 = fmaxf(bm0, fmaxf(score[nt][0], score[nt][1]));

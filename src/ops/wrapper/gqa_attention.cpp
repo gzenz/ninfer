@@ -434,6 +434,61 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
                                         cache, out, stream);
 }
 
+void gqa_attention_windowed(const Tensor& q, const Tensor& k, const Tensor& v,
+                            const Tensor& positions, const Tensor& valid_columns,
+                            const Tensor& kv_table_rows, float scale,
+                            PagedKVBatchLayerView cache, GqaExecutionEnvelope envelope,
+                            GqaDraftWindow window, WorkspaceArena& workspace, Tensor& out,
+                            cudaStream_t stream) {
+    constexpr const char* op = "gqa_attention_windowed";
+    if (window.span == 0) {
+        throw std::invalid_argument("gqa_attention_windowed: span must be positive");
+    }
+    const std::int32_t width = q.ne[2];
+    const std::int32_t batch = q.ne[3];
+    validate_batched_attention_tensors(q, positions, valid_columns, kv_table_rows, out, cache,
+                                       envelope, scale, op);
+    if (k.dtype != DType::BF16 || v.dtype != DType::BF16) {
+        throw std::invalid_argument("gqa_attention_windowed: k/v must be BF16");
+    }
+    const std::int32_t kv_heads = kv_heads_for_q_heads(q.ne[1], op);
+    require_shape(k, kHeadDim, kv_heads, width, batch, op, "k");
+    require_shape(v, kHeadDim, kv_heads, width, batch, op, "v");
+    require_contiguous_nonnull(k, op, "k");
+    require_contiguous_nonnull(v, op, "v");
+    // The route must be SmallT: the windowed kernels only exist there.
+    const detail::GqaAttentionRoute route =
+        detail::gqa_attention_resolve_route(q.ne[1], width, batch, envelope);
+    if (route != detail::GqaAttentionRoute::SmallT) {
+        throw std::invalid_argument(
+            "gqa_attention_windowed: only the SmallT route supports windows");
+    }
+    // Real cache capacity guards the position bound; the envelope only promises
+    // the virtual (admitted) key count for split sizing.
+    const std::uint32_t capacity = validate_batch_cache(cache, kv_heads, op);
+    // Clamp the window to the cache capacity before the int32 narrowing: a span or
+    // sink beyond every possible key behaves as full attention for that dimension,
+    // and clamping keeps the signed arithmetic downstream overflow-free.
+    const std::uint32_t effective_span = std::min(window.span, capacity);
+    const std::uint32_t effective_sink  = std::min(window.sink, capacity);
+    if (effective_span < static_cast<std::uint32_t>(width)) {
+        throw std::invalid_argument(
+            "gqa_attention_windowed: span must cover the query tile width");
+    }
+
+    auto scope = workspace.scope();
+    const std::int32_t splits =
+        detail::gqa_attention_split_capacity(q.ne[1], width, cache.dtype, envelope);
+    SmallTWorkspace partial =
+        allocate_small_t_workspace(workspace, q.ne[1], width, splits, batch);
+    const ops::GqaDraftWindow effective{effective_span, effective_sink};
+    detail::gqa_attention_small_t_windowed_launch(q, k, v, positions, valid_columns,
+                                                  kv_table_rows, scale, cache, envelope,
+                                                  effective, static_cast<std::int32_t>(capacity),
+                                                  0, width, partial.acc, partial.m, partial.l, out,
+                                                  stream);
+}
+
 void gqa_kv_append(const Tensor& k, const Tensor& v, const Tensor& positions,
                    PagedKVLayerView cache, cudaStream_t stream) {
     constexpr const char* op = "gqa_kv_append";

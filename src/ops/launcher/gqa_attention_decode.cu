@@ -8,6 +8,7 @@
 #include "core/device.h" // CUDA_CHECK
 #include "ninfer/ops/gqa_attention.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <stdexcept>
 
@@ -106,7 +107,8 @@ void launch_tc_partial_bf16(const Tensor& q, CacheInput input, const Tensor& pos
             ? nullptr
             : static_cast<const std::int32_t*>(invocation.table_rows->data),
         cache.block_tables.ne[0], invocation.width, invocation.full_width, invocation.column_begin,
-        logical_capacity, scale, static_cast<__nv_bfloat16*>(partial_acc.data),
+        logical_capacity, scale, invocation.window_span, invocation.sink_keys,
+        static_cast<__nv_bfloat16*>(partial_acc.data),
         static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data));
     CUDA_CHECK(cudaGetLastError());
 }
@@ -148,7 +150,8 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
                     ? nullptr
                     : static_cast<const std::int32_t*>(invocation.table_rows->data),
                 cache.block_tables.ne[0], invocation.full_width, invocation.column_begin,
-                logical_capacity, scale, static_cast<__nv_bfloat16*>(partial_acc.data),
+                logical_capacity, scale, invocation.window_span, invocation.sink_keys,
+                static_cast<__nv_bfloat16*>(partial_acc.data),
                 static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data));
     };
     if constexpr (TokenTile == 6) {
@@ -239,8 +242,19 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
                                       GqaExecutionEnvelope envelope, Tensor& partial_acc,
                                       Tensor& partial_m, Tensor& partial_l, Tensor& out,
                                       cudaStream_t stream) {
-    const auto logical_capacity      = static_cast<std::int32_t>(envelope.max_visible_keys);
-    const auto implementation_window = static_cast<std::int32_t>(envelope.max_visible_keys);
+    const auto logical_capacity      = invocation.logical_capacity != 0
+                                          ? invocation.logical_capacity
+                                          : static_cast<std::int32_t>(envelope.max_visible_keys);
+    // The implementation window keys the i8 warp/KeyBlock route on the admitted
+    // span; windowed calls pass the clamped span so small windows select the
+    // compact routes instead of the long-context ones.
+    const auto implementation_window =
+        invocation.window_span > 0
+            ? static_cast<std::int32_t>(std::min<std::uint64_t>(
+                  static_cast<std::uint64_t>(invocation.window_span) +
+                      static_cast<std::uint64_t>(invocation.sink_keys),
+                  static_cast<std::uint64_t>(envelope.max_visible_keys)))
+            : static_cast<std::int32_t>(envelope.max_visible_keys);
     const auto splits =
         gqa_small_t_launch_capacity<Geometry>(envelope, invocation.width, cache.dtype);
 
@@ -313,7 +327,8 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
                     ? nullptr
                     : static_cast<const std::int32_t*>(invocation.valid_columns->data),
                 invocation.width, invocation.full_width, invocation.column_begin,
-                invocation.batch_size, splits, static_cast<__nv_bfloat16*>(out.data));
+                invocation.batch_size, splits, invocation.window_span, invocation.sink_keys,
+                static_cast<__nv_bfloat16*>(out.data));
     };
     const bool masked         = invocation.valid_columns != nullptr;
     const auto launch_profile = [&]<bool Int8, bool MultiBatch, bool Masked>() {
@@ -360,6 +375,39 @@ void gqa_attention_small_t_launch(const Tensor& q, const Tensor& k, const Tensor
         .column_begin  = column_begin,
         .width         = width,
         .batch_size    = q.ne[3],
+    };
+    if (q.ne[1] == Gqa27Geometry::QHeads) {
+        gqa_attention_small_t_launch_for<Gqa27Geometry>(q, input, pos, scale, cache, invocation,
+                                                        envelope, partial_acc, partial_m, partial_l,
+                                                        out, stream);
+        return;
+    }
+    gqa_attention_small_t_launch_for<Gqa35Geometry>(q, input, pos, scale, cache, invocation,
+                                                    envelope, partial_acc, partial_m, partial_l,
+                                                    out, stream);
+}
+
+void gqa_attention_small_t_windowed_launch(const Tensor& q, const Tensor& k, const Tensor& v,
+                                          const Tensor& pos, const Tensor& valid_columns,
+                                          const Tensor& table_rows, float scale,
+                                          PagedKVBatchLayerView cache,
+                                          GqaExecutionEnvelope envelope, GqaDraftWindow window,
+                                          std::int32_t logical_capacity, std::int32_t column_begin,
+                                          std::int32_t width, Tensor& partial_acc,
+                                          Tensor& partial_m, Tensor& partial_l, Tensor& out,
+                                          cudaStream_t stream) {
+    const GqaAppendInput input{static_cast<const __nv_bfloat16*>(k.data),
+                               static_cast<const __nv_bfloat16*>(v.data)};
+    const GqaSmallTInvocation invocation{
+        .valid_columns    = valid_columns.data == nullptr ? nullptr : &valid_columns,
+        .table_rows       = &table_rows,
+        .full_width       = q.ne[2],
+        .column_begin     = column_begin,
+        .width            = width,
+        .batch_size       = q.ne[3],
+        .window_span      = static_cast<std::int32_t>(window.span),
+        .sink_keys        = static_cast<std::int32_t>(window.sink),
+        .logical_capacity = logical_capacity,
     };
     if (q.ne[1] == Gqa27Geometry::QHeads) {
         gqa_attention_small_t_launch_for<Gqa27Geometry>(q, input, pos, scale, cache, invocation,

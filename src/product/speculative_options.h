@@ -33,15 +33,27 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options) 
             throw std::invalid_argument(
                 "--draft-tokens and --lm-head-draft require --spec mtp|dflash");
         }
+        if (options.mtp_attention_window != 0) {
+            throw std::invalid_argument("--mtp-attention-window requires --spec mtp");
+        }
         return;
     case SpeculativeBackend::Mtp:
         if (options.draft_tokens == 0 || options.draft_tokens > 5) {
             throw std::invalid_argument("--spec mtp requires --draft-tokens in [1,5]");
         }
+        if (options.mtp_attention_window != 0 &&
+            options.mtp_attention_window < options.draft_tokens + 1) {
+            throw std::invalid_argument(
+                "--mtp-attention-window must be at least draft-tokens + 1 (the window must "
+                "contain the query tile)");
+        }
         return;
     case SpeculativeBackend::DFlash:
         if (options.draft_tokens == 0 || options.draft_tokens > 15) {
             throw std::invalid_argument("--spec dflash requires --draft-tokens in [1,15]");
+        }
+        if (options.mtp_attention_window != 0) {
+            throw std::invalid_argument("--mtp-attention-window requires --spec mtp");
         }
         return;
     }

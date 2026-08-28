@@ -72,6 +72,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--request-log-jsonl FILE] [--request-log-max-mib N] [--request-log-keep N] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
            "[--kv-dtype bf16|int8] [--spec mtp|dflash --draft-tokens N] "
+           "[--mtp-attention-window N] "
            "[--default-max-tokens N] "
            "[--vision] [--no-cuda-graph] [--no-prefix-reuse] "
            "[--lm-head-draft] [--no-thinking] [--preserve-thinking] "
@@ -231,6 +232,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--spec") {
             options.speculative.backend =
                 product::parse_speculative_backend(require_value("--spec"));
+        } else if (arg == "--mtp-attention-window") {
+            options.speculative.mtp_attention_window = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--mtp-attention-window"),
+                                      "mtp-attention-window"));
         } else if (arg == "--draft-tokens") {
             options.speculative.draft_tokens = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--draft-tokens"), "draft-tokens"));

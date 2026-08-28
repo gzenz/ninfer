@@ -5,6 +5,7 @@
 
 #include "targets/qwen3_6/impl/runtime/schedule.h"
 #include "ninfer/ops/gdn_replay.h"
+#include "ninfer/ops/gqa_attention.h"
 #include "ninfer/ops/prepare_ragged_prefix.h"
 #include "ninfer/ops/scatter.h"
 #include "ninfer/ops/speculative_round.h"
@@ -42,14 +43,38 @@ std::array<std::int32_t, 3> prompt_rope_position(const PreparedPromptData& promp
             prompt.positions[2 * tokens + token]};
 }
 
+// The sink prefix admitted alongside a draft window: exactly one KV page, so
+// the sink segment is a single contiguous page lookup.
+inline constexpr std::uint32_t kMtpAttentionSinkKeys = 64;
+
 schedule::MtpGqaEnvelopes mtp_gqa_envelopes(std::uint32_t max_frontier, std::uint32_t k,
-                                            std::uint32_t capacity) {
+                                            std::uint32_t capacity,
+                                            std::uint32_t attention_window = 0) {
     const auto visible = [capacity](std::uint64_t value) {
         return static_cast<std::uint32_t>(std::min<std::uint64_t>(capacity, value));
     };
     schedule::MtpGqaEnvelopes out;
     out.target_verify = {1, visible(static_cast<std::uint64_t>(max_frontier) + k + 1ULL)};
-    out.batch         = out.target_verify;
+    if (attention_window != 0) {
+        // Windowed draft: the envelope promises the virtual (admitted) key count
+        // so split sizing and warp routing key on the window, not the frontier.
+        // The target-verify envelope stays frontier-dependent (full attention).
+        // The partial kernel partitions the UNION of all rows' windows in one
+        // virtual layout: a width-(k+1) tile's union spans window + sink + k keys
+        // (sink and window disjoint), so the batch envelope must include the tile
+        // width or the host launch capacity underestimates the device's active
+        // splits at the INT8 policy boundaries. AR steps are width 1.
+        const std::uint32_t union_span =
+            visible(static_cast<std::uint64_t>(attention_window) + kMtpAttentionSinkKeys + k);
+        const std::uint32_t row_span =
+            visible(static_cast<std::uint64_t>(attention_window) + kMtpAttentionSinkKeys);
+        out.batch     = {1, union_span};
+        for (std::uint32_t step = 0; step + 1 < k; ++step) {
+            out.ar[step] = {1, row_span};
+        }
+        return out;
+    }
+    out.batch = out.target_verify;
     for (std::uint32_t step = 0; step + 1 < k; ++step) {
         out.ar[step] = {1, visible(static_cast<std::uint64_t>(max_frontier) + k + step + 2ULL)};
     }
@@ -184,7 +209,8 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
                                  DeviceContext& device_in)
     : model(model_in), device(device_in), capacity(plan.capacity), kv_capacity(plan.kv_capacity),
       max_concurrency(plan.max_concurrency), prefill_chunk(plan.prefill_chunk),
-      draft_window(plan.draft_window), speculative_backend(plan.speculative_backend),
+      draft_window(plan.draft_window), mtp_attention_window(plan.mtp_attention_window),
+      speculative_backend(plan.speculative_backend),
       kv_dtype(plan.kv_dtype), kv_quant_group(plan.kv_quant_group),
       proposal_head(plan.proposal_head), vision_enabled(plan.features.vision),
       use_cuda_graph(plan.use_cuda_graph), kv_payload_bytes(plan.persistent.kv_payload_bytes),
@@ -1731,7 +1757,11 @@ void ProgramImplCore::prepare_graphs() {
                                        io,
                                        prefill_hidden,
                                        prefill_chunk,
-                                       proposal_head};
+                                       proposal_head,
+                                       ops::GqaDraftWindow{mtp_attention_window,
+                                                           mtp_attention_window != 0
+                                                               ? kMtpAttentionSinkKeys
+                                                               : 0U}};
     };
 
     if (speculative_backend == SpeculativeBackend::None) {
@@ -1776,7 +1806,7 @@ void ProgramImplCore::prepare_graphs() {
         prepare_representative(code_warm.min, 1);
         device.synchronize();
         schedule::mtp_decode_batch(mtp_state, 1, draft_window,
-                                   mtp_gqa_envelopes(code_warm.max, draft_window, capacity),
+                                   mtp_gqa_envelopes(code_warm.max, draft_window, capacity, mtp_attention_window),
                                    nullptr);
         device.synchronize();
 
@@ -1792,7 +1822,7 @@ void ProgramImplCore::prepare_graphs() {
                     planned.topology_class * max_concurrency + (batch_size - 1U);
                 schedule::capture_mtp_decode_batch(
                     mtp_state, static_cast<std::int32_t>(batch_size), draft_window,
-                    mtp_gqa_envelopes(planned.max, draft_window, capacity), profile.definition);
+                    mtp_gqa_envelopes(planned.max, draft_window, capacity, mtp_attention_window), profile.definition);
             }
         }
     }
@@ -2369,13 +2399,13 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
     try {
         DecodeGraphExecutable* executable = nullptr;
         schedule::MtpGqaEnvelopes envelopes =
-            mtp_gqa_envelopes(maximum_frontier, draft_window, capacity);
+            mtp_gqa_envelopes(maximum_frontier, draft_window, capacity, mtp_attention_window);
         if (use_cuda_graph) {
             DecodeGraphProfile& profile =
                 select_graph_profile(mtp_graphs, static_cast<std::uint32_t>(lanes.size()),
                                      maximum_frontier, "MTP batch");
             executable = &install_graph_profile(mtp_graphs, profile, "MTP batch");
-            envelopes  = mtp_gqa_envelopes(profile.max_execution_frontier, draft_window, capacity);
+            envelopes  = mtp_gqa_envelopes(profile.max_execution_frontier, draft_window, capacity, mtp_attention_window);
         }
 
         for (std::size_t row = 0; row < lanes.size(); ++row) {
@@ -2414,7 +2444,11 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
 
         schedule::MtpBatchContext schedule_state{{device, model, work, decoder->linear_attention,
                                                   replay_records ? &*replay_records : nullptr, io,
-                                                  prefill_hidden, prefill_chunk, proposal_head},
+                                                  prefill_hidden, prefill_chunk, proposal_head,
+                                                  ops::GqaDraftWindow{mtp_attention_window,
+                                                                      mtp_attention_window != 0
+                                                                          ? kMtpAttentionSinkKeys
+                                                                          : 0U}},
                                                  decoder->text_kv,
                                                  *decoder->mtp_cache(),
                                                  *io.mtp_decode,

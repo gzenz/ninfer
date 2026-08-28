@@ -396,9 +396,19 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
         Tensor v_batch        = v.view({kCfg.head_dim, kCfg.n_kv, width, active_sequence_batch_});
         Tensor a_batch        = a.view({kCfg.head_dim, kCfg.n_q, width, active_sequence_batch_});
         Tensor position_batch = positions.view({width, active_sequence_batch_});
-        ops::gqa_attention(q_batch, k_batch, v_batch, position_batch, *active_valid_columns_,
-                           *active_backend_kv_table_rows_, kAttnScale,
-                           batch_mtp_kv_->batch_layer_view(0), envelope, work_, a_batch, s);
+        if (active_draft_window_.span > 0) {
+            // Windowed draft attention: the envelope already promises the
+            // admitted (virtual) key count, so split sizing and warp routing
+            // key on the window. The target verify path keeps full attention.
+            ops::gqa_attention_windowed(q_batch, k_batch, v_batch, position_batch,
+                                        *active_valid_columns_, *active_backend_kv_table_rows_,
+                                        kAttnScale, batch_mtp_kv_->batch_layer_view(0), envelope,
+                                        active_draft_window_, work_, a_batch, s);
+        } else {
+            ops::gqa_attention(q_batch, k_batch, v_batch, position_batch, *active_valid_columns_,
+                               *active_backend_kv_table_rows_, kAttnScale,
+                               batch_mtp_kv_->batch_layer_view(0), envelope, work_, a_batch, s);
+        }
     } else {
         ops::gqa_attention(qn, kn, v, positions, Tensor{}, io_.backend_kv_table_row, kAttnScale,
                            batch_mtp_kv_->batch_layer_view(0), envelope, work_, a, s);
@@ -754,7 +764,8 @@ void TextContext::mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidd
                                            const Tensor& cache_positions,
                                            const Tensor& rope_positions,
                                            const Tensor& valid_columns, const Tensor& kv_table_rows,
-                                           ops::GqaExecutionEnvelope envelope, Tensor& mtp_hidden) {
+                                           ops::GqaExecutionEnvelope envelope, Tensor& mtp_hidden,
+                                           ops::GqaDraftWindow draft_window) {
     if (batch_mtp_kv_ == nullptr) { throw std::runtime_error("MTP forward is not enabled"); }
     const std::int32_t width = ids.ne[0];
     const std::int32_t batch = ids.ne[1];
@@ -778,6 +789,7 @@ void TextContext::mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidd
     ScopedValue<const Tensor*> valid_binding(active_valid_columns_, &valid_columns);
     ScopedValue<std::int32_t> batch_binding(active_sequence_batch_, batch);
     ScopedValue<std::int32_t> width_binding(active_sequence_width_, width);
+    ScopedValue<ops::GqaDraftWindow> window_binding(active_draft_window_, draft_window);
     mtp_forward_core(ids, hidden, cache_positions, rope_positions, envelope, mtp_hidden, nullptr);
 }
 

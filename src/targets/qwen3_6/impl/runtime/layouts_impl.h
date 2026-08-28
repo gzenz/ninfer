@@ -576,14 +576,27 @@ void validate_target_options(DeviceContext& device, const EngineOptions& options
             throw std::invalid_argument(
                 "disabled speculative decoding requires draft_tokens=0 and the full proposal head");
         }
+        if (options.speculative.mtp_attention_window != 0) {
+            throw std::invalid_argument(
+                "MTP attention window requires the MTP speculative backend");
+        }
         break;
     case SpeculativeBackend::Mtp:
         if (options.speculative.draft_tokens == 0 ||
             options.speculative.draft_tokens > kMaximumMtpDraftTokens) {
             throw std::invalid_argument("MTP draft window must be in [1,5]");
         }
+        if (options.speculative.mtp_attention_window != 0 &&
+            options.speculative.mtp_attention_window < options.speculative.draft_tokens + 1) {
+            throw std::invalid_argument(
+                "MTP attention window must be at least draft_tokens + 1");
+        }
         break;
     case SpeculativeBackend::DFlash:
+        if (options.speculative.mtp_attention_window != 0) {
+            throw std::invalid_argument(
+                "MTP attention window requires the MTP speculative backend");
+        }
         if (kMaximumDFlashDraftTokens == 0) {
             throw std::invalid_argument("DFlash is not supported by this target");
         }
@@ -616,6 +629,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->max_concurrency     = inputs.max_concurrency;
     impl->prefill_chunk       = inputs.prefill_chunk;
     impl->draft_window        = inputs.draft_window;
+    impl->mtp_attention_window = inputs.mtp_attention_window;
     impl->speculative_backend = inputs.speculative_backend;
     impl->proposal_head       = inputs.proposal_head;
     impl->features            = inputs.features;
@@ -694,6 +708,7 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .max_concurrency     = options.max_concurrency,
         .prefill_chunk       = std::min(options.prefill_chunk, options.max_context),
         .draft_window        = options.speculative.draft_tokens,
+        .mtp_attention_window = options.speculative.mtp_attention_window,
         .speculative_backend = options.speculative.backend,
         .kv_dtype       = options.kv_cache == KvCacheStorage::BFloat16 ? DType::BF16 : DType::I8,
         .kv_quant_group = options.kv_cache == KvCacheStorage::BFloat16 ? 0 : qwen3_6::kKvQuantGroup,

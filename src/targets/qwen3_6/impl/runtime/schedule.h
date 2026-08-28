@@ -6,6 +6,7 @@
 #include "core/device.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/bidirectional_gqa_attention.h"
+#include "ninfer/ops/gqa_attention.h"
 #include "ninfer/ops/kv_cache_append_prefix.h"
 #include "ninfer/ops/swa.h"
 #include "core/decode_graph.h"
@@ -39,6 +40,9 @@ struct ExecutionCore {
     Tensor& prefill_hidden;
     std::uint32_t prefill_chunk;
     ProposalHead proposal_head;
+    // MTP draft-attention window (span 0 = full causal). Consumed by the MTP
+    // decode-batch draft forwards only.
+    ops::GqaDraftWindow mtp_draft_window{};
 };
 
 struct PrefillContext {

@@ -220,7 +220,8 @@ public:
     void mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidden,
                                   const Tensor& cache_positions, const Tensor& rope_positions,
                                   const Tensor& valid_columns, const Tensor& kv_table_rows,
-                                  ops::GqaExecutionEnvelope envelope, Tensor& mtp_hidden);
+                                  ops::GqaExecutionEnvelope envelope, Tensor& mtp_hidden,
+                                  ops::GqaDraftWindow draft_window = {});
     void mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor& draft_tokens);
     void mtp_forward_batch(const Tensor& ids, const Tensor& hidden, const Tensor& positions,
                            ops::GqaExecutionEnvelope envelope, Tensor& mtp_hidden,
@@ -301,6 +302,9 @@ private:
     const Tensor* active_valid_columns_                   = nullptr;
     const Tensor* active_backend_kv_table_rows_           = nullptr;
     const ops::GqaExecutionEnvelope* active_gqa_envelope_ = nullptr;
+    // Draft-attention window (span 0 = full causal attention). Bound for the
+    // MTP decode-batch path only; the target verify path ignores it.
+    ops::GqaDraftWindow active_draft_window_{};
     std::int32_t active_sequence_batch_                   = 0;
     std::int32_t active_sequence_width_                   = 0;
     std::int32_t rope_delta_                              = 0;

@@ -93,6 +93,33 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
                    WorkspaceArena& workspace, Tensor& out, cudaStream_t stream);
 
 /**
+ * Draft window for gqa_attention_windowed. span 0 would be the plain A1 contract and is
+ * rejected; use gqa_attention instead. sink 0 attends to the window only.
+ */
+struct GqaDraftWindow {
+    std::uint32_t span = 0;
+    std::uint32_t sink = 0;
+};
+
+/**
+ * A1-W: the A1 contract with a restricted admitted key set. For a query at absolute position p
+ * the admitted keys are {x : max(0, p - span + 1) <= x <= p} union {x : x < sink}. Everything
+ * else - tensor layouts, geometries, masking, cache-write behavior, and the causal bound - is
+ * identical to A1. The execution envelope is a promise over the admitted (virtual) key count:
+ * V(row) = min(p+1, span) + min(sink, max(0, p+1-span)), and max_visible_keys >= max V. The
+ * Op requires span >= max row width (the window must contain the query tile itself) and is
+ * registered only on the SmallT route (T <= 6) for both cache dtypes, masked and unmasked.
+ * Kernels partition the remapped virtual key space, so both host split capacity and device
+ * active splits key on V rather than on p+1; the cache positions remain real absolute keys.
+ */
+void gqa_attention_windowed(const Tensor& q, const Tensor& k, const Tensor& v,
+                            const Tensor& positions, const Tensor& valid_columns,
+                            const Tensor& kv_table_rows, float scale,
+                            PagedKVBatchLayerView cache, GqaExecutionEnvelope envelope,
+                            GqaDraftWindow window, WorkspaceArena& workspace, Tensor& out,
+                            cudaStream_t stream);
+
+/**
  * A2: perform only the cache-write part of A1. k/v are contiguous BF16 `[256,4|2,T]`, positions is
  * contiguous sequential I32 [T], and every addressed code and INT8 scale is overwritten. It reads
  * no unrelated cache row, receives no execution envelope, and owns no persistent frontier.

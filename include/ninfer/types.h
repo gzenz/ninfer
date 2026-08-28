@@ -66,6 +66,11 @@ struct SpeculativeOptions {
     SpeculativeBackend backend = SpeculativeBackend::None;
     std::uint32_t draft_tokens = 0;
     ProposalHead proposal_head = ProposalHead::Full;
+    // MTP draft-attention window in keys (0 = full causal attention). When set,
+    // the draft head attends to the newest `mtp_attention_window` keys plus a
+    // 64-key prefix sink; the target verify path keeps full attention, so
+    // greedy outputs are unchanged (only proposal quality shifts).
+    std::uint32_t mtp_attention_window = 0;
 };
 
 struct LoadProgress {

@@ -77,6 +77,67 @@ __device__ __forceinline__ bool gqa_valid_q_head(int kv_head, int q_head) {
            q_head < (kv_head + 1) * Geometry::GroupSize && q_head < Geometry::QHeads;
 }
 
+// Windowed-draft virtual-key remap. A draft window restricts attention to the
+// newest `span` keys plus a prefix "sink" of `sink_keys` keys. The two regions
+// are disjoint, so kernels address them through one monotone virtual index v:
+// the sink keys first, then the window keys. All split/partition arithmetic
+// runs in v-space; gqa_window_key() maps v back to the real key at the four
+// physical touch points (page gather, staging, score mask, cache write).
+// span == 0 is the identity remap (v == key) and must stay bit-identical to
+// the unwindowed path.
+struct GqaDraftWindowLayout {
+    int read_start;  // first real key of the window region (first row's floor)
+    int sink;        // number of leading sink keys (clamped to read_start for staging)
+    int vlen;        // total virtual length: window-region keys + sink keys
+    int span;        // per-row window width (the configured draft window)
+    int sink_keys;   // the raw configured sink (rows admit any key < sink_keys)
+};
+
+__device__ __forceinline__ GqaDraftWindowLayout
+gqa_draft_window_layout(int full, int first_pos, int window_span, int sink_keys) {
+    // full = last_pos + 1 (keys visible to the last row). The window floor comes
+    // from the FIRST row: the earliest query needs keys down to first_pos - span
+    // + 1, so the union of all rows' windows is [max(0, first_pos + 1 - span),
+    // full). Rows mask their own windows via the causal bound plus the per-key
+    // window predicate at the score mask.
+    GqaDraftWindowLayout out{};
+    out.span      = window_span;
+    out.sink_keys = sink_keys;
+    if (window_span <= 0 || window_span >= full) {
+        out.read_start = 0;
+        out.sink       = 0;
+        out.vlen       = full;
+        return out;
+    }
+    const int floor_pos = first_pos + 1 - window_span;
+    out.read_start      = floor_pos > 0 ? floor_pos : 0;
+    out.sink            = sink_keys < out.read_start ? sink_keys : out.read_start;
+    out.vlen            = (full - out.read_start) + out.sink;
+    return out;
+}
+
+__device__ __forceinline__ int gqa_window_key(int v, const GqaDraftWindowLayout& w) {
+    return v < w.sink ? v : w.read_start + (v - w.sink);
+}
+
+// Per-row window membership: the layout covers the union of all rows' windows
+// (floor from the first row), so each row masks its own window at the score.
+__device__ __forceinline__ bool gqa_key_in_row_window(int key, int qabs,
+                                                      const GqaDraftWindowLayout& w) {
+    if (w.span == 0) { return true; }
+    return key >= qabs - w.span + 1 || key < w.sink_keys;
+}
+
+// Inverse map for new-token positions in the cache-write path. Returns -1 when
+// the position falls in neither region; the window always contains the newest
+// `width` tokens (span >= width enforced host-side), so live tokens never
+// receive -1 in practice.
+__device__ __forceinline__ int gqa_window_virtual(int key, const GqaDraftWindowLayout& w) {
+    if (key < w.sink) { return key; }
+    if (key >= w.read_start) { return w.sink + (key - w.read_start); }
+    return -1;
+}
+
 template <typename Geometry>
 __device__ __forceinline__ int gqa_small_t_default_splits(int window) {
     int target_keys_per_split = 480 / Geometry::DecodeSplitScale;
@@ -147,7 +208,8 @@ __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kerne
     const __nv_bfloat16* partial_acc, const float* partial_m, const float* partial_l,
     const std::int32_t* positions, const std::int32_t* valid_columns, std::int32_t tokens,
     std::int32_t full_width, std::int32_t column_begin, std::int32_t batch_size,
-    std::int32_t split_count, __nv_bfloat16* out) {
+    std::int32_t split_count, std::int32_t window_span, std::int32_t sink_keys,
+    __nv_bfloat16* out) {
     static_assert(DChunk > 0 && DChunk <= kGqaHeadDim);
 
     const int q_head      = static_cast<int>(blockIdx.x);
@@ -168,6 +230,7 @@ __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kerne
     if constexpr (Offset) { positions += column_begin; }
     if constexpr (MultiBatch) { positions += batch * full_width; }
     const int last_pos = positions[tokens - 1];
+    const int first_pos = positions[0];
     int output_column  = token;
     if constexpr (Offset) { output_column += column_begin; }
     if constexpr (MultiBatch) { output_column += batch * full_width; }
@@ -182,7 +245,8 @@ __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kerne
         partial_l += partial_stat_row;
     }
 
-    const int window = last_pos + 1;
+    const GqaDraftWindowLayout win = gqa_draft_window_layout(last_pos + 1, first_pos, window_span, sink_keys);
+    const int window               = win.vlen;
     const int active_split_count =
         gqa_small_t_active_splits<Geometry, Int8>(window, split_count, tokens);
 

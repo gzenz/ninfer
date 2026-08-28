@@ -582,6 +582,33 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             if (!sequence.kv) {
                 throw std::logic_error("resident prefix has no KV allocation bundle");
             }
+            // Same transient-shortage guard as the FullReset preflight: growing
+            // the resident entitlement (append or MTP bridge) can also hit an
+            // exhausted pool after a concurrent restore, and resize throws
+            // std::bad_alloc - fatal to the engine. Reject as retryable.
+            {
+                if (request_plan.text_kv_page_entitlement >
+                        sequence.kv->text.page_entitlement() &&
+                    !decoder->text_kv.pool().can_reserve(
+                        request_plan.text_kv_page_entitlement)) {
+                    throw RequestError(
+                        RequestErrorKind::Overloaded,
+                        "KV page entitlement is temporarily exhausted; retry after "
+                        "active requests drain");
+                }
+                if (qwen3_6::PagedKVCache* backend_now = backend_kv_cache();
+                    backend_now != nullptr && sequence.kv->backend) {
+                    if (request_plan.backend_kv_page_entitlement >
+                            sequence.kv->backend->page_entitlement() &&
+                        !backend_now->pool().can_reserve(
+                            request_plan.backend_kv_page_entitlement)) {
+                        throw RequestError(
+                            RequestErrorKind::Overloaded,
+                            "KV page entitlement is temporarily exhausted; retry after "
+                            "active requests drain");
+                    }
+                }
+            }
             if (sequence.text_kv_valid < base) {
                 throw std::logic_error("resident Text KV is shorter than the append frontier");
             }

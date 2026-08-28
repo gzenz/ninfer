@@ -2,6 +2,7 @@
 
 // Small fixed-capacity request scheduling and batched decode execution for every backend.
 
+#include "core/nvtx.h"
 #include "ninfer/types.h"
 #include "runtime/contract/types.h"
 #include "runtime/engine/admission_policy.h"
@@ -1225,6 +1226,8 @@ private:
 
     void run_decode_round(const RoundMembership& membership) {
         const std::span<const std::uint32_t> lanes = membership.lane_span();
+        nvtx::ScopedRange round_range(nvtx::Name::DecodeOrdinaryRound, nvtx::Category::Decode,
+                                      static_cast<std::uint64_t>(lanes.size()));
         const BatchedGeneratedRound round =
             instance_.program->decode_batch(lanes, membership.budget_span());
 

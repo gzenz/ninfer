@@ -49,6 +49,11 @@ enum class Name : std::size_t {
     SparseMoePrefill,
     SparseMoeSmallT,
     SparseMoeDecode,
+    MtpTargetVerify,
+    MtpDraftAlign,
+    MtpDraftArStep,
+    MtpPropose,
+    MtpAccept,
     Count,
 };
 
@@ -125,6 +130,11 @@ enum class Name : std::size_t {
         "sparse_moe.prefill",
         "sparse_moe.small_t",
         "sparse_moe.decode",
+        "mtp.target_verify",
+        "mtp.draft_align",
+        "mtp.draft_ar_step",
+        "mtp.propose",
+        "mtp.accept",
     };
     static const auto handles = [] {
         std::array<nvtxStringHandle_t, names.size()> out{};

@@ -1,3 +1,4 @@
+#include "core/nvtx.h"
 #include "targets/qwen3_6/impl/runtime/instance.h"
 #include "targets/qwen3_6/impl/runtime/schedule.h"
 
@@ -70,6 +71,8 @@ void mtp_bridge_and_propose(PrefillContext& state, const Tensor& next_token,
 auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std::uint32_t k,
                            MtpGqaEnvelopes envelopes) {
     return [&state, batch_size, k, envelopes] {
+        nvtx::ScopedRange round_range(nvtx::Name::DecodeMtpRound, nvtx::Category::Mtp,
+                                      static_cast<std::uint64_t>(batch_size));
         if (batch_size <= 0 || batch_size > static_cast<std::int32_t>(kMaximumConcurrency) ||
             k == 0 || k > kMtpDecodeMaximumDrafts) {
             throw std::logic_error("MTP decode batch state is incomplete");
@@ -118,6 +121,8 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
         ops::speculative_prepare_verify_inputs(anchors, current_drafts, frontiers, current_extents,
                                                verify_ids, target_positions,
                                                state.execution.device.stream);
+        nvtx::ScopedRange verify_range(nvtx::Name::MtpTargetVerify, nvtx::Category::Mtp,
+                                       static_cast<std::uint64_t>(batch_size));
         target_verify_accept(state.execution, state.continuation_hidden_store, card,
                              TargetVerifyFrameView{
                                  .ids             = verify_ids,
@@ -147,15 +152,28 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
                                     ar_positions, ar_rope_positions, ar_valid_columns,
                                     static_cast<std::int32_t>(state.text_cache.max_context()),
                                     state.execution.device.stream);
-        card.mtp_forward_decode_batch(alignment_ids, target_hidden, target_positions, target_rope,
-                                      licensed_counts, mtp_rows, envelopes.batch, alignment_hidden);
+        {
+            nvtx::ScopedRange align_range(nvtx::Name::MtpDraftAlign, nvtx::Category::Mtp,
+                                          static_cast<std::uint64_t>(batch_size));
+            card.mtp_forward_decode_batch(alignment_ids, target_hidden, target_positions,
+                                          target_rope, licensed_counts, mtp_rows, envelopes.batch,
+                                          alignment_hidden);
+        }
+        nvtx::ScopedRange accept_range(nvtx::Name::MtpAccept, nvtx::Category::Mtp,
+                                        static_cast<std::uint64_t>(batch_size));
         ops::speculative_select_accepted_hidden(alignment_hidden, accepted, ar_hidden,
                                                 state.execution.device.stream);
 
         Tensor proposal_logits = frame.proposal_logits.slice(1, 0, batch_size);
         Tensor draft0          = next_drafts.slice(1, 0, 1).view({batch_size});
-        card.mtp_propose_batch(ar_hidden, proposal_logits, draft0);
+        {
+            nvtx::ScopedRange propose_range(nvtx::Name::MtpPropose, nvtx::Category::Mtp,
+                                            static_cast<std::uint64_t>(batch_size));
+            card.mtp_propose_batch(ar_hidden, proposal_logits, draft0);
+        }
         for (std::uint32_t step = 0; step + 1 < k; ++step) {
+            nvtx::ScopedRange ar_range(nvtx::Name::MtpDraftArStep, nvtx::Category::Mtp,
+                                       static_cast<std::uint64_t>(step));
             Tensor previous =
                 next_drafts.slice(1, static_cast<std::int32_t>(step), 1).view({batch_size});
             Tensor next =

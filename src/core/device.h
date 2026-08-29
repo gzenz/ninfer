@@ -27,6 +27,16 @@ struct DeviceContext {
     int sm() const noexcept;
     std::size_t total_vram() const noexcept;
     void synchronize() const;
+
+    // Event for non-blocking decode round completion polling.
+    // Recorded after each graph launch; the host syncs the event
+    // (not the stream) so later queued work doesn't block.
+    void record_decode_event() const;
+    void sync_decode_event() const;
+    [[nodiscard]] bool decode_event_ready() const;
+
+private:
+    mutable cudaEvent_t decode_event_ = nullptr;
 };
 
 class CudaEventTimer {

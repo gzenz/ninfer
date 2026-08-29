@@ -23,7 +23,7 @@ __global__ void terminal_check_kernel(
     if (row >= batch) return;
 
     if (blockIdx.x == 0 && threadIdx.x == 0) {
-        const int count     = licensed_counts[row];
+        const int count     = (width == 1) ? 1 : licensed_counts[row];
         const int budget    = remaining_budgets[row];
         const int num_stops = stop_token_counts[row];
 

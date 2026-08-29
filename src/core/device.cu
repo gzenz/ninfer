@@ -81,6 +81,7 @@ DeviceContext::DeviceContext(int device_id) : device(device_id) {
 }
 
 DeviceContext::~DeviceContext() {
+    destroy_event(decode_event_);
     if (stream != nullptr || load_stream != nullptr) {
         log_cuda_error("cudaSetDevice", cudaSetDevice(device));
     }
@@ -119,6 +120,26 @@ int DeviceContext::sm() const noexcept { return props.major * 10 + props.minor; 
 std::size_t DeviceContext::total_vram() const noexcept { return props.totalGlobalMem; }
 
 void DeviceContext::synchronize() const { CUDA_CHECK(cudaStreamSynchronize(stream)); }
+
+void DeviceContext::record_decode_event() const {
+    if (decode_event_ == nullptr) {
+        cudaEventCreateWithFlags(&decode_event_, cudaEventDisableTiming);
+    }
+    CUDA_CHECK(cudaEventRecord(decode_event_, stream));
+}
+
+void DeviceContext::sync_decode_event() const {
+    if (decode_event_ != nullptr) {
+        CUDA_CHECK(cudaEventSynchronize(decode_event_));
+    } else {
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+    }
+}
+
+[[nodiscard]] bool DeviceContext::decode_event_ready() const {
+    if (decode_event_ == nullptr) { return false; }
+    return cudaEventQuery(decode_event_) == cudaSuccess;
+}
 
 CudaEventTimer::CudaEventTimer(const DeviceContext& ctx) : stream_(ctx.stream) {
     cudaError_t err = cudaSetDevice(ctx.device);

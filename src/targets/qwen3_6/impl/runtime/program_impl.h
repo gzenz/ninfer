@@ -2296,6 +2296,13 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             ordinary_host_ingress->lanes[row]             = static_cast<std::int32_t>(sequence.lane);
             ordinary_host_ingress->remaining_budgets[row]  = static_cast<std::int32_t>(budgets[row].generated_tokens_remaining);
             ordinary_host_ingress->sampling[row]           = request.sampling_host;
+            // Copy stop tokens from lane-indexed storage to row-indexed ingress.
+            ordinary_host_ingress->stop_token_counts[row] =
+                ordinary_host_ingress->stop_token_counts[lanes[row]];
+            for (std::uint32_t s = 0; s < kMaxStopTokens; ++s) {
+                ordinary_host_ingress->stop_token_table[row * kMaxStopTokens + s] =
+                    ordinary_host_ingress->stop_token_table[lanes[row] * kMaxStopTokens + s];
+            }
             materialize_sequence_kv(sequence, frontier + 1, 0);
         }
 
@@ -2312,7 +2319,8 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
         mark_workspace_usage(workspace_plan.ordinary_round);
         schedule::ordinary_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
                                         envelope, executable);
-        device.synchronize();
+        device.record_decode_event();
+        device.sync_decode_event();
 
         const double seconds = std::chrono::duration<double>(Clock::now() - start).count();
         for (std::size_t row = 0; row < lanes.size(); ++row) {
@@ -2432,6 +2440,14 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             mtp_host_ingress->lanes[row]              = static_cast<std::int32_t>(sequence.lane);
             mtp_host_ingress->rope_deltas[row]        = sequence.rope_delta;
             mtp_host_ingress->sampling[row]           = request.sampling_host;
+            // Copy stop tokens from lane-indexed storage to row-indexed ingress.
+            // install_stop_tokens writes by lane; the graph/kernel reads by row.
+            mtp_host_ingress->stop_token_counts[row] =
+                mtp_host_ingress->stop_token_counts[lanes[row]];
+            for (std::uint32_t s = 0; s < kMaxStopTokens; ++s) {
+                mtp_host_ingress->stop_token_table[row * kMaxStopTokens + s] =
+                    mtp_host_ingress->stop_token_table[lanes[row] * kMaxStopTokens + s];
+            }
             materialize_sequence_kv(sequence, frontier + extent + 1,
                                     std::min(capacity, frontier + extent + draft_window));
         }
@@ -2449,7 +2465,8 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         mark_workspace_usage(workspace_plan.mtp_round);
         schedule::mtp_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
                                    draft_window, envelopes, executable);
-        device.synchronize();
+        device.record_decode_event();
+        device.sync_decode_event();
 
         const double seconds = std::chrono::duration<double>(Clock::now() - started).count();
         for (std::size_t row = 0; row < lanes.size(); ++row) {

@@ -884,7 +884,6 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
             }
         }
 
-        device.synchronize();
         work.reset();
     } catch (...) {
         try {

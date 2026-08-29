@@ -2293,8 +2293,9 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             ordinary_host_ingress->rope_positions[row] =
                 checked_i32(frontier, "ordinary batch RoPE position") + sequence.rope_delta;
             ordinary_host_ingress->text_kv_table_rows[row] = sequence.kv->text.bound_row();
-            ordinary_host_ingress->lanes[row]    = static_cast<std::int32_t>(sequence.lane);
-            ordinary_host_ingress->sampling[row] = request.sampling_host;
+            ordinary_host_ingress->lanes[row]             = static_cast<std::int32_t>(sequence.lane);
+            ordinary_host_ingress->remaining_budgets[row]  = static_cast<std::int32_t>(budgets[row].generated_tokens_remaining);
+            ordinary_host_ingress->sampling[row]           = request.sampling_host;
             materialize_sequence_kv(sequence, frontier + 1, 0);
         }
 

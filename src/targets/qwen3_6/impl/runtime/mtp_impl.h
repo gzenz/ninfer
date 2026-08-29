@@ -194,6 +194,16 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
                                        cudaMemcpyDeviceToDevice, state.execution.device.stream));
         }
 
+        Tensor committed_counts_out = frame.committed_counts.slice(0, 0, batch_size);
+        Tensor terminal_flags_out   = frame.terminal_flags.slice(0, 0, batch_size);
+        ops::terminal_check(licensed_tokens, licensed_counts, budgets,
+                            frame.stop_token_table.slice(1, 0, batch_size),
+                            frame.stop_token_counts.slice(0, 0, batch_size),
+                            committed_counts_out,
+                            terminal_flags_out,
+                            batch_size, width,
+                            state.execution.device.stream);
+
         CUDA_CHECK(cudaMemcpyAsync(&state.host_egress, frame.egress.data,
                                    sizeof(qwen3_6::MtpDecodeEgress), cudaMemcpyDeviceToHost,
                                    state.execution.device.stream));

@@ -99,6 +99,7 @@ OrdinaryDecodeState::OrdinaryDecodeState(DeviceSpan backing,
     text_kv_table_rows =
         ingress_tensor(offsetof(OrdinaryDecodeIngress, text_kv_table_rows), DType::I32);
     lanes    = ingress_tensor(offsetof(OrdinaryDecodeIngress, lanes), DType::I32);
+    remaining_budgets = ingress_tensor(offsetof(OrdinaryDecodeIngress, remaining_budgets), DType::I32);
     sampling = reinterpret_cast<const ops::SamplingConfig*>(
         static_cast<const unsigned char*>(ingress.data) +
         offsetof(OrdinaryDecodeIngress, sampling));
@@ -109,6 +110,12 @@ OrdinaryDecodeState::OrdinaryDecodeState(DeviceSpan backing,
         offsetof(OrdinaryDecodeIngress, stop_token_counts), DType::I32, {count});
     sampled_tokens = Tensor(static_cast<unsigned char*>(egress.data) +
                                 offsetof(OrdinaryDecodeEgress, sampled_tokens),
+                            DType::I32, {count});
+    committed_counts = Tensor(static_cast<unsigned char*>(egress.data) +
+                                  offsetof(OrdinaryDecodeEgress, committed_counts),
+                              DType::I32, {count});
+    terminal_flags = Tensor(static_cast<unsigned char*>(egress.data) +
+                                offsetof(OrdinaryDecodeEgress, terminal_flags),
                             DType::I32, {count});
     logits         = layout.logits.bind(backing);
     hidden         = layout.hidden.bind(backing);
@@ -274,6 +281,8 @@ MtpDecodeState::MtpDecodeState(DeviceSpan backing, const MtpDecodeStateLayout& l
     next_drafts =
         egress_tensor(offsetof(MtpDecodeEgress, next_drafts), DType::I32, {batch, drafts});
     next_extents     = egress_tensor(offsetof(MtpDecodeEgress, next_extents), DType::I32, {batch});
+    committed_counts = egress_tensor(offsetof(MtpDecodeEgress, committed_counts), DType::I32, {batch});
+    terminal_flags   = egress_tensor(offsetof(MtpDecodeEgress, terminal_flags), DType::I32, {batch});
     verify_ids       = layout.verify_ids.bind(backing);
     target_positions = layout.target_positions.bind(backing);
     target_argmax    = layout.target_argmax.bind(backing);

@@ -2,6 +2,7 @@
 #include "targets/qwen3_6/impl/runtime/schedule.h"
 
 #include "ninfer/ops/sampling.h"
+#include "ninfer/ops/terminal_check.h"
 #include "ninfer/ops/scatter.h"
 
 #include <stdexcept>
@@ -40,6 +41,16 @@ auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
         ops::scatter(hidden, lanes, state.continuation_hidden_store, state.execution.device.stream);
         ops::sample(logits, sampled, TextConfig::token_domain, ordinary.sampling, cache_positions,
                     ops::kSamplePurposeDecode, state.execution.work, state.execution.device.stream);
+        Tensor committed_counts_out = ordinary.committed_counts.slice(0, 0, batch_size);
+        Tensor terminal_flags_out   = ordinary.terminal_flags.slice(0, 0, batch_size);
+        ops::terminal_check(sampled, sampled, ordinary.remaining_budgets.slice(0, 0, batch_size),
+                            ordinary.stop_token_table.slice(1, 0, batch_size),
+                            ordinary.stop_token_counts.slice(0, 0, batch_size),
+                            committed_counts_out,
+                            terminal_flags_out,
+                            batch_size, 1,
+                            state.execution.device.stream);
+
         CUDA_CHECK(cudaMemcpyAsync(&state.host_egress, ordinary.egress.data,
                                    sizeof(qwen3_6::OrdinaryDecodeEgress), cudaMemcpyDeviceToHost,
                                    state.execution.device.stream));

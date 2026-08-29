@@ -34,6 +34,7 @@ struct OrdinaryDecodeIngress {
     std::array<std::int32_t, kMaximumConcurrency> rope_positions{};
     std::array<std::int32_t, kMaximumConcurrency> text_kv_table_rows{};
     std::array<std::int32_t, kMaximumConcurrency> lanes{};
+    std::array<std::int32_t, kMaximumConcurrency> remaining_budgets{};
     std::array<ops::SamplingConfig, kMaximumConcurrency> sampling{};
     std::array<TokenId, kMaximumConcurrency * kMaxStopTokens> stop_token_table{};
     std::array<std::int32_t, kMaximumConcurrency> stop_token_counts{};
@@ -41,6 +42,8 @@ struct OrdinaryDecodeIngress {
 
 struct OrdinaryDecodeEgress {
     std::array<TokenId, kMaximumConcurrency> sampled_tokens{};
+    std::array<std::int32_t, kMaximumConcurrency> committed_counts{};
+    std::array<std::int32_t, kMaximumConcurrency> terminal_flags{};
 };
 
 // Stable pinned/device transfer formats for concurrent MTP decode. The arrays use the maximum
@@ -69,6 +72,8 @@ struct MtpDecodeEgress {
     // Step-major: all B rows for proposal step 0, followed by all B rows for step 1, etc.
     std::array<TokenId, kMaximumConcurrency * kMtpDecodeMaximumDrafts> next_drafts{};
     std::array<std::int32_t, kMaximumConcurrency> next_extents{};
+    std::array<std::int32_t, kMaximumConcurrency> committed_counts{};
+    std::array<std::int32_t, kMaximumConcurrency> terminal_flags{};
 };
 
 // Stable pinned/device transfer formats for one exact-B DFlash transaction. The proposal is
@@ -169,10 +174,13 @@ struct OrdinaryDecodeState {
     Tensor rope_positions;
     Tensor text_kv_table_rows;
     Tensor lanes;
+    Tensor remaining_budgets;
     const ops::SamplingConfig* sampling = nullptr;
     Tensor stop_token_table;
     Tensor stop_token_counts;
     Tensor sampled_tokens;
+    Tensor committed_counts;
+    Tensor terminal_flags;
     Tensor logits;
     Tensor hidden;
 
@@ -228,6 +236,8 @@ struct MtpDecodeState {
     Tensor accepted_drafts;
     Tensor next_drafts;
     Tensor next_extents;
+    Tensor committed_counts;
+    Tensor terminal_flags;
     Tensor verify_ids;
     Tensor target_positions;
     Tensor target_argmax;

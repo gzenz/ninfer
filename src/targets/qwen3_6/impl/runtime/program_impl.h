@@ -2335,8 +2335,13 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             request.timings.decode_seconds += seconds;
         }
         return runtime::BatchedGeneratedRound{
-            .tokens = std::span<const TokenId>(ordinary_host_egress->sampled_tokens.data(),
-                                               lanes.size())};
+            .tokens            = std::span<const TokenId>(ordinary_host_egress->sampled_tokens.data(),
+                                                           lanes.size()),
+            .row_counts        = {},
+            .committed_counts  = std::span<const std::int32_t>(
+                ordinary_host_egress->committed_counts.data(), lanes.size()),
+            .terminal_flags    = std::span<const std::int32_t>(
+                ordinary_host_egress->terminal_flags.data(), lanes.size())};
     } catch (...) {
         try {
             device.synchronize();
@@ -2491,11 +2496,15 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             request.timings.decode_seconds += seconds;
         }
         return runtime::BatchedGeneratedRound{
-            .tokens     = std::span<const TokenId>(mtp_host_egress->licensed_tokens.data(),
-                                                   lanes.size() * width),
-            .row_counts = std::span<const std::int32_t>(mtp_host_egress->licensed_counts.data(),
-                                                        lanes.size()),
-            .row_stride = width};
+            .tokens           = std::span<const TokenId>(mtp_host_egress->licensed_tokens.data(),
+                                                         lanes.size() * width),
+            .row_counts       = std::span<const std::int32_t>(mtp_host_egress->licensed_counts.data(),
+                                                              lanes.size()),
+            .committed_counts = std::span<const std::int32_t>(
+                mtp_host_egress->committed_counts.data(), lanes.size()),
+            .terminal_flags   = std::span<const std::int32_t>(
+                mtp_host_egress->terminal_flags.data(), lanes.size()),
+            .row_stride       = width};
     } catch (...) {
         try {
             device.synchronize();

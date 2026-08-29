@@ -1255,8 +1255,6 @@ private:
             if (count == 0 || count > round.row_stride) {
                 throw std::logic_error("decode batch returned an invalid licensed row extent");
             }
-            const auto row_tokens =
-                round.tokens.subspan(row * round.row_stride, static_cast<std::size_t>(count));
             if (cancelled[row]) {
                 (void)request->output.preview_terminal(FinishReason::Cancelled);
                 accepted[row]       = 0;
@@ -1264,15 +1262,55 @@ private:
                 finish_reasons[row] = FinishReason::Cancelled;
                 continue;
             }
-            const OutputDecision decision = request->output.preview(
-                row_tokens, request->budget->remaining(), request->budget->limit_reason());
-            if (decision.accepted_tokens == 0 || decision.accepted_tokens > count ||
-                (!decision.finished() && decision.accepted_tokens != count)) {
-                throw std::logic_error("output policy returned an invalid licensed prefix");
+            // Use device-side terminal_check results when available.
+            // committed_counts and terminal_flags are written by the terminal_check
+            // kernel inside the graph and arrive via the D2H egress memcpy.
+            if (!round.terminal_flags.empty() && !round.committed_counts.empty()) {
+                const auto device_committed =
+                    static_cast<std::uint32_t>(round.committed_counts[row]);
+                const auto device_terminal = static_cast<std::uint8_t>(round.terminal_flags[row]);
+                if (device_committed == 0 || device_committed > count) {
+                    throw std::logic_error("device terminal_check returned invalid committed count");
+                }
+                if (device_terminal) {
+                    // Terminal: must run output.preview for stop-string matching,
+                    // detokenization, and finish_reason resolution.
+                    const auto row_tokens = round.tokens.subspan(
+                        row * round.row_stride, static_cast<std::size_t>(count));
+                    const OutputDecision decision = request->output.preview(
+                        row_tokens, request->budget->remaining(),
+                        request->budget->limit_reason());
+                    accepted[row]       = decision.accepted_tokens;
+                    terminal[row]       = decision.finished() ? 1 : 0;
+                    finish_reasons[row] = decision.finish_reason;
+                } else {
+                    // Non-terminal: skip the expensive output.preview entirely.
+                    // The device already checked stop-tokens and budget.
+                    // Accept all committed tokens, feed them to output for streaming.
+                    const auto row_tokens = round.tokens.subspan(
+                        row * round.row_stride, static_cast<std::size_t>(device_committed));
+                    (void)request->output.preview(
+                        row_tokens, request->budget->remaining(),
+                        request->budget->limit_reason());
+                    accepted[row]       = device_committed;
+                    terminal[row]       = 0;
+                    finish_reasons[row] = FinishReason::None;
+                }
+            } else {
+                // Fallback: no device terminal check (e.g., DFlash or graphs off).
+                const auto row_tokens = round.tokens.subspan(
+                    row * round.row_stride, static_cast<std::size_t>(count));
+                const OutputDecision decision = request->output.preview(
+                    row_tokens, request->budget->remaining(),
+                    request->budget->limit_reason());
+                if (decision.accepted_tokens == 0 || decision.accepted_tokens > count ||
+                    (!decision.finished() && decision.accepted_tokens != count)) {
+                    throw std::logic_error("output policy returned an invalid licensed prefix");
+                }
+                accepted[row]       = decision.accepted_tokens;
+                terminal[row]       = decision.finished() ? 1 : 0;
+                finish_reasons[row] = decision.finish_reason;
             }
-            accepted[row]       = decision.accepted_tokens;
-            terminal[row]       = decision.finished() ? 1 : 0;
-            finish_reasons[row] = decision.finish_reason;
         }
 
         instance_.program->resolve_pending_batch(

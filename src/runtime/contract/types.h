@@ -71,6 +71,8 @@ struct GeneratedRound {
 struct BatchedGeneratedRound {
     std::span<const TokenId> tokens;
     std::span<const std::int32_t> row_counts;
+    std::span<const std::int32_t> committed_counts;
+    std::span<const std::int32_t> terminal_flags;
     std::uint32_t row_stride = 1;
 };
 

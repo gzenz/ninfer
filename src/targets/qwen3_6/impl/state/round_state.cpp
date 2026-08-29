@@ -102,6 +102,11 @@ OrdinaryDecodeState::OrdinaryDecodeState(DeviceSpan backing,
     sampling = reinterpret_cast<const ops::SamplingConfig*>(
         static_cast<const unsigned char*>(ingress.data) +
         offsetof(OrdinaryDecodeIngress, sampling));
+    stop_token_table = Tensor(static_cast<unsigned char*>(ingress.data) +
+        offsetof(OrdinaryDecodeIngress, stop_token_table), DType::I32,
+        {static_cast<std::int32_t>(kMaxStopTokens), count});
+    stop_token_counts = Tensor(static_cast<unsigned char*>(ingress.data) +
+        offsetof(OrdinaryDecodeIngress, stop_token_counts), DType::I32, {count});
     sampled_tokens = Tensor(static_cast<unsigned char*>(egress.data) +
                                 offsetof(OrdinaryDecodeEgress, sampled_tokens),
                             DType::I32, {count});
@@ -255,6 +260,10 @@ MtpDecodeState::MtpDecodeState(DeviceSpan backing, const MtpDecodeStateLayout& l
     rope_deltas = ingress_tensor(offsetof(MtpDecodeIngress, rope_deltas), DType::I32, {batch});
     sampling    = reinterpret_cast<const ops::SamplingConfig*>(
         static_cast<const unsigned char*>(ingress.data) + offsetof(MtpDecodeIngress, sampling));
+    stop_token_table = ingress_tensor(offsetof(MtpDecodeIngress, stop_token_table),
+                                       DType::I32, {static_cast<std::int32_t>(kMaxStopTokens), batch});
+    stop_token_counts = ingress_tensor(offsetof(MtpDecodeIngress, stop_token_counts),
+                                        DType::I32, {batch});
 
     licensed_tokens =
         egress_tensor(offsetof(MtpDecodeEgress, licensed_tokens), DType::I32, {width, batch});

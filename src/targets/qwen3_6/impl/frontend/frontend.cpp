@@ -834,6 +834,10 @@ PublishedOutput OutputSession::commit_preview() noexcept {
 std::uint32_t OutputSession::reasoning_tokens() const noexcept {
     return impl_ != nullptr ? impl_->state.reasoning_tokens : 0;
 }
+std::span<const TokenId> OutputSession::stop_token_ids() const noexcept {
+    return impl_->policy.token_ids;
+}
+
 
 Frontend::Frontend(std::shared_ptr<const Impl> impl) noexcept : impl_(std::move(impl)) {}
 

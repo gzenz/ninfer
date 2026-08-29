@@ -1237,15 +1237,37 @@ private:
         nvtx::ScopedRange round_range(nvtx::Name::DecodeOrdinaryRound, nvtx::Category::Decode,
                                       static_cast<std::uint64_t>(lanes.size()));
 
-        // Phase 3 pipelining: launch graph, then process previous round
-        // while the GPU executes. For now, use sync decode_batch until
-        // process_pending_round is fully implemented.
-        // TODO: replace with decode_batch_async + process_pending + finish_decode_batch
-        //
-        // the previous round. The GPU runs graph_N while the host does
-        // preview/resolve/streaming for round N-1.
+        // Phase 3 pipelining: launch graph_N, then process round N-1
+        // while the GPU executes graph_N.
+        instance_.program->decode_batch_async(lanes, membership.budget_span());
+
+        // Process the previous pending round while graph_N runs on the GPU.
+        if (pending_round_.active) {
+            process_pending_round();
+        }
+
+        // Finish the current round: sync event (waits for graph_N only if
+        // host work finished before the GPU), read egress, update state.
         const BatchedGeneratedRound round =
-            instance_.program->decode_batch(lanes, membership.budget_span());
+            instance_.program->finish_decode_batch(lanes);
+
+        // Store as pending for the next iteration.
+        pending_round_.membership = membership;
+        pending_round_.round = round;
+        pending_round_.active = true;
+    }
+
+    void drain_pending_round() {
+        if (pending_round_.active) {
+            process_pending_round();
+        }
+    }
+
+    void process_pending_round() {
+        const auto& membership = pending_round_.membership;
+        const auto& round = pending_round_.round;
+        const std::span<const std::uint32_t> lanes = membership.lane_span();
+        pending_round_.active = false;
 
         // Check cancellations for the current round.
         std::array<std::uint8_t, kMaximumConcurrency> cancelled{};
@@ -1413,6 +1435,11 @@ private:
 
             try {
                 std::scoped_lock execution_lock(execution_mutex_);
+                // Drain any pending round from the previous iteration before
+                // doing anything that depends on sequence state (membership,
+                // admission, prefill). The pending round's preview/resolve
+                // updates the ledger and lifecycle which these operations read.
+                drain_pending_round();
                 const bool have_pending          = expire_pending_requests();
                 const auto cancelled_at_boundary = snapshot_cancellations();
                 cancel_active_requests(cancelled_at_boundary);

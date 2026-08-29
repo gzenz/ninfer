@@ -79,6 +79,7 @@ add_library(ninfer_ops STATIC
   ops/launcher/layer_norm.cu
   ops/launcher/mtp_pack.cu
   ops/launcher/mtp_round.cu
+  ops/launcher/terminal_check.cu
   ops/launcher/speculative_round.cu
   ops/launcher/position.cu
   ops/launcher/prepare_ragged_prefix.cu
@@ -247,6 +248,7 @@ add_library(ninfer_ops STATIC
   ops/wrapper/linear_swiglu.cpp
   ops/wrapper/mtp_pack.cpp
   ops/wrapper/mtp_round.cpp
+  ops/wrapper/terminal_check.cpp
   ops/wrapper/speculative_round.cpp
   ops/wrapper/position.cpp
   ops/wrapper/prepare_ragged_prefix.cpp

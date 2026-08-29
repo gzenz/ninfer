@@ -18,6 +18,7 @@ namespace ninfer {
 using TokenId = std::int32_t;
 
 inline constexpr std::uint32_t kMaximumConcurrency = 8;
+inline constexpr std::uint32_t kMaxStopTokens = 32;
 // Aggregate encoded image/video payload retained by one prompt, independent of item count.
 inline constexpr std::size_t kMaximumPromptMediaBytes = 256ULL << 20;
 inline constexpr std::size_t kDefaultMediaCacheBytes  = 1ULL << 30;

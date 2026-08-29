@@ -362,6 +362,13 @@ private:
         }
     };
 
+    // Pending round state for async decode pipelining.
+    struct PendingRound {
+        RoundMembership membership;
+        BatchedGeneratedRound round;
+        bool active = false;
+    };
+
     struct ActiveAdmissionSet {
         std::array<ActiveAdmissionSnapshot, kMaximumConcurrency> requests{};
         std::size_t size = 0;
@@ -1229,9 +1236,18 @@ private:
         const std::span<const std::uint32_t> lanes = membership.lane_span();
         nvtx::ScopedRange round_range(nvtx::Name::DecodeOrdinaryRound, nvtx::Category::Decode,
                                       static_cast<std::uint64_t>(lanes.size()));
+
+        // Phase 3 pipelining: launch graph, then process previous round
+        // while the GPU executes. For now, use sync decode_batch until
+        // process_pending_round is fully implemented.
+        // TODO: replace with decode_batch_async + process_pending + finish_decode_batch
+        //
+        // the previous round. The GPU runs graph_N while the host does
+        // preview/resolve/streaming for round N-1.
         const BatchedGeneratedRound round =
             instance_.program->decode_batch(lanes, membership.budget_span());
 
+        // Check cancellations for the current round.
         std::array<std::uint8_t, kMaximumConcurrency> cancelled{};
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             cancelled[row] =
@@ -1243,6 +1259,8 @@ private:
             round.tokens.size() < static_cast<std::size_t>(round.row_stride) * lanes.size()) {
             throw std::logic_error("decode batch returned an invalid ragged layout");
         }
+
+
 
         std::array<std::uint32_t, kMaximumConcurrency> accepted{};
         std::array<std::uint8_t, kMaximumConcurrency> terminal{};
@@ -1435,6 +1453,7 @@ private:
     }
 
     Instance& instance_;
+    PendingRound pending_round_{};
     const std::uint32_t max_concurrency_;
     const std::size_t max_outstanding_;
     const std::chrono::milliseconds pending_timeout_;

@@ -163,6 +163,10 @@ public:
     [[nodiscard]] runtime::BatchedGeneratedRound
     decode_batch(std::span<const std::uint32_t> lanes,
                  std::span<const runtime::RoundBudget> budgets);
+    void decode_batch_async(std::span<const std::uint32_t> lanes,
+                            std::span<const runtime::RoundBudget> budgets);
+    [[nodiscard]] runtime::BatchedGeneratedRound finish_decode_batch(
+        std::span<const std::uint32_t> lanes);
     void resolve_prefill_lane(std::uint32_t lane, bool terminal);
     void resolve_pending_batch(std::span<const std::uint32_t> lanes,
                                std::span<const std::uint32_t> accepted_tokens,

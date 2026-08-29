@@ -174,6 +174,18 @@ Program<Variant>::decode_batch(std::span<const std::uint32_t> lanes,
 }
 
 template <>
+void Program<Variant>::decode_batch_async(std::span<const std::uint32_t> lanes,
+                                          std::span<const runtime::RoundBudget> budgets) {
+    impl_->decode_batch_async(lanes, budgets);
+}
+
+template <>
+runtime::BatchedGeneratedRound
+Program<Variant>::finish_decode_batch(std::span<const std::uint32_t> lanes) {
+    return impl_->finish_decode_batch(lanes);
+}
+
+template <>
 void Program<Variant>::resolve_pending_batch(std::span<const std::uint32_t> lanes,
                                              std::span<const std::uint32_t> accepted_tokens,
                                              std::span<const std::uint8_t> terminal,

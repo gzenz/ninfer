@@ -2361,13 +2361,20 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
     }
 }
 
-runtime::BatchedGeneratedRound
-ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
+void
+ProgramImplCore::launch_mtp_batch(std::span<const std::uint32_t> lanes,
                                   std::span<const runtime::RoundBudget> budgets) {
     if (speculative_backend != SpeculativeBackend::Mtp || !io.mtp_decode ||
         decoder->mtp_cache() == nullptr) {
         throw std::logic_error("MTP batch execution requires the MTP backend");
     }
+    // Save state for finish_mtp_batch (used by both decode_batch and decode_batch_async).
+    async_size_ = lanes.size();
+    for (std::size_t i = 0; i < lanes.size(); ++i) {
+        async_lanes_[i] = lanes[i];
+        async_budgets_[i] = budgets[i];
+    }
+    async_started_ = std::chrono::steady_clock::now();
     if (lanes.empty() || lanes.size() > max_concurrency || budgets.size() != lanes.size()) {
         throw std::invalid_argument("MTP batch membership is invalid");
     }
@@ -2466,6 +2473,23 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         schedule::mtp_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
                                    draft_window, envelopes, executable);
         device.record_decode_event();
+        // sync_decode_event() is called by finish_mtp_batch, allowing host work
+        // to overlap with the graph execution on the GPU.
+    } catch (...) {
+        try { device.synchronize(); } catch (...) {}
+        for (const std::uint32_t lane : lanes) {
+            if (lane < max_concurrency) { clear_lane(sequences[lane], requests[lane]); }
+        }
+        throw;
+    }
+}
+
+runtime::BatchedGeneratedRound
+ProgramImplCore::finish_mtp_batch(std::span<const std::uint32_t> lanes) {
+    const std::uint32_t width = draft_window + 1U;
+    const auto& budgets = async_budgets_;  // saved by decode_batch_async
+    const auto started = async_started_;   // saved by decode_batch_async
+    try {
         device.sync_decode_event();
 
         const double seconds = std::chrono::duration<double>(Clock::now() - started).count();
@@ -2700,8 +2724,37 @@ ProgramImplCore::decode_batch(std::span<const std::uint32_t> lanes,
     if (speculative_backend == SpeculativeBackend::None) {
         return decode_ordinary_batch(lanes, budgets);
     }
-    if (speculative_backend == SpeculativeBackend::Mtp) { return decode_mtp_batch(lanes, budgets); }
+    if (speculative_backend == SpeculativeBackend::Mtp) {
+        launch_mtp_batch(lanes, budgets);
+        return finish_mtp_batch(lanes);
+    }
     return decode_dflash_batch(lanes, budgets);
+}
+
+void ProgramImplCore::decode_batch_async(std::span<const std::uint32_t> lanes,
+                                         std::span<const runtime::RoundBudget> budgets) {
+    // Launch the graph without syncing. launch_mtp_batch saves the async state.
+    if (speculative_backend == SpeculativeBackend::Mtp) {
+        launch_mtp_batch(lanes, budgets);
+    } else {
+        // Fallback: sync decode for non-MTP backends.
+        (void)decode_batch(lanes, budgets);
+        async_size_ = 0;  // signal that finish is not needed
+    }
+}
+
+runtime::BatchedGeneratedRound
+ProgramImplCore::finish_decode_batch(std::span<const std::uint32_t> lanes) {
+    if (async_size_ == 0) {
+        // Fallback path: decode_batch already completed synchronously.
+        // Return a minimal empty round (should not be called in this case).
+        throw std::logic_error("finish_decode_batch called without a pending async batch");
+    }
+    async_size_ = 0;
+    if (speculative_backend == SpeculativeBackend::Mtp) {
+        return finish_mtp_batch(lanes);
+    }
+    throw std::logic_error("finish_decode_batch is not supported for this backend");
 }
 
 void ProgramImplCore::resolve_non_speculative_pending(SequenceState& sequence,

@@ -3,6 +3,7 @@
 // Qwen3.6 family runtime implementation; instantiated only by exact variants.
 
 #include "core/arena.h"
+#include <chrono>
 #include "core/gdn_replay_records.h"
 #include "ninfer/ops/sampling.h"
 #include "core/decode_graph.h"
@@ -227,6 +228,10 @@ public:
     [[nodiscard]] runtime::BatchedGeneratedRound
     decode_batch(std::span<const std::uint32_t> lanes,
                  std::span<const runtime::RoundBudget> budgets);
+    void decode_batch_async(std::span<const std::uint32_t> lanes,
+                            std::span<const runtime::RoundBudget> budgets);
+    [[nodiscard]] runtime::BatchedGeneratedRound finish_decode_batch(
+        std::span<const std::uint32_t> lanes);
     void resolve_prefill_lane(std::uint32_t lane, bool terminal);
     void resolve_pending_batch(std::span<const std::uint32_t> lanes,
                                std::span<const std::uint32_t> accepted_tokens,
@@ -293,6 +298,11 @@ public:
     const std::uint32_t prefill_chunk;
     const std::uint32_t draft_window;
     const SpeculativeBackend speculative_backend;
+    // Async decode batch state: stored by decode_batch_async, consumed by finish_decode_batch.
+    std::array<std::uint32_t, kMaximumConcurrency> async_lanes_{};
+    std::array<runtime::RoundBudget, kMaximumConcurrency> async_budgets_{};
+    std::size_t async_size_ = 0;
+    std::chrono::steady_clock::time_point async_started_{};
     const DType kv_dtype;
     const std::int32_t kv_quant_group;
     const ProposalHead proposal_head;
@@ -339,6 +349,10 @@ public:
     std::size_t workspace_logical_peak_bytes = 0;
 
 private:
+    void launch_mtp_batch(std::span<const std::uint32_t> lanes,
+                          std::span<const runtime::RoundBudget> budgets);
+    [[nodiscard]] runtime::BatchedGeneratedRound finish_mtp_batch(
+        std::span<const std::uint32_t> lanes);
     void clear_lane(SequenceState& sequence, RequestControl& request) noexcept;
     void ordered_reset(SequenceState& sequence);
     void prepare_graphs();

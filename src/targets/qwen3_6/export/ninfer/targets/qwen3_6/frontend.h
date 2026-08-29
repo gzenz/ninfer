@@ -102,6 +102,7 @@ public:
     [[nodiscard]] runtime::OutputDecision preview_terminal(FinishReason reason);
     [[nodiscard]] PublishedOutput commit_preview() noexcept;
     [[nodiscard]] std::uint32_t reasoning_tokens() const noexcept;
+    [[nodiscard]] std::span<const TokenId> stop_token_ids() const noexcept;
 
 private:
     class Impl;

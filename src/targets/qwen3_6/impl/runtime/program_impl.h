@@ -1916,6 +1916,25 @@ void ProgramImplCore::install_sampling(SequenceState& sequence, RequestControl& 
                                device.stream));
 }
 
+void ProgramImplCore::install_stop_tokens(std::uint32_t lane, std::span<const TokenId> stop_ids) {
+    if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
+    if (stop_ids.size() > kMaxStopTokens) {
+        throw std::invalid_argument("stop token set exceeds maximum capacity");
+    }
+    if (ordinary_host_ingress) {
+        ordinary_host_ingress->stop_token_counts[lane] = static_cast<std::int32_t>(stop_ids.size());
+        for (std::size_t i = 0; i < stop_ids.size(); ++i) {
+            ordinary_host_ingress->stop_token_table[lane * kMaxStopTokens + i] = stop_ids[i];
+        }
+    }
+    if (mtp_host_ingress) {
+        mtp_host_ingress->stop_token_counts[lane] = static_cast<std::int32_t>(stop_ids.size());
+        for (std::size_t i = 0; i < stop_ids.size(); ++i) {
+            mtp_host_ingress->stop_token_table[lane * kMaxStopTokens + i] = stop_ids[i];
+        }
+    }
+}
+
 void ProgramImplCore::copy_tail(SequenceState& sequence, const Tensor& source) {
     if (source.dtype != DType::BF16 || source.ne[0] != TextConfig::hidden || source.ne[1] != 1) {
         throw std::logic_error("target tail hidden has an invalid shape");

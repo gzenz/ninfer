@@ -35,6 +35,8 @@ struct OrdinaryDecodeIngress {
     std::array<std::int32_t, kMaximumConcurrency> text_kv_table_rows{};
     std::array<std::int32_t, kMaximumConcurrency> lanes{};
     std::array<ops::SamplingConfig, kMaximumConcurrency> sampling{};
+    std::array<TokenId, kMaximumConcurrency * kMaxStopTokens> stop_token_table{};
+    std::array<std::int32_t, kMaximumConcurrency> stop_token_counts{};
 };
 
 struct OrdinaryDecodeEgress {
@@ -56,6 +58,8 @@ struct MtpDecodeIngress {
     std::array<std::int32_t, kMaximumConcurrency> lanes{};
     std::array<std::int32_t, kMaximumConcurrency> rope_deltas{};
     std::array<ops::SamplingConfig, kMaximumConcurrency> sampling{};
+    std::array<TokenId, kMaximumConcurrency * kMaxStopTokens> stop_token_table{};
+    std::array<std::int32_t, kMaximumConcurrency> stop_token_counts{};
 };
 
 struct MtpDecodeEgress {
@@ -166,6 +170,8 @@ struct OrdinaryDecodeState {
     Tensor text_kv_table_rows;
     Tensor lanes;
     const ops::SamplingConfig* sampling = nullptr;
+    Tensor stop_token_table;
+    Tensor stop_token_counts;
     Tensor sampled_tokens;
     Tensor logits;
     Tensor hidden;
@@ -215,6 +221,8 @@ struct MtpDecodeState {
     Tensor lanes;
     Tensor rope_deltas;
     const ops::SamplingConfig* sampling = nullptr;
+    Tensor stop_token_table;
+    Tensor stop_token_counts;
     Tensor licensed_tokens;
     Tensor licensed_counts;
     Tensor accepted_drafts;

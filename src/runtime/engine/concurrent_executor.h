@@ -1009,6 +1009,7 @@ private:
             target_started                = true;
             const PrefillStepResult first = instance_.program->start_prefill_lane(
                 lane, std::move(request->prompt), std::move(selected_plan), transient);
+            instance_.program->install_stop_tokens(lane, request->output.stop_token_ids());
             if (!first.complete && (!prefill_lane_ || *prefill_lane_ != lane)) {
                 throw std::logic_error("partial prefill did not retain its execution owner");
             }

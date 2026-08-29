@@ -192,6 +192,11 @@ void Program<Variant>::abort_lane(std::uint32_t lane) noexcept {
 }
 
 template <>
+void Program<Variant>::install_stop_tokens(std::uint32_t lane, std::span<const TokenId> stop_ids) {
+    impl_->install_stop_tokens(lane, stop_ids);
+}
+
+template <>
 bool Program<Variant>::has_retained_lane(std::uint32_t lane) const noexcept {
     return impl_->has_retained_lane(lane);
 }

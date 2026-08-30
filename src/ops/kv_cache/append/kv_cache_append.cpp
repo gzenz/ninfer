@@ -55,9 +55,11 @@ std::uint32_t validate_full_cache(const PagedKVLayerView& cache, std::int32_t kv
     if (cache.k_pages.dtype != profile.code_dtype || cache.v_pages.dtype != profile.code_dtype) {
         throw std::invalid_argument("kv_cache_append: invalid cache code dtype");
     }
-    require_shape(cache.k_pages, kFullHeadDim, kPagedKVPageSize, kv_heads, physical_pages,
+    const std::int32_t code_leading_extent =
+        cache.dtype == DType::U8 ? kFullHeadDim / 2 : kFullHeadDim;
+    require_shape(cache.k_pages, code_leading_extent, kPagedKVPageSize, kv_heads, physical_pages,
                   kAppendOp, "cache k pages");
-    require_shape(cache.v_pages, kFullHeadDim, kPagedKVPageSize, kv_heads, physical_pages,
+    require_shape(cache.v_pages, code_leading_extent, kPagedKVPageSize, kv_heads, physical_pages,
                   kAppendOp, "cache v pages");
     require_contiguous_nonnull(cache.k_pages, kAppendOp, "cache k pages");
     require_contiguous_nonnull(cache.v_pages, kAppendOp, "cache v pages");
@@ -74,7 +76,10 @@ std::uint32_t validate_full_cache(const PagedKVLayerView& cache, std::int32_t kv
         return static_cast<std::uint32_t>(capacity);
     }
 
-    if (cache.k_scale_pages.dtype != DType::FP16 || cache.v_scale_pages.dtype != DType::FP16) {
+    const DType expected_scale_dtype =
+        cache.dtype == DType::U8 ? DType::U8 : DType::FP16;
+    if (cache.k_scale_pages.dtype != expected_scale_dtype ||
+        cache.v_scale_pages.dtype != expected_scale_dtype) {
         throw std::invalid_argument("kv_cache_append: invalid cache scale dtype");
     }
     require_shape(cache.k_scale_pages, profile.scale_leading_extent, kPagedKVPageSize, kv_heads,

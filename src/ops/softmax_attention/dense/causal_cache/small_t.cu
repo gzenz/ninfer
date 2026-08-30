@@ -44,7 +44,8 @@ std::int32_t causal_small_t_split_upper_bound(std::int32_t window) {
 template <typename Geometry>
 std::int32_t causal_small_t_split_count(std::int32_t window, std::int32_t tokens, DType kv_dtype) {
     if constexpr (Geometry::SmallTSplitScale == 1) {
-        if (kv_dtype == DType::FP8_E4M3FN && tokens == 1 && window > 8198) {
+        if ((kv_dtype == DType::FP8_E4M3FN || kv_dtype == DType::U8) && tokens == 1 &&
+            window > 8198) {
             return Geometry::SmallTMaximumSplits;
         }
     }
@@ -232,7 +233,7 @@ std::int32_t causal_attention_split_capacity(std::int32_t q_heads, std::int32_t 
                                              CausalAttentionExecutionEnvelope envelope) {
     if (tokens < 1 || tokens > 6 ||
         (cache_dtype != DType::BF16 && cache_dtype != DType::I8 &&
-         cache_dtype != DType::FP8_E4M3FN) ||
+         cache_dtype != DType::FP8_E4M3FN && cache_dtype != DType::U8) ||
         envelope.min_visible_keys == 0 || envelope.min_visible_keys > envelope.max_visible_keys) {
         throw std::invalid_argument("causal_softmax_attention split capacity: invalid profile");
     }
@@ -369,6 +370,12 @@ void causal_attention_small_t_launch(
                                             partial_l, out, stream);
         return;
     }
+    if (cache.dtype == DType::U8) {
+        causal_attention_small_t_nvfp4_launch(q, k, v, pos, valid_columns, table_rows, scale, cache,
+                                              envelope, column_begin, width, partial_acc, partial_m,
+                                              partial_l, out, stream);
+        return;
+    }
     const CausalAppendInput input{static_cast<const __nv_bfloat16*>(k.data),
                                   static_cast<const __nv_bfloat16*>(v.data)};
     const CausalSmallTInvocation invocation{
@@ -398,6 +405,11 @@ void causal_attention_cached_small_t_launch(const Tensor& q, const Tensor& pos, 
     if (cache.dtype == DType::FP8_E4M3FN) {
         causal_attention_cached_small_t_fp8_launch(q, pos, scale, cache, envelope, partial_acc,
                                                    partial_m, partial_l, out, stream);
+        return;
+    }
+    if (cache.dtype == DType::U8) {
+        causal_attention_cached_small_t_nvfp4_launch(q, pos, scale, cache, envelope, partial_acc,
+                                                    partial_m, partial_l, out, stream);
         return;
     }
     const CausalCachedInput input{};

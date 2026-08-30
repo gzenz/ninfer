@@ -23,6 +23,8 @@ inline D256KVCacheProfile d256_kv_cache_profile(DType dtype) {
         return {DType::I8, 64, 4};
     case DType::FP8_E4M3FN:
         return {DType::FP8_E4M3FN, 256, 1};
+    case DType::U8:
+        return {DType::U8, 16, 16};
     default:
         throw std::invalid_argument("unsupported D256 KV-cache dtype");
     }

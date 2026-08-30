@@ -213,6 +213,7 @@ struct OutputOptions {
     // Presentation constraint supplied by the protocol adapter. It bounds only Qwen's emitted
     // function-name grammar; it does not require the name to match a currently declared tool.
     std::uint32_t tool_name_max_length = 128;
+    bool tolerant_tool_calls = false;
 };
 
 struct RequestOptions {

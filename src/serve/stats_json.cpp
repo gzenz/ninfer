@@ -42,7 +42,7 @@ std::string format_stats_json(const StatsSnapshot& s) {
               {"planned_slack_bytes", s.memory.planned_slack_bytes},
               {"host_kv_capacity_bytes", s.memory.host_kv_capacity_bytes},
               {"host_kv_occupied_bytes", s.memory.host_kv_occupied_bytes},
-              {"device_state_occupied_slots", s.memory.device_state_occupied_slots},
+              {"host_state_capacity_slots", s.memory.host_state_capacity_slots},
               {"host_state_occupied_slots", s.memory.host_state_occupied_slots},
               {"weights", arena(s.memory.weights)},
               {"sequence", arena(s.memory.sequence)},

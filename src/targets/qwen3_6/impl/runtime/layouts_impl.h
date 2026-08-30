@@ -695,8 +695,18 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .prefill_chunk       = std::min(options.prefill_chunk, options.max_context),
         .draft_window        = options.speculative.draft_tokens,
         .speculative_backend = options.speculative.backend,
-        .kv_dtype       = options.kv_cache == KvCacheStorage::BFloat16 ? DType::BF16 : DType::I8,
-        .kv_quant_group = options.kv_cache == KvCacheStorage::BFloat16 ? 0 : qwen3_6::kKvQuantGroup,
+        // For NVFP4: DType::U8 is opaque byte-addressable storage holding packed 4-bit
+        // E2M1 codes; quant_group=16 is the NVFP4 super-block. The 4-bit packing is
+        // handled in the codec/kernel, storage is byte-addressable. Scale planes use
+        // DType::U8 for E4M3 scale bytes.
+        .kv_dtype       = options.kv_cache == KvCacheStorage::BFloat16
+                        ? DType::BF16
+                        : (options.kv_cache == KvCacheStorage::Nvfp4Group16 ? DType::U8 : DType::I8),
+        .kv_quant_group = options.kv_cache == KvCacheStorage::BFloat16
+                        ? 0
+                        : (options.kv_cache == KvCacheStorage::Nvfp4Group16
+                               ? qwen3_6::kKvNvfp4Group
+                               : qwen3_6::kKvQuantGroup),
         .proposal_head  = options.speculative.proposal_head,
         .features       = qwen3_6::startup_features(options),
         .use_cuda_graph = options.use_cuda_graph,

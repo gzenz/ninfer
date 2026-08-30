@@ -51,7 +51,8 @@ std::uint32_t parse_u32(std::string_view text, const char* label, bool allow_zer
 KvCacheStorage parse_kv_cache(std::string_view text) {
     if (text == "bf16") { return KvCacheStorage::BFloat16; }
     if (text == "int8") { return KvCacheStorage::Int8Group64; }
-    throw std::invalid_argument("--kv-dtype must be bf16 or int8");
+    if (text == "nvfp4") { return KvCacheStorage::Nvfp4Group16; }
+    throw std::invalid_argument("--kv-dtype must be bf16, int8, or nvfp4");
 }
 
 std::vector<int> parse_int_list(std::string_view value, const char* label) {
@@ -820,6 +821,8 @@ std::string kv_cache_name(KvCacheStorage storage) {
         return "bf16";
     case KvCacheStorage::Int8Group64:
         return "int8-group64";
+    case KvCacheStorage::Nvfp4Group16:
+        return "nvfp4-group16";
     }
     return "unknown";
 }

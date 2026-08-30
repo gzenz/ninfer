@@ -49,6 +49,7 @@ cannot be combined with `--vision`. A later request cannot enable a capability o
 | Method and path | Behavior |
 |---|---|
 | `GET /health` | process health |
+| `GET /stats` | read-only operational snapshot: scheduler occupancy, cumulative counters, HTTP admission depth, memory layout, and load provenance |
 | `GET /v1/models` | configured OpenAI model alias and effective `max_model_len` |
 | `GET /v1/models/{id}` | lookup of the configured alias and effective `max_model_len` |
 | `POST /v1/chat/completions` | OpenAI-style chat generation |
@@ -642,7 +643,9 @@ curl http://127.0.0.1:8080/v1/messages/count_tokens \
 ## Authentication and CORS
 
 Pass `--api-key VALUE` to require the same value as an OpenAI bearer token or Anthropic
-`x-api-key` header. `GET /health` and CORS preflight requests remain unauthenticated.
+`x-api-key` header. `GET /health`, `GET /stats`, and CORS preflight requests remain
+unauthenticated (`/stats` exposes only aggregate operational state, never request content or
+keys).
 
 ```bash
 curl http://127.0.0.1:8080/v1/models \
@@ -675,6 +678,8 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--media-live-mib N` | all live prepared BF16 media payloads | `2048` |
 | `--media-preprocess-threads N` | bounded media preprocessing workers; `0` selects at most 16 from host concurrency | `0` |
 | `--request-log-jsonl FILE` | append full-precision server/request records | disabled |
+| `--request-log-max-mib N` | rotate the JSONL request log once the active file reaches N MiB; `0` disables rotation (unbounded) | `0` |
+| `--request-log-keep N` | rotated JSONL files to retain (`FILE.1` .. `FILE.N`, oldest dropped) | `4` |
 | `--response-store-max-records N` | maximum locally retained Responses objects | `1024` |
 | `--response-store-max-mib N` | total local Response envelope/Item/context budget | `256` |
 | `--kv-dtype bf16\|int8\|fp8` | KV-cache storage | `bf16` |
@@ -730,6 +735,12 @@ Run `./build/apps/ninfer-serve --help` for the exact option contract.
 in append mode and flushes every event, so successive model or MTP blocks may share one campaign
 file. The parent directory must already exist. Failure to open the file aborts startup; the log path
 is also rejected if it resolves to the model artifact.
+
+With `--request-log-max-mib N` (N > 0), the active file is rotated by rename once it reaches
+N MiB: `FILE` becomes `FILE.1`, `FILE.1` shifts to `FILE.2`, and so on up to `FILE.N`
+(`--request-log-keep N`, default 4), where the oldest is dropped. Rotation is rename-based, so no
+record is lost. The default `--request-log-max-mib 0` keeps the historical unbounded single-file
+behaviour.
 
 Add `--request-log-jsonl profiles/bench/run/server.requests.jsonl` to the startup command to write
 the log at that path.

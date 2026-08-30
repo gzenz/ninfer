@@ -91,7 +91,7 @@ void assert_common(const Json& doc) {
     check(doc["memory"]["planned_slack_bytes"] == 98765432ULL, "memory.slack");
     check(doc["memory"]["host_kv_capacity_bytes"] == 8589934592ULL, "memory.host_kv_capacity");
     check(doc["memory"]["host_kv_occupied_bytes"] == 4294967296ULL, "memory.host_kv_occupied");
-    check(doc["memory"]["host_state_capacity_slots"] == 4, "memory.device_state_occupied");
+    check(doc["memory"]["host_state_capacity_slots"] == 8, "memory.host_state_capacity_slots");
     check(doc["memory"]["host_state_occupied_slots"] == 2, "memory.host_state_occupied");
     check(doc["memory"].contains("weights"), "memory.weights present");
     check(doc["memory"].contains("sequence"), "memory.sequence present");

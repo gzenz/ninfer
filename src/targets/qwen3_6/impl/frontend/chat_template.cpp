@@ -328,9 +328,9 @@ constexpr std::string_view kToolInstructions =
 // froggeric v22 tool instructions (xml branch): think-first example + stricter format rules.
 constexpr std::string_view kFroggericToolInstructions =
     "\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n"
-    "<tool_call>\n"
+    "🔈\n"
     "Brief explanation of tool call\n"
-    "</tool_call>\n"
+    "🔉\n"
     "<function=example_function_name>\n"
     "<parameter=example_parameter_1>\n"
     "value_1\n"
@@ -344,9 +344,9 @@ constexpr std::string_view kFroggericToolInstructions =
     "</tool_call>\n\n"
     "<IMPORTANT>\n"
     "Reminder:\n"
-    "- You can use the <tool_call></tool_call> block to plan your next tool call OR to synthesize data and "
+    "- You can use the 🔈🔉 block to plan your next tool call OR to synthesize data and "
     "formulate your final response to the user.\n"
-    "- ALL explanation and reasoning MUST be placed strictly inside the <tool_call></tool_call> block.\n"
+    "- ALL explanation and reasoning MUST be placed strictly inside the 🔈🔉 block.\n"
     "- Function calls MUST follow the specified format: an inner <function=...></function> block "
     "must be nested within <tool_call></tool_call> XML tags\n"
     "- If you choose to call a tool, you MUST output the <tool_call> block IMMEDIATELY after "
@@ -407,7 +407,7 @@ RenderedFragment render_tool_call(const ToolCall& call, bool allow_empty_argumen
         // froggeric v22: string arguments render verbatim after the function tag
         rendered.append_template("<tool_call>\n<function=");
         rendered.append_literal(call.name);
-        rendered.append_template("\n");
+        rendered.append_template(">\n");
         rendered.append_literal(call.arguments_json);
         rendered.append_template("</function>\n</tool_call>");
         return std::move(rendered).release();

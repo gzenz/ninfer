@@ -17,7 +17,7 @@
 //   - No external scale multiplication: the MMA applies scales internally
 //   - V dequant uses kv_cache_nvfp4_dequant_e2m1x8_from (4 bytes -> 8 bf16)
 //   - PV uses mma_bf16 (V is dequantized to BF16, not FP16)
-//   - Q/K/V quantization uses group-16 quantize_nvfp4_k16 after Hadamard rotation
+//   - Q/K quantization uses group-16 quantize_nvfp4_k16 after Hadamard rotation; V is quantized without rotation
 
 #include "ops/kv_cache/nvfp4_g16_codec.cuh"
 #include "ops/kv_cache/hadamard_d256.cuh"
@@ -246,14 +246,14 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             }
             __syncwarp();
 
-            // V: load, Hadamard, write to had_s, then group-quantize.
+            // V: load (NO Hadamard - only K is rotated, matching FP8/int8), write to had_s, then group-quantize.
 #pragma unroll
             for (int r = 0; r < 8; ++r) {
                 const int d = lane + 32 * r;
                 values[r] =
                     __bfloat162float(input.v[kv_cache_nvfp4_src_index<Geometry>(kv_head, d, token)]);
             }
-            normalized_hadamard_d256_inplace(values, lane);
+            // V is NOT rotated (only K is rotated for quant quality, matching FP8/int8).
 #pragma unroll
             for (int r = 0; r < 8; ++r) {
                 had_s[warp * D + lane + 32 * r] = __float2bfloat16(values[r]);

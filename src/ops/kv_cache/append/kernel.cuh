@@ -236,7 +236,7 @@ __device__ __forceinline__ void kv_cache_append_full_nvfp4_row(
         const int d = lane + 32 * r;
         v_values[r]  = __bfloat162float(v[kv_cache_nvfp4_src_index<Geometry>(kv_head, d, token)]);
     }
-    normalized_hadamard_d256_inplace(v_values, lane);
+    // V is NOT rotated (mirrors FP8/int8: only K is rotated for quant quality).
 #pragma unroll
     for (int r = 0; r < 8; ++r) {
         const int d = lane + 32 * r;

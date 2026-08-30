@@ -331,6 +331,7 @@ constexpr std::string_view kFroggericToolInstructions =
     "<think>\n"
     "Brief explanation of tool call\n"
     "</think>\n"
+    "<tool_call>\n"
     "<function=example_function_name>\n"
     "<parameter=example_parameter_1>\n"
     "value_1\n"

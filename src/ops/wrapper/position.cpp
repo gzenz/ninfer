@@ -55,6 +55,9 @@ void scale_positions_yarn(const Tensor& source, std::uint32_t original_context, 
     if (source.ne[0] != destination.ne[0]) {
         throw std::invalid_argument("scale_positions_yarn: source and destination shapes differ");
     }
+    if (source.data != destination.data) {
+        throw std::invalid_argument("scale_positions_yarn: source and destination must be the same tensor (in-place only)");
+    }
     if (!(factor >= 1.0F)) {
         throw std::invalid_argument("scale_positions_yarn: factor must be >= 1.0");
     }

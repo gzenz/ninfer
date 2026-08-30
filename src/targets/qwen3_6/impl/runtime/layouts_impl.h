@@ -588,9 +588,16 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
 }
 
 void validate_target_options(DeviceContext& device, const EngineOptions& options) {
+    const float raw_max = static_cast<float>(Variant::maximum_context) *
+        (options.rope_scaling_factor > 1.0F ? options.rope_scaling_factor : 1.0F);
     const std::uint32_t effective_max = static_cast<std::uint32_t>(
-        static_cast<float>(Variant::maximum_context) *
-        (options.rope_scaling_factor > 1.0F ? options.rope_scaling_factor : 1.0F));
+        std::min(raw_max, static_cast<float>(ops::kCausalAttentionMaximumVisibleKeys)));
+    if (options.rope_scaling_factor < 1.0F) {
+        throw std::invalid_argument("rope_scaling_factor must be >= 1.0");
+    }
+    if (options.rope_scaling_factor > 1.0F && options.speculative.backend == SpeculativeBackend::DFlash) {
+        throw std::invalid_argument("rope_scaling_factor is not supported with DFlash speculative decoding");
+    }
     if (options.max_context == 0 || options.max_context > effective_max) {
         throw std::invalid_argument("max_context exceeds the variant effective context capacity");
     }

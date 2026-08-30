@@ -129,6 +129,16 @@ __device__ __forceinline__ int causal_small_t_fp8_active_splits(int window, int 
     return splits < launch_capacity ? splits : launch_capacity;
 }
 
+template <typename Geometry>
+__device__ __forceinline__ int causal_small_t_nvfp4_active_splits(int window, int launch_capacity,
+                                                                  int tokens) {
+    int splits = causal_small_t_default_splits<Geometry>(window);
+    if constexpr (Geometry::SmallTSplitScale == 1) {
+        if (tokens == 1 && window > 8198) { splits = Geometry::SmallTMaximumSplits; }
+    }
+    return splits < launch_capacity ? splits : launch_capacity;
+}
+
 __device__ __forceinline__ int causal_small_t_tc_swz(int row, int col) {
     return (((col >> 3) ^ (row & 7)) << 3) | (col & 7);
 }

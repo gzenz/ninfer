@@ -232,7 +232,7 @@ std::int32_t causal_attention_split_capacity(std::int32_t q_heads, std::int32_t 
                                              CausalAttentionExecutionEnvelope envelope) {
     if (tokens < 1 || tokens > 6 ||
         (cache_dtype != DType::BF16 && cache_dtype != DType::I8 &&
-         cache_dtype != DType::FP8_E4M3FN) ||
+         cache_dtype != DType::FP8_E4M3FN && cache_dtype != DType::U8) ||
         envelope.min_visible_keys == 0 || envelope.min_visible_keys > envelope.max_visible_keys) {
         throw std::invalid_argument("causal_softmax_attention split capacity: invalid profile");
     }

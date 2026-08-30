@@ -4,8 +4,8 @@
 #include "ops/common/warp.cuh"
 #include "ops/kernel/paged_kv_address.cuh"
 #include "ops/kv_cache/fp8_e4m3_row_codec.cuh"
-#include "ops/kv_cache/nvfp4_g16_codec.cuh"
 #include "ops/kv_cache/int8_g64_codec.cuh"
+#include "ops/kv_cache/nvfp4_g16_codec.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -199,61 +199,131 @@ __launch_bounds__(256) __global__
                                            physical_page, position & kPagedKVPageMask, lane);
 }
 
+template <typename Geometry>
+__device__ __forceinline__ void kv_cache_append_full_nvfp4_row(
+    const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
+    std::uint8_t* __restrict__ cache_k, std::uint8_t* __restrict__ cache_v,
+    std::uint8_t* __restrict__ scale_k, std::uint8_t* __restrict__ scale_v,
+    __nv_bfloat16* __restrict__ row_buf, int token, int kv_head, int physical_page, int page_off,
+    int lane) {
+    constexpr unsigned FullMask = 0xffffffffU;
 
-// --- NVFP4 group-16 full append ---
-template <typename Geometry, typename Metadata>
-__device__ __forceinline__ void kv_cache_append_full_nvfp4_row(const __nv_bfloat16* __restrict__ k,
-                                                               const __nv_bfloat16* __restrict__ v,
-                                                               std::uint8_t* __restrict__ cache_k,
-                                                               std::uint8_t* __restrict__ cache_v,
-                                                               std::uint8_t* __restrict__ scale_k,
-                                                               std::uint8_t* __restrict__ scale_v,
-                                                               std::int32_t token, std::int32_t kv_head,
-                                                               const std::int32_t* __restrict__ positions,
-                                                               Metadata metadata) {
-    const std::int32_t position = positions[0] + token;
-    const std::int32_t* block_table = metadata.block_table();
-    const int physical_page = paged_kv_physical_page(block_table, position);
-    const int page_off = position & kPagedKVPageMask;
-
+    float k_values[8];
 #pragma unroll
-    for (int group = 0; group < kKVCacheNvfp4Groups; ++group) {
-        const int byte_off = group * (kKVCacheNvfp4Group / 2);
-        const std::int64_t src =
-            kv_cache_nvfp4_src_index<Geometry>(kv_head, group * kKVCacheNvfp4Group, token);
-        const std::int64_t k_code_off =
-            kv_cache_nvfp4_code_index<Geometry>(physical_page, kv_head, byte_off, page_off);
-        const std::int64_t v_code_off =
-            kv_cache_nvfp4_code_index<Geometry>(physical_page, kv_head, byte_off, page_off);
-        const std::int64_t k_scale_off =
-            kv_cache_nvfp4_scale_index<Geometry>(physical_page, kv_head, group, page_off);
-        const std::int64_t v_scale_off =
-            kv_cache_nvfp4_scale_index<Geometry>(physical_page, kv_head, group, page_off);
-        kv_cache_nvfp4_quantize_k16(&k[src], &cache_k[k_code_off], &scale_k[k_scale_off]);
-        kv_cache_nvfp4_quantize_k16(&v[src], &cache_v[v_code_off], &scale_v[v_scale_off]);
+    for (int r = 0; r < 8; ++r) {
+        const int d = lane + 32 * r;
+        k_values[r]  = __bfloat162float(k[kv_cache_nvfp4_src_index<Geometry>(kv_head, d, token)]);
+    }
+    normalized_hadamard_d256_inplace(k_values, lane);
+#pragma unroll
+    for (int r = 0; r < 8; ++r) {
+        const int d = lane + 32 * r;
+        row_buf[d]  = __float2bfloat16(k_values[r]);
+    }
+    __syncwarp();
+    if (lane < kKVCacheNvfp4Groups) {
+        const int grp = lane;
+        kv_cache_nvfp4_quantize_k16(
+            &row_buf[grp * kKVCacheNvfp4Group],
+            &cache_k[kv_cache_nvfp4_code_index<Geometry>(physical_page, kv_head,
+                                                         grp * (kKVCacheNvfp4Group / 2), page_off)],
+            &scale_k[kv_cache_nvfp4_scale_index<Geometry>(physical_page, kv_head, grp, page_off)]);
+    }
+
+    float v_values[8];
+#pragma unroll
+    for (int r = 0; r < 8; ++r) {
+        const int d = lane + 32 * r;
+        v_values[r]  = __bfloat162float(v[kv_cache_nvfp4_src_index<Geometry>(kv_head, d, token)]);
+    }
+    normalized_hadamard_d256_inplace(v_values, lane);
+#pragma unroll
+    for (int r = 0; r < 8; ++r) {
+        const int d = lane + 32 * r;
+        row_buf[d]  = __float2bfloat16(v_values[r]);
+    }
+    __syncwarp();
+    if (lane < kKVCacheNvfp4Groups) {
+        const int grp = lane;
+        kv_cache_nvfp4_quantize_k16(
+            &row_buf[grp * kKVCacheNvfp4Group],
+            &cache_v[kv_cache_nvfp4_code_index<Geometry>(physical_page, kv_head,
+                                                         grp * (kKVCacheNvfp4Group / 2), page_off)],
+            &scale_v[kv_cache_nvfp4_scale_index<Geometry>(physical_page, kv_head, grp, page_off)]);
     }
 }
 
 template <typename Geometry, typename Metadata>
-__launch_bounds__(256) __global__ void kv_cache_append_full_nvfp4_kernel(
-    const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
-    const std::int32_t* __restrict__ positions, Metadata metadata,
-    std::uint8_t* __restrict__ cache_k, std::uint8_t* __restrict__ cache_v,
-    std::uint8_t* __restrict__ scale_k, std::uint8_t* __restrict__ scale_v,
-    std::int32_t width) {
-    constexpr int Warps = 8;
-    const int tokens = metadata.valid_tokens(width);
-    const int warp = static_cast<int>(threadIdx.x) >> 5;
-    const int unit = static_cast<int>(blockIdx.x) * Warps + warp;
-    const std::int64_t units = static_cast<std::int64_t>(tokens) * Geometry::KVHeads;
-    if (static_cast<std::int64_t>(unit) >= units) { return; }
+__launch_bounds__(256) __global__
+    void kv_cache_append_full_nvfp4_kernel(const __nv_bfloat16* __restrict__ k,
+                                           const __nv_bfloat16* __restrict__ v,
+                                           const std::int32_t* __restrict__ positions,
+                                           Metadata metadata,
+                                           std::uint8_t* __restrict__ cache_k,
+                                           std::uint8_t* __restrict__ cache_v,
+                                           std::uint8_t* __restrict__ scale_k,
+                                           std::uint8_t* __restrict__ scale_v,
+                                           std::int32_t width) {
+    constexpr int Warps         = 8;
+    constexpr unsigned FullMask = 0xffffffffU;
+    __shared__ __nv_bfloat16 smem_buf[Warps * kKVCacheNvfp4HeadDim];
+    const int tokens            = metadata.valid_tokens(width);
+    const int warp              = static_cast<int>(threadIdx.x) >> 5;
+    const int lane              = static_cast<int>(threadIdx.x) & 31;
+    const int unit              = static_cast<int>(blockIdx.x) * Warps + warp;
+    const int units             = tokens * Geometry::KVHeads;
+    if (unit >= units) return;
 
-    const int kv_head = unit % Geometry::KVHeads;
-    const int token = unit / Geometry::KVHeads;
-    kv_cache_append_full_nvfp4_row<Geometry, Metadata>(
-        k, v, cache_k, cache_v, scale_k, scale_v, token, kv_head, positions, metadata);
+    const int kv_head               = unit % Geometry::KVHeads;
+    const int token                 = unit / Geometry::KVHeads;
+    const int position              = positions[0] + token;
+    const std::int32_t* block_table = metadata.block_table();
+    int physical_page               = lane == 0 ? paged_kv_physical_page(block_table, position) : 0;
+    physical_page                   = __shfl_sync(FullMask, physical_page, 0);
+    kv_cache_append_full_nvfp4_row<Geometry>(k, v, cache_k, cache_v, scale_k, scale_v,
+                                             &smem_buf[warp * kKVCacheNvfp4HeadDim], token,
+                                             kv_head, physical_page, position & kPagedKVPageMask,
+                                             lane);
 }
 
+template <typename Geometry, typename Metadata>
+__launch_bounds__(256) __global__
+    void kv_cache_append_full_nvfp4_page_kernel(const __nv_bfloat16* __restrict__ k,
+                                                const __nv_bfloat16* __restrict__ v,
+                                                const std::int32_t* __restrict__ positions,
+                                                Metadata metadata,
+                                                std::uint8_t* __restrict__ cache_k,
+                                                std::uint8_t* __restrict__ cache_v,
+                                                std::uint8_t* __restrict__ scale_k,
+                                                std::uint8_t* __restrict__ scale_v,
+                                                std::int32_t width) {
+    constexpr int TokensPerTile = 8;
+    constexpr unsigned FullMask = 0xffffffffU;
+    constexpr int Warps         = 8;
+    __shared__ __nv_bfloat16 smem_buf[Warps * kKVCacheNvfp4HeadDim];
+    const int tokens            = metadata.valid_tokens(width);
+    const int warp              = static_cast<int>(threadIdx.x) >> 5;
+    const int lane              = static_cast<int>(threadIdx.x) & 31;
+    const int kv_head           = static_cast<int>(blockIdx.y);
+    const int tile_delta        = static_cast<int>(blockIdx.x);
+    const int base_position     = positions[0];
+    const int tile_position     = (base_position / TokensPerTile + tile_delta) * TokensPerTile;
+    const int logical_page      = tile_position >> kPagedKVPageShift;
+    const int token_begin       = max(0, tile_position - base_position);
+    const int token_end         = min(tokens, tile_position + TokensPerTile - base_position);
+    if (token_begin >= token_end) return;
+
+    const int token = token_begin + warp;
+    if (token >= token_end) return;
+    const std::int32_t* block_table = metadata.block_table();
+    int physical_page               = lane == 0 ? block_table[logical_page] : 0;
+    physical_page                   = __shfl_sync(FullMask, physical_page, 0);
+    const int position              = base_position + token;
+    kv_cache_append_full_nvfp4_row<Geometry>(k, v, cache_k, cache_v, scale_k, scale_v,
+                                             &smem_buf[warp * kKVCacheNvfp4HeadDim], token,
+                                             kv_head, physical_page, position & kPagedKVPageMask,
+                                             lane);
+}
 
 template <typename Geometry, typename Metadata>
 __launch_bounds__(256) __global__

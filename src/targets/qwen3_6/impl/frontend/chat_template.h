@@ -133,6 +133,7 @@ struct RenderedChat {
 enum class ChatTemplateSemantics : std::uint8_t {
     ThinkingToggle,
     ReasoningEffort,
+    FroggericV22,
 };
 
 class CompiledChatTemplate {

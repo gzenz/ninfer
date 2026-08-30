@@ -775,7 +775,7 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
         // enabled. With thinking disabled the generation prologue itself is an empty
         // think block, so replay must keep it to stay token-consistent for prefix reuse.
         const bool keep_thinking = (preserve_thinking || (static_cast<long>(i) > last_query_index)) &&
-                                   (!froggeric || !reasoning.empty() || !options.enable_thinking);
+                                   (!froggeric || !reasoning.text.empty() || !options.enable_thinking);
         if (!preserve_thinking && !rewrite_checkpoint && static_cast<long>(i) > last_query_index) {
             // Closing the current turn may rewrite everything beginning with this assistant
             // segment. Keep the stable history before the opener recoverable; retaining the

@@ -5,6 +5,7 @@
 #include "ops/common/math.h"
 #include "ops/kernel/gqa_attention_prefill_bf16.cuh"
 #include "ops/kernel/gqa_attention_prefill_i8.cuh"
+#include "ops/kernel/gqa_attention_prefill_nvfp4.cuh"
 #include "core/device.h" // CUDA_CHECK
 
 #include <cstdint>
@@ -30,7 +31,25 @@ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& po
     CUDA_CHECK(attr_i8);
 
     const auto tokens = static_cast<std::int32_t>(q.ne[2]);
-    if (cache.dtype == DType::I8) {
+    if (cache.dtype == DType::U8) {
+        static const cudaError_t attr_nvfp4 = cudaFuncSetAttribute(
+            gqa_attention_prefill_nvfp4_kernel<Geometry, Metadata>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, kGqaPrefillNvfp4SmemBytes);
+        CUDA_CHECK(attr_nvfp4);
+        const dim3 attention_grid(static_cast<unsigned>(div_up(tokens, kGqaPrefillNvfp4Br)),
+                                  static_cast<unsigned>(Geometry::QHeads), 1u);
+        const Tensor& cache_k_scale = cache.k_scale_pages;
+        const Tensor& cache_v_scale = cache.v_scale_pages;
+        gqa_attention_prefill_nvfp4_kernel<Geometry, Metadata>
+            <<<attention_grid, kGqaPrefillNvfp4Threads, kGqaPrefillNvfp4SmemBytes, stream>>>(
+                static_cast<const __nv_bfloat16*>(q.data),
+                static_cast<const std::uint8_t*>(cache_k.data),
+                static_cast<const std::uint8_t*>(cache_v.data),
+                static_cast<const std::uint8_t*>(cache_k_scale.data),
+                static_cast<const std::uint8_t*>(cache_v_scale.data), metadata,
+                static_cast<const std::int32_t*>(positions.data), scale,
+                static_cast<__nv_bfloat16*>(out.data), tokens);
+    } else if (cache.dtype == DType::I8) {
         const dim3 attention_grid(static_cast<unsigned>(div_up(tokens, kGqaPrefillI8Br)),
                                   static_cast<unsigned>(Geometry::QHeads), 1u);
         const Tensor& cache_k_scale = cache.k_scale_pages;
@@ -64,7 +83,44 @@ void gqa_kv_append_launch_for(const Tensor& k, const Tensor& v, const Tensor& po
     const auto tokens = static_cast<std::int32_t>(k.ne[2]);
     Tensor& cache_k   = cache.k_pages;
     Tensor& cache_v   = cache.v_pages;
-    if (cache.dtype == DType::I8) {
+    if (cache.dtype == DType::U8) {
+        Tensor& cache_k_scale    = cache.k_scale_pages;
+        Tensor& cache_v_scale    = cache.v_scale_pages;
+        if (tokens >= 128 && Geometry::KVHeads == 2) {
+            constexpr int kPageBlock     = 256;
+            constexpr int kTokensPerTile = 8;
+            const int max_tiles          = div_up(tokens + kTokensPerTile - 1, kTokensPerTile);
+            const dim3 fill_grid(static_cast<unsigned>(max_tiles),
+                                 static_cast<unsigned>(Geometry::KVHeads),
+                                 static_cast<unsigned>(kGqaKvNvfp4Groups));
+            gqa_attention_prefill_fill_nvfp4_page_kernel<Geometry, Metadata>
+                <<<fill_grid, kPageBlock, 0, stream>>>(
+                    static_cast<const __nv_bfloat16*>(k.data),
+                    static_cast<const __nv_bfloat16*>(v.data),
+                    static_cast<const std::int32_t*>(positions.data), metadata,
+                    static_cast<std::uint8_t*>(cache_k.data),
+                    static_cast<std::uint8_t*>(cache_v.data),
+                    static_cast<std::uint8_t*>(cache_k_scale.data),
+                    static_cast<std::uint8_t*>(cache_v_scale.data), tokens);
+        } else {
+            constexpr int kFillWarps = 8;
+            constexpr int kFillBlock = kFillWarps * 32;
+            const std::int64_t fill_units =
+                static_cast<std::int64_t>(tokens) * Geometry::KVHeads * kGqaKvNvfp4Groups;
+            const int fill_grid =
+                static_cast<int>(div_up(fill_units, static_cast<std::int64_t>(kFillWarps)));
+            gqa_attention_prefill_fill_nvfp4_kernel<Geometry, Metadata>
+                <<<fill_grid, kFillBlock, 0, stream>>>(
+                    static_cast<const __nv_bfloat16*>(k.data),
+                    static_cast<const __nv_bfloat16*>(v.data),
+                    static_cast<const std::int32_t*>(positions.data), metadata,
+                    static_cast<std::uint8_t*>(cache_k.data),
+                    static_cast<std::uint8_t*>(cache_v.data),
+                    static_cast<std::uint8_t*>(cache_k_scale.data),
+                    static_cast<std::uint8_t*>(cache_v_scale.data), tokens);
+        }
+        CUDA_CHECK(cudaGetLastError());
+    } else if (cache.dtype == DType::I8) {
         Tensor& cache_k_scale    = cache.k_scale_pages;
         Tensor& cache_v_scale    = cache.v_scale_pages;
         constexpr int kFillBlock = 256;

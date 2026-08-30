@@ -472,7 +472,12 @@ select_kv_pressure_actions(const KVAddressSpaceStore& addresses, LogicalKVPageSt
         }
     };
     select_device_runs(true);
-    if (device_remaining != 0 && selection.host_bytes_remaining == 0 && host_allocation_available &&
+    // Demote device-resident pages to host even when the candidate itself needs host
+    // KV budget (host_bytes_remaining > 0). The demote pass frees device pages at the
+    // cost of added host demand; the caller's feasibility check rejects the option if
+    // the combined host demand exceeds the budget. Without this, a candidate that needs
+    // host KV budget suppresses all demotes, causing full eviction instead of parking.
+    if (device_remaining != 0 && host_allocation_available &&
         host_extents != nullptr) {
         select_device_runs(false);
     }

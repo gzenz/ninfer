@@ -333,6 +333,20 @@ int main() {
     failures += check(!secret_present, "startup argv retained the API key");
     failures += check(redaction_present, "startup argv omitted the API-key redaction marker");
 
+    const ServeOptions rotated = parse({"ninfer-serve", "model.ninfer", "--request-log-jsonl",
+                                         "requests.jsonl", "--request-log-max-mib", "16",
+                                         "--request-log-keep", "8"});
+    failures += check(rotated.request_log_max_mib == 16,
+                      "--request-log-max-mib did not set the rotation size");
+    failures += check(rotated.request_log_keep == 8,
+                      "--request-log-keep did not set the retained file count");
+    failures +=
+        check(serve_usage_text("ninfer-serve").find("--request-log-max-mib") != std::string::npos,
+              "serve help omits --request-log-max-mib");
+    failures +=
+        check(serve_usage_text("ninfer-serve").find("--request-log-keep") != std::string::npos,
+              "serve help omits --request-log-keep");
+
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

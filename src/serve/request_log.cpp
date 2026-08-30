@@ -1045,7 +1045,8 @@ ServerLogEnvironment query_server_log_environment(int device) {
 }
 
 JsonlRequestLog::JsonlRequestLog(const std::string& path,
-                                 const std::string& protected_artifact_path)
+                                 const std::string& protected_artifact_path,
+                                 const std::uint32_t max_mib, const std::uint32_t keep)
     : path_(path) {
     if (path_.empty()) { return; }
     if (!protected_artifact_path.empty() &&
@@ -1057,6 +1058,11 @@ JsonlRequestLog::JsonlRequestLog(const std::string& path,
     if (!output_) {
         throw std::runtime_error("failed to open request JSONL log for append: " + path_);
     }
+    max_bytes_ = static_cast<std::uint64_t>(max_mib) * (1ULL << 20);
+    keep_      = keep;
+    std::error_code size_error;
+    const std::uintmax_t existing = std::filesystem::file_size(path_, size_error);
+    written_bytes_ = size_error ? 0 : static_cast<std::uint64_t>(existing);
 }
 
 void JsonlRequestLog::write_server_start(const ServeOptions& options,
@@ -1110,6 +1116,38 @@ void JsonlRequestLog::append(std::string record) {
     if (!output_) {
         failed_ = true;
         write_console_log(ConsoleLogLevel::Error, "request JSONL logging failed for " + path_);
+        return;
+    }
+    written_bytes_ += record.size() + 1;
+    if (max_bytes_ > 0 && written_bytes_ >= max_bytes_) {
+        rotate_locked();
+    }
+}
+
+// Caller holds mutex_ and output_ is open. Renames the active file to .1, shifts
+// .1 -> .2 -> ... -> .keep (dropping the oldest), then reopens a fresh active
+// file. Rename-based, so no record is lost (unlike copytruncate).
+void JsonlRequestLog::rotate_locked() {
+    output_.close();
+    std::error_code ec;
+    if (keep_ >= 1) {
+        for (std::uint32_t i = keep_ - 1; i >= 1; --i) {
+            const std::string src = path_ + "." + std::to_string(i);
+            const std::string dst = path_ + "." + std::to_string(i + 1);
+            if (std::filesystem::exists(src, ec)) {
+                std::filesystem::remove(dst, ec); // drop the file about to be overwritten
+                std::filesystem::rename(src, dst, ec);
+            }
+        }
+        std::filesystem::rename(path_, path_ + ".1", ec);
+    } else {
+        std::filesystem::remove(path_, ec); // keep=0: retain no rotated copies
+    }
+    output_.open(path_, std::ios::out | std::ios::app);
+    written_bytes_ = 0;
+    if (!output_) {
+        failed_ = true;
+        write_console_log(ConsoleLogLevel::Error, "request JSONL rotation failed for " + path_);
     }
 }
 

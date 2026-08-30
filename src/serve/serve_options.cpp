@@ -74,7 +74,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--device-state-slots N] [--host-state-slots N] [--host-kv-mib N] "
            "[--max-private-continuations N] [--max-shared-prefixes N] "
            "[--max-long-anchors-per-continuation N] "
-           "[--request-log-jsonl FILE] "
+           "[--request-log-jsonl FILE] [--request-log-max-mib N] [--request-log-keep N] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
            "[--kv-dtype bf16|int8|fp8] [--spec mtp|dflash --draft-tokens N] "
            "[--default-max-tokens N] [--default-thinking-budget N] "
@@ -91,6 +91,8 @@ std::string serve_usage_text(const char* argv0) {
            "       --media-live-mib defaults to 2048 and bounds all live BF16 patch payloads\n"
            "       --media-preprocess-threads defaults to 0 (auto, at most 16 workers)\n"
            "       --request-log-jsonl appends full-precision server/request records\n"
+           "       --request-log-max-mib rotates the JSONL log at N MiB (0 = unbounded);\n"
+           "       --request-log-keep retains N rotated files (default 4), oldest dropped\n"
            "       --model-id overrides the artifact identity.model_id reported by the server\n"
            "       Responses state is process-local and bounded to 1024 records / 256 MiB by "
            "default\n"
@@ -240,6 +242,15 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             if (options.request_log_jsonl.empty()) {
                 throw std::invalid_argument("--request-log-jsonl must not be empty");
             }
+        } else if (arg == "--request-log-max-mib") {
+            // 0 disables rotation (unbounded); positive caps the active file size.
+            options.request_log_max_mib =
+                static_cast<std::uint32_t>(parse_nonnegative_int(require_value("--request-log-max-mib"),
+                                                                 "request-log-max-mib"));
+        } else if (arg == "--request-log-keep") {
+            options.request_log_keep =
+                static_cast<std::uint32_t>(parse_nonnegative_int(require_value("--request-log-keep"),
+                                                                 "request-log-keep"));
         } else if (arg == "--response-store-max-records") {
             const int records = parse_nonnegative_int(require_value("--response-store-max-records"),
                                                       "response-store-max-records");

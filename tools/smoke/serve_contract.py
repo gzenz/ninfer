@@ -323,6 +323,31 @@ def parse_responses_stream(response: Response) -> tuple[str, str, dict[str, Any]
     return terminal_content, terminal_reasoning, terminal
 
 
+def stats(base_url: str) -> dict[str, Any]:
+    """Assert the read-only /stats endpoint returns a well-formed snapshot."""
+    doc = json_response(base_url, "GET", "/stats")
+    for key in ("schema", "schema_version", "timestamp_unix_ms", "scheduler", "counters",
+                "http", "memory", "load"):
+        if key not in doc:
+            raise ContractError(f"/stats response is missing top-level key {key!r}")
+    if doc["schema"] != "ninfer_serve_stats":
+        raise ContractError(f"/stats schema is {doc['schema']!r}, not ninfer_serve_stats")
+    for key in ("running", "prefilling", "decode_ready", "waiting"):
+        if not isinstance(doc["scheduler"].get(key), int):
+            raise ContractError(f"/stats scheduler.{key} is not an integer")
+    for key in ("computed_prefill_tokens", "committed_decode_tokens", "decode_rounds",
+                "decode_row_rounds"):
+        if not isinstance(doc["counters"].get(key), int):
+            raise ContractError(f"/stats counters.{key} is not an integer")
+    if not isinstance(doc["http"].get("in_flight"), int):
+        raise ContractError("/stats http.in_flight is not an integer")
+    if not isinstance(doc["http"].get("max_in_flight"), int):
+        raise ContractError("/stats http.max_in_flight is not an integer")
+    if not isinstance(doc["memory"].get("kv_capacity_page_groups"), int):
+        raise ContractError("/stats memory.kv_capacity_page_groups is not an integer")
+    return doc
+
+
 def exercise(base_url: str, model: str) -> dict[str, Any]:
     models = json_response(base_url, "GET", "/v1/models")
     entries = models.get("data")
@@ -333,6 +358,8 @@ def exercise(base_url: str, model: str) -> dict[str, Any]:
     single_model = json_response(base_url, "GET", f"/v1/models/{model}")
     if single_model.get("id") != model:
         raise ContractError("single-model response has the wrong id")
+
+    stats_snapshot = stats(base_url)
 
     anthropic_prompt = {
         "model": model,
@@ -502,6 +529,10 @@ def exercise(base_url: str, model: str) -> dict[str, Any]:
         "responses_output_tokens": response_output_tokens,
         "image_prompt_tokens": image_prompt_tokens,
         "anthropic_stop_reason": anthropic["stop_reason"],
+        "stats": {
+            "scheduler": stats_snapshot["scheduler"],
+            "http": stats_snapshot["http"],
+        },
     }
 
 

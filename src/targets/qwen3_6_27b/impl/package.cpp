@@ -93,7 +93,11 @@ Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentit
         return WeightsProfile::Qwen36Nvfp4;
     }
     if (identity.model_id == qwen3_8_model_id && identity.weights_id == "nvfp4") {
-        return WeightsProfile::Qwen38Nvfp4;
+        // Local: the Ostfralla-derived qwen3.8 nvfp4 artifact carries the Qwen3.6 NVFP4
+        // object layout (W8G32_F16S endpoints, bind_nvfp4_text_layers), not upstream's
+        // FP8 profile. Route it to Qwen36Nvfp4; reverting this one return value adopts
+        // the official FP8 artifact.
+        return WeightsProfile::Qwen36Nvfp4;
     }
     throw std::runtime_error("artifact identity '" + identity.model_id + "/" + identity.weights_id +
                              "' is not supported by target '" + std::string(target_key) + "'");

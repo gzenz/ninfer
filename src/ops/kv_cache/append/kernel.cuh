@@ -4,6 +4,7 @@
 #include "ops/common/warp.cuh"
 #include "ops/kernel/paged_kv_address.cuh"
 #include "ops/kv_cache/fp8_e4m3_row_codec.cuh"
+#include "ops/kv_cache/nvfp4_g16_codec.cuh"
 #include "ops/kv_cache/int8_g64_codec.cuh"
 
 #include <cuda_bf16.h>
@@ -197,6 +198,62 @@ __launch_bounds__(256) __global__
     kv_cache_append_full_fp8_row<Geometry>(k, v, cache_k, cache_v, scale_k, scale_v, token, kv_head,
                                            physical_page, position & kPagedKVPageMask, lane);
 }
+
+
+// --- NVFP4 group-16 full append ---
+template <typename Geometry, typename Metadata>
+__device__ __forceinline__ void kv_cache_append_full_nvfp4_row(const __nv_bfloat16* __restrict__ k,
+                                                               const __nv_bfloat16* __restrict__ v,
+                                                               std::uint8_t* __restrict__ cache_k,
+                                                               std::uint8_t* __restrict__ cache_v,
+                                                               std::uint8_t* __restrict__ scale_k,
+                                                               std::uint8_t* __restrict__ scale_v,
+                                                               std::int32_t token, std::int32_t kv_head,
+                                                               const std::int32_t* __restrict__ positions,
+                                                               Metadata metadata) {
+    const std::int32_t position = positions[0] + token;
+    const std::int32_t* block_table = metadata.block_table();
+    const int physical_page = paged_kv_physical_page(block_table, position);
+    const int page_off = position & kPagedKVPageMask;
+
+#pragma unroll
+    for (int group = 0; group < kKVCacheNvfp4Groups; ++group) {
+        const int byte_off = group * (kKVCacheNvfp4Group / 2);
+        const std::int64_t src =
+            kv_cache_nvfp4_src_index<Geometry>(kv_head, group * kKVCacheNvfp4Group, token);
+        const std::int64_t k_code_off =
+            kv_cache_nvfp4_code_index<Geometry>(physical_page, kv_head, byte_off, page_off);
+        const std::int64_t v_code_off =
+            kv_cache_nvfp4_code_index<Geometry>(physical_page, kv_head, byte_off, page_off);
+        const std::int64_t k_scale_off =
+            kv_cache_nvfp4_scale_index<Geometry>(physical_page, kv_head, group, page_off);
+        const std::int64_t v_scale_off =
+            kv_cache_nvfp4_scale_index<Geometry>(physical_page, kv_head, group, page_off);
+        kv_cache_nvfp4_quantize_k16(&k[src], &cache_k[k_code_off], &scale_k[k_scale_off]);
+        kv_cache_nvfp4_quantize_k16(&v[src], &cache_v[v_code_off], &scale_v[v_scale_off]);
+    }
+}
+
+template <typename Geometry, typename Metadata>
+__launch_bounds__(256) __global__ void kv_cache_append_full_nvfp4_kernel(
+    const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
+    const std::int32_t* __restrict__ positions, Metadata metadata,
+    std::uint8_t* __restrict__ cache_k, std::uint8_t* __restrict__ cache_v,
+    std::uint8_t* __restrict__ scale_k, std::uint8_t* __restrict__ scale_v,
+    std::int32_t width) {
+    constexpr int Warps = 8;
+    const int tokens = metadata.valid_tokens(width);
+    const int warp = static_cast<int>(threadIdx.x) >> 5;
+    const int unit = static_cast<int>(blockIdx.x) * Warps + warp;
+    const std::int64_t units = static_cast<std::int64_t>(tokens) * Geometry::KVHeads;
+    if (static_cast<std::int64_t>(unit) >= units) { return; }
+
+    const int kv_head = unit % Geometry::KVHeads;
+    const int token = unit / Geometry::KVHeads;
+    kv_cache_append_full_nvfp4_row<Geometry, Metadata>(
+        k, v, cache_k, cache_v, scale_k, scale_v, token, kv_head, positions, metadata);
+}
+
 
 template <typename Geometry, typename Metadata>
 __launch_bounds__(256) __global__

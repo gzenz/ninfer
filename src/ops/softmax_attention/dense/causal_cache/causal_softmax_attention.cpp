@@ -89,7 +89,7 @@ std::uint32_t validate_cache(const PagedKVLayerView& cache, std::int32_t kv_head
         return static_cast<std::uint32_t>(capacity);
     }
 
-    if (cache.k_scale_pages.dtype != DType::FP16 || cache.v_scale_pages.dtype != DType::FP16) {
+    if (cache.k_scale_pages.dtype != DType::FP16 && cache.k_scale_pages.dtype != DType::U8) {
         throw std::invalid_argument(std::string(op) + ": invalid KV cache scale dtype");
     }
     require_shape(cache.k_scale_pages, profile.scale_leading_extent, kPagedKVPageSize, kv_heads,
@@ -145,7 +145,7 @@ std::uint32_t validate_batch_cache(const PagedKVBatchLayerView& cache, std::int3
         return static_cast<std::uint32_t>(capacity);
     }
 
-    if (cache.k_scale_pages.dtype != DType::FP16 || cache.v_scale_pages.dtype != DType::FP16) {
+    if (cache.k_scale_pages.dtype != DType::FP16 && cache.k_scale_pages.dtype != DType::U8) {
         throw std::invalid_argument(std::string(op) + ": invalid KV cache scale dtype");
     }
     require_shape(cache.k_scale_pages, profile.scale_leading_extent, kPagedKVPageSize, kv_heads,

@@ -74,7 +74,7 @@ std::uint32_t validate_full_cache(const PagedKVLayerView& cache, std::int32_t kv
         return static_cast<std::uint32_t>(capacity);
     }
 
-    if (cache.k_scale_pages.dtype != DType::FP16 || cache.v_scale_pages.dtype != DType::FP16) {
+    if (cache.k_scale_pages.dtype != DType::FP16 && cache.k_scale_pages.dtype != DType::U8) {
         throw std::invalid_argument("kv_cache_append: invalid cache scale dtype");
     }
     require_shape(cache.k_scale_pages, profile.scale_leading_extent, kPagedKVPageSize, kv_heads,

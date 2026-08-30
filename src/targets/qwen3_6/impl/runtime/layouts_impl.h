@@ -72,6 +72,8 @@ TargetKVCacheProfile target_kv_cache_profile(KvCacheStorage storage) {
         return {DType::I8, qwen3_6::kKvInt8QuantGroup};
     case KvCacheStorage::Fp8E4M3Row256:
         return {DType::FP8_E4M3FN, qwen3_6::kKvFp8QuantGroup};
+    case KvCacheStorage::Nvfp4Group16:
+        return {DType::U8, qwen3_6::kKvNvfp4QuantGroup};
     }
     throw std::invalid_argument("unknown KV-cache storage profile");
 }

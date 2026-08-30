@@ -11506,6 +11506,9 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
     case DType::FP8_E4M3FN:
         out.kv_cache = KvCacheStorage::Fp8E4M3Row256;
         break;
+    case DType::U8:
+        out.kv_cache = KvCacheStorage::Nvfp4Group16;
+        break;
     default:
         std::terminate();
     }

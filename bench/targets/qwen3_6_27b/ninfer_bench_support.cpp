@@ -52,7 +52,8 @@ KvCacheStorage parse_kv_cache(std::string_view text) {
     if (text == "bf16") { return KvCacheStorage::BFloat16; }
     if (text == "int8") { return KvCacheStorage::Int8Group64; }
     if (text == "fp8") { return KvCacheStorage::Fp8E4M3Row256; }
-    throw std::invalid_argument("--kv-dtype must be bf16, int8, or fp8");
+    if (text == "nvfp4") { return KvCacheStorage::Nvfp4Group16; }
+    throw std::invalid_argument("--kv-dtype must be bf16, int8, fp8, or nvfp4");
 }
 
 std::vector<int> parse_int_list(std::string_view value, const char* label) {
@@ -853,6 +854,8 @@ std::string kv_cache_name(KvCacheStorage storage) {
         return "int8-group64";
     case KvCacheStorage::Fp8E4M3Row256:
         return "fp8-e4m3-row256";
+    case KvCacheStorage::Nvfp4Group16:
+        return "nvfp4-g16";
     }
     return "unknown";
 }

@@ -44,6 +44,8 @@ struct Options {
     std::uint32_t stride      = 2048;
     int device                = 0;
     ninfer::KvCacheStorage kv = ninfer::KvCacheStorage::Fp8E4M3Row256;
+    float rope_scaling_factor              = 1.0F;
+    std::uint32_t rope_scaling_original_context = 262144;
     bool quick                = false;
 };
 
@@ -52,7 +54,8 @@ struct Options {
                                 "\nusage: ninfer-perplexity <model.ninfer> "
                                 "(--corpus <manifest.json> [--quick] | --text <utf8-file>) "
                                 "[--context N] [--stride N] [--device N] "
-                                "[--kv-dtype bf16|int8|fp8] [--output <directory>]");
+                                "[--kv-dtype bf16|int8|fp8] [--output <directory>] "
+                                "[--rope-scaling-factor F] [--rope-scaling-original-context N]");
 }
 
 template <class Integer>
@@ -70,7 +73,8 @@ Options parse_options(int argc, char** argv) {
         std::cout << "usage: ninfer-perplexity <model.ninfer> "
                      "(--corpus <manifest.json> [--quick] | --text <utf8-file>)\n"
                      "       [--context N] [--stride N] [--device N]\n"
-                     "       [--kv-dtype bf16|int8|fp8] [--output <directory>]\n";
+                     "       [--kv-dtype bf16|int8|fp8] [--output <directory>]\n"
+                     "       [--rope-scaling-factor F] [--rope-scaling-original-context N]\n";
         std::exit(0);
     }
     if (argc < 2 || std::string_view(argv[1]).starts_with("--")) {
@@ -111,6 +115,18 @@ Options parse_options(int argc, char** argv) {
             }
         } else if (option == "--output") {
             out.output = std::filesystem::path(value("--output"));
+        } else if (option == "--rope-scaling-factor") {
+            const std::string_view text = value("--rope-scaling-factor");
+            double parsed{};
+            const auto [end, err] = std::from_chars(text.data(), text.data() + text.size(), parsed);
+            if (err != std::errc{} || end != text.data() + text.size() ||
+                parsed < 1.0 || parsed > 16.0) {
+                usage_error("--rope-scaling-factor must be in [1.0, 16.0]");
+            }
+            out.rope_scaling_factor = static_cast<float>(parsed);
+        } else if (option == "--rope-scaling-original-context") {
+            out.rope_scaling_original_context = parse_integer<std::uint32_t>(
+                value("--rope-scaling-original-context"), "rope-scaling-original-context");
         } else {
             usage_error("unknown option: " + std::string(option));
         }
@@ -205,6 +221,8 @@ int run(const Options& options) {
     engine_options.device                 = options.device;
     engine_options.max_context            = options.context;
     engine_options.kv_cache               = options.kv;
+    engine_options.rope_scaling_factor          = options.rope_scaling_factor;
+    engine_options.rope_scaling_original_context = options.rope_scaling_original_context;
     engine_options.load_progress.callback = [&](std::string_view phase, std::uint64_t done,
                                                 std::uint64_t total) {
         const std::uint64_t bucket =

@@ -80,6 +80,7 @@ std::string usage_text(const char* argv0) {
            "       [--max-context N] [--kv-capacity N|auto] [--prefill-chunk N] [--max-new N]\n"
            "       [--device N]\n"
            "       [--kv-dtype bf16|int8|fp8] [--spec mtp|dflash --draft-tokens N]\n"
+           "       [--rope-scaling-factor F] [--rope-scaling-original-context N]\n"
            "       [--lm-head-draft]\n"
            "       [--temperature F] [--top-p F] [--top-k N] [--min-p F]\n"
            "       [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]\n"
@@ -135,6 +136,12 @@ Options parse_options(int argc, char** argv) {
             options.device = parse_device(value(arg));
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_cache(value(arg));
+        } else if (arg == "--rope-scaling-factor") {
+            options.rope_scaling_factor =
+                parse_float(value(arg), "rope-scaling-factor", 1.0f, 16.0f);
+        } else if (arg == "--rope-scaling-original-context") {
+            options.rope_scaling_original_context =
+                parse_u32(value(arg), "rope-scaling-original-context");
         } else if (arg == "--spec") {
             options.speculative.backend = product::parse_speculative_backend(value(arg));
         } else if (arg == "--draft-tokens") {

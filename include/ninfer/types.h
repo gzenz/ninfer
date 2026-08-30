@@ -123,6 +123,8 @@ struct EngineOptions {
     std::uint32_t media_preprocess_threads = 0;
     bool enable_vision                     = false;
     bool use_cuda_graph                    = true;
+    float rope_scaling_factor              = 1.0F;
+    std::uint32_t rope_scaling_original_context = 262144;
     ContextCacheOptions context_cache;
     ContextCostOptions context_cost;
     LoadProgress load_progress;

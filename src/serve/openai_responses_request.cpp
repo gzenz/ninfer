@@ -548,7 +548,10 @@ struct AssistantInputRun {
         case AssistantInputPhase::Content:
             invalid_assistant_history(index, "reasoning cannot follow assistant message content");
         case AssistantInputPhase::Calls:
-            invalid_assistant_history(index, "reasoning cannot follow function_call Items");
+            // Reasoning after tool calls: append to current turn (rare but valid).
+            turn.reasoning_content = std::move(reasoning);
+            phase                  = AssistantInputPhase::Reasoning;
+            return;
         }
         throw std::logic_error("unreachable assistant input phase");
     }
@@ -557,10 +560,9 @@ struct AssistantInputRun {
         if (message.role != ChatRole::Assistant) {
             throw std::logic_error("assistant input run received a non-assistant message");
         }
-        if (phase == AssistantInputPhase::Calls) {
-            invalid_assistant_history(
-                index, "assistant message content cannot follow function_call Items");
-        }
+        // Allow text after function_call items: append to the current turn's content.
+        // The chat template renders body after tool calls, which is valid for ninfer.
+        // Claude Code sends this pattern when the model explains after calling tools.
         turn.content.insert(turn.content.end(), std::make_move_iterator(message.content.begin()),
                             std::make_move_iterator(message.content.end()));
         phase = AssistantInputPhase::Content;

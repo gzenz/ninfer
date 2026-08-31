@@ -15,6 +15,49 @@ Details: [docs/maintainer/kv-nvfp4-yarn.md](docs/maintainer/kv-nvfp4-yarn.md)
 
 <!-- /fork-changelog -->
 
+
+## Froggeric v22 Chat Template
+
+This fork works with any Qwen3.8-27B NVFP4 `.ninfer` artifact. The Froggeric v22
+template improves tool-call reliability for agentic workloads. To inject it into
+an existing `.ninfer` artifact:
+
+1. **Download the base artifact**: [Ostfralla/Qwen3.8-27B-NVFP4-NInfer](https://huggingface.co/Ostfralla/Qwen3.8-27B-NVFP4-NInfer) on HuggingFace.
+
+2. **Inject the froggeric template** using the artifact container API:
+   ```python
+   from tools.artifact.container import Artifact, ArtifactWriter, ArtifactIdentity
+   from tools.artifact.container import ArtifactObject, ResourceObject
+
+   # Read the existing artifact
+   art = Artifact("ostfralla/qwen3_8_27b_nvfp4.ninfer")
+   objects = list(art.objects)
+
+   # Find and replace the chat_template.jinja resource
+   with open("tests/fixtures/frontend/froggeric_v22_chat_template.jinja", "rb") as f:
+       froggeric_template = f.read()
+
+   new_objects = []
+   for obj in objects:
+       if isinstance(obj, ResourceObject) and obj.name == "frontend/chat_template.jinja":
+           new_objects.append(ResourceObject(obj.name, obj.encoding, 0, froggeric_template))
+       else:
+           new_objects.append(obj)
+
+   # Write the modified artifact
+   ArtifactWriter("out/qwen3_8_27b_nvfp4-froggeric.ninfer", art.identity, new_objects).write_all()
+   ```
+
+3. **Serve**:
+   ```bash
+   ./build/apps/ninfer-serve out/qwen3_8_27b_nvfp4-froggeric.ninfer      --host 0.0.0.0 --port 8080 --kv-dtype nvfp4 --vision      --spec mtp --draft-tokens 5 --lm-head-draft      --tolerant-tool-calls --host-kv-mib <sysmem MiB to spare for host KV>      --rope-scaling-factor 2.12 --rope-scaling-original-context 262144
+   ```
+
+The engine matches the template by SHA256 digest at load time and activates
+`ChatTemplateSemantics::FroggericV22` — an optimized C++ renderer that replaces
+jinja interpretation with direct rendering including stricter tool-call instructions,
+no-dangling-intent enforcement, and think-close variant handling.
+
 # NInfer
 
 > Selected checkpoints. Maximum single-GPU inference performance.

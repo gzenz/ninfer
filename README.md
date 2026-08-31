@@ -1,3 +1,20 @@
+<!-- fork-changelog -->
+## Fork changes vs upstream
+
+- **NVFP4 KV cache** (`--kv-dtype nvfp4`): 4-bit E2M1 codes + E4M3 group-16 scales. 45% less KV VRAM than int8.
+- **YaRN context extension** (`--rope-scaling-factor`): linear RoPE scaling up to 555k context (c=3+vision) or 600k (c=1). No quality loss.
+- **Host-KV thrash fix**: un-suppresses demote-to-host when candidate needs host KV budget (issue #98).
+- **Froggeric v22 chat template**: `ChatTemplateSemantics::FroggericV22` with no-dangling-intent rule.
+- **Tolerant tool-call recovery** (`--tolerant-tool-calls`): recovers complete Qwen calls with malformed wrappers.
+- **Depth-matching tool-call close scan**: handles balanced nested markers in parameter values.
+- **Request-log rotation** (`--request-log-max-mib`, `--request-log-keep`): size-based JSONL rotation.
+- **/stats endpoint**: runtime gauges, KV transfer counters, pressure metrics, cache reuse paths.
+- **Ostfralla artifact routing**: maps qwen3.8/nvfp4 to Qwen36Nvfp4 (W8G32) profile.
+
+Details: [docs/maintainer/kv-nvfp4-yarn.md](docs/maintainer/kv-nvfp4-yarn.md)
+
+<!-- /fork-changelog -->
+
 # NInfer
 
 > Selected checkpoints. Maximum single-GPU inference performance.

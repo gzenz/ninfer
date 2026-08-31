@@ -36,7 +36,7 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_bf
     constexpr int PVNt    = D / 8;
     constexpr int PVKs    = Bc / 16;
     // The 262144-key maximum envelope spans at most 49 pages in this split geometry.
-    constexpr int PageIds       = 64;
+    constexpr int PageIds       = 128;
     constexpr float Log2E       = 1.4426950408889634074f;
     constexpr unsigned FullMask = 0xffffffffu;
     constexpr int QkvRows       = 2 * Bc;

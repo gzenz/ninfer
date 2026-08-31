@@ -120,8 +120,8 @@ Options parse_options(int argc, char** argv) {
             double parsed{};
             const auto [end, err] = std::from_chars(text.data(), text.data() + text.size(), parsed);
             if (err != std::errc{} || end != text.data() + text.size() ||
-                parsed < 1.0 || parsed > 16.0) {
-                usage_error("--rope-scaling-factor must be in [1.0, 16.0]");
+                parsed < 1.0 || parsed > 32.0) {
+                usage_error("--rope-scaling-factor must be in [1.0, 32.0]");
             }
             out.rope_scaling_factor = static_cast<float>(parsed);
         } else if (option == "--rope-scaling-original-context") {

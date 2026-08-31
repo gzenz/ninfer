@@ -138,7 +138,7 @@ Options parse_options(int argc, char** argv) {
             options.kv_cache = parse_kv_cache(value(arg));
         } else if (arg == "--rope-scaling-factor") {
             options.rope_scaling_factor =
-                parse_float(value(arg), "rope-scaling-factor", 1.0f, 16.0f);
+                parse_float(value(arg), "rope-scaling-factor", 1.0f, 32.0f);
         } else if (arg == "--rope-scaling-original-context") {
             options.rope_scaling_original_context =
                 parse_u32(value(arg), "rope-scaling-original-context");

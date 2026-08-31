@@ -442,7 +442,12 @@ public:
     identity_target(const AdmissionCandidate<Variant>& candidate) const;
     [[nodiscard]] PressureTargetHandle
     root_maximal_target(const AdmissionCandidate<Variant>& root_candidate);
+    [[nodiscard]] std::optional<PressureTargetHandle>
+    guided_closure_target(const AdmissionCandidate<Variant>& candidate,
+                          std::span<const std::uint32_t> preferred_owner_ordinals);
+    [[nodiscard]] runtime::PressureTargetGuidance guidance(PressureTargetHandle target);
     [[nodiscard]] runtime::PressureTargetAssessment assess(PressureTargetHandle target);
+    void retain_assessment(PressureTargetHandle target);
     [[nodiscard]] PreparedPressureExpansion<Variant> prepare_expansion(PressureTargetHandle parent);
     [[nodiscard]] PressureExpansionView
     commit_expansion(PreparedPressureExpansion<Variant>&& prepared);

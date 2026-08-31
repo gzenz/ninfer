@@ -218,6 +218,38 @@ def _session_alternating_64k_host_swap(context: CaseContext, corpus: Corpus) -> 
     context.require_success(b2)
 
 
+def _session_rotation_55k_host(context: CaseContext, corpus: Corpus) -> None:
+    source_ids: list[str] = []
+    for index in range(6):
+        source = _responses_shape(
+            context,
+            corpus,
+            f"rotation-55k-{index}",
+            f"source-{index}",
+            store=True,
+        )
+        context.require_success(source)
+        source_ids.append(_response_id(source))
+
+    def resume(role: str, source_index: int) -> None:
+        request = context.start(
+            role,
+            responses_request(
+                context.model,
+                "Return the retained answer and its session marker in one short line.",
+                32,
+                store=True,
+                previous_response_id=source_ids[source_index],
+            ),
+        )
+        context.require_success(request)
+
+    resume("warm-context-0", 0)
+    for round_index in range(1, 4):
+        for source_index in range(6):
+            resume(f"round-{round_index}-context-{source_index}", source_index)
+
+
 def _unmarked_common(context: CaseContext, corpus: Corpus) -> None:
     first = _chat_shape(context, corpus, "unmarked-common-a", "first")
     context.require_success(first)
@@ -1074,6 +1106,7 @@ _DEFINITIONS = (
     _definition("session-hot-continuation", "openai_responses", "cache-hot", "session", ("long-8k-16",), "Named Responses session continuation.", _session_hot),
     _definition("session-alternating", "openai_responses", "cache-pressure-device", "session", ("long-8k-16",), "Alternating named sessions.", _session_alternating),
     _definition("session-alternating-64k-host-swap", "openai_responses", "cache-swap-64k-host", "resource", ("long-64k-32", "long-64k-independent-32"), "Two near-capacity sessions alternate through Host KV.", _session_alternating_64k_host_swap),
+    _definition("session-rotation-55k-host", "openai_responses", "cache-rotation-55k-host", "resource", tuple(f"rotation-55k-{index}" for index in range(6)), "Six early-divergent 55K Responses roots, one warm branch, then three sequential round-robin branch rounds under Device/Host KV pressure.", _session_rotation_55k_host),
     _definition("unmarked-common-prefix-miss", "openai_chat", "cache-hot", "private", ("unmarked-common-a", "unmarked-common-b"), "Raw token commonality without a checkpoint.", _unmarked_common),
     _definition("resume-after-interference-device", "openai_responses", "cache-pressure-device", "resource", ("long-8k-16", "interferer-256"), "Pressure graph with Device-resident source.", _pressure_graph, symmetric_role_groups=(SymmetricRoleGroup("interferers", ("interferer-b", "interferer-c")),)),
     _definition("resume-after-interference-state-host", "openai_responses", "cache-pressure-state-host", "resource", ("long-8k-16", "interferer-256"), "Pressure graph with Host State restore.", _pressure_graph, symmetric_role_groups=(SymmetricRoleGroup("interferers", ("interferer-b", "interferer-c")),)),

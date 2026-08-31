@@ -155,10 +155,31 @@ PressureTargetHandle PressurePlanningSession<Variant>::root_maximal_target(
 }
 
 template <>
+std::optional<PressureTargetHandle> PressurePlanningSession<Variant>::guided_closure_target(
+    const AdmissionCandidate<Variant>& candidate,
+    std::span<const std::uint32_t> preferred_owner_ordinals) {
+    if (impl_ == nullptr) { throw std::logic_error("pressure planning session is empty"); }
+    return impl_->guided_closure_target(candidate, preferred_owner_ordinals);
+}
+
+template <>
+runtime::PressureTargetGuidance
+PressurePlanningSession<Variant>::guidance(PressureTargetHandle target) {
+    if (impl_ == nullptr) { throw std::logic_error("pressure planning session is empty"); }
+    return impl_->guidance(target);
+}
+
+template <>
 runtime::PressureTargetAssessment
 PressurePlanningSession<Variant>::assess(PressureTargetHandle target) {
     if (impl_ == nullptr) { throw std::logic_error("pressure planning session is empty"); }
     return impl_->assess(target);
+}
+
+template <>
+void PressurePlanningSession<Variant>::retain_assessment(PressureTargetHandle target) {
+    if (impl_ == nullptr) { throw std::logic_error("pressure planning session is empty"); }
+    impl_->retain_assessment(target);
 }
 
 template <>

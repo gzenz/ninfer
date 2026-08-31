@@ -697,26 +697,60 @@ root candidate
 但当前 active reservations、lane 或 open transaction 仍阻塞 maximal-release target，结果为 temporarily
 blocked。
 
-### 8.7 有界 best-first search
+### 8.7 有界 anytime search
 
-有了 incumbent 后，Planner 在全部 candidate roots 上执行 best-first branch-and-bound：
+有了 incumbent 后，Planner 保留一个完整的 lazy branch-and-bound frontier。Program 原子地产生全部
+canonical children，但 children 先只取得 candidate-root 的 certified lower bound 和一份 cheap
+guidance；Planner 每次只对一个 popped target 调用 exact assessment，因此预算检查粒度不会退化成整层
+children 的 projection batch。
 
-1. 以 lower bound 最小的 target 为下一 expansion；
-2. Program 原子地产生其 canonical successors；
-3. 每个等价完整 target 只 assessment 一次；
-4. 可行且逻辑可采用的 target 可以替换 incumbent；
-5. 仍可扩展且 lower bound 不高于 incumbent 的 target 回到 queue；
-6. queue 穷尽、证明 model-optimal，或达到 target/time/value budget 时停止；
-7. 始终使用停止时的最佳完整 incumbent。
+Planner 先为每个仍有竞争力的 candidate 构造一个 target-owned direct closure，再运行小型
+deterministic Pareto beam：
 
-一次 expansion 的 children 要么完整加入，要么完整丢弃，避免 target budget 使结果依赖生成顺序。
-Budget 只控制 cache retention 质量；它不截断 candidate identity 检查和 maximal-release correctness
-assessment。
+- ResourceManager 只根据 selected hits、shared credit、retention weight、last-hit epoch 和稳定 ordinal 排列
+  owner 偏好；它不理解 target 的 State/KV 物理动作；
+- Program 从 candidate 的完整 physical peak、当前 occupancy/capacity 和已选 pressure effects 计算 residual，
+  优先沿低价值 owner 追加不删除 checkpoint 的 canonical successors，得到一个完整 closure；pressure effect
+  必须作用于完整 peak 后再与 capacity 比较，不能直接作用于已经 clamp 为零的 deficit，否则 Host 有空闲时的
+  Device-to-Host demotion 会被误判为新的 Host 缺口；
+- direct closure 只提供一个待验证 target；Program 的完整 compose、alias accounting、Host extent allocation
+  和 physical-peak proof 仍由随后的一次 exact assessment 完成；
+- 若 direct closure 未形成可用 seed，Program 从相同的 peak/residual 与 transfer metadata 提供 cheap
+  guidance；ResourceManager 根据 owner outcomes、retention weight、hit history 和 shared credit 形成独立的
+  logical-damage axes；
+- beam 在 physical progress、logical damage 和 estimated work 的 Pareto frontier 上排序，逐个送入 exact
+  assessment；每个 candidate 找到普通可行 target 后结束自己的 seed phase；
+- beam 丢弃的 target 仍留在 lazy exact frontier，heuristic 不能删除 proof path。
 
-若本次实际 assessment 的 canonical targets 为 \(N\)，heap search 的管理成本为 \(O(N\log N)\)，总成本再加
-Program 对这些 targets 的 physical projection work。设当前有 \(A\) 个 eligible owners，stored target
-decisions 使用 \(O(NA)\) memory；physical oracle 与 successor scratch 还受启动时配置的 owner、checkpoint
-和 logical-page descriptor 上限约束。\(N\) 由固定 target budget 封顶。
+Direct closure、guided seed 与后续 exact search 共享同一个 wall budget；budget 在不可分的 closure 或 exact
+assessment 之间检查，因此单次操作最多造成一次粒度内超时。
+
+随后继续 exact branch-and-bound：
+
+1. 未 assessment 的 target 只携带保守的 certified lower bound；
+2. Program exact assessment 与 ResourceManager logical-publication check 是采用 target 的唯一 oracle；
+3. 可行且逻辑可采用的 target 可以替换 incumbent；
+4. 仍可扩展且 lower bound 不高于 incumbent 的 target 进入 exact queue；
+5. queue 与 lazy frontier 穷尽、证明 model-optimal，或达到 target/time/value budget 时停止；
+6. 始终使用停止时的最佳完整 incumbent。
+
+Guidance 只决定工作顺序，不能创建 `ResourcePlan`、标记 target feasible、执行 exact pruning，或贡献
+`model_optimal` 证明。一次 expansion 的 children 要么完整加入，要么完整丢弃，避免 target budget 使结果
+依赖生成顺序。Budget 只控制 cache retention 质量；它不截断 candidate identity 检查和 maximal-release
+correctness assessment。Guided seed 同时受 exact-assessment 数量和 wall watchdog 限制；watchdog 在每个 exact
+assessment 之间检查，单个不可分 assessment 最多造成一次粒度内超时。
+
+Pressure session 的热路径不使用 page/target 的线性 canonical lookup：target choices 进入预定容量的 flat
+hash index；State/KV placement 与 alias accounting 使用 Program 启动时按 logical descriptor capacity 分配的
+generation scratch。Exact assessment 缓存 successor expansion 所需的 residual，checkpoint baseline recovery
+在 session 开始时计算一次；当前 incumbent 还可保留其 complete composed projection，seal 只执行最终
+revalidation，不重复 compose。上述缓存都绑定当前 `resource_revision` 和单个 planning session，不跨 Program
+共享。
+
+若本次实际 assessment 的 canonical targets 为 \(N\)，heap search 的管理成本为 \(O(N\log N)\)，小 beam
+的管理成本有固定上限，总成本再加 Program 对这些 targets 的 physical projection work。设当前有 \(A\) 个
+eligible owners，stored target decisions 使用 \(O(NA)\) memory；physical oracle 与 successor scratch 还受
+启动时配置的 owner、checkpoint 和 logical-page descriptor 上限约束。\(N\) 由固定 target budget 封顶。
 因此组合目标空间可以很大，但一次 admission 的规划时间和内存不会随理论组合数无界增长。
 
 ### 8.8 确定性选择

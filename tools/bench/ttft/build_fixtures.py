@@ -426,6 +426,37 @@ def build(tokenizer_path: Path) -> None:
     independent_64k_path = TEXT_ROOT / "long_64k_independent.json"
     _write_json(independent_64k_path, independent_64k)
 
+    rotation_55k: list[list[dict[str, str]]] = []
+    rotation_55k_paths: list[Path] = []
+    for index, label in enumerate(("ALPHA", "BRAVO", "COBALT", "DELTA", "EMBER", "FOXTROT")):
+        messages = _fit_user_prompt(
+            tokenizer,
+            source_ids,
+            55000,
+            leading_messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        f"{label} session: retain this independent TTFT rotation context. "
+                        "Answer the supplied document without referring to another session."
+                    ),
+                }
+            ],
+        )
+        path = TEXT_ROOT / f"rotation_55k_{index}.json"
+        _write_json(path, messages)
+        rotation_55k.append(messages)
+        rotation_55k_paths.append(path)
+    rotation_55k_common = max(
+        _common_rendered_tokens(tokenizer, rotation_55k[left], rotation_55k[right])
+        for left in range(len(rotation_55k))
+        for right in range(left + 1, len(rotation_55k))
+    )
+    if rotation_55k_common > 3:
+        raise RuntimeError(
+            "55K rotation fixtures do not diverge at the first system-content token"
+        )
+
     exact = _fit_user_prompt(tokenizer, source_ids, 8129)
     over = _fit_user_prompt(tokenizer, source_ids, 8193)
     exact_path = TEXT_ROOT / "context_exact.json"
@@ -512,6 +543,15 @@ def build(tokenizer_path: Path) -> None:
                 max_output_tokens=32,
                 seed_common_prefix_tokens=independent_64k_common,
             ),
+            **{
+                f"rotation-55k-{index}": _file_record(
+                    path,
+                    prompt_tokens=55000,
+                    max_output_tokens=32,
+                    max_peer_common_prefix_tokens=rotation_55k_common,
+                )
+                for index, path in enumerate(rotation_55k_paths)
+            },
             "long-256k-32": _existing_case("long_niah_256k", 260096, 32),
             "interferer-256": _existing_case("scenario_story_zh_scifi", 127, 256),
             "holder-4096": _existing_case("scenario_story_zh_scifi", 127, 4096),
@@ -654,6 +694,20 @@ def check() -> None:
             raise RuntimeError(f"{name} exceeds the media byte envelope")
     if manifest["media"]["many-image-33"]["vision_tokens"] <= VISION_TOKEN_LIMIT:
         raise RuntimeError("33-image rejection fixture does not exceed the Vision envelope")
+
+    rotation = [manifest["shapes"].get(f"rotation-55k-{index}") for index in range(6)]
+    if any(
+        not isinstance(record, dict)
+        or record.get("prompt_tokens") != 55000
+        or record.get("max_output_tokens") != 32
+        or record.get("max_peer_common_prefix_tokens", 4) > 3
+        for record in rotation
+    ):
+        raise RuntimeError("55K rotation fixtures are outside their qualified shape")
+    if len({record["path"] for record in rotation}) != 6 or len(
+        {record["sha256"] for record in rotation}
+    ) != 6:
+        raise RuntimeError("55K rotation fixtures are not byte-distinct")
 
 
 def main(argv: Sequence[str] | None = None) -> int:

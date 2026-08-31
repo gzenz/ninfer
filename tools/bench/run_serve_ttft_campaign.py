@@ -41,6 +41,7 @@ RESOURCE_CASES = (
     "resume-after-interference-evicted",
     "resume-after-interference-catalog",
     "session-alternating-64k-host-swap",
+    "session-rotation-55k-host",
 )
 CAMPAIGNS = {
     "smoke": ("cold-short",),
@@ -350,7 +351,7 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     selection.add_argument(
         "--campaign",
         choices=tuple(CAMPAIGNS),
-        help="smoke=one baseline, resource=six placement comparisons, full=all audited cases",
+        help="smoke=one baseline, resource=pressure and Host-rotation cases, full=all audited cases",
     )
     selection.add_argument(
         "--case",

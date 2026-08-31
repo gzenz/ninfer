@@ -100,6 +100,10 @@ public:
         const PressureTargetHandle identity = session.identity_target(candidate);
         queue_.push_back(identity);
         std::optional<Incumbent> incumbent;
+        // The identity target is already canonical in the Program session.  The search budget
+        // bounds every canonical target admitted to this scenario, including children committed
+        // now but still waiting in the breadth-first queue; assessed targets are only telemetry.
+        std::uint32_t canonical_targets = 1;
         std::uint32_t targets_evaluated = 0;
         std::size_t cursor              = 0;
 
@@ -120,19 +124,22 @@ public:
                         .stable_target       = assessment.stable_target_ordinal,
                         .degradation_units   = assessment.degradation_units,
                         .dropped_checkpoints = assessment.dropped_checkpoints,
-                        .assessment_digest   = assessment.assessment_digest,
+                        .owner_outcomes      = std::vector<PressureOwnerOutcome>(
+                            assessment.owner_outcomes.begin(), assessment.owner_outcomes.end()),
                     };
+                    session.retain_assessment(target);
                 }
             }
 
             if (!assessment.expandable || contains(expanded_, target)) { continue; }
             auto prepared                 = session.prepare_expansion(target);
-            const std::uint32_t remaining = input.target_budget - targets_evaluated;
+            const std::uint32_t remaining = input.target_budget - canonical_targets;
             if (prepared.new_canonical_count() > remaining) {
                 session.discard_expansion(std::move(prepared));
                 continue;
             }
             const auto children = session.commit_expansion(std::move(prepared));
+            canonical_targets += children.new_canonical_count;
             expanded_.push_back(target);
             for (const PressureTargetHandle child : children.children) {
                 if (!contains(assessed_, child) && !contains(queue_, child)) {
@@ -142,28 +149,19 @@ public:
         }
 
         if (!incumbent) { return std::nullopt; }
-        const PressureTargetAssessment selected = session.assess(incumbent->target);
-        const TransitionValue selected_value    = fold_target(input, selected);
-        if (selected.assessment_digest != incumbent->assessment_digest ||
-            selected.stable_target_ordinal != incumbent->stable_target ||
-            selected_value != incumbent->value) {
-            throw std::logic_error("shared capture target changed before seal");
-        }
-        std::vector<PressureOwnerOutcome> outcomes(selected.owner_outcomes.begin(),
-                                                   selected.owner_outcomes.end());
         std::optional<CapturePressurePlan> pressure = session.seal_capture(incumbent->target);
         if (!pressure) {
             throw std::logic_error("selected shared capture target could not be sealed");
         }
         return Result{
             .pressure                = std::move(*pressure),
-            .owner_outcomes          = std::move(outcomes),
-            .baseline_value          = selected_value.baseline_public,
-            .target_value            = selected_value.target_public,
-            .immediate_ns            = selected_value.immediate,
-            .net_gain                = selected_value.gain,
+            .owner_outcomes          = std::move(incumbent->owner_outcomes),
+            .baseline_value          = incumbent->value.baseline_public,
+            .target_value            = incumbent->value.target_public,
+            .immediate_ns            = incumbent->value.immediate,
+            .net_gain                = incumbent->value.gain,
             .stable_scenario_ordinal = input.stable_scenario_ordinal,
-            .stable_target_ordinal   = selected.stable_target_ordinal,
+            .stable_target_ordinal   = incumbent->stable_target,
             .targets_evaluated       = targets_evaluated,
         };
     }
@@ -197,7 +195,7 @@ private:
         std::uint32_t stable_target       = 0;
         std::uint32_t degradation_units   = 0;
         std::uint32_t dropped_checkpoints = 0;
-        std::uint64_t assessment_digest   = 0;
+        std::vector<PressureOwnerOutcome> owner_outcomes;
     };
 
     static void validate(const Input& input) {

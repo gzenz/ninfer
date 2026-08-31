@@ -853,6 +853,15 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     }
     state_store = std::make_unique<StateImageStore>(
         *state_images, host_state_images.get(), static_cast<std::uint32_t>(logical_state_capacity));
+    pressure_private_owner_scratch_.resize(continuation_capacity);
+    pressure_shared_owner_scratch_.resize(shared_prefix_capacity);
+    pressure_private_drop_scratch_.resize(continuation_capacity);
+    const std::size_t pressure_checkpoint_capacity =
+        2U + context_cache.max_long_anchors_per_continuation.value_or(0U);
+    for (auto& dropped : pressure_private_drop_scratch_) {
+        dropped.reserve(pressure_checkpoint_capacity);
+    }
+    pressure_state_scratch_.reserve(static_cast<std::size_t>(logical_state_capacity));
     if (plan.persistent.replay_records) {
         replay_records.emplace(backing, *plan.persistent.replay_records);
         replay_fold.emplace(*replay_records, state_images->linear().all_layers_view());
@@ -879,6 +888,12 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
         backend_kv_addresses = std::make_unique<KVAddressSpaceStore>(
             *backend_kv_pages, backend->execution_tables(), address_capacity,
             backend->execution_tables().logical_page_capacity());
+    }
+    pressure_text_page_scratch_.resize(text_kv_pages->capacity());
+    pressure_text_selected_pages_.reserve(text_kv_pages->capacity());
+    if (backend_kv_pages) {
+        pressure_backend_page_scratch_.resize(backend_kv_pages->capacity());
+        pressure_backend_selected_pages_.reserve(backend_kv_pages->capacity());
     }
     if (plan.context_cache.host_kv_capacity_bytes != 0) {
         std::vector<HostKVPageLayout> layouts;
@@ -1866,6 +1881,59 @@ std::vector<qwen3_6::detail::PressureDecision> ProgramImplCore::inspect_shared_p
     return inspect_shared_pressure_options(shared, residual, protection, current);
 }
 
+void ProgramImplCore::begin_pressure_page_scratch() const noexcept {
+    if (++pressure_page_scratch_generation_ == 0) {
+        std::fill(pressure_text_page_scratch_.begin(), pressure_text_page_scratch_.end(),
+                  PressurePageScratchSlot{});
+        std::fill(pressure_backend_page_scratch_.begin(), pressure_backend_page_scratch_.end(),
+                  PressurePageScratchSlot{});
+        pressure_page_scratch_generation_ = 1;
+    }
+    pressure_text_selected_pages_.clear();
+    pressure_backend_selected_pages_.clear();
+}
+
+ProgramImplCore::PressurePageScratchSlot&
+ProgramImplCore::pressure_page_scratch(const LogicalKVPageStore& store,
+                                       LogicalKVPageHandle page) const {
+    std::vector<PressurePageScratchSlot>* slots = nullptr;
+    if (&store == text_kv_pages.get()) {
+        slots = &pressure_text_page_scratch_;
+    } else if (&store == backend_kv_pages.get()) {
+        slots = &pressure_backend_page_scratch_;
+    } else {
+        throw std::logic_error("pressure page scratch received a foreign logical store");
+    }
+    const std::uint32_t index = store.descriptor_index(page);
+    if (index >= slots->size()) {
+        throw std::logic_error("pressure page scratch descriptor is outside startup capacity");
+    }
+    PressurePageScratchSlot& slot = (*slots)[index];
+    if (slot.generation != pressure_page_scratch_generation_) {
+        slot = PressurePageScratchSlot{.generation = pressure_page_scratch_generation_};
+    }
+    return slot;
+}
+
+const ProgramImplCore::PressurePageScratchSlot*
+ProgramImplCore::find_pressure_page_scratch(const LogicalKVPageStore& store,
+                                            LogicalKVPageHandle page) const {
+    const std::vector<PressurePageScratchSlot>* slots = nullptr;
+    if (&store == text_kv_pages.get()) {
+        slots = &pressure_text_page_scratch_;
+    } else if (&store == backend_kv_pages.get()) {
+        slots = &pressure_backend_page_scratch_;
+    } else {
+        throw std::logic_error("pressure page scratch received a foreign logical store");
+    }
+    const std::uint32_t index = store.descriptor_index(page);
+    if (index >= slots->size()) {
+        throw std::logic_error("pressure page scratch descriptor is outside startup capacity");
+    }
+    const PressurePageScratchSlot& slot = (*slots)[index];
+    return slot.generation == pressure_page_scratch_generation_ ? &slot : nullptr;
+}
+
 std::vector<runtime::ContextTransferRequirement>
 ProgramImplCore::checkpoint_restore_requirements(const SequenceKVBundle& kv,
                                                  const qwen3_6::TargetKVRequirement& requirement,
@@ -1931,6 +1999,7 @@ bool ProgramImplCore::pressure_checkpoint_recovery_impacts(
     std::span<const SharedPrefixHandle* const> shared_owners,
     std::span<const qwen3_6::detail::PressureDecision* const> shared_decisions,
     std::span<const std::uint32_t> shared_ordinals,
+    std::span<const qwen3_6::detail::PressureBaselineRecovery> baseline_recovery,
     const runtime::ContextMachineCostModel& machine_cost,
     std::vector<runtime::PressureCheckpointRecoveryImpact>& output,
     std::uint64_t& projection_work) const {
@@ -1949,8 +2018,6 @@ bool ProgramImplCore::pressure_checkpoint_recovery_impacts(
     };
 
     struct PagePlacement {
-        const LogicalKVPageStore* store = nullptr;
-        LogicalKVPageHandle page;
         bool device              = false;
         bool host                = false;
         std::uint64_t host_group = 0;
@@ -1964,11 +2031,10 @@ bool ProgramImplCore::pressure_checkpoint_recovery_impacts(
     };
 
     std::vector<StatePlacement> state_placements;
-    std::vector<PagePlacement> page_placements;
     std::vector<OwnerProjection> projected_owners;
     state_placements.reserve(private_owners.size() + shared_owners.size());
-    page_placements.reserve((private_owners.size() + shared_owners.size()) * 8U);
     projected_owners.reserve(private_owners.size() + shared_owners.size());
+    begin_pressure_page_scratch();
     std::uint64_t next_host_group = 1;
 
     const auto set_state_placement = [&](StateImageHandle state, bool device, bool host) -> bool {
@@ -1982,20 +2048,12 @@ bool ProgramImplCore::pressure_checkpoint_recovery_impacts(
     };
     const auto set_page_placement = [&](const LogicalKVPageStore& store, LogicalKVPageHandle page,
                                         bool device, bool host, std::uint64_t host_group) -> bool {
-        const auto found =
-            std::find_if(page_placements.begin(), page_placements.end(), [&](const auto& item) {
-                return item.store == &store && item.page == page;
-            });
-        if (found != page_placements.end()) {
-            return found->device == device && found->host == host;
-        }
-        page_placements.push_back(PagePlacement{
-            .store      = &store,
-            .page       = page,
-            .device     = device,
-            .host       = host,
-            .host_group = host_group,
-        });
+        PressurePageScratchSlot& slot = pressure_page_scratch(store, page);
+        if (slot.projected) { return slot.device == device && slot.host == host; }
+        slot.projected  = true;
+        slot.device     = device;
+        slot.host       = host;
+        slot.host_group = host_group;
         return true;
     };
     const auto apply_kv_action = [&](const KVAddressSpaceStore* addresses,
@@ -2114,14 +2172,15 @@ bool ProgramImplCore::pressure_checkpoint_recovery_impacts(
     };
     const auto final_page_placement = [&](const LogicalKVPageStore& store,
                                           LogicalKVPageHandle page) -> PagePlacement {
-        const auto found =
-            std::find_if(page_placements.begin(), page_placements.end(), [&](const auto& item) {
-                return item.store == &store && item.page == page;
-            });
-        if (found != page_placements.end()) { return *found; }
+        const PressurePageScratchSlot* slot = find_pressure_page_scratch(store, page);
+        if (slot != nullptr && slot->projected) {
+            return PagePlacement{
+                .device     = slot->device,
+                .host       = slot->host,
+                .host_group = slot->host_group,
+            };
+        }
         return PagePlacement{
-            .store  = &store,
-            .page   = page,
             .device = store.device_resident(page),
             .host   = store.host_resident(page),
         };
@@ -2140,12 +2199,18 @@ bool ProgramImplCore::pressure_checkpoint_recovery_impacts(
     const auto target_direct_cost = [&](const SequenceKVBundle& kv,
                                         const CheckpointProjection& checkpoint) {
         if (!checkpoint.survives) { return infinity; }
-        std::vector<runtime::ContextTransferRequirement> requirements;
-        requirements.reserve(3);
+        std::array<runtime::ContextTransferRequirement, 3> requirements{};
+        std::size_t requirement_count = 0;
+        const auto append_requirement = [&](runtime::ContextTransferRequirement requirement) {
+            if (requirement_count >= requirements.size()) {
+                throw std::logic_error("checkpoint recovery requirement capacity exceeded");
+            }
+            requirements[requirement_count++] = requirement;
+        };
         const StatePlacement state = final_state_placement(checkpoint.state);
         if (!state.device) {
             if (!state.host || host_state_images == nullptr) { return infinity; }
-            requirements.push_back(state_transfer_requirement(
+            append_requirement(state_transfer_requirement(
                 host_state_images->layout(), runtime::ContextTransferDirection::HostToDevice));
         }
         const auto append_kv = [&](const KVAddressSpaceStore& addresses,
@@ -2190,7 +2255,7 @@ bool ProgramImplCore::pressure_checkpoint_recovery_impacts(
             if (missing != 0) {
                 const HostKVPageLayout layout =
                     plan_host_kv_page_layout(pages.physical_pool().geometry());
-                requirements.push_back(kv_transfer_requirement(
+                append_requirement(kv_transfer_requirement(
                     resource, runtime::ContextTransferDirection::HostToDevice, layout, missing,
                     runs));
             }
@@ -2209,7 +2274,9 @@ bool ProgramImplCore::pressure_checkpoint_recovery_impacts(
                 return infinity;
             }
         }
-        return recovery_cost_ns(requirements, {}, machine_cost);
+        return recovery_cost_ns(std::span<const runtime::ContextTransferRequirement>(
+                                    requirements.data(), requirement_count),
+                                {}, machine_cost);
     };
 
     for (const OwnerProjection& owner : projected_owners) {
@@ -2269,27 +2336,18 @@ bool ProgramImplCore::pressure_checkpoint_recovery_impacts(
                               right.checkpoint.ref.ordinal};
         });
 
-        std::vector<std::uint64_t> baseline_direct(checkpoints.size(), infinity);
         std::vector<std::uint64_t> target_direct(checkpoints.size(), infinity);
         for (std::size_t index = 0; index < checkpoints.size(); ++index) {
-            baseline_direct[index] = recovery_cost_ns(
-                checkpoint_restore_requirements(*kv, checkpoints[index].checkpoint.required_kv,
-                                                checkpoints[index].state),
-                {}, machine_cost);
             target_direct[index] = target_direct_cost(*kv, checkpoints[index]);
-            projection_work += 2;
+            ++projection_work;
         }
-        const auto recovery_profile = [&](bool target_state, std::size_t selected) {
+        const auto target_recovery_profile = [&](std::size_t selected) {
             const CheckpointProjection& checkpoint = checkpoints[selected];
-            std::uint64_t best  = machine_cost.prefill_ns(checkpoint.checkpoint.rebuild_work);
-            const bool survives = !target_state || checkpoint.survives;
-            const std::uint64_t direct =
-                target_state ? target_direct[selected] : baseline_direct[selected];
-            if (survives) { best = std::min(best, direct); }
+            std::uint64_t best = machine_cost.prefill_ns(checkpoint.checkpoint.rebuild_work);
+            if (checkpoint.survives) { best = std::min(best, target_direct[selected]); }
             for (std::size_t prior = 0; prior < selected; ++prior) {
-                if (target_state && !checkpoints[prior].survives) { continue; }
-                const std::uint64_t prior_direct =
-                    target_state ? target_direct[prior] : baseline_direct[prior];
+                if (!checkpoints[prior].survives) { continue; }
+                const std::uint64_t prior_direct = target_direct[prior];
                 if (prior_direct == infinity || checkpoints[prior].checkpoint.ref.frontier >
                                                     checkpoint.checkpoint.ref.frontier) {
                     continue;
@@ -2304,13 +2362,18 @@ bool ProgramImplCore::pressure_checkpoint_recovery_impacts(
             return best;
         };
         for (std::size_t index = 0; index < checkpoints.size(); ++index) {
-            const std::uint64_t baseline = recovery_profile(false, index);
-            const std::uint64_t target   = recovery_profile(true, index);
-            if (target < baseline) { return false; }
+            const auto baseline = std::find_if(
+                baseline_recovery.begin(), baseline_recovery.end(), [&](const auto& value) {
+                    return value.owner_ordinal == owner.ordinal &&
+                           value.checkpoint == checkpoints[index].checkpoint.ref;
+                });
+            if (baseline == baseline_recovery.end()) { return false; }
+            const std::uint64_t target = target_recovery_profile(index);
+            if (target < baseline->recovery_ns) { return false; }
             output.push_back(runtime::PressureCheckpointRecoveryImpact{
                 .owner_ordinal        = owner.ordinal,
                 .checkpoint           = checkpoints[index].checkpoint.ref,
-                .baseline_recovery_ns = baseline,
+                .baseline_recovery_ns = baseline->recovery_ns,
                 .target_recovery_ns   = target,
             });
             ++projection_work;
@@ -2792,22 +2855,22 @@ std::optional<detail::PhysicalPressureEffect> ProgramImplCore::combined_pressure
         shared_pressure_owners.size() != shared_pressure_options.size()) {
         throw std::invalid_argument("combined pressure selection is not row aligned");
     }
+    begin_pressure_page_scratch();
 
-    std::vector<bool> selected_private(continuation_capacity, false);
-    std::vector<bool> selected_shared(shared_prefix_capacity, false);
-    std::vector<bool> evicted_private(continuation_capacity, false);
-    std::vector<bool> evicted_shared(shared_prefix_capacity, false);
-    std::vector<std::vector<runtime::CheckpointRef>> dropped_private(continuation_capacity);
+    std::vector<std::uint8_t>& private_owner_state = pressure_private_owner_scratch_;
+    std::vector<std::uint8_t>& shared_owner_state  = pressure_shared_owner_scratch_;
+    constexpr std::uint8_t kOwnerSelected          = 1U;
+    constexpr std::uint8_t kOwnerEvicted           = 2U;
+    std::fill(private_owner_state.begin(), private_owner_state.end(), 0);
+    std::fill(shared_owner_state.begin(), shared_owner_state.end(), 0);
+    std::vector<std::vector<runtime::CheckpointRef>>& dropped_private =
+        pressure_private_drop_scratch_;
+    for (auto& dropped : dropped_private) { dropped.clear(); }
     // Preserving pressure work is published per option. Aliased physical targets would let the
     // first publication invalidate the next while both effects had already been credited.
-    std::vector<StateImageHandle> pressure_states;
+    std::vector<StateImageHandle>& pressure_states = pressure_state_scratch_;
+    pressure_states.clear();
 
-    struct PressurePageTarget {
-        const LogicalKVPageStore* store = nullptr;
-        LogicalKVPageHandle page;
-    };
-
-    std::vector<PressurePageTarget> pressure_pages;
     const auto append_pressure_targets = [&](const qwen3_6::detail::PressureDecision& option,
                                              const SequenceState* sequence,
                                              const SharedPrefixState* shared) {
@@ -2865,16 +2928,14 @@ std::optional<detail::PhysicalPressureEffect> ProgramImplCore::combined_pressure
             for (std::uint32_t offset = 0; offset < action.page_count; ++offset) {
                 const LogicalKVPageHandle page =
                     addresses->logical_page(*address, action.begin_page + offset);
-                const bool backend = addresses == backend_kv_addresses.get();
+                const bool backend            = addresses == backend_kv_addresses.get();
+                PressurePageScratchSlot& slot = pressure_page_scratch(*pages, page);
                 if (protected_materialization_page(protection, *addresses,
                                                    action.begin_page + offset, page, backend) ||
-                    std::find_if(pressure_pages.begin(), pressure_pages.end(),
-                                 [&](const PressurePageTarget& target) {
-                                     return target.store == pages && target.page == page;
-                                 }) != pressure_pages.end()) {
+                    slot.pressure_targeted) {
                     return false;
                 }
-                pressure_pages.push_back(PressurePageTarget{.store = pages, .page = page});
+                slot.pressure_targeted = true;
             }
             return true;
         };
@@ -2908,14 +2969,14 @@ std::optional<detail::PhysicalPressureEffect> ProgramImplCore::combined_pressure
             return std::nullopt;
         }
         const std::uint32_t index = ContractAccess::index(*owner);
-        if (selected_private[index] ||
+        if ((private_owner_state[index] & kOwnerSelected) != 0 ||
             (protection != nullptr && protection->private_source_index == index)) {
             return std::nullopt;
         }
-        selected_private[index] = true;
+        private_owner_state[index] |= kOwnerSelected;
         if (option.evicts_continuation) {
             if (option.effect.added != detail::PhysicalResources{}) { return std::nullopt; }
-            evicted_private[index] = true;
+            private_owner_state[index] |= kOwnerEvicted;
         } else {
             if (!append_pressure_targets(option, &continuation_states[index], nullptr)) {
                 return std::nullopt;
@@ -2940,11 +3001,11 @@ std::optional<detail::PhysicalPressureEffect> ProgramImplCore::combined_pressure
             return std::nullopt;
         }
         const std::uint32_t index = ContractAccess::index(*owner);
-        if (selected_shared[index]) { return std::nullopt; }
-        selected_shared[index] = true;
+        if ((shared_owner_state[index] & kOwnerSelected) != 0) { return std::nullopt; }
+        shared_owner_state[index] |= kOwnerSelected;
         if (option.evicts_continuation) {
             if (option.effect.added != detail::PhysicalResources{}) { return std::nullopt; }
-            evicted_shared[index] = true;
+            shared_owner_state[index] |= kOwnerEvicted;
         } else {
             if (!append_pressure_targets(option, nullptr, &shared_prefix_states[index])) {
                 return std::nullopt;
@@ -2956,33 +3017,39 @@ std::optional<detail::PhysicalPressureEffect> ProgramImplCore::combined_pressure
         }
     }
 
-    struct SelectedPage {
-        LogicalKVPageHandle page;
-        std::uint32_t references = 0;
+    std::vector<PressureSelectedPage>& main_pages    = pressure_text_selected_pages_;
+    std::vector<PressureSelectedPage>& backend_pages = pressure_backend_selected_pages_;
+    const auto append_selected_page = [&](LogicalKVPageStore& store, LogicalKVPageHandle page,
+                                          std::vector<PressureSelectedPage>& selected) {
+        PressurePageScratchSlot& slot = pressure_page_scratch(store, page);
+        if (slot.selected_index == std::numeric_limits<std::uint32_t>::max()) {
+            if (selected.size() >= std::numeric_limits<std::uint32_t>::max()) {
+                throw std::overflow_error("pressure selected page count exceeds uint32");
+            }
+            slot.selected_index = static_cast<std::uint32_t>(selected.size());
+            selected.push_back(PressureSelectedPage{.page = page, .references = 1});
+        } else {
+            if (slot.selected_index >= selected.size()) {
+                throw std::logic_error("pressure selected page scratch is inconsistent");
+            }
+            ++selected[slot.selected_index].references;
+        }
     };
-
-    std::vector<SelectedPage> main_pages;
-    std::vector<SelectedPage> backend_pages;
-    const auto append_address = [](const KVAddressSpaceStore& addresses,
-                                   KVAddressSpaceHandle address, std::vector<SelectedPage>& pages) {
+    const auto append_address = [&](const KVAddressSpaceStore& addresses, LogicalKVPageStore& store,
+                                    KVAddressSpaceHandle address,
+                                    std::vector<PressureSelectedPage>& selected) {
         if (!addresses.valid(address) || addresses.active(address)) {
             throw std::logic_error("evicted KV address is not an inactive publication");
         }
         for (std::uint32_t offset = 0; offset < addresses.mapped_pages(address); ++offset) {
             const LogicalKVPageHandle page = addresses.logical_page(address, offset);
-            const auto existing            = std::find_if(pages.begin(), pages.end(),
-                                                          [&](const auto& item) { return item.page == page; });
-            if (existing == pages.end()) {
-                pages.push_back(SelectedPage{.page = page, .references = 1});
-            } else {
-                ++existing->references;
-            }
+            append_selected_page(store, page, selected);
         }
     };
-    const auto append_address_suffix = [](const KVAddressSpaceStore& addresses,
-                                          KVAddressSpaceHandle address,
-                                          std::uint32_t retained_pages,
-                                          std::vector<SelectedPage>& pages) {
+    const auto append_address_suffix = [&](const KVAddressSpaceStore& addresses,
+                                           LogicalKVPageStore& store, KVAddressSpaceHandle address,
+                                           std::uint32_t retained_pages,
+                                           std::vector<PressureSelectedPage>& selected) {
         if (!addresses.valid(address) || addresses.active(address)) {
             throw std::logic_error("dropped checkpoint KV suffix is invalid");
         }
@@ -2992,49 +3059,47 @@ std::optional<detail::PhysicalPressureEffect> ProgramImplCore::combined_pressure
         }
         for (std::uint32_t offset = retained_pages; offset < mapped; ++offset) {
             const LogicalKVPageHandle page = addresses.logical_page(address, offset);
-            const auto existing            = std::find_if(pages.begin(), pages.end(),
-                                                          [&](const auto& item) { return item.page == page; });
-            if (existing == pages.end()) {
-                pages.push_back(SelectedPage{.page = page, .references = 1});
-            } else {
-                ++existing->references;
-            }
+            append_selected_page(store, page, selected);
         }
     };
     for (std::uint32_t index = 0; index < continuation_capacity; ++index) {
-        if (!evicted_private[index]) { continue; }
+        if ((private_owner_state[index] & kOwnerEvicted) == 0) { continue; }
         const SequenceState& sequence = continuation_states[index];
         if (!sequence.kv) { return std::nullopt; }
-        append_address(*text_kv_addresses, sequence.kv->text, main_pages);
+        append_address(*text_kv_addresses, *text_kv_pages, sequence.kv->text, main_pages);
         if (sequence.kv->backend) {
             if (!backend_kv_addresses || !backend_kv_pages) { return std::nullopt; }
-            append_address(*backend_kv_addresses, *sequence.kv->backend, backend_pages);
+            append_address(*backend_kv_addresses, *backend_kv_pages, *sequence.kv->backend,
+                           backend_pages);
         }
     }
     for (std::uint32_t index = 0; index < continuation_capacity; ++index) {
-        if (dropped_private[index].empty() || evicted_private[index]) { continue; }
+        if (dropped_private[index].empty() || (private_owner_state[index] & kOwnerEvicted) != 0) {
+            continue;
+        }
         const SequenceState& sequence = continuation_states[index];
         if (!sequence.kv) { return std::nullopt; }
         const std::optional<qwen3_6::TargetKVRequirement> retained =
             retained_requirement_after_drops(continuation_summary(sequence),
                                              dropped_private[index]);
         if (!retained) { return std::nullopt; }
-        append_address_suffix(*text_kv_addresses, sequence.kv->text, retained->main_pages,
-                              main_pages);
+        append_address_suffix(*text_kv_addresses, *text_kv_pages, sequence.kv->text,
+                              retained->main_pages, main_pages);
         if (sequence.kv->backend) {
             if (!backend_kv_addresses || !backend_kv_pages) { return std::nullopt; }
-            append_address_suffix(*backend_kv_addresses, *sequence.kv->backend,
+            append_address_suffix(*backend_kv_addresses, *backend_kv_pages, *sequence.kv->backend,
                                   retained->backend_pages, backend_pages);
         }
     }
     for (std::uint32_t index = 0; index < shared_prefix_capacity; ++index) {
-        if (!evicted_shared[index]) { continue; }
+        if ((shared_owner_state[index] & kOwnerEvicted) == 0) { continue; }
         const SharedPrefixState& shared = shared_prefix_states[index];
         if (!shared.kv) { return std::nullopt; }
-        append_address(*text_kv_addresses, shared.kv->text, main_pages);
+        append_address(*text_kv_addresses, *text_kv_pages, shared.kv->text, main_pages);
         if (shared.kv->backend) {
             if (!backend_kv_addresses || !backend_kv_pages) { return std::nullopt; }
-            append_address(*backend_kv_addresses, *shared.kv->backend, backend_pages);
+            append_address(*backend_kv_addresses, *backend_kv_pages, *shared.kv->backend,
+                           backend_pages);
         }
     }
 
@@ -3066,7 +3131,7 @@ std::optional<detail::PhysicalPressureEffect> ProgramImplCore::combined_pressure
         std::uint32_t references = 0;
         for (std::uint32_t index = 0; index < continuation_capacity; ++index) {
             const SequenceState& sequence = continuation_states[index];
-            if (evicted_private[index]) {
+            if ((private_owner_state[index] & kOwnerEvicted) != 0) {
                 if (sequence.rewrite_state && *sequence.rewrite_state == state) { ++references; }
                 references += static_cast<std::uint32_t>(std::count_if(
                     sequence.long_anchors.begin(), sequence.long_anchors.end(),
@@ -3083,7 +3148,8 @@ std::optional<detail::PhysicalPressureEffect> ProgramImplCore::combined_pressure
             }
         }
         for (std::uint32_t index = 0; index < shared_prefix_capacity; ++index) {
-            if (evicted_shared[index] && shared_prefix_states[index].state == state) {
+            if ((shared_owner_state[index] & kOwnerEvicted) != 0 &&
+                shared_prefix_states[index].state == state) {
                 ++references;
             }
         }
@@ -3134,17 +3200,24 @@ std::optional<detail::PhysicalPressureEffect> ProgramImplCore::combined_pressure
             }
         }
 
-        const auto removed_page_references = [](const std::vector<SelectedPage>& removals,
-                                                LogicalKVPageHandle page) {
-            const auto removal = std::find_if(removals.begin(), removals.end(),
-                                              [&](const auto& item) { return item.page == page; });
-            return removal == removals.end() ? 0U : removal->references;
+        const auto removed_page_references = [&](LogicalKVPageStore& pages,
+                                                 LogicalKVPageHandle page) {
+            const PressurePageScratchSlot* slot = find_pressure_page_scratch(pages, page);
+            if (slot == nullptr ||
+                slot->selected_index == std::numeric_limits<std::uint32_t>::max()) {
+                return 0U;
+            }
+            const std::vector<PressureSelectedPage>& selected =
+                &pages == text_kv_pages.get() ? main_pages : backend_pages;
+            if (slot->selected_index >= selected.size()) {
+                throw std::logic_error("pressure selected page scratch is inconsistent");
+            }
+            return selected[slot->selected_index].references;
         };
         const auto append_kv_ownership_transfers =
             [&](const KVAddressSpaceStore& addresses, LogicalKVPageStore& pages,
                 KVAddressSpaceHandle address, std::uint32_t protected_pages,
-                std::uint32_t transferable_pages, const std::vector<SelectedPage>& removals,
-                runtime::ContextResourceClass resource) {
+                std::uint32_t transferable_pages, runtime::ContextResourceClass resource) {
                 if (!addresses.valid(address) ||
                     protected_pages > addresses.mapped_pages(address) ||
                     transferable_pages > protected_pages) {
@@ -3155,7 +3228,7 @@ std::optional<detail::PhysicalPressureEffect> ProgramImplCore::combined_pressure
                 for (std::uint32_t offset = 0; offset < protected_pages; ++offset) {
                     const LogicalKVPageHandle page = addresses.logical_page(address, offset);
                     const std::uint32_t references = pages.address_references(page);
-                    const std::uint32_t removed    = removed_page_references(removals, page);
+                    const std::uint32_t removed    = removed_page_references(pages, page);
                     if (removed >= references) { return false; }
                     if (references <= 1 || references - removed != 1) { continue; }
                     if (offset >= transferable_pages) {
@@ -3215,20 +3288,21 @@ std::optional<detail::PhysicalPressureEffect> ProgramImplCore::combined_pressure
             };
         if (!append_kv_ownership_transfers(*text_kv_addresses, *text_kv_pages, *protection->text,
                                            protection->text_pages, protection->text_transfer_pages,
-                                           main_pages, runtime::ContextResourceClass::MainKV)) {
+                                           runtime::ContextResourceClass::MainKV)) {
             return std::nullopt;
         }
         if (protection->backend &&
             (!backend_kv_addresses || !backend_kv_pages ||
              !append_kv_ownership_transfers(*backend_kv_addresses, *backend_kv_pages,
                                             *protection->backend, protection->backend_pages,
-                                            protection->backend_transfer_pages, backend_pages,
+                                            protection->backend_transfer_pages,
                                             runtime::ContextResourceClass::BackendKV))) {
             return std::nullopt;
         }
     }
 
-    std::vector<StateImageHandle> selected_states;
+    std::vector<StateImageHandle>& selected_states = pressure_state_scratch_;
+    selected_states.clear();
     const auto append_state = [&](StateImageHandle state) {
         if (state_store->valid(state) && std::find(selected_states.begin(), selected_states.end(),
                                                    state) == selected_states.end()) {
@@ -3237,7 +3311,7 @@ std::optional<detail::PhysicalPressureEffect> ProgramImplCore::combined_pressure
     };
     for (std::uint32_t index = 0; index < continuation_capacity; ++index) {
         const SequenceState& sequence = continuation_states[index];
-        if (evicted_private[index]) {
+        if ((private_owner_state[index] & kOwnerEvicted) != 0) {
             append_state(sequence.state.write);
             if (!sequence.state_source_retained || sequence.state.read == sequence.state.write) {
                 append_state(sequence.state.read);
@@ -3257,7 +3331,9 @@ std::optional<detail::PhysicalPressureEffect> ProgramImplCore::combined_pressure
         }
     }
     for (std::uint32_t index = 0; index < shared_prefix_capacity; ++index) {
-        if (evicted_shared[index]) { append_state(shared_prefix_states[index].state); }
+        if ((shared_owner_state[index] & kOwnerEvicted) != 0) {
+            append_state(shared_prefix_states[index].state);
+        }
     }
 
     const auto sequence_references_state = [&](std::uint32_t index, const SequenceState& sequence,
@@ -3300,11 +3376,12 @@ std::optional<detail::PhysicalPressureEffect> ProgramImplCore::combined_pressure
         for (std::uint32_t index = 0; index < continuation_capacity; ++index) {
             if (continuation_slots[index].role == ContinuationSlotRole::Free) { continue; }
             const SequenceState& sequence = continuation_states[index];
-            if (!evicted_private[index] && sequence_references_state(index, sequence, state)) {
+            if ((private_owner_state[index] & kOwnerEvicted) == 0 &&
+                sequence_references_state(index, sequence, state)) {
                 referenced_by_survivor = true;
                 break;
             }
-            if (evicted_private[index]) {
+            if ((private_owner_state[index] & kOwnerEvicted) != 0) {
                 if (sequence.rewrite_state && *sequence.rewrite_state == state) {
                     ++selected_checkpoint_references;
                 }
@@ -3324,7 +3401,7 @@ std::optional<detail::PhysicalPressureEffect> ProgramImplCore::combined_pressure
         for (std::uint32_t index = 0; index < shared_prefix_capacity; ++index) {
             if (shared_prefix_slots[index].role == SharedPrefixSlotRole::Free) { continue; }
             if (shared_prefix_states[index].state != state) { continue; }
-            if (!evicted_shared[index]) {
+            if ((shared_owner_state[index] & kOwnerEvicted) == 0) {
                 referenced_by_survivor = true;
                 break;
             }
@@ -3349,11 +3426,11 @@ std::optional<detail::PhysicalPressureEffect> ProgramImplCore::combined_pressure
     }
 
     const auto append_released_pages = [&](LogicalKVPageStore& pages,
-                                           const std::vector<SelectedPage>& selected,
+                                           const std::vector<PressureSelectedPage>& selected,
                                            runtime::ContextResourceClass resource) {
         const std::size_t stride =
             plan_host_kv_page_layout(pages.physical_pool().geometry()).page_stride;
-        for (const SelectedPage& item : selected) {
+        for (const PressureSelectedPage& item : selected) {
             if (pages.address_references(item.page) != item.references ||
                 pages.writer_references(item.page) != 0 || pages.source_pins(item.page) != 0) {
                 continue;
@@ -3388,9 +3465,9 @@ std::optional<detail::PhysicalPressureEffect> ProgramImplCore::combined_pressure
 std::optional<AdmissionCandidate> ProgramImplCore::seal_materialization(
     const AdmissionCandidate& admission, const PreparedPromptData& prompt,
     std::span<const ContinuationHandle* const> pressure_owners,
-    std::span<const qwen3_6::detail::PressureDecision> pressure_options,
+    std::span<const qwen3_6::detail::PressureDecision* const> pressure_options,
     std::span<const SharedPrefixHandle* const> shared_pressure_owners,
-    std::span<const qwen3_6::detail::PressureDecision> shared_pressure_options) {
+    std::span<const qwen3_6::detail::PressureDecision* const> shared_pressure_options) {
     if (admission.impl_ == nullptr || has_context_transaction() || pending_transaction_) {
         return std::nullopt;
     }
@@ -3407,9 +3484,9 @@ std::optional<AdmissionCandidate> ProgramImplCore::seal_materialization(
 
 std::optional<AdmissionCandidate> ProgramImplCore::compose_materialization(
     AdmissionCandidate&& admission, std::span<const ContinuationHandle* const> pressure_owners,
-    std::span<const qwen3_6::detail::PressureDecision> pressure_options,
+    std::span<const qwen3_6::detail::PressureDecision* const> pressure_options,
     std::span<const SharedPrefixHandle* const> shared_pressure_owners,
-    std::span<const qwen3_6::detail::PressureDecision> shared_pressure_options) {
+    std::span<const qwen3_6::detail::PressureDecision* const> shared_pressure_options) {
     if (admission.impl_ == nullptr || pressure_owners.size() != pressure_options.size() ||
         shared_pressure_owners.size() != shared_pressure_options.size() ||
         !admission.impl_->pressure_options.empty() ||
@@ -3443,12 +3520,18 @@ std::optional<AdmissionCandidate> ProgramImplCore::compose_materialization(
         return count(option.main_kv_changes) + count(option.backend_kv_changes);
     };
     std::size_t private_demotion_count = 0;
-    for (const auto& option : pressure_options) {
-        private_demotion_count += demotion_count(option);
+    for (const qwen3_6::detail::PressureDecision* option : pressure_options) {
+        if (option == nullptr) {
+            throw std::invalid_argument("materialization pressure option is null");
+        }
+        private_demotion_count += demotion_count(*option);
     }
     std::size_t shared_demotion_count = 0;
-    for (const auto& option : shared_pressure_options) {
-        shared_demotion_count += demotion_count(option);
+    for (const qwen3_6::detail::PressureDecision* option : shared_pressure_options) {
+        if (option == nullptr) {
+            throw std::invalid_argument("materialization shared pressure option is null");
+        }
+        shared_demotion_count += demotion_count(*option);
     }
     host_layouts.reserve(private_demotion_count + shared_demotion_count);
     private_host_requests.reserve(private_demotion_count);
@@ -3482,7 +3565,8 @@ std::optional<AdmissionCandidate> ProgramImplCore::compose_materialization(
         }
     };
     for (std::size_t position = 0; position < pressure_options.size(); ++position) {
-        const ContinuationHandle* owner = pressure_owners[position];
+        const ContinuationHandle* owner                   = pressure_owners[position];
+        const qwen3_6::detail::PressureDecision& proposed = *pressure_options[position];
         if (owner == nullptr || ContractAccess::owner(*owner) != this) {
             throw std::invalid_argument("materialization pressure owner is invalid");
         }
@@ -3496,18 +3580,15 @@ std::optional<AdmissionCandidate> ProgramImplCore::compose_materialization(
             throw std::invalid_argument("materialization pressure owner is duplicated");
         }
         qwen3_6::detail::PressureDecision expected;
-        if (pressure_options[position].evicts_continuation) {
+        if (proposed.evicts_continuation) {
             expected = inspect_eviction_option(continuation_states[index]);
         } else {
-            if (!pressure_decision_valid(continuation_states[index], pressure_options[position],
-                                         &*protection)) {
+            if (!pressure_decision_valid(continuation_states[index], proposed, &*protection)) {
                 return std::nullopt;
             }
-            expected = pressure_options[position];
+            expected = proposed;
         }
-        if (expected != pressure_options[position] || expected.shared_owner) {
-            return std::nullopt;
-        }
+        if (expected != proposed || expected.shared_owner) { return std::nullopt; }
         removed = checked_resource_sum(removed, expected.effect.removed);
         added   = checked_resource_sum(added, expected.effect.added);
         details.pressure_options.push_back(expected);
@@ -3532,7 +3613,8 @@ std::optional<AdmissionCandidate> ProgramImplCore::compose_materialization(
     details.shared_pressure_indices.reserve(shared_pressure_options.size());
     details.shared_pressure_generations.reserve(shared_pressure_options.size());
     for (std::size_t position = 0; position < shared_pressure_options.size(); ++position) {
-        const SharedPrefixHandle* owner = shared_pressure_owners[position];
+        const SharedPrefixHandle* owner                   = shared_pressure_owners[position];
+        const qwen3_6::detail::PressureDecision& proposed = *shared_pressure_options[position];
         if (owner == nullptr || ContractAccess::owner(*owner) != this) {
             throw std::invalid_argument("materialization shared pressure owner is invalid");
         }
@@ -3547,18 +3629,16 @@ std::optional<AdmissionCandidate> ProgramImplCore::compose_materialization(
             throw std::invalid_argument("materialization shared pressure owner is duplicated");
         }
         qwen3_6::detail::PressureDecision expected;
-        if (shared_pressure_options[position].evicts_continuation) {
+        if (proposed.evicts_continuation) {
             expected = inspect_shared_eviction_option(shared_prefix_states[index]);
         } else {
-            if (!shared_pressure_decision_valid(shared_prefix_states[index],
-                                                shared_pressure_options[position], &*protection)) {
+            if (!shared_pressure_decision_valid(shared_prefix_states[index], proposed,
+                                                &*protection)) {
                 return std::nullopt;
             }
-            expected = shared_pressure_options[position];
+            expected = proposed;
         }
-        if (expected != shared_pressure_options[position] || !expected.shared_owner) {
-            return std::nullopt;
-        }
+        if (expected != proposed || !expected.shared_owner) { return std::nullopt; }
         removed = checked_resource_sum(removed, expected.effect.removed);
         added   = checked_resource_sum(added, expected.effect.added);
         details.shared_pressure_options.push_back(expected);
@@ -3580,8 +3660,8 @@ std::optional<AdmissionCandidate> ProgramImplCore::compose_materialization(
     }
 
     const std::optional<detail::PhysicalPressureEffect> combined = combined_pressure_effect(
-        &*protection, pressure_owners, pressure_options, shared_pressure_owners,
-        shared_pressure_options, &host_last_reference_releases);
+        &*protection, pressure_owners, details.pressure_options, shared_pressure_owners,
+        details.shared_pressure_options, &host_last_reference_releases);
     if (!combined) { return std::nullopt; }
     removed = combined->aggregate_delta.removed;
     added   = combined->aggregate_delta.added;
@@ -6453,6 +6533,20 @@ ProgramImplCore::materialization_deficit(const AdmissionCandidateImpl& admission
     // would forbid Device-to-Host demotion even when Host capacity is available.
     const detail::PhysicalResources required =
         checked_resource_sum(physical_occupancy(), admission.demand.physical_peak_additional);
+    return positive_resource_difference(required, admission_capacity());
+}
+
+detail::PhysicalResources
+ProgramImplCore::guided_materialization_deficit(const AdmissionCandidateImpl& admission,
+                                                const detail::PhysicalDelta& pressure) const {
+    // Pressure acts on the candidate's complete peak, not on its already-clamped deficit.  Applying
+    // a demotion directly to a zero Host deficit would otherwise manufacture Host pressure even
+    // when the arena has ample slack and steer the heuristic toward unnecessary destruction.
+    const detail::PhysicalResources projected_peak = positive_resource_difference(
+        checked_resource_sum(admission.demand.physical_peak_additional, pressure.added),
+        pressure.removed);
+    const detail::PhysicalResources required =
+        checked_resource_sum(physical_occupancy(), projected_peak);
     return positive_resource_difference(required, admission_capacity());
 }
 

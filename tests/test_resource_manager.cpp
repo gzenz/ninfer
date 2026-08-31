@@ -3,12 +3,14 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <iostream>
 #include <optional>
 #include <span>
 #include <stdexcept>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -481,7 +483,12 @@ public:
     identity_target(const FakeAdmissionCandidate& candidate) const;
     [[nodiscard]] FakePressureTargetHandle
     root_maximal_target(const FakeAdmissionCandidate& candidate);
+    [[nodiscard]] std::optional<FakePressureTargetHandle>
+    guided_closure_target(const FakeAdmissionCandidate& candidate,
+                          std::span<const std::uint32_t> preferred_owner_ordinals);
+    [[nodiscard]] ninfer::runtime::PressureTargetGuidance guidance(FakePressureTargetHandle target);
     [[nodiscard]] ninfer::runtime::PressureTargetAssessment assess(FakePressureTargetHandle target);
+    void retain_assessment(FakePressureTargetHandle target);
     [[nodiscard]] FakePreparedPressureExpansion prepare_expansion(FakePressureTargetHandle parent);
     [[nodiscard]] FakePressureExpansionView
     commit_expansion(FakePreparedPressureExpansion&& prepared);
@@ -525,6 +532,7 @@ private:
     std::vector<Target> targets_;
     std::vector<Target> expansion_scratch_;
     std::vector<FakePressureTargetHandle> committed_children_;
+    std::vector<ninfer::runtime::PressureOwnerOutcome> guidance_outcomes_;
     std::vector<ninfer::runtime::PressureOwnerOutcome> assessment_outcomes_;
     std::vector<ninfer::runtime::PressureCheckpointRecoveryImpact> assessment_impacts_;
 };
@@ -646,7 +654,7 @@ public:
 
     [[nodiscard]] bool
     target_feasible(std::span<const FakeTargetDecision> decisions) const noexcept {
-        if (decisions.size() < required_pressure_actions) { return false; }
+        if (pressure_units(decisions) < required_pressure_actions) { return false; }
         const bool has_eviction =
             std::any_of(decisions.begin(), decisions.end(),
                         [](const auto& decision) { return decision.evicts_continuation; });
@@ -662,6 +670,15 @@ public:
             return false;
         }
         return true;
+    }
+
+    [[nodiscard]] std::size_t
+    pressure_units(std::span<const FakeTargetDecision> decisions) const noexcept {
+        std::size_t units = 0;
+        for (const FakeTargetDecision& decision : decisions) {
+            units += decision.evicts_continuation ? eviction_pressure_action_units : 1U;
+        }
+        return units;
     }
 
     [[nodiscard]] ContextTransactionReserveStatus
@@ -950,32 +967,38 @@ public:
 
     void invalidate_resources() noexcept { advance_revision(); }
 
-    std::size_t required_pressure_actions           = 0;
-    std::uint32_t private_pressure_alternatives     = 1;
+    std::size_t required_pressure_actions       = 0;
+    std::size_t eviction_pressure_action_units  = 1;
+    std::uint32_t private_pressure_alternatives = 1;
+    std::optional<std::size_t> pressure_optional_target_capacity;
     std::uint64_t pressure_action_immediate_ns      = 100'000'000;
     std::uint32_t pressure_action_degradation_units = 1;
     bool include_cumulative_private_target          = false;
     bool combined_target_cancels_pressure_copy      = false;
     std::optional<std::uint64_t> pressure_target_immediate_ns_override;
     std::optional<std::uint64_t> required_action_id;
-    bool require_evictions                  = false;
-    bool abort_start                        = false;
-    bool abort_progress                     = false;
-    bool progress_in_progress_once          = false;
-    bool finish_fail_next                   = false;
-    bool finish_release                     = false;
-    bool abort_capture_start                = false;
-    ContextTransactionStatus capture_status = ContextTransactionStatus::Published;
+    std::uint32_t pressure_assessment_delay_us    = 0;
+    std::uint64_t pressure_checkpoint_recovery_ns = 100;
+    bool require_evictions                        = false;
+    bool abort_start                              = false;
+    bool abort_progress                           = false;
+    bool progress_in_progress_once                = false;
+    bool finish_fail_next                         = false;
+    bool finish_release                           = false;
+    bool abort_capture_start                      = false;
+    ContextTransactionStatus capture_status       = ContextTransactionStatus::Published;
     FakeCaptureAssessment capture_assessment;
     FakeContinuationSummary capture_summary;
     FakePhysicalUsage usage;
 
     std::uint64_t admission_inspections         = 0;
     std::uint64_t pressure_planning_sessions    = 0;
+    std::uint64_t pressure_target_assessments   = 0;
     std::uint64_t start_calls                   = 0;
     std::uint64_t finish_calls                  = 0;
     std::uint64_t abort_calls                   = 0;
     std::uint64_t skipped_captures              = 0;
+    std::size_t pressure_target_count_peak      = 0;
     std::uint32_t finish_frontier               = 16;
     std::uint32_t started_source_id             = 0;
     ClaimDisposition started_source_disposition = ClaimDisposition::ConsumedToActive;
@@ -1037,6 +1060,8 @@ FakePressurePlanningSession::FakePressurePlanningSession(
             .stable_ordinal  = static_cast<std::uint32_t>(index),
         });
     }
+    program.pressure_target_count_peak =
+        std::max(program.pressure_target_count_peak, targets_.size());
     if (++program.planning_generation_ == 0) { ++program.planning_generation_; }
     ++program.pressure_planning_sessions;
     generation_ = program.planning_generation_;
@@ -1153,9 +1178,146 @@ FakePressurePlanningSession::root_maximal_target(const FakeAdmissionCandidate& c
     };
 }
 
+std::optional<FakePressureTargetHandle> FakePressurePlanningSession::guided_closure_target(
+    const FakeAdmissionCandidate& candidate,
+    std::span<const std::uint32_t> preferred_owner_ordinals) {
+    require(!scratch_live_, "fake guided pressure closure conflicts with expansion scratch");
+    const std::uint32_t selected_candidate = candidate_index(candidate);
+    populate_options(selected_candidate);
+    Target target{
+        .candidate_index = selected_candidate,
+        .choices         = std::vector<std::uint16_t>(owners_.size(), 0),
+    };
+    std::vector<std::size_t> order;
+    order.reserve(owners_.size());
+    const auto append = [&](std::size_t index) {
+        if (std::find(order.begin(), order.end(), index) == order.end()) { order.push_back(index); }
+    };
+    for (const std::uint32_t ordinal : preferred_owner_ordinals) {
+        const auto found = std::find_if(owners_.begin(), owners_.end(), [&](const Owner& owner) {
+            return owner.ordinal == ordinal;
+        });
+        if (found != owners_.end()) { append(static_cast<std::size_t>(found - owners_.begin())); }
+    }
+    for (std::size_t index = 0; index < owners_.size(); ++index) { append(index); }
+
+    const auto selected_decisions = [&] {
+        std::vector<FakeTargetDecision> decisions;
+        for (std::size_t index = 0; index < owners_.size(); ++index) {
+            const std::uint16_t choice = target.choices[index];
+            if (choice != 0) {
+                decisions.push_back(options_[selected_candidate][index][choice - 1U]);
+            }
+        }
+        return decisions;
+    };
+    for (int destructive = 0; destructive < 2; ++destructive) {
+        for (const std::size_t owner_index : order) {
+            const auto& alternatives = options_[selected_candidate][owner_index];
+            if (target.choices[owner_index] != 0 || alternatives.empty()) { continue; }
+            const auto found = std::find_if(
+                alternatives.begin(), alternatives.end(), [&](const FakeTargetDecision& decision) {
+                    return decision.evicts_continuation == (destructive != 0);
+                });
+            if (found == alternatives.end()) { continue; }
+            target.choices[owner_index] =
+                static_cast<std::uint16_t>(1U + (found - alternatives.begin()));
+            if (program_->target_feasible(selected_decisions())) {
+                auto existing =
+                    std::find_if(targets_.begin(), targets_.end(),
+                                 [&](const Target& prior) { return same_target(prior, target); });
+                std::uint32_t target_index = 0;
+                if (existing != targets_.end()) {
+                    target_index = static_cast<std::uint32_t>(existing - targets_.begin());
+                } else {
+                    target.stable_ordinal = static_cast<std::uint32_t>(targets_.size());
+                    targets_.push_back(std::move(target));
+                    target_index = static_cast<std::uint32_t>(targets_.size() - 1U);
+                    program_->pressure_target_count_peak =
+                        std::max(program_->pressure_target_count_peak, targets_.size());
+                }
+                return FakePressureTargetHandle{.generation = generation_, .index = target_index};
+            }
+        }
+    }
+    return std::nullopt;
+}
+
+ninfer::runtime::PressureTargetGuidance
+FakePressurePlanningSession::guidance(FakePressureTargetHandle handle) {
+    require(valid(handle) && !scratch_live_, "fake pressure guidance is stale");
+    const Target& target = targets_[handle.index];
+    populate_options(target.candidate_index);
+    const FakeAdmissionCandidate& candidate = *candidates_[target.candidate_index];
+    guidance_outcomes_.clear();
+    std::vector<FakeTargetDecision> selected;
+    std::uint32_t degradation_units = 0;
+    std::uint32_t dropped           = 0;
+    for (std::size_t index = 0; index < owners_.size(); ++index) {
+        const std::uint16_t choice = target.choices[index];
+        if (choice == 0) { continue; }
+        const auto& alternatives = options_[target.candidate_index][index];
+        require(choice <= alternatives.size(), "fake pressure guidance choice is invalid");
+        const FakeTargetDecision& decision = alternatives[choice - 1U];
+        selected.push_back(decision);
+        degradation_units += decision.degradation_units;
+        dropped += decision.dropped_checkpoints;
+        guidance_outcomes_.push_back(ninfer::runtime::PressureOwnerOutcome{
+            .owner_ordinal       = owners_[index].ordinal,
+            .disposition         = decision.evicts_continuation ? ClaimDisposition::Evicted
+                                                                : ClaimDisposition::Retained,
+            .degradation_units   = decision.degradation_units,
+            .dropped_checkpoints = decision.dropped_checkpoints,
+            .shared              = owners_[index].shared,
+        });
+    }
+    ninfer::runtime::MaterializationMachineSummary machine = candidate.identity.machine;
+    const bool combined_copy_cancelled =
+        program_->combined_target_cancels_pressure_copy && selected.size() > 1U &&
+        std::none_of(selected.begin(), selected.end(),
+                     [](const auto& decision) { return decision.evicts_continuation; });
+    if (!selected.empty() && program_->pressure_target_immediate_ns_override) {
+        machine.immediate_ns = *program_->pressure_target_immediate_ns_override;
+    } else if (combined_copy_cancelled) {
+        ++machine.immediate_ns;
+    } else {
+        for (const FakeTargetDecision& decision : selected) {
+            machine.immediate_ns += decision.immediate_ns;
+            ++machine.copy_operations;
+        }
+    }
+    const std::size_t selected_units = program_->pressure_units(selected);
+    const std::size_t remaining      = selected_units >= program_->required_pressure_actions
+                                           ? 0
+                                           : program_->required_pressure_actions - selected_units;
+    return ninfer::runtime::PressureTargetGuidance{
+        .physical =
+            {
+                .unsatisfied_constraints   = remaining == 0 ? 0U : 1U,
+                .estimated_remaining_steps = static_cast<std::uint32_t>(remaining),
+                .normalized_residual_q20   = static_cast<std::uint64_t>(remaining) << 20U,
+            },
+        .estimated_machine     = machine,
+        .owner_outcomes        = guidance_outcomes_,
+        .candidate_ordinal     = target.candidate_index,
+        .stable_target_ordinal = target.stable_ordinal,
+        .degradation_units     = degradation_units,
+        .dropped_checkpoints   = dropped,
+    };
+}
+
+void FakePressurePlanningSession::retain_assessment(FakePressureTargetHandle handle) {
+    require(valid(handle) && !scratch_live_, "fake retained pressure assessment is stale");
+}
+
 ninfer::runtime::PressureTargetAssessment
 FakePressurePlanningSession::assess(FakePressureTargetHandle handle) {
     require(valid(handle) && !scratch_live_, "fake pressure assessment is stale");
+    if (program_->pressure_assessment_delay_us != 0) {
+        std::this_thread::sleep_for(
+            std::chrono::microseconds(program_->pressure_assessment_delay_us));
+    }
+    ++program_->pressure_target_assessments;
     const Target& target = targets_[handle.index];
     populate_options(target.candidate_index);
     const FakeAdmissionCandidate& candidate = *candidates_[target.candidate_index];
@@ -1194,7 +1356,7 @@ FakePressurePlanningSession::assess(FakePressureTargetHandle handle) {
                                   .frontier = 16,
                                   .ordinal  = 0},
                 .baseline_recovery_ns = 0,
-                .target_recovery_ns   = 100,
+                .target_recovery_ns   = program_->pressure_checkpoint_recovery_ns,
             });
         }
         if (!decision.evicts_continuation) { expandable = true; }
@@ -1295,6 +1457,13 @@ FakePressurePlanningSession::commit_expansion(FakePreparedPressureExpansion&& pr
     require(scratch_live_ && prepared.generation == generation_ &&
                 prepared.scratch_generation == scratch_generation_,
             "fake prepared expansion is stale");
+    if (program_->pressure_optional_target_capacity) {
+        const std::size_t maximum =
+            candidates_.size() + 1U + *program_->pressure_optional_target_capacity;
+        if (prepared.new_count > maximum - std::min(maximum, targets_.size())) {
+            throw std::length_error("prepared pressure expansion exceeds the target arena");
+        }
+    }
     committed_children_.clear();
     std::uint32_t new_count = 0;
     for (Target& child : expansion_scratch_) {
@@ -1312,6 +1481,8 @@ FakePressurePlanningSession::commit_expansion(FakePreparedPressureExpansion&& pr
         committed_children_.push_back(
             FakePressureTargetHandle{.generation = generation_, .index = index});
     }
+    program_->pressure_target_count_peak =
+        std::max(program_->pressure_target_count_peak, targets_.size());
     require(new_count == prepared.new_count, "fake expansion count changed before commit");
     expansion_scratch_.clear();
     scratch_live_ = false;
@@ -1574,6 +1745,55 @@ void test_shared_capture_subtracts_private_transition_loss() {
             "shared capture gain did not subtract the private capability transition loss");
 }
 
+void test_shared_capture_budget_bounds_committed_canonical_targets() {
+    using Planner = ninfer::runtime::SharedCapturePlanner<FakePackage>;
+
+    constexpr std::size_t private_owner_count = 16;
+    constexpr std::size_t shared_owner_count  = 4;
+    constexpr std::uint32_t target_budget     = 64;
+
+    FakeProgram program;
+    program.required_pressure_actions         = private_owner_count + shared_owner_count + 1U;
+    program.pressure_optional_target_capacity = target_budget;
+
+    std::array<FakeContinuationHandle, private_owner_count> private_handles;
+    std::array<const FakeContinuationHandle*, private_owner_count> private_owners;
+    std::array<std::uint32_t, private_owner_count> private_ordinals;
+    for (std::size_t index = 0; index < private_owner_count; ++index) {
+        private_handles[index]  = FakeContinuationHandle(static_cast<std::uint32_t>(index + 1U), 0);
+        private_owners[index]   = &private_handles[index];
+        private_ordinals[index] = static_cast<std::uint32_t>(index);
+    }
+
+    std::array<FakeSharedPrefixHandle, shared_owner_count> shared_handles;
+    std::array<const FakeSharedPrefixHandle*, shared_owner_count> shared_owners;
+    std::array<std::uint32_t, shared_owner_count> shared_ordinals;
+    for (std::size_t index = 0; index < shared_owner_count; ++index) {
+        shared_handles[index].id = static_cast<std::uint32_t>(index + 1U);
+        shared_owners[index]     = &shared_handles[index];
+        shared_ordinals[index]   = static_cast<std::uint32_t>(private_owner_count + index);
+    }
+
+    const FakeCaptureAssessment capture{
+        .shortlist_key       = FakeShortlistKey{.digest = 91, .frontier = 64},
+        .publishes_shared    = true,
+        .physically_feasible = false,
+    };
+    Planner planner;
+    const auto result = planner.plan(program, test_cost_model(),
+                                     Planner::Input{
+                                         .capture                = &capture,
+                                         .private_owners         = private_owners,
+                                         .private_owner_ordinals = private_ordinals,
+                                         .shared_owners          = shared_owners,
+                                         .shared_owner_ordinals  = shared_ordinals,
+                                         .target_budget          = target_budget,
+                                     });
+    require(!result, "bounded infeasible shared-capture search unexpectedly found a plan");
+    require(program.pressure_target_count_peak <= target_budget,
+            "shared-capture search committed more canonical targets than its budget");
+}
+
 void test_equal_lower_bound_does_not_short_circuit_tie_break() {
     using Planner = ninfer::runtime::MaterializationPlanner<FakePackage>;
 
@@ -1642,6 +1862,110 @@ void test_equal_lower_bound_does_not_short_circuit_tie_break() {
 
     require(result && result->candidate_index == 1 && program.pressure_planning_sessions == 1,
             "equal lower bound bypassed the pressure target that wins the stable tie-break");
+}
+
+void test_candidate_search_prefers_deep_reuse_without_eviction() {
+    using Planner = ninfer::runtime::MaterializationPlanner<FakePackage>;
+
+    FakeProgram program;
+    program.required_pressure_actions         = 2;
+    program.eviction_pressure_action_units    = 2;
+    program.pressure_action_immediate_ns      = 1'000'000;
+    program.pressure_action_degradation_units = 1;
+    program.pressure_assessment_delay_us      = 1'000;
+    program.pressure_checkpoint_recovery_ns   = 8'000'000'000ULL;
+
+    FakeAdmissionCandidate root;
+    root.identity.machine.minimum_request_ns = 8'000'000'000ULL;
+    root.identity.machine.immediate_ns       = 8'000'000'000ULL;
+    root.identity.physical_status    = ninfer::runtime::MaterializationPhysicalStatus::Infeasible;
+    root.identity.source_disposition = ClaimDisposition::ConsumedToActive;
+    root.identity.expandable         = true;
+    root.identity.assessment_digest  = 101;
+
+    FakeAdmissionCandidate reuse;
+    reuse.value.reusable_prompt_tokens          = 55'048;
+    reuse.private_source_id                     = 1;
+    reuse.identity.machine.minimum_request_ns   = 100'000'000;
+    reuse.identity.machine.immediate_ns         = 100'000'000;
+    reuse.identity.machine.reused_prompt_tokens = 55'048;
+    reuse.identity.physical_status    = ninfer::runtime::MaterializationPhysicalStatus::Infeasible;
+    reuse.identity.source_disposition = ClaimDisposition::ConsumedToActive;
+    reuse.identity.expandable         = true;
+    reuse.identity.assessment_digest  = 202;
+
+    std::array<Planner::CandidateInput, 2> candidates{
+        Planner::CandidateInput{
+            .candidate = &root, .stable_ordinal = 0, .current_session_binding = false},
+        Planner::CandidateInput{
+            .candidate = &reuse, .stable_ordinal = 1, .current_session_binding = true},
+    };
+    std::array<FakeContinuationHandle, 3> owner_handles{
+        FakeContinuationHandle{1, 0},
+        FakeContinuationHandle{2, 0},
+        FakeContinuationHandle{3, 0},
+    };
+    const std::array<const FakeContinuationHandle*, 3> private_owners{
+        &owner_handles[0], &owner_handles[1], &owner_handles[2]};
+    const std::array<std::uint32_t, 3> private_ordinals{0, 1, 2};
+    const std::array<ninfer::runtime::MaterializationOwnerPolicy, 3> owner_policy{
+        ninfer::runtime::MaterializationOwnerPolicy{.ordinal         = 0,
+                                                    .retention_class = RetentionClass::LiveSession,
+                                                    .private_retention_weight = 16},
+        ninfer::runtime::MaterializationOwnerPolicy{.ordinal         = 1,
+                                                    .retention_class = RetentionClass::LiveSession,
+                                                    .private_retention_weight = 16},
+        ninfer::runtime::MaterializationOwnerPolicy{.ordinal         = 2,
+                                                    .retention_class = RetentionClass::LiveSession,
+                                                    .private_retention_weight = 16},
+    };
+    const std::array<ninfer::runtime::MaterializationCheckpointPolicy, 3> checkpoint_policy{
+        ninfer::runtime::MaterializationCheckpointPolicy{
+            .owner_ordinal = 0,
+            .checkpoint    = CheckpointRef{.kind     = CheckpointKind::SessionEndpoint,
+                                           .frontier = 16,
+                                           .ordinal  = 0},
+            .rebuild_ns    = 8'000'000'000ULL},
+        ninfer::runtime::MaterializationCheckpointPolicy{
+            .owner_ordinal = 1,
+            .checkpoint    = CheckpointRef{.kind     = CheckpointKind::SessionEndpoint,
+                                           .frontier = 16,
+                                           .ordinal  = 0},
+            .rebuild_ns    = 8'000'000'000ULL},
+        ninfer::runtime::MaterializationCheckpointPolicy{
+            .owner_ordinal = 2,
+            .checkpoint    = CheckpointRef{.kind     = CheckpointKind::SessionEndpoint,
+                                           .frontier = 16,
+                                           .ordinal  = 0},
+            .rebuild_ns    = 8'000'000'000ULL},
+    };
+
+    Planner planner;
+    const auto pressure_inputs = [&]() -> Planner::PressureInputs {
+        return Planner::PressureInputs{
+            .private_owners         = private_owners,
+            .private_owner_ordinals = private_ordinals,
+            .shared_owners          = {},
+            .shared_owner_ordinals  = {},
+            .owner_policy           = owner_policy,
+            .checkpoint_policy      = checkpoint_policy,
+        };
+    };
+    const auto logical_goal = [](std::uint32_t, ClaimDisposition,
+                                 std::span<const ninfer::runtime::PressureOwnerOutcome>)
+        -> std::optional<Planner::LogicalGoal> {
+        return Planner::LogicalGoal{.publication_slot = 0};
+    };
+    auto result = planner.plan(program, FakePreparedPrompt{}, test_cost_model(), candidates, 0,
+                               pressure_inputs, logical_goal, Planner::Clock::now());
+
+    require(result && result->plan && result->candidate_index == 1,
+            "shallow Root pressure path starved the cheaper reuse candidate");
+    require(result->plan->private_actions.size() == 2 &&
+                std::none_of(
+                    result->plan->private_actions.begin(), result->plan->private_actions.end(),
+                    [](const FakeTargetDecision& action) { return action.evicts_continuation; }),
+            "one-step eviction outranked the multi-step preserving reuse closure");
 }
 
 void test_feasible_identity_expands_when_pressure_can_remove_copy() {
@@ -2067,6 +2391,39 @@ void test_two_owners_jointly_close_pressure() {
             "planner did not combine preserving targets from two owners");
 }
 
+void test_guided_pressure_reaches_deep_retention_before_maximal_fallback() {
+    constexpr std::size_t owner_count = 7;
+    FakeManager manager               = make_manager(1, owner_count + 1U);
+    FakeProgram program;
+    std::array<std::uint32_t, owner_count> owner_ids{};
+    for (std::size_t index = 0; index < owner_count; ++index) {
+        const std::uint32_t content = static_cast<std::uint32_t>(70U + index);
+        const ActiveRequest active =
+            start_active(manager, program, content, make_base(content), index + 1U);
+        owner_ids[index] = active.sequence.id;
+        (void)finish_active(manager, program, active);
+    }
+
+    program.required_pressure_actions     = 3;
+    program.private_pressure_alternatives = 4;
+    program.pressure_assessment_delay_us  = 2'000;
+    auto inspection = manager.inspect(program, FakePreparedPrompt{90}, make_base(90), 20);
+    require(inspection.choice.has_value(), "guided pressure search found no admission plan");
+
+    program.abort_start = true;
+    (void)manager.reserve_materialization(program, std::move(*inspection.choice),
+                                          FakePreparedPrompt{90}, {});
+    require(program.started_action_ids.size() == program.required_pressure_actions,
+            "guided pressure search selected maximal release instead of a retention closure");
+    for (const std::uint32_t owner_id : owner_ids) {
+        require(std::find(program.started_action_ids.begin(), program.started_action_ids.end(),
+                          2000U + owner_id) == program.started_action_ids.end(),
+                "guided pressure search evicted a parked owner");
+    }
+    require(program.pressure_target_assessments <= 8,
+            "guided pressure search returned to eager breadth-first assessment");
+}
+
 void test_combined_target_reprices_cancelled_pressure_copy() {
     FakeManager manager = make_manager(1, 3);
     FakeProgram program;
@@ -2365,8 +2722,12 @@ int main() {
     run_test("portfolio demand and owner aggregation", test_portfolio_demand_and_owner_aggregation);
     run_test("shared capture private transition loss",
              test_shared_capture_subtracts_private_transition_loss);
+    run_test("shared capture committed target budget",
+             test_shared_capture_budget_bounds_committed_canonical_targets);
     run_test("equal lower-bound tie-break",
              test_equal_lower_bound_does_not_short_circuit_tie_break);
+    run_test("candidate-stratified reuse closure",
+             test_candidate_search_prefers_deep_reuse_without_eviction);
     run_test("feasible identity pressure improvement",
              test_feasible_identity_expands_when_pressure_can_remove_copy);
     run_test("dominating identity fast path",
@@ -2387,6 +2748,8 @@ int main() {
     run_test("cumulative owner target",
              test_cumulative_owner_target_closes_pressure_without_eviction);
     run_test("joint two-owner pressure", test_two_owners_jointly_close_pressure);
+    run_test("guided deep retention",
+             test_guided_pressure_reaches_deep_retention_before_maximal_fallback);
     run_test("combined target exact repricing",
              test_combined_target_reprices_cancelled_pressure_copy);
     run_test("in-progress and capture", test_in_progress_adoption_and_private_capture);

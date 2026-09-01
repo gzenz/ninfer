@@ -197,27 +197,56 @@ public:
             incumbent.target =
                 session.identity_target(*candidates[incumbent.candidate_index].candidate);
         } else {
-            PressureTargetHandle root_maximal =
-                session.root_maximal_target(*candidates[root_candidate_index].candidate);
-            PressureTargetAssessment assessment = session.assess(root_maximal);
-            if (assessment.candidate_ordinal != root_candidate_index) {
-                throw std::logic_error("maximal pressure target changed admission candidate");
+            // Try guided_closure first — it prefers demote (preserves
+            // continuations on host for h2d restore). Only fall back to
+            // root_maximal (eviction) if guided_closure fails.
+            bool have_incumbent = false;
+            if (const std::optional<PressureTargetHandle> early_closure =
+                    session.guided_closure_target(
+                        *candidates[root_candidate_index].candidate, {})) {
+                PressureTargetAssessment assessment = session.assess(*early_closure);
+                ++targets_evaluated;
+                planning_saturating_add(projection_work, assessment.projection_work);
+                std::optional<LogicalGoal> goal;
+                if (assessment.physical_status == MaterializationPhysicalStatus::Feasible) {
+                    goal = logical_goal(root_candidate_index, assessment.source_disposition,
+                                        assessment.owner_outcomes);
+                }
+                if (goal) {
+                    const FoldedCost cost =
+                        fold_assessment(candidates[root_candidate_index], assessment,
+                                        pressure.owner_policy, pressure.checkpoint_policy);
+                    incumbent = make_incumbent(*early_closure, assessment, cost, *goal);
+                    session.retain_assessment(*early_closure);
+                    assessed_.push_back(*early_closure);
+                    discovered_.push_back(*early_closure);
+                    have_incumbent = true;
+                }
             }
-            ++targets_evaluated;
-            planning_saturating_add(projection_work, assessment.projection_work);
-            std::optional<LogicalGoal> goal;
-            if (assessment.physical_status == MaterializationPhysicalStatus::Feasible) {
-                goal = logical_goal(root_candidate_index, assessment.source_disposition,
-                                    assessment.owner_outcomes);
+            if (!have_incumbent) {
+                // Guided closure failed — fall back to root_maximal (eviction).
+                PressureTargetHandle root_maximal =
+                    session.root_maximal_target(*candidates[root_candidate_index].candidate);
+                PressureTargetAssessment assessment = session.assess(root_maximal);
+                if (assessment.candidate_ordinal != root_candidate_index) {
+                    throw std::logic_error("maximal pressure target changed admission candidate");
+                }
+                ++targets_evaluated;
+                planning_saturating_add(projection_work, assessment.projection_work);
+                std::optional<LogicalGoal> goal;
+                if (assessment.physical_status == MaterializationPhysicalStatus::Feasible) {
+                    goal = logical_goal(root_candidate_index, assessment.source_disposition,
+                                        assessment.owner_outcomes);
+                }
+                if (!goal) { return std::nullopt; }
+                const FoldedCost cost =
+                    fold_assessment(candidates[root_candidate_index], assessment, pressure.owner_policy,
+                                    pressure.checkpoint_policy);
+                incumbent = make_incumbent(root_maximal, assessment, cost, *goal);
+                session.retain_assessment(root_maximal);
+                assessed_.push_back(root_maximal);
+                discovered_.push_back(root_maximal);
             }
-            if (!goal) { return std::nullopt; }
-            const FoldedCost cost =
-                fold_assessment(candidates[root_candidate_index], assessment, pressure.owner_policy,
-                                pressure.checkpoint_policy);
-            incumbent = make_incumbent(root_maximal, assessment, cost, *goal);
-            session.retain_assessment(root_maximal);
-            assessed_.push_back(root_maximal);
-            discovered_.push_back(root_maximal);
         }
 
         const Clock::time_point search_started = Clock::now();

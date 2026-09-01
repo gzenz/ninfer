@@ -420,7 +420,6 @@ inline void PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::populate_options
     CandidateOptions& options = candidate_options[selected_candidate];
     if (options.populated) { return; }
     options.owners.resize(owners.size());
-    options.eviction_choices.resize(owners.size(), 0);
     const AdmissionCandidate& candidate = *candidates[selected_candidate];
     const std::optional<typename Core::MaterializationSourceProtection> protection =
         program->materialization_source_protection(*candidate.impl_);
@@ -428,8 +427,8 @@ inline void PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::populate_options
         throw std::logic_error("pressure planning candidate source protection is stale");
     }
     for (std::size_t index = 0; index < owners.size(); ++index) {
-        const Owner& owner                       = owners[index];
-        std::vector<PressureDecision>& decisions = options.owners[index];
+        const Owner& owner                   = owners[index];
+        CandidateOwnerOptions& owner_options = options.owners[index];
         using PlanningContractAccess =
             qwen3_6::detail::RuntimeContractAccess<NINFER_QWEN36_VARIANT>;
         const bool selected_private_source =
@@ -443,6 +442,8 @@ inline void PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::populate_options
                                             PlanningContractAccess::epoch(*owner.shared_handle) ==
                                                 candidate.impl_->shared_source_generation;
         if (selected_private_source || selected_shared_source) { continue; }
+        owner_options.participation              = OwnerParticipation::PressureEligible;
+        std::vector<PressureDecision>& decisions = owner_options.decisions;
         if (owner.shared) {
             PressureDecision eviction = program->inspect_shared_eviction_option(
                 program->shared_prefix_states[PlanningContractAccess::index(*owner.shared_handle)]);
@@ -461,9 +462,44 @@ inline void PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::populate_options
         if (decisions.size() > std::numeric_limits<std::uint16_t>::max()) {
             throw std::overflow_error("pressure owner target count is not representable");
         }
-        options.eviction_choices[index] = static_cast<std::uint16_t>(decisions.size());
+        owner_options.eviction_choice = static_cast<std::uint16_t>(decisions.size());
     }
     options.populated = true;
+}
+
+inline std::vector<PressureDecision>
+PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::pressure_successors(
+    const CandidateOwnerOptions& owner_options, std::size_t owner_index,
+    const detail::PhysicalResources& residual,
+    const typename Core::MaterializationSourceProtection& protection,
+    const PressureDecision* current) const {
+    if (owner_index >= owners.size()) {
+        throw std::out_of_range("pressure successor owner index is invalid");
+    }
+    if (owner_options.participation != OwnerParticipation::PressureEligible) { return {}; }
+
+    using PlanningContractAccess = qwen3_6::detail::RuntimeContractAccess<NINFER_QWEN36_VARIANT>;
+    std::vector<PressureDecision> successors;
+    if (owners[owner_index].shared) {
+        successors = program->inspect_shared_pressure_successors(
+            program->shared_prefix_states[PlanningContractAccess::index(
+                *owners[owner_index].shared_handle)],
+            residual, &protection, current);
+    } else {
+        successors = program->inspect_pressure_successors(
+            program->continuation_states[PlanningContractAccess::index(
+                *owners[owner_index].private_handle)],
+            residual, &protection, current);
+    }
+    if (owner_options.eviction_choice == 0 ||
+        owner_options.eviction_choice > owner_options.decisions.size()) {
+        throw std::logic_error("eligible pressure owner has no maximal outcome");
+    }
+    const PressureDecision& eviction = owner_options.decisions[owner_options.eviction_choice - 1U];
+    if (std::find(successors.begin(), successors.end(), eviction) == successors.end()) {
+        successors.push_back(eviction);
+    }
+    return successors;
 }
 
 inline qwen3_6::PressureTargetHandle
@@ -479,7 +515,7 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::root_maximal_target(
     };
     for (std::size_t index = 0; index < owners.size(); ++index) {
         maximal.owner_choices[index] =
-            candidate_options[selected_candidate].eviction_choices[index];
+            candidate_options[selected_candidate].owners[index].eviction_choice;
     }
     TargetNode* existing       = find_target(maximal);
     std::uint32_t target_index = 0;
@@ -515,6 +551,9 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::guided_closure_target(
     std::vector<std::size_t> owner_order;
     owner_order.reserve(owners.size());
     const auto append_owner = [&](std::size_t owner_index) {
+        if (options.owners[owner_index].participation != OwnerParticipation::PressureEligible) {
+            return;
+        }
         if (std::find(owner_order.begin(), owner_order.end(), owner_index) == owner_order.end()) {
             owner_order.push_back(owner_index);
         }
@@ -540,10 +579,10 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::guided_closure_target(
             } else {
                 const std::uint16_t choice = node.owner_choices[index];
                 if (choice != 0) {
-                    if (choice > options.owners[index].size()) {
+                    if (choice > options.owners[index].decisions.size()) {
                         throw std::logic_error("guided pressure choice is invalid");
                     }
-                    decision = &options.owners[index][choice - 1U];
+                    decision = &options.owners[index].decisions[choice - 1U];
                 }
             }
             if (decision == nullptr) { continue; }
@@ -599,31 +638,6 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::guided_closure_target(
         .candidate_index = selected_candidate,
         .owner_choices   = std::vector<std::uint16_t>(owners.size(), 0),
     };
-    using PlanningContractAccess = qwen3_6::detail::RuntimeContractAccess<NINFER_QWEN36_VARIANT>;
-    const auto successors_for    = [&](std::size_t owner_index,
-                                    const detail::PhysicalResources& residual,
-                                    const PressureDecision* current) {
-        std::vector<PressureDecision> successors;
-        if (owners[owner_index].shared) {
-            successors = program->inspect_shared_pressure_successors(
-                program->shared_prefix_states[PlanningContractAccess::index(
-                    *owners[owner_index].shared_handle)],
-                residual, &*protection, current);
-        } else {
-            successors = program->inspect_pressure_successors(
-                program->continuation_states[PlanningContractAccess::index(
-                    *owners[owner_index].private_handle)],
-                residual, &*protection, current);
-        }
-        const std::uint16_t eviction_choice = options.eviction_choices[owner_index];
-        if (eviction_choice != 0) {
-            const PressureDecision& eviction = options.owners[owner_index][eviction_choice - 1U];
-            if (std::find(successors.begin(), successors.end(), eviction) == successors.end()) {
-                successors.push_back(eviction);
-            }
-        }
-        return successors;
-    };
 
     struct Selection {
         std::size_t owner_index = 0;
@@ -661,11 +675,12 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::guided_closure_target(
             for (const std::size_t owner_index : owner_order) {
                 const std::uint16_t current_choice = target.owner_choices[owner_index];
                 const PressureDecision* current =
-                    current_choice == 0 ? nullptr
-                                        : &options.owners[owner_index][current_choice - 1U];
+                    current_choice == 0
+                        ? nullptr
+                        : &options.owners[owner_index].decisions[current_choice - 1U];
                 if (current != nullptr && current->evicts_continuation) { continue; }
-                std::vector<PressureDecision> successors =
-                    successors_for(owner_index, residual, current);
+                std::vector<PressureDecision> successors = pressure_successors(
+                    options.owners[owner_index], owner_index, residual, *protection, current);
                 std::optional<Selection> owner_best;
                 for (PressureDecision& successor : successors) {
                     const std::uint32_t prior_drops =
@@ -701,7 +716,7 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::guided_closure_target(
         }
         if (!selected) { return std::nullopt; }
 
-        std::vector<PressureDecision>& decisions = options.owners[selected->owner_index];
+        std::vector<PressureDecision>& decisions = options.owners[selected->owner_index].decisions;
         const auto existing  = std::find(decisions.begin(), decisions.end(), selected->decision);
         std::uint16_t choice = 0;
         if (existing != decisions.end()) {
@@ -734,12 +749,16 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::guidance(qwen3_6::PressureTa
     std::uint32_t total_degradation = 0;
     std::uint32_t total_dropped     = 0;
     for (std::size_t index = 0; index < owners.size(); ++index) {
-        const std::uint16_t choice = node.owner_choices[index];
-        if (choice > options.owners[index].size()) {
+        const std::uint16_t choice                 = node.owner_choices[index];
+        const CandidateOwnerOptions& owner_options = options.owners[index];
+        if (choice > owner_options.decisions.size()) {
             throw std::logic_error("pressure target guidance owner choice is invalid");
         }
         if (choice == 0) { continue; }
-        const PressureDecision& decision = options.owners[index][choice - 1U];
+        if (owner_options.participation != OwnerParticipation::PressureEligible) {
+            throw std::logic_error("materialization source has a pressure target");
+        }
+        const PressureDecision& decision = owner_options.decisions[choice - 1U];
         approximate_pressure.added       = NINFER_QWEN36_RUNTIME_NS::planning_resource_sum(
             approximate_pressure.added, decision.effect.added);
         approximate_pressure.removed = NINFER_QWEN36_RUNTIME_NS::planning_resource_sum(
@@ -804,12 +823,15 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::guidance(qwen3_6::PressureTa
             maximum_additional_relief[dimension], released > consumed ? released - consumed : 0U);
     };
     for (std::size_t index = 0; index < owners.size(); ++index) {
-        const std::uint16_t eviction_choice = options.eviction_choices[index];
+        const CandidateOwnerOptions& owner_options = options.owners[index];
+        if (owner_options.participation != OwnerParticipation::PressureEligible) { continue; }
+        const std::uint16_t eviction_choice = owner_options.eviction_choice;
         if (eviction_choice == 0 || node.owner_choices[index] == eviction_choice) { continue; }
-        const PressureDecision& eviction = options.owners[index][eviction_choice - 1U];
+        const PressureDecision& eviction = owner_options.decisions[eviction_choice - 1U];
         const PressureDecision* current =
-            node.owner_choices[index] == 0 ? nullptr
-                                           : &options.owners[index][node.owner_choices[index] - 1U];
+            node.owner_choices[index] == 0
+                ? nullptr
+                : &owner_options.decisions[node.owner_choices[index] - 1U];
         const detail::PhysicalDelta empty{};
         const detail::PhysicalDelta& prior = current == nullptr ? empty : current->effect;
         update_relief(0, eviction.effect.removed.device.active_lanes,
@@ -895,13 +917,18 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::assess(qwen3_6::PressureTarg
     std::uint32_t total_degradation = 0;
     std::uint32_t total_dropped     = 0;
     for (std::size_t index = 0; index < owners.size(); ++index) {
-        const std::uint16_t choice = node.owner_choices[index];
-        if (choice > options.owners[index].size()) {
+        const std::uint16_t choice                 = node.owner_choices[index];
+        const CandidateOwnerOptions& owner_options = options.owners[index];
+        if (choice > owner_options.decisions.size()) {
             throw std::logic_error("pressure target owner choice is invalid");
         }
         const Owner& owner = owners[index];
         const PressureDecision* decision =
-            choice == 0 ? nullptr : &options.owners[index][choice - 1U];
+            choice == 0 ? nullptr : &owner_options.decisions[choice - 1U];
+        if (decision != nullptr &&
+            owner_options.participation != OwnerParticipation::PressureEligible) {
+            throw std::logic_error("materialization source has a pressure target");
+        }
         if (owner.shared) {
             recovery_shared_owners.push_back(owner.shared_handle);
             recovery_shared_decisions.push_back(decision);
@@ -985,10 +1012,12 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::assess(qwen3_6::PressureTarg
     if (expandable) {
         expandable = false;
         for (std::size_t index = 0; index < owners.size(); ++index) {
+            const CandidateOwnerOptions& owner_options = options.owners[index];
+            if (owner_options.participation != OwnerParticipation::PressureEligible) { continue; }
             const std::uint16_t choice = node.owner_choices[index];
-            if ((choice == 0 && !options.owners[index].empty()) ||
-                (choice != 0 && choice <= options.owners[index].size() &&
-                 !options.owners[index][choice - 1U].evicts_continuation)) {
+            if ((choice == 0 && !owner_options.decisions.empty()) ||
+                (choice != 0 && choice <= owner_options.decisions.size() &&
+                 !owner_options.decisions[choice - 1U].evicts_continuation)) {
                 expandable = true;
                 break;
             }
@@ -1095,7 +1124,7 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::prepare_expansion(
     };
 
     const auto intern_prepared_decision = [&](std::size_t owner_index, PressureDecision decision) {
-        std::vector<PressureDecision>& decisions = options.owners[owner_index];
+        std::vector<PressureDecision>& decisions = options.owners[owner_index].decisions;
         const auto existing = std::find(decisions.begin(), decisions.end(), decision);
         if (existing != decisions.end()) {
             return static_cast<std::uint16_t>(1U + (existing - decisions.begin()));
@@ -1127,40 +1156,19 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::prepare_expansion(
         return choice;
     };
 
-    const auto successors_for = [&](std::size_t owner_index, const PressureDecision* current) {
-        std::vector<PressureDecision> successors;
-        using PlanningContractAccess =
-            qwen3_6::detail::RuntimeContractAccess<NINFER_QWEN36_VARIANT>;
-        if (owners[owner_index].shared) {
-            successors = program->inspect_shared_pressure_successors(
-                program->shared_prefix_states[PlanningContractAccess::index(
-                    *owners[owner_index].shared_handle)],
-                residual, &*protection, current);
-        } else {
-            successors = program->inspect_pressure_successors(
-                program->continuation_states[PlanningContractAccess::index(
-                    *owners[owner_index].private_handle)],
-                residual, &*protection, current);
-        }
-        const std::uint16_t eviction_choice = options.eviction_choices[owner_index];
-        if (eviction_choice != 0) {
-            successors.push_back(options.owners[owner_index][eviction_choice - 1U]);
-        }
-        return successors;
-    };
-
     for (std::size_t owner_index = 0; owner_index < owners.size(); ++owner_index) {
-        const std::uint16_t eviction_choice = options.eviction_choices[owner_index];
-        if (eviction_choice == 0) { continue; }
+        CandidateOwnerOptions& owner_options = options.owners[owner_index];
+        if (owner_options.participation != OwnerParticipation::PressureEligible) { continue; }
         const std::uint16_t current_choice       = node.owner_choices[owner_index];
-        std::vector<PressureDecision>& decisions = options.owners[owner_index];
+        std::vector<PressureDecision>& decisions = owner_options.decisions;
         if (current_choice > decisions.size() ||
             (current_choice != 0 && decisions[current_choice - 1U].evicts_continuation)) {
             continue;
         }
         const PressureDecision* current =
             current_choice == 0 ? nullptr : &decisions[current_choice - 1U];
-        std::vector<PressureDecision> successors = successors_for(owner_index, current);
+        std::vector<PressureDecision> successors =
+            pressure_successors(owner_options, owner_index, residual, *protection, current);
         for (PressureDecision& successor : successors) {
             const std::uint16_t choice =
                 intern_prepared_decision(owner_index, std::move(successor));
@@ -1205,7 +1213,11 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::commit_expansion(
         if (prepared_decision.owner_index >= options.owners.size()) {
             throw std::logic_error("prepared pressure owner index is invalid");
         }
-        std::vector<PressureDecision>& decisions = options.owners[prepared_decision.owner_index];
+        CandidateOwnerOptions& owner_options = options.owners[prepared_decision.owner_index];
+        if (owner_options.participation != OwnerParticipation::PressureEligible) {
+            throw std::logic_error("materialization source has a prepared pressure decision");
+        }
+        std::vector<PressureDecision>& decisions = owner_options.decisions;
         if (prepared_decision.choice != decisions.size() + 1U) {
             throw std::logic_error("prepared pressure owner choice is not canonical");
         }
@@ -1285,10 +1297,14 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::seal(
     for (std::size_t index = 0; index < owners.size(); ++index) {
         const std::uint16_t choice = node.owner_choices[index];
         if (choice == 0) { continue; }
-        if (choice > options.owners[index].size()) {
+        const CandidateOwnerOptions& owner_options = options.owners[index];
+        if (choice > owner_options.decisions.size()) {
             throw std::logic_error("pressure target owner choice is invalid at seal");
         }
-        const PressureDecision& decision = options.owners[index][choice - 1U];
+        if (owner_options.participation != OwnerParticipation::PressureEligible) {
+            throw std::logic_error("materialization source has a pressure target at seal");
+        }
+        const PressureDecision& decision = owner_options.decisions[choice - 1U];
         if (owners[index].shared) {
             selected_shared_owners.push_back(owners[index].shared_handle);
             selected_shared_decisions.push_back(&decision);
@@ -1332,10 +1348,14 @@ PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT>::seal_capture(
     for (std::size_t index = 0; index < owners.size(); ++index) {
         const std::uint16_t choice = node.owner_choices[index];
         if (choice == 0) { continue; }
-        if (choice > options.owners[index].size()) {
+        const CandidateOwnerOptions& owner_options = options.owners[index];
+        if (choice > owner_options.decisions.size()) {
             throw std::logic_error("capture pressure owner choice is invalid at seal");
         }
-        const PressureDecision& decision = options.owners[index][choice - 1U];
+        if (owner_options.participation != OwnerParticipation::PressureEligible) {
+            throw std::logic_error("materialization source has a capture pressure target at seal");
+        }
+        const PressureDecision& decision = owner_options.decisions[choice - 1U];
         if (owners[index].shared) {
             selected_shared_owners.push_back(owners[index].shared_handle);
             selected_shared_decisions.push_back(&decision);

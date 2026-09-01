@@ -1251,9 +1251,19 @@ struct PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT> {
         bool root_maximal            = false;
     };
 
+    enum class OwnerParticipation : std::uint8_t {
+        MaterializationSource,
+        PressureEligible,
+    };
+
+    struct CandidateOwnerOptions {
+        OwnerParticipation participation = OwnerParticipation::MaterializationSource;
+        std::vector<PressureDecision> decisions;
+        std::uint16_t eviction_choice = 0;
+    };
+
     struct CandidateOptions {
-        std::vector<std::vector<PressureDecision>> owners;
-        std::vector<std::uint16_t> eviction_choices;
+        std::vector<CandidateOwnerOptions> owners;
         bool populated = false;
     };
 
@@ -1300,6 +1310,11 @@ struct PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT> {
     [[nodiscard]] const TargetNode* find_target(const TargetNode& target) const noexcept;
     void index_target(std::uint32_t target_index);
     void populate_options(std::uint32_t candidate_index);
+    [[nodiscard]] std::vector<PressureDecision>
+    pressure_successors(const CandidateOwnerOptions& owner_options, std::size_t owner_index,
+                        const detail::PhysicalResources& residual,
+                        const typename Core::MaterializationSourceProtection& protection,
+                        const PressureDecision* current) const;
 
     Core* program                                        = nullptr;
     const runtime::ContextMachineCostModel* machine_cost = nullptr;

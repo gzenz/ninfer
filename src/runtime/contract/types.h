@@ -451,6 +451,28 @@ struct PressureOwnerOutcome {
                                                    const PressureOwnerOutcome&) noexcept = default;
 };
 
+// Cheap, target-neutral ordering evidence for an unassessed pressure target.  This is deliberately
+// not a feasibility certificate: only PressureTargetAssessment may admit or seal a target.  The
+// Program owns the physical projection and the common planner combines the owner outcomes with its
+// retention policy.
+struct PressurePhysicalGuidance {
+    std::uint32_t unsatisfied_constraints   = 0;
+    std::uint32_t estimated_remaining_steps = 0;
+    std::uint64_t normalized_residual_q20   = 0;
+};
+
+// The spans are borrowed from a PressurePlanningSession scratch generation and remain valid only
+// until the next session operation.  The common planner folds them immediately into owning values.
+struct PressureTargetGuidance {
+    PressurePhysicalGuidance physical;
+    MaterializationMachineSummary estimated_machine;
+    std::span<const PressureOwnerOutcome> owner_outcomes;
+    std::uint32_t candidate_ordinal     = 0;
+    std::uint32_t stable_target_ordinal = 0;
+    std::uint32_t degradation_units     = 0;
+    std::uint32_t dropped_checkpoints   = 0;
+};
+
 // The spans are borrowed from a PressurePlanningSession scratch generation and remain valid only
 // until the next session mutation. The common planner folds them immediately into owning values.
 struct PressureTargetAssessment {

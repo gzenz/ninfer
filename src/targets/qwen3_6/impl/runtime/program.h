@@ -24,6 +24,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <array>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <span>
@@ -220,6 +221,12 @@ struct PressureDecision {
 
     [[nodiscard]] friend bool operator==(const PressureDecision&,
                                          const PressureDecision&) noexcept = default;
+};
+
+struct PressureBaselineRecovery {
+    std::uint32_t owner_ordinal = 0;
+    runtime::CheckpointRef checkpoint;
+    std::uint64_t recovery_ns = 0;
 };
 
 struct CaptureAssessmentImpl {
@@ -529,9 +536,9 @@ public:
     [[nodiscard]] std::optional<AdmissionCandidate> seal_materialization(
         const AdmissionCandidate& admission, const PreparedPromptData& prompt,
         std::span<const ContinuationHandle* const> pressure_owners,
-        std::span<const qwen3_6::detail::PressureDecision> pressure_options,
+        std::span<const qwen3_6::detail::PressureDecision* const> pressure_options,
         std::span<const SharedPrefixHandle* const> shared_pressure_owners,
-        std::span<const qwen3_6::detail::PressureDecision> shared_pressure_options);
+        std::span<const qwen3_6::detail::PressureDecision* const> shared_pressure_options);
     [[nodiscard]] AdmissionCandidate
     make_capture_pressure_candidate(const CaptureAssessment& assessment,
                                     const runtime::ContextMachineCostModel& machine_cost) const;
@@ -699,6 +706,37 @@ private:
     std::uint64_t resource_revision_            = 1;
     std::uint32_t pressure_planning_generation_ = 0;
     bool pressure_planning_active_              = false;
+
+    struct PressurePageScratchSlot {
+        std::uint32_t generation     = 0;
+        std::uint32_t selected_index = std::numeric_limits<std::uint32_t>::max();
+        std::uint64_t host_group     = 0;
+        bool projected               = false;
+        bool device                  = false;
+        bool host                    = false;
+        bool pressure_targeted       = false;
+    };
+
+    struct PressureSelectedPage {
+        LogicalKVPageHandle page;
+        std::uint32_t references = 0;
+    };
+
+    mutable std::uint32_t pressure_page_scratch_generation_ = 0;
+    mutable std::vector<PressurePageScratchSlot> pressure_text_page_scratch_;
+    mutable std::vector<PressurePageScratchSlot> pressure_backend_page_scratch_;
+    mutable std::vector<PressureSelectedPage> pressure_text_selected_pages_;
+    mutable std::vector<PressureSelectedPage> pressure_backend_selected_pages_;
+    mutable std::vector<std::uint8_t> pressure_private_owner_scratch_;
+    mutable std::vector<std::uint8_t> pressure_shared_owner_scratch_;
+    mutable std::vector<std::vector<runtime::CheckpointRef>> pressure_private_drop_scratch_;
+    mutable std::vector<StateImageHandle> pressure_state_scratch_;
+
+    void begin_pressure_page_scratch() const noexcept;
+    [[nodiscard]] PressurePageScratchSlot& pressure_page_scratch(const LogicalKVPageStore& store,
+                                                                 LogicalKVPageHandle page) const;
+    [[nodiscard]] const PressurePageScratchSlot*
+    find_pressure_page_scratch(const LogicalKVPageStore& store, LogicalKVPageHandle page) const;
 
     struct MaterializationSourceProtection {
         struct StateOwnershipCandidate {
@@ -1030,6 +1068,9 @@ private:
     materialization_source_protection(const AdmissionCandidateImpl& admission) const;
     [[nodiscard]] detail::PhysicalResources
     materialization_deficit(const AdmissionCandidateImpl& admission) const;
+    [[nodiscard]] detail::PhysicalResources
+    guided_materialization_deficit(const AdmissionCandidateImpl& admission,
+                                   const detail::PhysicalDelta& pressure) const;
     [[nodiscard]] bool
     protected_materialization_page(const MaterializationSourceProtection* protection,
                                    const KVAddressSpaceStore& addresses, std::uint32_t page_offset,
@@ -1084,6 +1125,7 @@ private:
         std::span<const SharedPrefixHandle* const> shared_owners,
         std::span<const qwen3_6::detail::PressureDecision* const> shared_decisions,
         std::span<const std::uint32_t> shared_ordinals,
+        std::span<const qwen3_6::detail::PressureBaselineRecovery> baseline_recovery,
         const runtime::ContextMachineCostModel& machine_cost,
         std::vector<runtime::PressureCheckpointRecoveryImpact>& output,
         std::uint64_t& projection_work) const;
@@ -1107,9 +1149,9 @@ private:
                                                    StateImageHandle state) const noexcept;
     [[nodiscard]] std::optional<AdmissionCandidate> compose_materialization(
         AdmissionCandidate&& admission, std::span<const ContinuationHandle* const> pressure_owners,
-        std::span<const qwen3_6::detail::PressureDecision> pressure_options,
+        std::span<const qwen3_6::detail::PressureDecision* const> pressure_options,
         std::span<const SharedPrefixHandle* const> shared_pressure_owners,
-        std::span<const qwen3_6::detail::PressureDecision> shared_pressure_options);
+        std::span<const qwen3_6::detail::PressureDecision* const> shared_pressure_options);
     [[nodiscard]] std::optional<detail::PhysicalPressureEffect> combined_pressure_effect(
         const MaterializationSourceProtection* protection,
         std::span<const ContinuationHandle* const> pressure_owners,
@@ -1204,6 +1246,7 @@ struct PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT> {
     struct TargetNode {
         std::uint32_t candidate_index = 0;
         std::vector<std::uint16_t> owner_choices;
+        std::optional<detail::PhysicalResources> assessed_residual;
         std::uint32_t stable_ordinal = 0;
         bool root_maximal            = false;
     };
@@ -1233,7 +1276,12 @@ struct PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT> {
     identity_target(const AdmissionCandidate& candidate) const;
     [[nodiscard]] qwen3_6::PressureTargetHandle
     root_maximal_target(const AdmissionCandidate& root_candidate);
+    [[nodiscard]] std::optional<qwen3_6::PressureTargetHandle>
+    guided_closure_target(const AdmissionCandidate& candidate,
+                          std::span<const std::uint32_t> preferred_owner_ordinals);
+    [[nodiscard]] runtime::PressureTargetGuidance guidance(qwen3_6::PressureTargetHandle target);
     [[nodiscard]] runtime::PressureTargetAssessment assess(qwen3_6::PressureTargetHandle target);
+    void retain_assessment(qwen3_6::PressureTargetHandle target);
     [[nodiscard]] qwen3_6::PreparedPressureExpansion<NINFER_QWEN36_VARIANT>
     prepare_expansion(qwen3_6::PressureTargetHandle parent);
     [[nodiscard]] qwen3_6::PressureExpansionView
@@ -1248,6 +1296,9 @@ struct PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT> {
 
     [[nodiscard]] bool valid(qwen3_6::PressureTargetHandle target) const noexcept;
     [[nodiscard]] std::uint32_t candidate_index(const AdmissionCandidate& candidate) const;
+    [[nodiscard]] TargetNode* find_target(const TargetNode& target) noexcept;
+    [[nodiscard]] const TargetNode* find_target(const TargetNode& target) const noexcept;
+    void index_target(std::uint32_t target_index);
     void populate_options(std::uint32_t candidate_index);
 
     Core* program                                        = nullptr;
@@ -1259,23 +1310,30 @@ struct PressurePlanningSessionImpl<NINFER_QWEN36_VARIANT> {
     std::vector<Owner> owners;
     std::vector<CandidateOptions> candidate_options;
     std::vector<TargetNode> targets;
+    std::vector<std::uint32_t> target_hash_table;
     std::vector<TargetNode> expansion_scratch;
     std::vector<PreparedOwnerDecision> prepared_owner_decisions;
     std::vector<qwen3_6::PressureTargetHandle> committed_children;
     std::vector<const ContinuationHandle*> selected_private_owners;
-    std::vector<PressureDecision> selected_private_decisions;
+    std::vector<const PressureDecision*> selected_private_decisions;
     std::vector<const SharedPrefixHandle*> selected_shared_owners;
-    std::vector<PressureDecision> selected_shared_decisions;
+    std::vector<const PressureDecision*> selected_shared_decisions;
     std::vector<const ContinuationHandle*> recovery_private_owners;
     std::vector<const PressureDecision*> recovery_private_decisions;
     std::vector<std::uint32_t> recovery_private_ordinals;
     std::vector<const SharedPrefixHandle*> recovery_shared_owners;
     std::vector<const PressureDecision*> recovery_shared_decisions;
     std::vector<std::uint32_t> recovery_shared_ordinals;
+    std::vector<PressureBaselineRecovery> baseline_recovery;
     std::vector<runtime::PressureOwnerOutcome> assessment_outcomes;
     std::vector<runtime::PressureCheckpointRecoveryImpact> assessment_impacts;
-    std::uint32_t prepared_new_count = 0;
-    bool scratch_live                = false;
+    std::vector<runtime::PressureOwnerOutcome> guidance_outcomes;
+    std::optional<AdmissionCandidate> latest_projection;
+    std::optional<AdmissionCandidate> retained_projection;
+    std::uint32_t latest_projection_target   = std::numeric_limits<std::uint32_t>::max();
+    std::uint32_t retained_projection_target = std::numeric_limits<std::uint32_t>::max();
+    std::uint32_t prepared_new_count         = 0;
+    bool scratch_live                        = false;
 };
 
 template <>

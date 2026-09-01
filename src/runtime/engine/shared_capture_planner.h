@@ -124,8 +124,10 @@ public:
                         .stable_target       = assessment.stable_target_ordinal,
                         .degradation_units   = assessment.degradation_units,
                         .dropped_checkpoints = assessment.dropped_checkpoints,
-                        .assessment_digest   = assessment.assessment_digest,
+                        .owner_outcomes      = std::vector<PressureOwnerOutcome>(
+                            assessment.owner_outcomes.begin(), assessment.owner_outcomes.end()),
                     };
+                    session.retain_assessment(target);
                 }
             }
 
@@ -147,28 +149,19 @@ public:
         }
 
         if (!incumbent) { return std::nullopt; }
-        const PressureTargetAssessment selected = session.assess(incumbent->target);
-        const TransitionValue selected_value    = fold_target(input, selected);
-        if (selected.assessment_digest != incumbent->assessment_digest ||
-            selected.stable_target_ordinal != incumbent->stable_target ||
-            selected_value != incumbent->value) {
-            throw std::logic_error("shared capture target changed before seal");
-        }
-        std::vector<PressureOwnerOutcome> outcomes(selected.owner_outcomes.begin(),
-                                                   selected.owner_outcomes.end());
         std::optional<CapturePressurePlan> pressure = session.seal_capture(incumbent->target);
         if (!pressure) {
             throw std::logic_error("selected shared capture target could not be sealed");
         }
         return Result{
             .pressure                = std::move(*pressure),
-            .owner_outcomes          = std::move(outcomes),
-            .baseline_value          = selected_value.baseline_public,
-            .target_value            = selected_value.target_public,
-            .immediate_ns            = selected_value.immediate,
-            .net_gain                = selected_value.gain,
+            .owner_outcomes          = std::move(incumbent->owner_outcomes),
+            .baseline_value          = incumbent->value.baseline_public,
+            .target_value            = incumbent->value.target_public,
+            .immediate_ns            = incumbent->value.immediate,
+            .net_gain                = incumbent->value.gain,
             .stable_scenario_ordinal = input.stable_scenario_ordinal,
-            .stable_target_ordinal   = selected.stable_target_ordinal,
+            .stable_target_ordinal   = incumbent->stable_target,
             .targets_evaluated       = targets_evaluated,
         };
     }
@@ -202,7 +195,7 @@ private:
         std::uint32_t stable_target       = 0;
         std::uint32_t degradation_units   = 0;
         std::uint32_t dropped_checkpoints = 0;
-        std::uint64_t assessment_digest   = 0;
+        std::vector<PressureOwnerOutcome> owner_outcomes;
     };
 
     static void validate(const Input& input) {

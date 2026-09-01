@@ -4,6 +4,7 @@
 #include "runtime/engine/context_portfolio_value.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <limits>
@@ -77,9 +78,14 @@ public:
 
     MaterializationPlanner() {
         queue_.reserve(kTargetBudget);
+        pending_.reserve(kTargetBudget);
+        guided_.reserve(kTargetBudget);
         identity_costs_.reserve(16);
+        candidate_guided_steps_.reserve(16);
+        candidate_seed_complete_.reserve(16);
         assessed_.reserve(kTargetBudget);
         expanded_.reserve(kTargetBudget);
+        discovered_.reserve(kTargetBudget);
         impact_scratch_.reserve(32);
         portfolio_owner_scratch_.reserve(32);
         portfolio_checkpoint_scratch_.reserve(64);
@@ -95,9 +101,14 @@ public:
             throw std::invalid_argument("materialization planning problem has no root candidate");
         }
         queue_.clear();
+        pending_.clear();
+        guided_.clear();
         identity_costs_.clear();
+        candidate_guided_steps_.assign(candidates.size(), 0);
+        candidate_seed_complete_.assign(candidates.size(), false);
         assessed_.clear();
         expanded_.clear();
+        discovered_.clear();
 
         std::optional<Incumbent> identity_best;
         std::vector<IdentityRoot> roots;
@@ -124,9 +135,9 @@ public:
                     .publication_slot   = goal->publication_slot,
                     .source_disposition = identity.source_disposition,
                     .cost               = cost,
-                    .assessment_digest  = identity.assessment_digest,
                 };
             }
+            if (goal) { candidate_seed_complete_[index] = true; }
             const bool needs_pressure =
                 !goal.has_value() &&
                 (identity.physical_status == MaterializationPhysicalStatus::Feasible ||
@@ -189,6 +200,9 @@ public:
             PressureTargetHandle root_maximal =
                 session.root_maximal_target(*candidates[root_candidate_index].candidate);
             PressureTargetAssessment assessment = session.assess(root_maximal);
+            if (assessment.candidate_ordinal != root_candidate_index) {
+                throw std::logic_error("maximal pressure target changed admission candidate");
+            }
             ++targets_evaluated;
             planning_saturating_add(projection_work, assessment.projection_work);
             std::optional<LogicalGoal> goal;
@@ -197,9 +211,26 @@ public:
                                     assessment.owner_outcomes);
             }
             if (!goal) { return std::nullopt; }
-            incumbent = make_incumbent(root_maximal, assessment, candidates[root_candidate_index],
-                                       pressure.owner_policy, pressure.checkpoint_policy, *goal);
+            const FoldedCost cost =
+                fold_assessment(candidates[root_candidate_index], assessment, pressure.owner_policy,
+                                pressure.checkpoint_policy);
+            incumbent = make_incumbent(root_maximal, assessment, cost, *goal);
+            session.retain_assessment(root_maximal);
+            assessed_.push_back(root_maximal);
+            discovered_.push_back(root_maximal);
         }
+
+        const Clock::time_point search_started = Clock::now();
+        const std::uint64_t search_budget_ns =
+            std::min<std::uint64_t>(5'000'000ULL, incumbent.cost.total_ns / 20U);
+        const std::uint64_t guided_watchdog_ns = search_budget_ns;
+        std::uint64_t maximum_step_ns          = 0;
+        std::uint32_t optional_targets         = 0;
+        std::uint32_t guided_assessments       = 0;
+        MaterializationStopReason stop_reason  = MaterializationStopReason::QueueExhausted;
+        bool model_optimal                     = true;
+        bool budget_exhausted                  = false;
+        std::uint64_t interrupted_lower_bound  = std::numeric_limits<std::uint64_t>::max();
 
         for (const IdentityRoot& root : roots) {
             if (!root.expandable || root.lower_bound_ns > incumbent.cost.total_ns) { continue; }
@@ -215,36 +246,259 @@ public:
                 identity_costs_[root.candidate_index].current_session_binding;
             entry.candidate_ordinal     = identity_costs_[root.candidate_index].candidate_ordinal;
             entry.stable_target_ordinal = root.candidate_index;
-            assessed_.push_back(entry.target);
-            queue_push(std::move(entry));
+            if (!contains(discovered_, entry.target)) { discovered_.push_back(entry.target); }
+            if (!contains(assessed_, entry.target)) { assessed_.push_back(entry.target); }
+            queue_push(entry);
+            const PressureTargetGuidance guidance = session.guidance(entry.target);
+            if (guidance.candidate_ordinal != root.candidate_index) {
+                throw std::logic_error("pressure guidance changed admission candidate");
+            }
+            guided_insert(GuidedEntry{
+                .target          = entry.target,
+                .candidate_index = root.candidate_index,
+                .lower_bound_ns  = root.lower_bound_ns,
+                .guidance        = fold_guidance(candidates[root.candidate_index], guidance,
+                                                 pressure.owner_policy),
+                .already_assessed_expandable = true,
+            });
         }
 
-        const Clock::time_point search_started = Clock::now();
-        const std::uint64_t search_budget_ns =
-            std::min<std::uint64_t>(5'000'000ULL, incumbent.cost.total_ns / 20U);
-        std::uint64_t maximum_expansion_ns    = 0;
-        std::uint32_t optional_targets        = 0;
-        MaterializationStopReason stop_reason = MaterializationStopReason::QueueExhausted;
-        bool model_optimal                    = true;
-        bool budget_exhausted                 = false;
-        std::uint64_t interrupted_lower_bound = std::numeric_limits<std::uint64_t>::max();
+        const auto make_queue_entry = [](PressureTargetHandle target,
+                                         const PressureTargetAssessment& assessment,
+                                         const FoldedCost& cost) {
+            return QueueEntry{
+                .target                    = target,
+                .candidate_index           = assessment.candidate_ordinal,
+                .lower_bound_ns            = cost.lower_bound_ns,
+                .affected_selected_hits    = cost.affected_selected_hits,
+                .newest_affected_hit_epoch = cost.newest_affected_hit_epoch,
+                .owner_evictions           = cost.owner_evictions,
+                .checkpoint_drops          = cost.checkpoint_drops,
+                .copy_operations           = cost.copy_operations,
+                .transferred_bytes         = cost.transferred_bytes,
+                .remaining_prefill         = cost.remaining_text_prefill,
+                .remaining_vision_prefill  = cost.remaining_vision_prefill,
+                .reused_prompt_tokens      = cost.reused_prompt_tokens,
+                .current_session_binding   = cost.current_session_binding,
+                .candidate_ordinal         = cost.candidate_ordinal,
+                .stable_target_ordinal     = assessment.stable_target_ordinal,
+            };
+        };
+
+        const auto assess_target =
+            [&](PressureTargetHandle target,
+                std::uint32_t expected_candidate) -> std::optional<QueueEntry> {
+            PressureTargetAssessment assessment = session.assess(target);
+            if (assessment.candidate_ordinal != expected_candidate ||
+                assessment.candidate_ordinal >= candidates.size()) {
+                throw std::logic_error("pressure target changed admission candidate");
+            }
+            assessed_.push_back(target);
+            ++targets_evaluated;
+            planning_saturating_add(projection_work, assessment.projection_work);
+            const FoldedCost cost =
+                fold_assessment(candidates[assessment.candidate_ordinal], assessment,
+                                pressure.owner_policy, pressure.checkpoint_policy);
+            std::optional<LogicalGoal> goal;
+            if (assessment.physical_status == MaterializationPhysicalStatus::Feasible) {
+                goal = logical_goal(assessment.candidate_ordinal, assessment.source_disposition,
+                                    assessment.owner_outcomes);
+            }
+            if (goal && !assessment.root_maximal) {
+                candidate_seed_complete_[assessment.candidate_ordinal] = true;
+            }
+            if (goal && cost.less(incumbent.cost)) {
+                incumbent = make_incumbent(target, assessment, cost, *goal);
+                session.retain_assessment(target);
+            }
+            if (!assessment.expandable || cost.lower_bound_ns > incumbent.cost.total_ns) {
+                return std::nullopt;
+            }
+            QueueEntry entry = make_queue_entry(target, assessment, cost);
+            queue_push(entry);
+            return entry;
+        };
+
+        const auto expand_target = [&](const QueueEntry& parent) {
+            if (contains(expanded_, parent.target)) { return true; }
+            if (optional_targets >= kTargetBudget) {
+                interrupted_lower_bound = std::min(interrupted_lower_bound, parent.lower_bound_ns);
+                return false;
+            }
+            auto prepared = session.prepare_expansion(parent.target);
+            if (prepared.new_canonical_count() > kTargetBudget - optional_targets) {
+                session.discard_expansion(std::move(prepared));
+                interrupted_lower_bound = std::min(interrupted_lower_bound, parent.lower_bound_ns);
+                return false;
+            }
+            const auto children = session.commit_expansion(std::move(prepared));
+            optional_targets += children.new_canonical_count;
+            expanded_.push_back(parent.target);
+            for (const PressureTargetHandle child : children.children) {
+                if (contains(discovered_, child)) { continue; }
+                discovered_.push_back(child);
+                const PressureTargetGuidance guidance = session.guidance(child);
+                if (guidance.candidate_ordinal >= candidates.size() ||
+                    guidance.candidate_ordinal != parent.candidate_index) {
+                    throw std::logic_error("pressure guidance changed admission candidate");
+                }
+                const std::uint32_t candidate_index = guidance.candidate_ordinal;
+                const std::uint64_t lower_bound_ns  = std::max(
+                    identity_costs_[candidate_index].lower_bound_ns, parent.lower_bound_ns);
+                if (lower_bound_ns > incumbent.cost.total_ns) { continue; }
+                const GuidanceCost cost =
+                    fold_guidance(candidates[candidate_index], guidance, pressure.owner_policy);
+                PendingEntry pending{
+                    .target          = child,
+                    .candidate_index = candidate_index,
+                    .lower_bound_ns  = lower_bound_ns,
+                    .guidance        = cost,
+                };
+                pending_push(pending);
+                if (!candidate_seed_complete_[candidate_index]) {
+                    guided_insert(GuidedEntry{
+                        .target          = child,
+                        .candidate_index = candidate_index,
+                        .lower_bound_ns  = lower_bound_ns,
+                        .guidance        = cost,
+                    });
+                }
+            }
+            return true;
+        };
+
+        const auto candidate_needs_seed = [&](std::uint32_t candidate_index) {
+            return candidate_index < roots.size() && roots[candidate_index].expandable &&
+                   !candidate_seed_complete_[candidate_index] &&
+                   roots[candidate_index].lower_bound_ns <= incumbent.cost.total_ns;
+        };
+        const auto has_open_seed = [&] {
+            return std::any_of(roots.begin(), roots.end(), [&](const IdentityRoot& root) {
+                return candidate_needs_seed(root.candidate_index);
+            });
+        };
+
+        std::vector<const MaterializationOwnerPolicy*> preferred_owners;
+        preferred_owners.reserve(pressure.owner_policy.size());
+        for (const MaterializationOwnerPolicy& policy : pressure.owner_policy) {
+            preferred_owners.push_back(&policy);
+        }
+        std::sort(preferred_owners.begin(), preferred_owners.end(),
+                  [](const auto* left, const auto* right) {
+                      return std::tuple{
+                                 left->selected_hit_count,
+                                 left->explicit_shared_credit ? 1U : 0U,
+                                 left->private_retention_weight,
+                                 left->last_hit_epoch,
+                                 left->ordinal,
+                             } < std::tuple{
+                                     right->selected_hit_count,
+                                     right->explicit_shared_credit ? 1U : 0U,
+                                     right->private_retention_weight,
+                                     right->last_hit_epoch,
+                                     right->ordinal,
+                                 };
+                  });
+        std::vector<std::uint32_t> preferred_owner_ordinals;
+        preferred_owner_ordinals.reserve(preferred_owners.size());
+        for (const MaterializationOwnerPolicy* policy : preferred_owners) {
+            preferred_owner_ordinals.push_back(policy->ordinal);
+        }
+
+        std::vector<IdentityRoot> closure_order;
+        closure_order.reserve(roots.size());
+        for (const IdentityRoot& root : roots) {
+            if (candidate_needs_seed(root.candidate_index)) { closure_order.push_back(root); }
+        }
+        std::sort(closure_order.begin(), closure_order.end(),
+                  [](const IdentityRoot& left, const IdentityRoot& right) {
+                      return std::tuple{left.lower_bound_ns, left.candidate_index} <
+                             std::tuple{right.lower_bound_ns, right.candidate_index};
+                  });
+        for (const IdentityRoot& root : closure_order) {
+            if (!candidate_needs_seed(root.candidate_index) ||
+                elapsed_ns(search_started, Clock::now()) >= guided_watchdog_ns ||
+                optional_targets >= kTargetBudget) {
+                continue;
+            }
+            const Clock::time_point step_started              = Clock::now();
+            const std::optional<PressureTargetHandle> closure = session.guided_closure_target(
+                *candidates[root.candidate_index].candidate, preferred_owner_ordinals);
+            maximum_step_ns = std::max(maximum_step_ns, elapsed_ns(step_started, Clock::now()));
+            if (!closure || contains(assessed_, *closure)) { continue; }
+            if (!contains(discovered_, *closure)) {
+                discovered_.push_back(*closure);
+                ++optional_targets;
+            }
+            const Clock::time_point assessment_started = Clock::now();
+            (void)assess_target(*closure, root.candidate_index);
+            ++guided_assessments;
+            maximum_step_ns =
+                std::max(maximum_step_ns, elapsed_ns(assessment_started, Clock::now()));
+        }
+
+        // Build one ordinary feasible seed per competitive candidate.  Candidate lower bounds
+        // schedule independent Pareto beams; physical distance only orders targets inside one
+        // candidate and can no longer let a shallow Root path starve a deeper reuse path.
+        while (has_open_seed() && !guided_.empty() &&
+               guided_assessments < kGuidedAssessmentBudget) {
+            if (elapsed_ns(search_started, Clock::now()) >= guided_watchdog_ns) { break; }
+            const GuidedEntry next = guided_pop();
+            if (!candidate_needs_seed(next.candidate_index) || contains(expanded_, next.target)) {
+                continue;
+            }
+            std::optional<QueueEntry> exact;
+            if (next.already_assessed_expandable) {
+                exact = QueueEntry{
+                    .target          = next.target,
+                    .candidate_index = next.candidate_index,
+                    .lower_bound_ns  = next.lower_bound_ns,
+                    .remaining_prefill =
+                        identity_costs_[next.candidate_index].remaining_text_prefill,
+                    .remaining_vision_prefill =
+                        identity_costs_[next.candidate_index].remaining_vision_prefill,
+                    .reused_prompt_tokens =
+                        identity_costs_[next.candidate_index].reused_prompt_tokens,
+                    .current_session_binding =
+                        identity_costs_[next.candidate_index].current_session_binding,
+                    .candidate_ordinal = identity_costs_[next.candidate_index].candidate_ordinal,
+                    .stable_target_ordinal = next.candidate_index,
+                };
+            } else if (!contains(assessed_, next.target)) {
+                const Clock::time_point step_started = Clock::now();
+                exact = assess_target(next.target, next.candidate_index);
+                ++guided_assessments;
+                maximum_step_ns = std::max(maximum_step_ns, elapsed_ns(step_started, Clock::now()));
+            }
+            if (!exact || !candidate_needs_seed(next.candidate_index)) { continue; }
+            if (elapsed_ns(search_started, Clock::now()) >= guided_watchdog_ns) { break; }
+            const Clock::time_point step_started = Clock::now();
+            if (!expand_target(*exact)) { break; }
+            maximum_step_ns = std::max(maximum_step_ns, elapsed_ns(step_started, Clock::now()));
+        }
 
         for (;;) {
-            if (queue_.empty()) {
+            while (!queue_.empty() && contains(expanded_, queue_.front().target)) {
+                (void)queue_pop();
+            }
+            while (!pending_.empty() && contains(assessed_, pending_.front().target)) {
+                (void)pending_pop();
+            }
+            if (queue_.empty() && pending_.empty()) {
                 stop_reason   = MaterializationStopReason::QueueExhausted;
                 model_optimal = true;
                 break;
             }
-            const QueueEntry& next = queue_.front();
-            if (next.lower_bound_ns > incumbent.cost.total_ns) {
+            const std::uint64_t queue_bound   = queue_.empty()
+                                                    ? std::numeric_limits<std::uint64_t>::max()
+                                                    : queue_.front().lower_bound_ns;
+            const std::uint64_t pending_bound = pending_.empty()
+                                                    ? std::numeric_limits<std::uint64_t>::max()
+                                                    : pending_.front().lower_bound_ns;
+            const std::uint64_t next_bound    = std::min(queue_bound, pending_bound);
+            if (next_bound > incumbent.cost.total_ns) {
                 stop_reason   = MaterializationStopReason::ModelOptimal;
                 model_optimal = true;
-                break;
-            }
-            if (optional_targets >= kTargetBudget) {
-                stop_reason      = MaterializationStopReason::TargetBudget;
-                model_optimal    = false;
-                budget_exhausted = true;
                 break;
             }
             const std::uint64_t elapsed = elapsed_ns(search_started, Clock::now());
@@ -255,112 +509,79 @@ public:
                 break;
             }
             const std::uint64_t possible_improvement =
-                incumbent.cost.total_ns > next.lower_bound_ns
-                    ? incumbent.cost.total_ns - next.lower_bound_ns
-                    : 0;
-            if (maximum_expansion_ns != 0 && maximum_expansion_ns >= possible_improvement) {
+                incumbent.cost.total_ns > next_bound ? incumbent.cost.total_ns - next_bound : 0;
+            if (possible_improvement != 0 && maximum_step_ns != 0 &&
+                maximum_step_ns >= possible_improvement) {
                 stop_reason   = MaterializationStopReason::ValueOfNextExpansion;
                 model_optimal = false;
                 break;
             }
 
-            const QueueEntry parent = queue_pop();
-            if (contains(expanded_, parent.target)) { continue; }
-            const Clock::time_point expansion_started = Clock::now();
-            auto prepared                             = session.prepare_expansion(parent.target);
-            if (prepared.new_canonical_count() > kTargetBudget - optional_targets) {
-                session.discard_expansion(std::move(prepared));
-                interrupted_lower_bound = parent.lower_bound_ns;
-                stop_reason             = MaterializationStopReason::ExpansionCapacity;
-                model_optimal           = false;
-                budget_exhausted        = true;
-                break;
-            }
-            const auto children = session.commit_expansion(std::move(prepared));
-            optional_targets += children.new_canonical_count;
-            expanded_.push_back(parent.target);
-
-            for (const PressureTargetHandle child : children.children) {
-                if (contains(assessed_, child)) { continue; }
-                PressureTargetAssessment assessment = session.assess(child);
-                assessed_.push_back(child);
-                ++targets_evaluated;
-                planning_saturating_add(projection_work, assessment.projection_work);
-                const FoldedCost cost =
-                    fold_assessment(candidates[assessment.candidate_ordinal], assessment,
-                                    pressure.owner_policy, pressure.checkpoint_policy);
-                std::optional<LogicalGoal> goal;
-                if (assessment.physical_status == MaterializationPhysicalStatus::Feasible) {
-                    goal = logical_goal(assessment.candidate_ordinal, assessment.source_disposition,
-                                        assessment.owner_outcomes);
+            const bool assess_pending =
+                !pending_.empty() && (queue_.empty() || pending_bound <= queue_bound);
+            const Clock::time_point step_started = Clock::now();
+            if (assess_pending) {
+                const PendingEntry next = pending_pop();
+                if (!contains(assessed_, next.target)) {
+                    (void)assess_target(next.target, next.candidate_index);
                 }
-                if (goal && cost.less(incumbent.cost)) {
-                    incumbent =
-                        make_incumbent(child, assessment, candidates[assessment.candidate_ordinal],
-                                       pressure.owner_policy, pressure.checkpoint_policy, *goal);
+            } else {
+                if (optional_targets >= kTargetBudget) {
+                    interrupted_lower_bound =
+                        std::min(interrupted_lower_bound, queue_.front().lower_bound_ns);
+                    stop_reason      = MaterializationStopReason::TargetBudget;
+                    model_optimal    = false;
+                    budget_exhausted = true;
+                    break;
                 }
-                if (assessment.expandable && cost.lower_bound_ns <= incumbent.cost.total_ns) {
-                    queue_push(QueueEntry{
-                        .target                    = child,
-                        .candidate_index           = assessment.candidate_ordinal,
-                        .lower_bound_ns            = cost.lower_bound_ns,
-                        .affected_selected_hits    = cost.affected_selected_hits,
-                        .newest_affected_hit_epoch = cost.newest_affected_hit_epoch,
-                        .owner_evictions           = cost.owner_evictions,
-                        .checkpoint_drops          = cost.checkpoint_drops,
-                        .copy_operations           = cost.copy_operations,
-                        .transferred_bytes         = cost.transferred_bytes,
-                        .remaining_prefill         = cost.remaining_text_prefill,
-                        .remaining_vision_prefill  = cost.remaining_vision_prefill,
-                        .reused_prompt_tokens      = cost.reused_prompt_tokens,
-                        .current_session_binding   = cost.current_session_binding,
-                        .candidate_ordinal         = cost.candidate_ordinal,
-                        .stable_target_ordinal     = assessment.stable_target_ordinal,
-                    });
+                const QueueEntry parent = queue_pop();
+                if (!expand_target(parent)) {
+                    stop_reason      = MaterializationStopReason::ExpansionCapacity;
+                    model_optimal    = false;
+                    budget_exhausted = true;
+                    break;
                 }
             }
-            maximum_expansion_ns =
-                std::max(maximum_expansion_ns, elapsed_ns(expansion_started, Clock::now()));
+            maximum_step_ns = std::max(maximum_step_ns, elapsed_ns(step_started, Clock::now()));
         }
 
-        const std::uint64_t search_elapsed_ns        = elapsed_ns(search_started, Clock::now());
-        PressureTargetAssessment selected_assessment = session.assess(incumbent.target);
-        planning_saturating_add(projection_work, selected_assessment.projection_work);
-        const FoldedCost selected_cost =
-            fold_assessment(candidates[incumbent.candidate_index], selected_assessment,
-                            pressure.owner_policy, pressure.checkpoint_policy);
-        if (!equivalent(selected_cost, incumbent.cost) ||
-            selected_assessment.assessment_digest != incumbent.assessment_digest) {
-            throw std::logic_error("selected pressure target changed before seal");
-        }
-        std::vector<PressureOwnerOutcome> selected_outcomes(
-            selected_assessment.owner_outcomes.begin(), selected_assessment.owner_outcomes.end());
-        std::optional<ResourcePlan> sealed = session.seal(incumbent.target, prompt);
+        const std::uint64_t search_elapsed_ns = elapsed_ns(search_started, Clock::now());
+        std::optional<ResourcePlan> sealed    = session.seal(incumbent.target, prompt);
         if (!sealed) { throw std::logic_error("selected pressure target could not be sealed"); }
 
-        std::uint64_t best_remaining =
-            queue_.empty() ? interrupted_lower_bound : queue_.front().lower_bound_ns;
-        best_remaining = std::min(best_remaining, interrupted_lower_bound);
-        if (best_remaining == std::numeric_limits<std::uint64_t>::max()) {
-            best_remaining = selected_cost.total_ns;
+        while (!queue_.empty() && contains(expanded_, queue_.front().target)) { (void)queue_pop(); }
+        while (!pending_.empty() && contains(assessed_, pending_.front().target)) {
+            (void)pending_pop();
         }
-        MaterializationDiagnostics diagnostics = make_diagnostics(
-            selected_cost, targets_evaluated, projection_work, planning_started, search_elapsed_ns,
-            stop_reason, model_optimal, budget_exhausted, best_remaining,
-            selected_assessment.degradation_units, selected_assessment.root_maximal);
+        std::uint64_t best_remaining = interrupted_lower_bound;
+        if (!queue_.empty()) {
+            best_remaining = std::min(best_remaining, queue_.front().lower_bound_ns);
+        }
+        if (!pending_.empty()) {
+            best_remaining = std::min(best_remaining, pending_.front().lower_bound_ns);
+        }
+        if (best_remaining == std::numeric_limits<std::uint64_t>::max()) {
+            best_remaining = incumbent.cost.total_ns;
+        }
+        MaterializationDiagnostics diagnostics =
+            make_diagnostics(incumbent.cost, targets_evaluated, projection_work, planning_started,
+                             search_elapsed_ns, stop_reason, model_optimal, budget_exhausted,
+                             best_remaining, incumbent.degradation_units, incumbent.root_maximal);
 
         Result result;
         result.plan               = std::move(*sealed);
         result.candidate_index    = incumbent.candidate_index;
         result.publication_slot   = incumbent.publication_slot;
-        result.source_disposition = selected_assessment.source_disposition;
-        result.owner_outcomes     = std::move(selected_outcomes);
+        result.source_disposition = incumbent.source_disposition;
+        result.owner_outcomes     = std::move(incumbent.owner_outcomes);
         result.diagnostics        = diagnostics;
         return result;
     }
 
 private:
-    static constexpr std::uint32_t kTargetBudget = 4096;
+    static constexpr std::uint32_t kTargetBudget           = 4096;
+    static constexpr std::uint32_t kGuidedBeamWidth        = 16;
+    static constexpr std::uint32_t kGuidedAssessmentBudget = 32;
 
     struct FoldedCost {
         std::uint64_t now_ns                    = 0;
@@ -409,7 +630,9 @@ private:
         std::uint32_t publication_slot      = std::numeric_limits<std::uint32_t>::max();
         ClaimDisposition source_disposition = ClaimDisposition::ConsumedToActive;
         FoldedCost cost;
-        std::uint64_t assessment_digest = 0;
+        std::vector<PressureOwnerOutcome> owner_outcomes;
+        std::uint32_t degradation_units = 0;
+        bool root_maximal               = false;
     };
 
     struct IdentityRoot {
@@ -434,6 +657,67 @@ private:
         bool current_session_binding            = false;
         std::uint32_t candidate_ordinal         = 0;
         std::uint32_t stable_target_ordinal     = 0;
+    };
+
+    struct GuidanceCost {
+        std::uint32_t estimated_remaining_steps = 0;
+        std::uint32_t unsatisfied_constraints   = 0;
+        std::uint64_t normalized_residual_q20   = 0;
+        std::uint64_t affected_selected_hits    = 0;
+        std::uint64_t newest_affected_hit_epoch = 0;
+        std::uint64_t retention_weight          = 0;
+        std::uint32_t explicit_shared_losses    = 0;
+        std::uint32_t owner_evictions           = 0;
+        std::uint32_t checkpoint_drops          = 0;
+        std::uint32_t degradation_units         = 0;
+        std::uint64_t estimated_immediate_ns    = 0;
+        std::uint32_t copy_operations           = 0;
+        std::uint64_t transferred_bytes         = 0;
+        std::uint64_t remaining_prefill         = 0;
+        std::uint64_t remaining_vision_prefill  = 0;
+        std::uint32_t reused_prompt_tokens      = 0;
+        bool current_session_binding            = false;
+        std::uint32_t candidate_ordinal         = 0;
+        std::uint32_t stable_target_ordinal     = 0;
+
+        [[nodiscard]] auto key() const noexcept {
+            return std::tuple{
+                affected_selected_hits,
+                explicit_shared_losses,
+                owner_evictions,
+                checkpoint_drops,
+                newest_affected_hit_epoch,
+                estimated_remaining_steps,
+                unsatisfied_constraints,
+                normalized_residual_q20,
+                retention_weight,
+                degradation_units,
+                estimated_immediate_ns,
+                copy_operations,
+                transferred_bytes,
+                remaining_prefill,
+                remaining_vision_prefill,
+                std::numeric_limits<std::uint32_t>::max() - reused_prompt_tokens,
+                current_session_binding ? 0U : 1U,
+                candidate_ordinal,
+                stable_target_ordinal,
+            };
+        }
+    };
+
+    struct PendingEntry {
+        PressureTargetHandle target{};
+        std::uint32_t candidate_index = 0;
+        std::uint64_t lower_bound_ns  = 0;
+        GuidanceCost guidance;
+    };
+
+    struct GuidedEntry {
+        PressureTargetHandle target{};
+        std::uint32_t candidate_index = 0;
+        std::uint64_t lower_bound_ns  = 0;
+        GuidanceCost guidance;
+        bool already_assessed_expandable = false;
     };
 
     struct CombinedImpact {
@@ -489,6 +773,46 @@ private:
         cost.current_session_binding  = candidate.current_session_binding;
         cost.candidate_ordinal        = candidate.stable_ordinal;
         cost.target_ordinal           = candidate.stable_ordinal;
+        return cost;
+    }
+
+    [[nodiscard]] GuidanceCost
+    fold_guidance(const CandidateInput& candidate, const PressureTargetGuidance& guidance,
+                  std::span<const MaterializationOwnerPolicy> owner_policies) const {
+        GuidanceCost cost;
+        cost.estimated_remaining_steps = guidance.physical.estimated_remaining_steps;
+        cost.unsatisfied_constraints   = guidance.physical.unsatisfied_constraints;
+        cost.normalized_residual_q20   = guidance.physical.normalized_residual_q20;
+        cost.checkpoint_drops          = guidance.dropped_checkpoints;
+        cost.degradation_units         = guidance.degradation_units;
+        cost.estimated_immediate_ns    = guidance.estimated_machine.immediate_ns;
+        cost.copy_operations           = guidance.estimated_machine.copy_operations;
+        cost.transferred_bytes         = guidance.estimated_machine.transferred_bytes;
+        cost.remaining_prefill         = guidance.estimated_machine.remaining_prefill_work.tokens;
+        cost.remaining_vision_prefill =
+            guidance.estimated_machine.remaining_prefill_work.vision_patches;
+        cost.reused_prompt_tokens    = guidance.estimated_machine.reused_prompt_tokens;
+        cost.current_session_binding = candidate.current_session_binding;
+        cost.candidate_ordinal       = candidate.stable_ordinal;
+        cost.stable_target_ordinal   = guidance.stable_target_ordinal;
+
+        for (const PressureOwnerOutcome& outcome : guidance.owner_outcomes) {
+            const MaterializationOwnerPolicy* policy =
+                owner_policy_for(owner_policies, outcome.owner_ordinal);
+            if (policy == nullptr) {
+                throw std::logic_error("pressure guidance references an unknown logical owner");
+            }
+            if (outcome.disposition == ClaimDisposition::Evicted) { ++cost.owner_evictions; }
+            const bool may_reduce_recovery_value =
+                outcome.disposition == ClaimDisposition::Evicted ||
+                outcome.dropped_checkpoints != 0 || outcome.degradation_units != 0;
+            if (!may_reduce_recovery_value) { continue; }
+            planning_saturating_add(cost.affected_selected_hits, policy->selected_hit_count);
+            cost.newest_affected_hit_epoch =
+                std::max(cost.newest_affected_hit_epoch, policy->last_hit_epoch);
+            planning_saturating_add(cost.retention_weight, policy->private_retention_weight);
+            if (policy->explicit_shared_credit) { ++cost.explicit_shared_losses; }
+        }
         return cost;
     }
 
@@ -595,22 +919,20 @@ private:
         return cost;
     }
 
-    [[nodiscard]] Incumbent make_incumbent(
-        PressureTargetHandle target, const PressureTargetAssessment& assessment,
-        const CandidateInput& candidate, std::span<const MaterializationOwnerPolicy> owner_policy,
-        std::span<const MaterializationCheckpointPolicy> checkpoint_policy, LogicalGoal goal) {
+    [[nodiscard]] static Incumbent make_incumbent(PressureTargetHandle target,
+                                                  const PressureTargetAssessment& assessment,
+                                                  FoldedCost cost, LogicalGoal goal) {
         return Incumbent{
             .target             = target,
             .candidate_index    = assessment.candidate_ordinal,
             .publication_slot   = goal.publication_slot,
             .source_disposition = assessment.source_disposition,
-            .cost = fold_assessment(candidate, assessment, owner_policy, checkpoint_policy),
-            .assessment_digest = assessment.assessment_digest,
+            .cost               = std::move(cost),
+            .owner_outcomes = std::vector<PressureOwnerOutcome>(assessment.owner_outcomes.begin(),
+                                                                assessment.owner_outcomes.end()),
+            .degradation_units = assessment.degradation_units,
+            .root_maximal      = assessment.root_maximal,
         };
-    }
-
-    [[nodiscard]] static bool equivalent(const FoldedCost& left, const FoldedCost& right) noexcept {
-        return left.key() == right.key();
     }
 
     [[nodiscard]] static auto queue_key(const QueueEntry& entry) noexcept {
@@ -644,6 +966,110 @@ private:
         });
         QueueEntry result = std::move(queue_.back());
         queue_.pop_back();
+        return result;
+    }
+
+    [[nodiscard]] static auto pending_key(const PendingEntry& entry) noexcept {
+        return std::tuple{entry.lower_bound_ns, entry.guidance.key()};
+    }
+
+    void pending_push(PendingEntry entry) {
+        pending_.push_back(std::move(entry));
+        std::push_heap(pending_.begin(), pending_.end(), [](const auto& left, const auto& right) {
+            return pending_key(right) < pending_key(left);
+        });
+    }
+
+    [[nodiscard]] PendingEntry pending_pop() {
+        std::pop_heap(pending_.begin(), pending_.end(), [](const auto& left, const auto& right) {
+            return pending_key(right) < pending_key(left);
+        });
+        PendingEntry result = std::move(pending_.back());
+        pending_.pop_back();
+        return result;
+    }
+
+    [[nodiscard]] static bool guidance_dominates(const GuidanceCost& left,
+                                                 const GuidanceCost& right) noexcept {
+        const std::array<std::uint64_t, 13> left_dimensions{
+            left.estimated_remaining_steps, left.unsatisfied_constraints,
+            left.normalized_residual_q20,   left.affected_selected_hits,
+            left.newest_affected_hit_epoch, left.explicit_shared_losses,
+            left.retention_weight,          left.owner_evictions,
+            left.checkpoint_drops,          left.estimated_immediate_ns,
+            left.degradation_units,         left.copy_operations,
+            left.transferred_bytes,
+        };
+        const std::array<std::uint64_t, 13> right_dimensions{
+            right.estimated_remaining_steps, right.unsatisfied_constraints,
+            right.normalized_residual_q20,   right.affected_selected_hits,
+            right.newest_affected_hit_epoch, right.explicit_shared_losses,
+            right.retention_weight,          right.owner_evictions,
+            right.checkpoint_drops,          right.estimated_immediate_ns,
+            right.degradation_units,         right.copy_operations,
+            right.transferred_bytes,
+        };
+        bool strict = false;
+        for (std::size_t index = 0; index < left_dimensions.size(); ++index) {
+            if (left_dimensions[index] > right_dimensions[index]) { return false; }
+            strict = strict || left_dimensions[index] < right_dimensions[index];
+        }
+        return strict;
+    }
+
+    void guided_insert(GuidedEntry entry) {
+        if (std::any_of(guided_.begin(), guided_.end(), [&](const GuidedEntry& existing) {
+                return existing.candidate_index == entry.candidate_index &&
+                       existing.lower_bound_ns <= entry.lower_bound_ns &&
+                       guidance_dominates(existing.guidance, entry.guidance);
+            })) {
+            return;
+        }
+        std::erase_if(guided_, [&](const GuidedEntry& existing) {
+            return existing.candidate_index == entry.candidate_index &&
+                   entry.lower_bound_ns <= existing.lower_bound_ns &&
+                   guidance_dominates(entry.guidance, existing.guidance);
+        });
+        guided_.push_back(std::move(entry));
+        const std::uint32_t candidate_index = guided_.back().candidate_index;
+        const std::size_t candidate_size    = static_cast<std::size_t>(
+            std::count_if(guided_.begin(), guided_.end(), [&](const GuidedEntry& item) {
+                return item.candidate_index == candidate_index;
+            }));
+        if (candidate_size <= kGuidedBeamWidth) { return; }
+        auto worst = guided_.end();
+        for (auto item = guided_.begin(); item != guided_.end(); ++item) {
+            if (item->candidate_index != candidate_index) { continue; }
+            if (worst == guided_.end() ||
+                std::tuple{worst->lower_bound_ns, worst->guidance.key()} <
+                    std::tuple{item->lower_bound_ns, item->guidance.key()}) {
+                worst = item;
+            }
+        }
+        if (worst == guided_.end()) {
+            throw std::logic_error("candidate guided beam accounting is inconsistent");
+        }
+        guided_.erase(worst);
+    }
+
+    [[nodiscard]] GuidedEntry guided_pop() {
+        const auto key = [&](const GuidedEntry& entry) {
+            if (entry.candidate_index >= candidate_guided_steps_.size()) {
+                throw std::logic_error("guided target candidate index is invalid");
+            }
+            return std::tuple{
+                candidate_guided_steps_[entry.candidate_index] == 0 ? 0U : 1U,
+                entry.lower_bound_ns,
+                entry.guidance.key(),
+            };
+        };
+        const auto best    = std::min_element(guided_.begin(), guided_.end(),
+                                              [&](const GuidedEntry& left, const GuidedEntry& right) {
+                                               return key(left) < key(right);
+                                           });
+        GuidedEntry result = std::move(*best);
+        guided_.erase(best);
+        ++candidate_guided_steps_[result.candidate_index];
         return result;
     }
 
@@ -692,9 +1118,14 @@ private:
     }
 
     std::vector<QueueEntry> queue_;
+    std::vector<PendingEntry> pending_;
+    std::vector<GuidedEntry> guided_;
     std::vector<FoldedCost> identity_costs_;
+    std::vector<std::uint32_t> candidate_guided_steps_;
+    std::vector<std::uint8_t> candidate_seed_complete_;
     std::vector<PressureTargetHandle> assessed_;
     std::vector<PressureTargetHandle> expanded_;
+    std::vector<PressureTargetHandle> discovered_;
     std::vector<CombinedImpact> impact_scratch_;
     ContextPortfolioValue portfolio_value_;
     std::vector<ContextPortfolioOwnerPolicy> portfolio_owner_scratch_;

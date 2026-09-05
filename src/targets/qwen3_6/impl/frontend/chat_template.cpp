@@ -803,7 +803,7 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
         const bool keep_thinking = preserve_thinking ||
                                    (froggeric && !options.enable_thinking &&
                                     reasoning.text.empty());
-        if (!preserve_thinking && !rewrite_checkpoint && static_cast<long>(i) > last_query_index) {
+        if (!preserve_thinking && static_cast<long>(i) > last_query_index) {
             // Closing the current turn may rewrite everything beginning with this assistant
             // segment. Keep the stable history before the opener recoverable; retaining the
             // deterministic opener itself is not worth losing the whole prefix when a caller
@@ -847,7 +847,7 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
         if (preserve_thinking) {
             rewrite_checkpoint = RewriteCheckpointByteSpec{
                 .kind = RewriteCheckpointKind::ResponseReplay, .offset = generation_begin};
-        } else if (!rewrite_checkpoint) {
+        } else {
             rewrite_checkpoint = RewriteCheckpointByteSpec{
                 .kind = RewriteCheckpointKind::TurnClosure, .offset = generation_begin};
         }

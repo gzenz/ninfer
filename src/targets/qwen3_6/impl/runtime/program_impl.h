@@ -10093,10 +10093,9 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
             reserve_state_entitlement(sequence, state_slots);
             refresh_state_views(sequence);
         } else if (is_rewrite_checkpoint_restore(request_plan.reuse)) {
-            if (!sequence.kv || sequence.text_kv_valid < base) {
-                throw std::logic_error("resident rewrite checkpoint has no complete KV allocation");
-            }
-            if (!sequence.rewrite_state || !state_store->valid(*sequence.rewrite_state) ||
+          try {
+            if (!sequence.kv || sequence.text_kv_valid < base ||
+                !sequence.rewrite_state || !state_store->valid(*sequence.rewrite_state) ||
                 state_store->role(*sequence.rewrite_state) != StateImageRole::CheckpointImmutable ||
                 (sequence.endpoint_valid &&
                  (!state_store->valid(sequence.state.read) ||
@@ -10130,6 +10129,17 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
                     state_store->freeze(*new_rewrite);
                     state_store->retain_checkpoint_reference(*new_rewrite);
                     sequence.rewrite_state = *new_rewrite;
+                    // If the new rewrite_state would exceed the slot budget,
+                    // release it and drop the checkpoint. The prefill will
+                    // proceed without a rewrite checkpoint for this turn.
+                    if (state_footprint(sequence) + 1 > state_slots) {
+                        state_store->release_checkpoint_reference(*new_rewrite);
+                        if (!state_store->release(*new_rewrite)) {
+                            std::fprintf(stderr, "[rewrite-restore] WARNING: leaked state slot\n");
+                        }
+                        sequence.rewrite_state.reset();
+                        sequence.rewrite_checkpoint = {};
+                    }
                 } else {
                     sequence.rewrite_checkpoint = {};
                 }
@@ -10157,6 +10167,10 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
             sequence.prefix_digests.truncate(base);
             reserve_state_entitlement(sequence, state_slots);
             refresh_state_views(sequence);
+          } catch (const std::exception& e) {
+            std::fprintf(stderr, "[rewrite-restore] FAILED: %s\n", e.what());
+            throw;
+          }
         } else {
             throw std::logic_error("request plan has an invalid prefix reuse path");
         }

@@ -1,15 +1,34 @@
 <!-- fork-changelog -->
 ## Fork changes vs upstream
 
+This fork targets **reliable 555k-context inference with 3 concurrent agentic sessions** (Claude Code, etc.) on a single RTX 5090 with NVFP4 KV. It is a clean divergence — upstream has its own host-KV cache implementation; ours is independently developed and battle-tested with real workloads.
+
+### Context cache and eviction
+
+- **Host-KV safety net** (`--host-kv-mib`, `--host-state-slots`): when device KV is full, evicted continuations are spilled to a pinned host arena (D2H) and restored via H2D on cache reuse. Scatter-gather allocation handles arena fragmentation. Smallest-first eviction with pinned-entry protection. Verified across 140+ requests with 3 concurrent 330k–470k sessions.
+- **Rewrite checkpoint at turn boundary**: checkpoint is captured where the prompt ends (before reasoning begins), not at the execution frontier. Follow-up prompts with `preserve_thinking=off` match the stored ledger up to the checkpoint.
+- **Token stability with `preserve_thinking=off`**: reasoning is dropped from ALL assistant messages when `preserve_thinking=off`, keeping prompt tokens stable across turns. Without this, the last assistant message's reasoning was kept on its turn but dropped on the next, shifting all subsequent tokens and breaking prefix reuse.
+- **Checkpoint lifecycle preservation**: rewrite checkpoint is retained when state slot reservation fails during `finish()` instead of being silently dropped. The aliased state image is still valid.
+
+### Engine robustness
+
+- **OOM recovery** (`std::bad_alloc` catch): materialization reserve and worker loop catch OOM, clear active state while preserving pending requests, back off admission for 4 iterations, fail all after 8 consecutive recoveries.
+
+### Context and model
+
+- **YaRN context extension** (`--rope-scaling-factor`, `--rope-scaling-original-context`): linear RoPE scaling to 555k context (c=3+vision) or 600k (c=1). No quality loss measured up to 600k.
 - **NVFP4 KV cache** (`--kv-dtype nvfp4`): 4-bit E2M1 codes + E4M3 group-16 scales. 45% less KV VRAM than int8.
-- **YaRN context extension** (`--rope-scaling-factor`): linear RoPE scaling up to 555k context (c=3+vision) or 600k (c=1). No quality loss.
-- **Host-KV thrash fix**: un-suppresses demote-to-host when candidate needs host KV budget (issue #98).
-- **Froggeric v22 chat template**: `ChatTemplateSemantics::FroggericV22` with no-dangling-intent rule.
+- **Froggeric v22 chat template**: C++ renderer with no-dangling-intent rule, stricter tool-call instructions, and think-close variant handling.
 - **Tolerant tool-call recovery** (`--tolerant-tool-calls`): recovers complete Qwen calls with malformed wrappers.
-- **Depth-matching tool-call close scan**: handles balanced nested markers in parameter values.
-- **Request-log rotation** (`--request-log-max-mib`, `--request-log-keep`): size-based JSONL rotation.
-- **/stats endpoint**: runtime gauges, KV transfer counters, pressure metrics, cache reuse paths.
+- **Reasoning-effort tier mapping**: High/Max map to XHigh instead of rejecting.
 - **Ostfralla artifact routing**: maps qwen3.8/nvfp4 to Qwen36Nvfp4 (W8G32) profile.
+
+### Monitoring and tooling
+
+- **/stats endpoint**: runtime gauges, KV transfer counters, pressure metrics, cache reuse paths.
+- **Monitoring dashboard** (`tools/monitor/`): live GPU/util/decode/prefill/TTFT graphs, KV cache occupancy, request log, 12VHPWR sensor.
+- **E2E test suite** (`tools/e2e/`): multi-phase KV eviction, device-KV pressure, slot pressure, trash mode.
+- **Request-log rotation** (`--request-log-max-mib`, `--request-log-keep`): size-based JSONL rotation.
 
 Details: [docs/maintainer/kv-nvfp4-yarn.md](docs/maintainer/kv-nvfp4-yarn.md)
 

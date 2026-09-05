@@ -308,6 +308,61 @@ std::optional<HostKVAllocation> HostKVArena::allocate(const HostKVPageLayout& la
     return HostKVAllocation(*this, descriptor_index, descriptor.generation);
 }
 
+std::vector<HostKVAllocation>
+HostKVArena::allocate_multi(const HostKVPageLayout& layout, std::uint32_t pages) noexcept {
+    try {
+        std::vector<HostKVAllocation> result;
+        if (pages == 0) { return result; }
+        const std::optional<std::uint32_t> layout_index = find_layout(layout);
+        if (!layout_index) { return result; }
+        const std::size_t page_stride = layout.page_stride;
+
+        // Check total free space first.
+        if (free_bytes() < page_stride * static_cast<std::size_t>(pages)) { return result; }
+
+        // Limit scatter-gather to 8 fragments — more indicates extreme
+        // fragmentation where the overhead outweighs the benefit.
+        constexpr std::uint32_t max_fragments = 8;
+        std::uint32_t remaining = pages;
+        std::uint32_t fragments = 0;
+        while (remaining > 0 && fragments < max_fragments) {
+            // Find the largest free extent.
+            std::size_t best_index = std::numeric_limits<std::size_t>::max();
+            std::size_t best_bytes = 0;
+            for (std::size_t i = 0; i < free_extents_.size(); ++i) {
+                if (free_extents_[i].bytes > best_bytes) {
+                    best_bytes = free_extents_[i].bytes;
+                    best_index = i;
+                }
+            }
+            if (best_index == std::numeric_limits<std::size_t>::max()) { break; }
+
+            // How many pages fit in this extent?
+            const std::uint32_t fit_pages = static_cast<std::uint32_t>(
+                std::min(free_extents_[best_index].bytes / page_stride,
+                         static_cast<std::size_t>(remaining)));
+            if (fit_pages == 0) { break; }
+
+            // Allocate from this extent.
+            std::optional<HostKVAllocation> block = allocate(layout, fit_pages);
+            if (!block) { break; }
+            result.push_back(std::move(*block));
+            remaining -= fit_pages;
+            ++fragments;
+        }
+
+        if (remaining > 0) {
+            // Couldn't allocate everything — roll back.
+            result.clear();
+        }
+        return result;
+    } catch (...) {
+        // noexcept: swallow std::bad_alloc from vector operations.
+        // Partial allocations are freed by HostKVAllocation destructors.
+        return {};
+    }
+}
+
 std::optional<HostKVAllocationRecipe> HostKVArena::plan_after_releases(
     std::span<const HostKVAllocationHandle> proposed_releases,
     std::span<const HostKVAllocationRequest> target_allocations) const {

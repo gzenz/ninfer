@@ -774,9 +774,13 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
 
         // froggeric v22: suppress empty think blocks on replay only when thinking is
         // enabled. With thinking disabled the generation prologue itself is an empty
-        // think block, so replay must keep it to stay token-consistent for prefix reuse.
-        const bool keep_thinking = (preserve_thinking || (static_cast<long>(i) > last_query_index)) &&
-                                   (!froggeric || !reasoning.text.empty() || !options.enable_thinking);
+        // When preserve_thinking=false, drop reasoning from ALL assistant
+        // messages to keep tokens stable across turns.  The only exception is
+        // froggeric with thinking disabled: the generation prologue is an
+        // empty think block that must be kept for token consistency.
+        const bool keep_thinking = preserve_thinking ||
+                                   (froggeric && !options.enable_thinking &&
+                                    reasoning.text.empty());
         if (!preserve_thinking && !rewrite_checkpoint && static_cast<long>(i) > last_query_index) {
             // Closing the current turn may rewrite everything beginning with this assistant
             // segment. Keep the stable history before the opener recoverable; retaining the

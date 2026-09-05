@@ -11,6 +11,7 @@
 #include <bit>
 #include <chrono>
 #include <cstddef>
+#include <cstdio>
 #include <cstdint>
 #include <limits>
 #include <optional>
@@ -308,14 +309,24 @@ public:
         std::optional<AdmissionCandidate> root = program.inspect_admission(
             prompt, base, *destination, nullptr, nullptr, std::nullopt, false, cost_model_);
         if (!root) { throw std::logic_error("Program rejected isolated root planning"); }
+        root->set_session_key(base.context_cache().session_key);
         candidates.push_back(Candidate{.plan = std::move(*root)});
 
         if (cache_enabled_) {
+            std::uint32_t shortlist_valid = 0, shortlist_key_miss = 0, shortlist_inspect_miss = 0;
             for (const PrefixIndexEntry& index : prefix_index_) {
                 if (!valid_prefix_index_entry(index)) { continue; }
+                ++shortlist_valid;
                 const std::optional<PrefixShortlistKey> incoming =
                     base.prefix_shortlist_key(index.key.frontier);
-                if (!incoming || *incoming != index.key) { continue; }
+                if (!incoming || *incoming != index.key) {
+                    ++shortlist_key_miss;
+                    std::fprintf(stderr,
+                                 "[shortlist] key MISS: slot=%u frontier=%u tag_match=%d\n",
+                                 index.slot, index.key.frontier,
+                                 incoming ? (incoming->identity_tag == index.key.identity_tag) : -1);
+                    continue;
+                }
 
                 if (!index.shared) {
                     const CatalogEntry& entry = catalog_[index.slot];
@@ -330,7 +341,14 @@ public:
                     std::optional<AdmissionCandidate> plan =
                         program.inspect_admission(prompt, base, *destination, &*entry.handle,
                                                   nullptr, index.checkpoint, retain, cost_model_);
-                    if (!plan) { continue; }
+                    if (!plan) {
+                        ++shortlist_inspect_miss;
+                        std::fprintf(stderr,
+                                     "[shortlist] inspect MISS: slot=%u frontier=%u retain=%d\n",
+                                     index.slot, index.checkpoint.frontier, static_cast<int>(retain));
+                        continue;
+                    }
+                    plan->set_session_key(base.context_cache().session_key);
                     if (plan->summary().reusable_prompt_tokens == 0 ||
                         (retain && plan->identity_assessment().source_disposition !=
                                        ClaimDisposition::Retained)) {
@@ -342,6 +360,10 @@ public:
                         session_index_[*current_session_cell].owner_id == entry.id &&
                         session_index_[*current_session_cell].revision == entry.revision;
                     append_unique(provisional_demand.exact_resident_keys, index.key);
+                    std::fprintf(stderr,
+                                 "[shortlist] HIT: slot=%u frontier=%u reuse_tokens=%u\n",
+                                 index.slot, index.checkpoint.frontier,
+                                 plan->summary().reusable_prompt_tokens);
                     candidates.push_back(Candidate{
                         .plan                    = std::move(*plan),
                         .current_session_binding = current_session_binding,
@@ -388,6 +410,92 @@ public:
                     .source_key = index.key,
                 });
             }
+
+            // Session-key fallback: openai_responses follow-ups do not always
+            // produce a PrefixShortlistKey match, so the shortlist loop above
+            // skips the request's own catalogued (possibly host-demoted)
+            // continuation and every turn re-prefills from scratch. Fall back
+            // to the session index: a Catalogued entry published under the
+            // same session key is a private candidate; inspect_admission
+            // decides how many tokens actually match and the materialization
+            // planner performs any host-KV restore (needs_transfer).
+            std::fprintf(stderr,
+                         "[shortlist] summary: valid=%u key_miss=%u inspect_miss=%u candidates=%zu\n",
+                         shortlist_valid, shortlist_key_miss, shortlist_inspect_miss, candidates.size());
+            if (base.context_cache().session_key && base.context_cache().update_session_index) {
+                for (std::uint32_t slot = 0; slot < catalog_count_; ++slot) {
+                    const CatalogEntry& entry = catalog_[slot];
+                    if (entry.state != CatalogState::Catalogued || !entry.handle ||
+                        entry.active_references != 0) {
+                        continue;
+                    }
+                    if (!entry.session || *entry.session != *base.context_cache().session_key) {
+                        continue;
+                    }
+                    // Skip entries the shortlist loop already selected as
+                    // candidates (dedup by slot). NOTE: prefix_index_ membership
+                    // can NOT be used here — rebuild_prefix_index() lists every
+                    // Catalogued entry, including the ones whose shortlist key
+                    // did not match, which are exactly the ones this fallback
+                    // must handle.
+                    bool selected = false;
+                    for (const Candidate& c : candidates) {
+                        if (c.source_slot == slot) { selected = true; break; }
+                    }
+                    if (selected) { continue; }
+                    // Try the endpoint checkpoint first. If thinking mode
+                    // (preserve_thinking=off) dropped reasoning from the
+                    // follow-up prompt, the endpoint won't match — the prompt
+                    // diverges from the ledger at the reasoning point. Fall
+                    // back to the rewrite checkpoint (turn boundary), which
+                    // is where the prompt still matches the cached ledger.
+                    std::optional<AdmissionCandidate> plan;
+                    runtime::CheckpointRef checkpoint{};
+                    if (entry.summary.endpoint) {
+                        checkpoint = runtime::CheckpointRef{
+                            .kind     = runtime::CheckpointKind::SessionEndpoint,
+                            .frontier = entry.summary.endpoint->ref.frontier,
+                            .ordinal  = 0};
+                        plan = program.inspect_admission(prompt, base, *destination, &*entry.handle,
+                                                         nullptr, checkpoint, false, cost_model_);
+                    }
+                    if ((!plan || plan->summary().reusable_prompt_tokens == 0) &&
+                        entry.summary.rewrite) {
+                        checkpoint = runtime::CheckpointRef{
+                            .kind     = entry.summary.rewrite->ref.kind,
+                            .frontier = entry.summary.rewrite->ref.frontier,
+                            .ordinal  = entry.summary.rewrite->ref.ordinal};
+                        plan = program.inspect_admission(prompt, base, *destination, &*entry.handle,
+                                                         nullptr, checkpoint, false, cost_model_);
+                    }
+                    if (plan) { plan->set_session_key(base.context_cache().session_key); }
+                    if (!plan || plan->summary().reusable_prompt_tokens == 0) { continue; }
+                    const bool current_session_binding =
+                        current_session_cell &&
+                        session_index_[*current_session_cell].slot == slot &&
+                        session_index_[*current_session_cell].owner_id == entry.id &&
+                        session_index_[*current_session_cell].revision == entry.revision;
+                    ++context_stats_.admission_catalog_hits;
+                    std::fprintf(stderr,
+                                 "[admit-session] slot=%u reuse=%u frontier=%u session_match\n",
+                                 slot, plan->summary().reusable_prompt_tokens, checkpoint.frontier);
+                    candidates.push_back(Candidate{
+                        .plan                    = std::move(*plan),
+                        .current_session_binding = current_session_binding,
+                        .source_slot             = slot,
+                        .source_id               = entry.id,
+                        .source_revision         = entry.revision,
+                        .selected_observation =
+                            PolicyObservationKey{
+                                .shared     = false,
+                                .slot       = slot,
+                                .owner_id   = entry.id,
+                                .revision   = entry.revision,
+                                .checkpoint = checkpoint,
+                            },
+                    });
+                }
+            }
         }
 
         std::optional<Choice> selected =
@@ -429,8 +537,14 @@ public:
         MaterializationRecord record = take_materialization_record(choice);
         reserve_logical_materialization(record);
 
-        const ContextTransactionReserveStatus status = program.start_resource_transaction(
-            std::move(*choice.plan_), std::move(prompt), cancellation);
+        ContextTransactionReserveStatus status;
+        try {
+            status = program.start_resource_transaction(
+                std::move(*choice.plan_), std::move(prompt), cancellation);
+        } catch (...) {
+            rollback_logical_materialization(record);
+            throw;
+        }
         choice.plan_.reset();
         if (status == ContextTransactionReserveStatus::Aborted) {
             rollback_logical_materialization(record);
@@ -1002,6 +1116,8 @@ public:
         out.pressure_search_budget_exhaustions = context_stats_.pressure_search_budget_exhaustions;
         out.pressure_maximal_fallback_selections =
             context_stats_.pressure_maximal_fallback_selections;
+        out.admission_catalog_hits        = context_stats_.admission_catalog_hits;
+        out.admission_safety_net_restores = program.safety_net_restore_count();
         out.historical_fork_hits            = context_stats_.historical_fork_hits;
         out.actual_context_transfer_seconds = context_stats_.actual_context_transfer_seconds;
 

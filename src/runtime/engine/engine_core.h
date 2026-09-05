@@ -20,7 +20,10 @@
 #include <cstdint>
 #include <deque>
 #include <exception>
+#include <csignal>
+#include <cstdio>
 #include <future>
+#include <unistd.h>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -79,6 +82,8 @@ public:
             !options.context_cache.max_shared_prefixes) {
             throw std::logic_error("target admission capacity does not match the Engine");
         }
+        std::signal(SIGSEGV, [](int sig) { const char msg[] = "[engine] CRASH: SIGSEGV\n"; ::write(2, msg, sizeof(msg)-1); std::signal(sig, SIG_DFL); ::raise(sig); });
+        std::signal(SIGABRT, [](int sig) { const char msg[] = "[engine] CRASH: SIGABRT\n"; ::write(2, msg, sizeof(msg)-1); std::signal(sig, SIG_DFL); ::raise(sig); });
         std::promise<void> startup;
         std::future<void> started = startup.get_future();
         worker_                   = std::thread([this, startup = std::move(startup)]() mutable {
@@ -747,6 +752,36 @@ private:
         request->cv.notify_one();
     }
 
+    // Best-effort noexcept completion for OOM/fatal paths.  Clears request
+    // state (prompt, base_plan, sequence, lane, budget, terminal_reason),
+    // releases reserved capacity if the consumer already left, sets
+    // response_done, and notifies the consumer.  Each step is individually
+    // guarded so a throw on one step does not skip the rest.
+    void force_complete_error(const std::shared_ptr<Request>& request,
+                              const std::exception_ptr& error) noexcept {
+        try { request->prompt = {}; } catch (...) {}
+        try { request->base_plan.reset(); } catch (...) {}
+        try { request->model_state = EngineRequestState::ModelFinished; } catch (...) {}
+        try { request->sequence.reset(); } catch (...) {}
+        try { request->lane.reset(); } catch (...) {}
+        try { request->budget.reset(); } catch (...) {}
+        try { request->terminal_reason.reset(); } catch (...) {}
+        bool release_capacity = false;
+        try {
+            std::lock_guard lock(request->mutex);
+            if (!request->response_done) {
+                request->error         = error;
+                request->response_done = true;
+            }
+            if (request->consumer_released && !request->capacity_released) {
+                request->capacity_released = true;
+                release_capacity            = true;
+            }
+        } catch (...) {}
+        if (release_capacity) { try { release_reserved_capacity(); } catch (...) {} }
+        try { request->cv.notify_one(); } catch (...) {}
+    }
+
     void complete_success(const std::shared_ptr<Request>& request, FinishReason reason) {
         HostPhaseMeasurement completion = begin_host_phase();
         release_planning_state(request);
@@ -1251,7 +1286,15 @@ private:
         if (!request->lane || !progress.pending) {
             throw std::logic_error("completed prefill has no lane or pending token");
         }
-        if (!request->admitted_begin || progress.summary != *request->admitted_begin) {
+        // The prompt and reuse path must match the committed admission exactly.
+        // reused_prompt_tokens may only grow: the transparent host-KV safety-net
+        // restore (a Root admission whose prefix is restored from host RAM)
+        // advances the staged prefill base after the admission was sealed, so
+        // the runtime legitimately reports more reuse than the plan committed.
+        if (!request->admitted_begin ||
+            progress.summary.prompt_tokens != request->admitted_begin->prompt_tokens ||
+            progress.summary.prefix_reuse_path != request->admitted_begin->prefix_reuse_path ||
+            progress.summary.reused_prompt_tokens < request->admitted_begin->reused_prompt_tokens) {
             throw std::logic_error("runtime Begin summary differs from committed admission");
         }
         const std::uint32_t lane = request->lane->value;
@@ -1498,9 +1541,28 @@ private:
             .started          = Clock::now(),
         };
 
-        const auto reserved = resources_.reserve_materialization(
-            *instance_.program, std::move(choice), std::move(request->prompt),
-            CancellationFlagView{&request->cancelled});
+        typename ResourceManagement::MaterializationReserveResult reserved;
+        try {
+            reserved = resources_.reserve_materialization(
+                *instance_.program, std::move(choice), std::move(request->prompt),
+                CancellationFlagView{&request->cancelled});
+        } catch (const std::bad_alloc& oom) {
+            std::fprintf(stderr, "[engine] OOM during materialization reserve: %s\n", oom.what());
+            oom_backoff_ = kOomBackoffIterations;
+            ++oom_recovery_count_;
+            if (!erase_pending(request)) {
+                // The prompt was already moved into reserve_materialization before the
+                // throw, so the request is unrecoverable.  This is a logic error — the
+                // request must have been in pending_ — but we cannot serve it with a
+                // moved-from prompt.  Fail hard rather than silently producing garbage.
+                throw std::logic_error("OOM admission lost its waiting request");
+            }
+            on_waiting_removed(request);
+            force_complete_error(request, oom_fallback_error_);
+            try { publish_runtime_stats(); } catch (...) {}
+            request_admission_check();
+            return AdmissionProgress::ControlProgress;
+        }
         if (reserved == ResourceManagement::MaterializationReserveResult::Stale) {
             request_admission_check();
             return AdmissionProgress::ControlProgress;
@@ -1777,6 +1839,33 @@ private:
         publish_runtime_stats();
     }
 
+    // Recover from any std::bad_alloc in the work loop by clearing active state and
+    // continuing.  The most common trigger is device-KV reservation failure, but host
+    // allocations can also trigger it.  Errors active and materializing requests, resets
+    // the scheduler and program state, but leaves pending requests in the FIFO so they
+    // can retry once memory is freed.  The worker loop continues after this.
+    // The worker holds execution_mutex_ across the failing operation and this cleanup.
+    void recover_from_oom_locked(std::exception_ptr error) noexcept {
+        if (!error) { error = oom_fallback_error_; }
+        try { scheduler_.reset(); } catch (...) {}
+        const std::shared_ptr<Request> materializing_request =
+            materializing_ ? materializing_->request : nullptr;
+        try { materializing_.reset(); } catch (...) {}
+        try { instance_.program->fail_all_cleanup(); } catch (...) {}
+        try { resources_.clear_after_program_cleanup(); } catch (...) {}
+        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+            if (slots_[lane] != nullptr) {
+                auto slot_request = std::move(slots_[lane]);
+                slots_[lane].reset();
+                force_complete_error(slot_request, error);
+            }
+        }
+        if (materializing_request != nullptr) {
+            force_complete_error(materializing_request, error);
+        }
+        try { publish_runtime_stats(); } catch (...) {}
+    }
+
     // The worker holds execution_mutex_ across the failing operation and this cleanup, so no
     // Program introspection can observe a partially cleared physical state.
     void fail_all_locked(std::exception_ptr error) noexcept {
@@ -1786,21 +1875,22 @@ private:
             failed_ = true;
             pending.swap(pending_);
         }
-        scheduler_.reset();
+        try { scheduler_.reset(); } catch (...) {}
         const std::shared_ptr<Request> materializing_request =
             materializing_ ? materializing_->request : nullptr;
-        materializing_.reset();
-        instance_.program->fail_all_cleanup();
-        resources_.clear_after_program_cleanup();
+        try { materializing_.reset(); } catch (...) {}
+        try { instance_.program->fail_all_cleanup(); } catch (...) {}
+        try { resources_.clear_after_program_cleanup(); } catch (...) {}
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             if (slots_[lane] != nullptr) {
-                complete_error(slots_[lane], error);
+                auto slot_request = std::move(slots_[lane]);
                 slots_[lane].reset();
+                force_complete_error(slot_request, error);
             }
         }
-        if (materializing_request != nullptr) { complete_error(materializing_request, error); }
-        for (const auto& request : pending) { complete_error(request, error); }
-        publish_runtime_stats();
+        if (materializing_request != nullptr) { force_complete_error(materializing_request, error); }
+        for (const auto& request : pending) { force_complete_error(request, error); }
+        try { publish_runtime_stats(); } catch (...) {}
     }
 
     void worker_loop() noexcept {
@@ -1840,7 +1930,10 @@ private:
                     scheduler_.build_round_membership(slots_, max_concurrency_);
                 const bool admission_check_pending =
                     admission_check_pending_.load(std::memory_order_acquire);
-                if (scheduler_.should_attempt_admission(
+                const bool skip_admission = oom_backoff_ > 0;
+                if (skip_admission) { --oom_backoff_; }
+                if (!skip_admission &&
+                    scheduler_.should_attempt_admission(
                         have_pending, admission_check_pending, !membership.empty(),
                         previous_unit_was_decode, instance_.program->has_context_transaction()) &&
                     consume_admission_check()) {
@@ -1860,6 +1953,7 @@ private:
                     finish_engine_phase(boundary, EngineHostPhase::Boundary);
                     run_control_batch(control_membership);
                     previous_unit_was_decode = true;
+                    oom_recovery_count_ = 0;
                     continue;
                 }
                 membership = scheduler_.build_round_membership(slots_, max_concurrency_);
@@ -1878,6 +1972,7 @@ private:
                     finish_engine_phase(boundary, EngineHostPhase::Boundary);
                     run_prefill_step(cancelled_at_unit_start);
                     previous_unit_was_decode = false;
+                    oom_recovery_count_ = 0;
                     continue;
                 }
                 if (action == ExecutionAction::Decode) {
@@ -1885,12 +1980,57 @@ private:
                     finish_engine_phase(boundary, EngineHostPhase::Boundary);
                     run_decode_round(membership, cancelled_at_unit_start);
                     previous_unit_was_decode = true;
+                    oom_recovery_count_ = 0;
                     continue;
                 }
                 set_host_work_class(HostWorkClass::Control);
                 finish_engine_phase(boundary, EngineHostPhase::Boundary);
+                // Do NOT reset oom_recovery_count_ here: idle iterations and
+                // admission-only iterations (where admit_planned_request caught
+                // an OOM internally) did not complete a real work unit.  Only
+                // successful control/prefill/decode above clears the streak.
+            } catch (const std::bad_alloc& oom) {
+                {
+                    char buf[256];
+                    buf[0] = '\0';
+                    int n = std::snprintf(buf, sizeof(buf), "[engine] WORKER OOM: %s - recovering", oom.what());
+                    if (n < 0) { n = 0; buf[0] = '\0'; }
+                    if (materializing_ && (size_t)n < sizeof(buf)) {
+                        n += std::snprintf(buf + n, sizeof(buf) - n, " mat=%llu", (unsigned long long)materializing_->request->id);
+                    }
+                    for (std::uint32_t lane = 0; lane < max_concurrency_ && (size_t)n < sizeof(buf); ++lane) {
+                        if (slots_[lane]) {
+                            n += std::snprintf(buf + n, sizeof(buf) - n, " lane%u=%llu", lane, (unsigned long long)slots_[lane]->id);
+                        }
+                    }
+                    std::fprintf(stderr, "%s\n", buf);
+                }
+                if (++oom_recovery_count_ > kOomMaxRecoveries) {
+                    std::fprintf(stderr, "[engine] WORKER OOM: %u consecutive recoveries — failing all pending\n",
+                                 oom_recovery_count_ - 1);
+                    const std::exception_ptr fatal_error = oom_fallback_error_;
+                    fail_all_locked(fatal_error);
+                    return;
+                }
+                std::exception_ptr oom_error;
+                try { oom_error = std::current_exception(); } catch (...) {}
+                if (!oom_error) { oom_error = oom_fallback_error_; }
+                HostPhaseMeasurement cleanup = begin_host_phase();
+                recover_from_oom_locked(oom_error);
+                finish_engine_phase(cleanup, EngineHostPhase::Maintenance);
+                oom_backoff_ = kOomBackoffIterations;
+                // Scheduler state was cleared by recover_from_oom_locked; treat the next
+                // iteration as a fresh scheduling boundary (no decode continuity).
+                previous_unit_was_decode = false;
+                continue;
             } catch (...) {
                 const std::exception_ptr error = std::current_exception();
+                try { std::rethrow_exception(error); }
+                catch (const std::exception& e) {
+                    std::fprintf(stderr, "[engine] WORKER CRASH: %s\n", e.what());
+                } catch (...) {
+                    std::fprintf(stderr, "[engine] WORKER CRASH: unknown exception\n");
+                }
                 HostPhaseMeasurement cleanup   = begin_host_phase();
                 fail_all_locked(error);
                 finish_engine_phase(cleanup, EngineHostPhase::Maintenance);
@@ -1933,6 +2073,13 @@ private:
     RuntimeStats published_stats_;
     bool stopping_ = false;
     bool failed_   = false;
+    static constexpr std::uint32_t kOomBackoffIterations = 4;
+    static constexpr std::uint32_t kOomMaxRecoveries = 8;  // before failing all pending
+    std::uint32_t oom_backoff_ = 0;      // iterations to skip admission after OOM
+    std::uint32_t oom_recovery_count_ = 0;  // consecutive OOMs without a successful work unit
+    const std::exception_ptr oom_fallback_error_ =
+        std::make_exception_ptr(RequestError(RequestErrorKind::Overloaded,
+                                             "engine out of memory during execution"));
     std::thread worker_;
 };
 

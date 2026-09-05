@@ -254,6 +254,12 @@ std::optional<AdmissionCandidate<Variant>> Program<Variant>::inspect_admission(
 }
 
 template <>
+std::uint64_t Program<Variant>::safety_net_restore_count() const noexcept {
+    return impl_ ? impl_->safety_net_restore_count_ : 0;
+}
+
+
+template <>
 std::optional<ResourcePlan<Variant>>
 Program<Variant>::seal_identity(const AdmissionCandidate<Variant>& admission,
                                 const PreparedPrompt& prompt) {

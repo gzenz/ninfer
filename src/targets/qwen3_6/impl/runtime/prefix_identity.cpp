@@ -380,11 +380,39 @@ std::array<std::uint64_t, 2> PrefixShortlistDigests::at(std::size_t frontier) co
 
 bool prefix_matches(const PreparedPromptData& prompt, std::span<const TokenId> resident_tokens,
                     const ResidentPrefixIdentity& resident_identity, std::size_t count) {
-    if (count > prompt.token_ids.size() || count > resident_tokens.size()) { return false; }
-    return std::equal(prompt.token_ids.begin(),
+    if (count > prompt.token_ids.size() || count > resident_tokens.size()) {
+        std::fprintf(stderr,
+                     "[prefix-match] SIZE FAIL: count=%zu prompt=%zu resident=%zu\n",
+                     count, prompt.token_ids.size(), resident_tokens.size());
+        return false;
+    }
+    const bool tokens_match = std::equal(prompt.token_ids.begin(),
                       prompt.token_ids.begin() + static_cast<std::ptrdiff_t>(count),
-                      resident_tokens.begin()) &&
-           resident_identity.matches(prompt, count);
+                      resident_tokens.begin());
+    if (!tokens_match) {
+        // Find first mismatch position
+        std::size_t mismatch_pos = 0;
+        for (std::size_t i = 0; i < count; ++i) {
+            if (prompt.token_ids[i] != resident_tokens[i]) {
+                mismatch_pos = i;
+                break;
+            }
+        }
+        std::fprintf(stderr,
+                     "[prefix-match] TOKEN MISMATCH: count=%zu mismatch_at=%zu "
+                     "prompt_tok=%u resident_tok=%u\n",
+                     count, mismatch_pos,
+                     static_cast<unsigned>(prompt.token_ids[mismatch_pos]),
+                     static_cast<unsigned>(resident_tokens[mismatch_pos]));
+        return false;
+    }
+    const bool id_match = resident_identity.matches(prompt, count);
+    if (!id_match) {
+        std::fprintf(stderr,
+                     "[prefix-match] IDENTITY FAIL: count=%zu\n", count);
+        return false;
+    }
+    return true;
 }
 
 } // namespace ninfer::targets::qwen3_6::detail

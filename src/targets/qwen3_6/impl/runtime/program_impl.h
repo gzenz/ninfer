@@ -11,6 +11,7 @@
 #include "ninfer/ops/scatter.h"
 #include "ninfer/ops/speculative_round.h"
 #include "ninfer/ops/target_logprobs.h"
+#include <cstring>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -3978,7 +3979,8 @@ ProgramImplCore::revalidate_materialization(const AdmissionCandidate& plan,
         return runtime::PreflightStatus::InvariantFailure;
     }
     if (source_state != nullptr &&
-        !qwen3_6::detail::prefix_matches(prompt, source_state->ledger,
+        !qwen3_6::detail::prefix_matches(prompt,
+                            source_state->compact_prefix.empty() ? source_state->ledger : source_state->compact_prefix,
                                          source_state->prefix_identity, details.reuse_base)) {
         return runtime::PreflightStatus::StalePolicyState;
     }
@@ -4219,8 +4221,27 @@ ProgramImplCore::reserve_materialization(AdmissionCandidate&& plan, PreparedProm
              (request_plan.reuse == ReusePath::Root))) {
             throw std::logic_error("materialization source does not match the selected reuse path");
         }
+        // Host-KV safety net: for root (cold start) materializations, check if the
+        // prompt prefix matches a previously evicted continuation whose KV was spilled
+        // to host RAM. If found, the materialization will restore KV via H2D instead
+        // of doing a full prefill.
+        if (request_plan.reuse == ReusePath::Root && host_kv_arena) {
+            const std::size_t max_count = static_cast<std::size_t>(prompt.token_ids.size());
+            if (const auto match = host_kv_safety_net.find(prompt, max_count, request_plan.session_key)) {
+                // Pin the entry instead of taking it: the entry stays in the net
+                // (arena bytes remain counted as net entries, not held hostage),
+                // but the spill's LRU eviction skips it (unless the spill is so
+                // large that even evicting pinned entries is needed). take_pinned()
+                // in start_sequence removes it for the H2D copy + re-add cycle.
+                transaction.host_kv_restore_entry_index = host_kv_safety_net.pin(match->index);
+                transaction.host_kv_restore_frontier = match->reuse_tokens;
+                transaction.host_kv_restore_checkpoint = match->checkpoint;
+                ++safety_net_restore_count_;
+            }
+        }
         if (source_state != nullptr &&
-            !qwen3_6::detail::prefix_matches(prompt, source_state->ledger,
+            !qwen3_6::detail::prefix_matches(prompt,
+                            source_state->compact_prefix.empty() ? source_state->ledger : source_state->compact_prefix,
                                              source_state->prefix_identity,
                                              request_plan.reuse_base)) {
             throw std::logic_error("planned resident prefix is no longer reusable");
@@ -4279,8 +4300,10 @@ ProgramImplCore::reserve_materialization(AdmissionCandidate&& plan, PreparedProm
         for (const CaptureGroup& group : request_plan.capture_groups) {
             const bool base_shared_promotion = group.frontier == request_plan.reuse_base &&
                                                group.shared && !group.rewrite && !group.long_anchor;
+            const bool rewrite_at_reuse_base = group.frontier == request_plan.reuse_base &&
+                                              group.rewrite;
             if (!group.identity ||
-                (group.frontier <= request_plan.reuse_base && !base_shared_promotion) ||
+                (group.frontier <= request_plan.reuse_base && !base_shared_promotion && !rewrite_at_reuse_base) ||
                 group.frontier > prompt_tokens ||
                 group.identity->shortlist_key.frontier != group.frontier ||
                 group.identity->prefix_identity() == nullptr ||
@@ -4355,6 +4378,7 @@ ProgramImplCore::reserve_materialization(AdmissionCandidate&& plan, PreparedProm
             .reuse              = request_plan.reuse,
             .mtp_bridge         = request_plan.mtp_bridge,
         };
+        request.session_key = request_plan.session_key;
         request.prefill.emplace(std::move(prefill));
         if (request.prefill->vision_plan) {
             if (!workspace_plan.vision) {
@@ -4387,6 +4411,14 @@ ProgramImplCore::reserve_materialization(AdmissionCandidate&& plan, PreparedProm
 
 void ProgramImplCore::release_materialization_staging(
     MaterializationTransaction& transaction) noexcept {
+    // If the transaction owned a safety net entry for restore but the
+    // materialization is being torn down before the restore ran, put it
+    // back so a later request can still restore from it.
+    if (transaction.host_kv_restore_entry_index) {
+        host_kv_safety_net.unpin(*transaction.host_kv_restore_entry_index);
+        transaction.host_kv_restore_entry_index.reset();
+        transaction.host_kv_restore_frontier = 0;
+    }
     const std::uint32_t lane = transaction.destination.value;
     if (lane < max_concurrency && requests[lane].lifecycle == Lifecycle::Empty) {
         requests[lane].prefill.reset();
@@ -4721,7 +4753,9 @@ void ProgramImplCore::prepare_materialization(MaterializationTransaction& transa
             transaction.reserved_state_count == 0) {
             throw std::logic_error("root materialization destination is not reserved");
         }
-        state_store->activate_reset(transaction.reserved_states[0], device.stream);
+        if (transaction.host_kv_restore_frontier == 0) {
+            state_store->activate_reset(transaction.reserved_states[0], device.stream);
+        }
     }
 
     KVAddressSpaceHandle text_address;
@@ -5380,8 +5414,65 @@ void ProgramImplCore::publish_pressure_host_releases(
         if (sequence == nullptr) {
             throw std::logic_error("checkpoint drop targets a shared pressure owner");
         }
+        bool capture_added_this_work = false;
         for (const runtime::CheckpointRef checkpoint : work.option.dropped_checkpoints) {
+            // Drop-time checkpoint capture: publish_checkpoint_drop releases the
+            // rewrite state image below; copy it to host first so a later
+            // eviction of this continuation can still serve checkpoint-level
+            // safety-net restores. Device-resident images copy D2H; demoted
+            // (HostOnly) images copy host-to-host from the pool view.
+            if ((checkpoint.kind == runtime::CheckpointKind::TurnClosure ||
+                 checkpoint.kind == runtime::CheckpointKind::ResponseReplay) &&
+                sequence->rewrite_state && state_store &&
+                state_store->valid(*sequence->rewrite_state) && state_images) {
+                const std::size_t capture_bytes = state_images->host_layout().image_bytes;
+                if (capture_bytes > 0) {
+                    DroppedCheckpointCapture capture;
+                    capture.slot_generation = continuation_slots[work.continuation_index].generation;
+                    capture.checkpoint_frontier = checkpoint.frontier;
+                    capture.state_bytes = capture_bytes;
+                    capture.state_host.resize(capture_bytes);
+                    const StateReplicaResidency residency =
+                        state_store->residency(*sequence->rewrite_state);
+                    bool captured = false;
+                    if (residency == StateReplicaResidency::DeviceOnly ||
+                        residency == StateReplicaResidency::Both) {
+                        const std::int32_t slot =
+                            state_store->physical_slot(*sequence->rewrite_state);
+                        const HostStateImageView capture_view{
+                            .data = capture.state_host.data(),
+                            .layout = &state_images->host_layout()};
+                        state_images->copy_to_host(slot, capture_view, device.transfer_stream);
+                        captured = true;
+                    } else if (const std::optional<qwen3_6::HostStateImageConstView> host_view =
+                                   state_store->host_replica_view(*sequence->rewrite_state);
+                               host_view && host_view->data != nullptr) {
+                        std::memcpy(capture.state_host.data(), host_view->data, capture_bytes);
+                        captured = true;
+                    }
+                    if (captured) {
+                        // Bound the side-store: keep the most recent captures
+                        // (LRU by capture time) so pinned host memory stays
+                        // bounded under repeated drops.
+                        constexpr std::size_t kMaxCaptures = 8;
+                        while (dropped_checkpoint_captures_.size() >= kMaxCaptures) {
+                            auto oldest = dropped_checkpoint_captures_.begin();
+                            for (auto it = dropped_checkpoint_captures_.begin();
+                                 it != dropped_checkpoint_captures_.end(); ++it) {
+                                if (it->second.captured < oldest->second.captured) { oldest = it; }
+                            }
+                            dropped_checkpoint_captures_.erase(oldest);
+                        }
+                        dropped_checkpoint_captures_[work.continuation_index] = std::move(capture);
+                        capture_added_this_work = true;
+                    }
+                }
+            }
             publish_checkpoint_drop(*sequence, checkpoint);
+        }
+        if (capture_added_this_work) {
+            // Complete this work's capture D2H copies before the vectors are held.
+            CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
         }
         delta.removed =
             checked_resource_sum(delta.removed, work.option.checkpoint_drop_effect.removed);
@@ -5705,6 +5796,351 @@ void ProgramImplCore::abort_pressure_work(MaterializationTransaction::PressureWo
     } catch (...) { std::terminate(); }
 }
 
+void ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index) noexcept {
+    try {
+        const SequenceState& sequence = continuation_states[index];
+        if (!sequence.kv || sequence.prefix_identity.size() == 0 ||
+            sequence.execution_frontier == 0 || !host_kv_arena) {
+            std::fprintf(stderr,
+                         "[safety-spill] SKIP guard: index=%u kv=%d identity=%zu frontier=%u arena=%d\n",
+                         index,
+                         sequence.kv ? 1 : 0,
+                         sequence.prefix_identity.size(),
+                         sequence.execution_frontier,
+                         host_kv_arena ? 1 : 0);
+            return;
+        }
+        const SequenceKVBundle& kv = *sequence.kv;
+
+        // Determine page counts from the address spaces.
+        const std::uint32_t text_pages = text_kv_addresses->mapped_pages(kv.text);
+        if (text_pages == 0) {
+            std::fprintf(stderr, "[safety-spill] SKIP: text_pages=0 index=%u\n", index);
+            return;
+        }
+        const std::uint32_t backend_pages =
+            kv.backend && backend_kv_addresses ? backend_kv_addresses->mapped_pages(*kv.backend) : 0;
+
+        // Get page layouts from the arena.
+        const HostKVPageLayout* text_layout =
+            host_kv_arena->layout_for(text_kv_pages->physical_pool().geometry());
+        if (text_layout == nullptr) {
+            std::fprintf(stderr, "[safety-spill] SKIP: text_layout=null index=%u\n", index);
+            return;
+        }
+
+        // Check if the arena has enough free capacity for text; if not, evict
+        // LRU safety-net entries until it fits (the old HostKvCache acquire_slab
+        // behavior — a new victim is worth more than the oldest parked one).
+        const std::size_t text_bytes = text_layout->page_stride * text_pages;
+        const std::size_t needed_total = [&] {
+            const HostKVPageLayout* bl =
+                backend_pages != 0
+                    ? host_kv_arena->layout_for(backend_kv_pages->physical_pool().geometry())
+                    : nullptr;
+            return text_bytes + (bl != nullptr ? bl->page_stride * backend_pages : 0);
+        }();
+        // Pre-check: would evicting ALL entries (pinned + unpinned) free enough
+        // space? If not, bail before evicting anything — don't destroy the
+        // entire safety net for a spill that will fail anyway.
+        {
+            std::size_t reclaimable = 0;
+            const std::size_t per_page = text_bytes / std::max(1U, text_pages);
+            for (std::size_t i = 0; i < host_kv_safety_net.size(); ++i) {
+                reclaimable += per_page *
+                    (host_kv_safety_net.at(i).text_page_count +
+                     host_kv_safety_net.at(i).backend_page_count);
+            }
+            if (host_kv_arena->free_bytes() + reclaimable < needed_total) {
+                std::fprintf(stderr,
+                             "[safety-spill] FAIL: insufficient capacity even after evicting all "
+                             "(free=%zu reclaimable=%zu need=%zu)\n",
+                             host_kv_arena->free_bytes(), reclaimable, needed_total);
+                return;
+            }
+        }
+        // Evict smallest entries first (fewest total pages). Bigger sessions are
+        // costlier to re-prefill, so preserve them. Tiebreak by age (oldest first).
+        // Evict ALL unpinned entries before ANY pinned entry — a pinned entry has
+        // an active restore transaction waiting on it (guaranteed ~10s loss now),
+        // while an unpinned entry is just a cache (loss only IF that session returns).
+        // When evicting pinned entries: take_pinned() will later throw
+        // std::out_of_range (entry not found), caught by the catch(...) block in
+        // start_sequence which falls back to root prefill. No H2D copy has been
+        // enqueued yet (take_pinned removes the entry BEFORE enqueuing H2D), so
+        // there is no use-after-free. The cudaStreamSynchronize is a safety
+        // landmine guard in case the protocol ever changes.
+        bool pinned_eviction_started = false;
+        while (host_kv_arena->free_bytes() < needed_total && host_kv_safety_net.size() > 0) {
+            std::optional<std::size_t> victim;
+            std::uint64_t victim_pages = 0;
+            for (std::size_t i = 0; i < host_kv_safety_net.size(); ++i) {
+                // Phase 1: only evict unpinned. Phase 2: also evict pinned.
+                if (!pinned_eviction_started && host_kv_safety_net.at(i).pinned) { continue; }
+                const std::uint64_t pages = static_cast<std::uint64_t>(host_kv_safety_net.at(i).text_page_count)
+                                          + host_kv_safety_net.at(i).backend_page_count;
+                if (!victim || pages < victim_pages ||
+                    (pages == victim_pages && host_kv_safety_net.at(i).created < host_kv_safety_net.at(victim.value()).created)) {
+                    victim = i;
+                    victim_pages = pages;
+                }
+            }
+            if (!victim) {
+                // All unpinned entries exhausted. Start evicting pinned entries.
+                if (!pinned_eviction_started) {
+                    const cudaError_t sync_err = cudaStreamSynchronize(device.transfer_stream);
+                    if (sync_err != cudaSuccess) {
+                        std::fprintf(stderr, "[safety-spill] sync FAIL: %s — not evicting pinned\n",
+                                     cudaGetErrorString(sync_err));
+                        break;
+                    }
+                    pinned_eviction_started = true;
+                    continue;
+                }
+                break;
+            }
+            const bool was_pinned = host_kv_safety_net.at(victim.value()).pinned;
+            std::fprintf(stderr,
+                         "[safety-spill] evict-smallest: index=%zu pages=%lu pinned=%d remaining=%zu free=%zu\n",
+                         victim.value(), static_cast<unsigned long>(victim_pages),
+                         static_cast<int>(was_pinned),
+                         host_kv_safety_net.size() - 1, host_kv_arena->free_bytes());
+            host_kv_safety_net.remove(victim.value());
+        }
+
+        // Check backend capacity.
+        const HostKVPageLayout* backend_layout = nullptr;
+        std::size_t backend_bytes = 0;
+        if (backend_pages != 0) {
+            backend_layout =
+                host_kv_arena->layout_for(backend_kv_pages->physical_pool().geometry());
+            if (backend_layout == nullptr) { return; }
+            backend_bytes = backend_layout->page_stride * backend_pages;
+            if (host_kv_arena->free_bytes() < text_bytes + backend_bytes) {
+                std::fprintf(stderr, "[safety-spill] FAIL: backend capacity free=%zu need=%zu\n",
+                             host_kv_arena->free_bytes(), text_bytes + backend_bytes);
+                return;
+            }
+        }
+
+        // Allocate host memory and copy D2H for text KV.
+        // Try single contiguous allocation first; fall back to scatter-gather
+        // (multi-extent) when the arena is fragmented.
+        std::vector<HostKVAllocation> text_allocations;
+        {
+            std::optional<HostKVAllocation> single =
+                host_kv_arena->allocate(*text_layout, text_pages);
+            if (single) {
+                text_allocations.push_back(std::move(*single));
+            } else {
+                std::fprintf(stderr, "[safety-spill] multi-extent: single failed, trying scatter-gather "
+                             "need=%zu free=%zu\n",
+                             text_bytes, host_kv_arena->free_bytes());
+                text_allocations = host_kv_arena->allocate_multi(*text_layout, text_pages);
+                if (text_allocations.empty()) {
+                    std::fprintf(stderr, "[safety-spill] FAIL: text allocate (fragmentation) need=%zu free=%zu\n",
+                                 text_bytes, host_kv_arena->free_bytes());
+                    return;
+                }
+                std::fprintf(stderr, "[safety-spill] multi-extent OK: %zu allocations for %u pages\n",
+                             text_allocations.size(), text_pages);
+            }
+        }
+        // Copy D2H for text KV, iterating over allocations (scatter-gather).
+        {
+            std::uint32_t page_offset = 0;
+            for (auto& alloc : text_allocations) {
+                const std::uint32_t alloc_pages = alloc.page_count();
+                std::vector<DeviceKVPageHandle> device_pages(alloc_pages);
+                for (std::uint32_t p = 0; p < alloc_pages; ++p) {
+                    device_pages[p] = text_kv_addresses->physical_page(kv.text, page_offset + p);
+                }
+                text_kv_pages->physical_pool().copy_to_host(
+                    device_pages, host_kv_arena->writable_view(alloc), device.transfer_stream);
+                page_offset += alloc_pages;
+            }
+        }
+        // Allocate host memory and copy D2H for backend KV if present.
+        std::optional<HostKVAllocation> backend_host;
+        std::vector<DeviceKVPageHandle> backend_device_pages;
+        if (backend_pages != 0) {
+            backend_host = host_kv_arena->allocate(*backend_layout, backend_pages);
+            if (!backend_host) {
+                std::fprintf(stderr, "[safety-spill] FAIL: backend allocate (fragmentation) need=%zu\n",
+                             backend_bytes);
+                cudaStreamSynchronize(device.transfer_stream);
+                return;
+            }
+            backend_device_pages.resize(backend_pages);
+            for (std::uint32_t page = 0; page < backend_pages; ++page) {
+                backend_device_pages[page] = backend_kv_addresses->physical_page(*kv.backend, page);
+            }
+            backend_kv_pages->physical_pool().copy_to_host(
+                backend_device_pages, host_kv_arena->writable_view(*backend_host),
+                device.transfer_stream);
+        }
+
+        // Copy the continuation state image to a pinned host buffer.
+        std::size_t state_bytes = 0;
+        std::vector<std::byte> state_host;
+        if (state_store && state_store->valid(sequence.state.read) && state_images) {
+            state_bytes = state_images->host_layout().image_bytes;
+            if (state_bytes > 0) {
+                state_host.resize(state_bytes);
+                const std::int32_t slot = state_store->physical_slot(sequence.state.read);
+                const HostStateImageView state_view{
+                    .data = state_host.data(),
+                    .layout = &state_images->host_layout()};
+                state_images->copy_to_host(slot, state_view, device.transfer_stream);
+            }
+        }
+
+        // Copy the rewrite-checkpoint state image too. Follow-up prompts
+        // diverge from the ledger where the previous generation began, so the
+        // checkpoint frontier is the level the safety net usually matches; its
+        // state must ride along or a checkpoint restore would use the wrong
+        // (endpoint) state. Only advertise the checkpoint when its state was
+        // actually captured.
+        std::size_t checkpoint_state_bytes = 0;
+        std::vector<std::byte> checkpoint_state_host;
+        bool checkpoint_valid = false;
+        std::uint32_t checkpoint_frontier = 0;
+        // Capture the rewrite-checkpoint state image. Follow-up prompts
+        // diverge from the ledger where the previous generation began, so the
+        // checkpoint frontier is the level the safety net usually matches.
+        // Device-resident replicas copy D2H; demoted (HostOnly) replicas copy
+        // host-to-host from the pool view — physical_slot would throw for
+        // those, aborting the spill after the KV D2H copies are enqueued.
+        if (sequence.rewrite_checkpoint.valid && sequence.rewrite_checkpoint.frontier != 0 &&
+            sequence.rewrite_state && state_store &&
+            state_store->valid(*sequence.rewrite_state) && state_images) {
+            checkpoint_state_bytes = state_images->host_layout().image_bytes;
+            if (checkpoint_state_bytes > 0) {
+                const StateReplicaResidency rewrite_residency =
+                    state_store->residency(*sequence.rewrite_state);
+                if (rewrite_residency == StateReplicaResidency::DeviceOnly ||
+                    rewrite_residency == StateReplicaResidency::Both) {
+                    checkpoint_state_host.resize(checkpoint_state_bytes);
+                    const std::int32_t checkpoint_slot =
+                        state_store->physical_slot(*sequence.rewrite_state);
+                    const HostStateImageView checkpoint_view{
+                        .data = checkpoint_state_host.data(),
+                        .layout = &state_images->host_layout()};
+                    state_images->copy_to_host(checkpoint_slot, checkpoint_view,
+                                               device.transfer_stream);
+                    checkpoint_valid = true;
+                    checkpoint_frontier = sequence.rewrite_checkpoint.frontier;
+                } else if (const std::optional<qwen3_6::HostStateImageConstView> host_view =
+                               state_store->host_replica_view(*sequence.rewrite_state);
+                           host_view && host_view->data != nullptr) {
+                    checkpoint_state_host.resize(checkpoint_state_bytes);
+                    std::memcpy(checkpoint_state_host.data(), host_view->data,
+                                checkpoint_state_bytes);
+                    checkpoint_valid = true;
+                    checkpoint_frontier = sequence.rewrite_checkpoint.frontier;
+                }
+            }
+        }
+
+        // Drop-time capture fallback: the demote path may have DROPPED the rewrite
+        // checkpoint (releasing its state image) before this eviction. If the
+        // side-store holds a capture for this slot (generation-matched), attach
+        // it so the entry still serves checkpoint-level restores.
+        if (!checkpoint_valid) {
+            const auto capture_it = dropped_checkpoint_captures_.find(index);
+            if (capture_it != dropped_checkpoint_captures_.end() &&
+                capture_it->second.slot_generation == continuation_slots[index].generation &&
+                capture_it->second.state_bytes > 0 &&
+                !capture_it->second.state_host.empty()) {
+                checkpoint_valid = true;
+                checkpoint_frontier = capture_it->second.checkpoint_frontier;
+                checkpoint_state_bytes = capture_it->second.state_bytes;
+                checkpoint_state_host = std::move(capture_it->second.state_host);
+                dropped_checkpoint_captures_.erase(capture_it);
+            }
+        }
+
+        // Diagnostic: log WHY checkpoint capture failed, but only after all
+        // three capture hooks (rewrite_checkpoint, host-replica, side-store)
+        // have been attempted. Previously this fired before the captures ran.
+        if (!checkpoint_valid) {
+            const char* reason = "rewrite_checkpoint_invalid";
+            if (sequence.rewrite_checkpoint.valid && sequence.rewrite_checkpoint.frontier != 0) {
+                if (!sequence.rewrite_state) { reason = "rewrite_state_null"; }
+                else if (!state_store || !state_store->valid(*sequence.rewrite_state)) {
+                    reason = "rewrite_state_invalid";
+                } else {
+                    const StateReplicaResidency r = state_store->residency(*sequence.rewrite_state);
+                    if (r == StateReplicaResidency::HostOnly) { reason = "rewrite_state_hostonly"; }
+                    else if (r == StateReplicaResidency::None) { reason = "rewrite_state_none"; }
+                    else { reason = "capture_logic_failed"; }
+                }
+            }
+            std::fprintf(stderr,
+                         "[safety-spill] ckpt-miss: index=%u frontier=%u reason=%s\n",
+                         index, sequence.execution_frontier, reason);
+        }
+
+        // Synchronize the transfer stream so the D2H copies complete before
+        // the device pages are released.
+        CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+
+        // Build the safety net entry.
+        HostKVSafetyNetEntry entry;
+        entry.session_key = const_cast<SequenceState&>(sequence).session_key;
+        entry.compact_prefix = const_cast<SequenceState&>(sequence).compact_prefix;
+        entry.prefix_identity.swap(const_cast<SequenceState&>(sequence).prefix_identity);
+        entry.ledger = sequence.ledger;
+        entry.execution_frontier = sequence.execution_frontier;
+        {
+            std::uint64_t cp_hash = 1469598103934665603ULL;
+            for (const TokenId t : entry.compact_prefix) {
+                cp_hash ^= static_cast<std::uint64_t>(t);
+                cp_hash *= 1099511628211ULL;
+            }
+            std::fprintf(stderr,
+                         "[compact-prefix] spill: index=%u size=%zu hash=%llu frontier=%u ckpt_frontier=%u\n",
+                         index, entry.compact_prefix.size(),
+                         static_cast<unsigned long long>(cp_hash),
+                         entry.execution_frontier, entry.checkpoint_frontier);
+        }
+        entry.text_page_count = text_pages;
+        entry.backend_page_count = backend_pages;
+        entry.text_allocations = std::move(text_allocations);
+        if (backend_host) {
+            entry.backend_host = std::move(*backend_host);
+        }
+        entry.state_host = std::move(state_host);
+        entry.state_bytes = state_bytes;
+        entry.checkpoint_valid = checkpoint_valid;
+        entry.checkpoint_frontier = checkpoint_frontier;
+        entry.checkpoint_state_host = std::move(checkpoint_state_host);
+        entry.checkpoint_state_bytes = checkpoint_state_bytes;
+        // An entry without a captured endpoint state image cannot be restored
+        // (the transparent restore would advance prefill past the KV with no
+        // state, or fail mid-restore after committing KV pages). Net entries
+        // therefore always carry a state image; a state-less spill is dropped.
+        if (entry.state_bytes == 0 || entry.state_host.empty()) {
+            std::fprintf(stderr,
+                         "[safety-spill] SKIP: no endpoint state image (index=%u frontier=%u)\n",
+                         index, entry.execution_frontier);
+        } else {
+            std::fprintf(stderr,
+                         "[safety-spill] OK: index=%u frontier=%u ckpt_valid=%d ckpt_frontier=%u "
+                         "ledger=%zu identity=%zu\n",
+                         index, entry.execution_frontier, static_cast<int>(checkpoint_valid),
+                         checkpoint_frontier, entry.ledger.size(), entry.prefix_identity.size());
+            host_kv_safety_net.add(std::move(entry));
+        }
+    } catch (...) {
+        // Safety net is best-effort. Sync any in-flight D2H copies before the
+        // host allocations are freed by destructors — a stale copy writing
+        // into reused arena bytes corrupts a later allocation silently.
+        try { cudaStreamSynchronize(device.transfer_stream); } catch (...) {}
+    }
+}
+
+
 ProgramImplCore::PhysicalReleaseResult
 ProgramImplCore::release_materialization_victim(MaterializationTransaction& transaction,
                                                 std::size_t position) noexcept {
@@ -5719,6 +6155,11 @@ ProgramImplCore::release_materialization_victim(MaterializationTransaction& tran
         continuation_slots[index].generation != generation) {
         return out;
     }
+
+    // Host-KV safety net: copy device KV to host RAM before eviction so the session
+    // can be restored via H2D when it returns. Falls back to real eviction if the
+    // host arena is full or the copy fails.
+    spill_victim_to_host_kv_safety_net(index);
 
     out.delta.removed = resident_resources(continuation_states[index]);
     release_continuation_slot(index);
@@ -6132,12 +6573,60 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
         return out;
     }
 
+    // Safety-net re-find: after pressure work (eviction + spill) completes,
+    // a safety-net entry may now exist that wasn't there at reserve time.
+    // The original safety-find ran before the spill; if it missed and the
+    // transaction is root-path, re-run the find to catch the just-spilled entry.
+    // This must run BEFORE prepare_materialization so that prepare sees
+    // frontier > 0 and skips the state activation (the reserve-time path's
+    // invariant: frontier > 0 → skip activate_reset).
+    // Safety-net re-find + prepare: wrap in try-catch so std::bad_alloc
+    // (from find, prepare, or vector allocations) falls back to root
+    // prefill instead of crashing the engine.
+    try {
+    if (transaction.host_kv_restore_frontier == 0 && transaction.plan &&
+        transaction.plan->impl_ && transaction.plan->impl_->reuse == ReusePath::Root) {
+        const std::uint32_t lane = transaction.destination.value;
+        if (lane < max_concurrency && requests[lane].prefill) {
+            const PreparedPromptData& prompt = requests[lane].prefill->prompt;
+            const std::size_t max_count = static_cast<std::size_t>(prompt.token_ids.size());
+            if (const auto match = host_kv_safety_net.find(prompt, max_count, requests[lane].session_key)) {
+                transaction.host_kv_restore_entry_index = host_kv_safety_net.pin(match->index);
+                transaction.host_kv_restore_frontier = match->reuse_tokens;
+                transaction.host_kv_restore_checkpoint = match->checkpoint;
+                ++safety_net_restore_count_;
+                std::fprintf(stderr,
+                             "[safety-find] re-find HIT after pressure: frontier=%u checkpoint=%d\n",
+                             match->reuse_tokens, static_cast<int>(match->checkpoint));
+            }
+        }
+    }
+
     if (!transaction.prepared) {
         prepare_materialization(transaction);
         enqueue_materialization_transfers(transaction);
         if (transaction.transfer_submitted) {
             out.status = runtime::ContextTransactionStatus::InProgress;
             return out;
+        }
+    }
+    } catch (const std::bad_alloc&) {
+        // OOM during re-find or prepare. Reset the restore and fall back
+        // to root prefill (no safety-net restore).
+        if (transaction.host_kv_restore_entry_index) {
+            host_kv_safety_net.unpin(*transaction.host_kv_restore_entry_index);
+            transaction.host_kv_restore_entry_index.reset();
+        }
+        transaction.host_kv_restore_frontier = 0;
+        std::fprintf(stderr, "[safety-find] re-find OOM: falling back to root prefill\n");
+        // Re-run prepare without the restore frontier
+        if (!transaction.prepared) {
+            prepare_materialization(transaction);
+            enqueue_materialization_transfers(transaction);
+            if (transaction.transfer_submitted) {
+                out.status = runtime::ContextTransactionStatus::InProgress;
+                return out;
+            }
         }
     }
     if (cancellation.requested()) {
@@ -6366,6 +6855,9 @@ void ProgramImplCore::release_continuation_slot(std::uint32_t index) noexcept {
     ContinuationSlot& slot = continuation_slots[index];
     slot.role              = ContinuationSlotRole::Free;
     if (++slot.generation == 0) { ++slot.generation; }
+    // A stale drop-time capture must not survive slot recycling — its bytes
+    // belong to a released continuation and a reused index would misattach.
+    dropped_checkpoint_captures_.erase(index);
 }
 
 detail::PhysicalResources
@@ -6648,7 +7140,8 @@ bool ProgramImplCore::can_retain_rewrite_checkpoint(const PreparedPromptData& pr
                                                     std::uint32_t reuse_base) const {
     if (!sequence.rewrite_checkpoint.valid || !sequence.rewrite_state ||
         !state_store->valid(*sequence.rewrite_state) ||
-        !qwen3_6::detail::prefix_matches(prompt, sequence.ledger, sequence.prefix_identity,
+        !qwen3_6::detail::prefix_matches(prompt,
+                            sequence.compact_prefix.empty() ? sequence.ledger : sequence.compact_prefix, sequence.prefix_identity,
                                          sequence.rewrite_checkpoint.frontier)) {
         return false;
     }
@@ -6858,6 +7351,14 @@ StartResult ProgramImplCore::start_request(MaterializationTransaction& transacti
                 throw std::logic_error("admission source capability is stale");
             }
             continuation_index                           = transaction.source_index;
+            // Spill the source to the safety net BEFORE consuming it.
+            // If start_sequence fails after consumption, the catch block's
+            // clear_lane will try to spill the partially-modified state — which
+            // may have invalid KV/identity and skip the spill silently. Spilling
+            // here while the state is still intact ensures the safety net has a
+            // valid copy. If start_sequence succeeds, the extra entry ages out
+            // of the LRU harmlessly.
+            spill_victim_to_host_kv_safety_net(*continuation_index);
             continuation_slots[*continuation_index].role = ContinuationSlotRole::Active;
         } else {
             continuation_index = transaction.root_continuation_index;
@@ -7474,6 +7975,7 @@ void ProgramImplCore::skip_capture(CaptureOffer&& offer) {
     ++prefill.next_capture;
     if (prefill.cursor == prefill.prompt_tokens &&
         requests[lane].lifecycle != Lifecycle::Prefilling) {
+        active_sequence(lane).compact_prefix = prefill.prompt.token_ids;
         requests[lane].prefill.reset();
     }
 }
@@ -8113,7 +8615,10 @@ ActiveCaptureResult ProgramImplCore::publish_active_capture(ActiveCaptureTransac
     const bool post_begin_prompt_frontier_capture =
         prefill.cursor == prefill.prompt_tokens && request.lifecycle != Lifecycle::Prefilling;
     ++prefill.next_capture;
-    if (post_begin_prompt_frontier_capture) { request.prefill.reset(); }
+    if (post_begin_prompt_frontier_capture) {
+        sequence.compact_prefix = prefill.prompt.token_ids;
+        request.prefill.reset();
+    }
     transaction.published = true;
     return out;
 }
@@ -8138,7 +8643,10 @@ ProgramImplCore::progress_active_capture_transaction(runtime::CancellationFlagVi
                 requests[transaction.lane].lifecycle != Lifecycle::Prefilling;
             prefill.pending_capture_offer = 0;
             ++prefill.next_capture;
-            if (post_begin_prompt_frontier_capture) { requests[transaction.lane].prefill.reset(); }
+            if (post_begin_prompt_frontier_capture) {
+                active_sequence(transaction.lane).compact_prefix = requests[transaction.lane].prefill->prompt.token_ids;
+                requests[transaction.lane].prefill.reset();
+            }
         }
         transaction.published = true;
         ActiveCaptureResult out;
@@ -8224,6 +8732,9 @@ ProgramImplCore::progress_active_capture_transaction(runtime::CancellationFlagVi
                 }
                 const detail::PhysicalResources resident =
                     resident_resources(continuation_states[index]);
+                // Spill to safety net before release (same as
+                // release_materialization_victim and release_continuation).
+                spill_victim_to_host_kv_safety_net(index);
                 release_continuation_slot(index);
                 work.committed_delta                   = detail::PhysicalDelta{.removed = resident};
                 work.completed                         = true;
@@ -8854,6 +9365,11 @@ FinishResult ProgramImplCore::finish(SequenceHandle sequence) noexcept {
         out.summary.long_anchors.reserve(state.long_anchors.size());
     } catch (...) { return out; }
     try {
+        // A clean-append turn (no mid-generation rewind) still has its decode
+        // fork pending at finish; the collapse below rebinds the state to the
+        // fork SOURCE — the image at the turn boundary the NEXT request will
+        // rewind to. Record that so the aliased-drop capture uses the image.
+        const bool fork_collapsed_to_source = state.state.fork_pending;
         if (state.state.fork_pending) {
             const StateImageHandle source      = state.state.read;
             const StateImageHandle destination = state.state.write;
@@ -8867,9 +9383,66 @@ FinishResult ProgramImplCore::finish(SequenceHandle sequence) noexcept {
         }
         if (state.rewrite_state && *state.rewrite_state == state.state.read) {
             if (state_store->checkpoint_references(*state.rewrite_state) == 0) { return out; }
-            state_store->release_checkpoint_reference(*state.rewrite_state);
-            state.rewrite_state.reset();
-            state.rewrite_checkpoint = {};
+            // Finish-time checkpoint capture: this inline drop strips the
+            // rewrite checkpoint from clean-append turns (the fork source
+            // aliases the state image, so no separate checkpoint state is
+            // retained). After a fork collapse state.read IS the image at
+            // rewrite_checkpoint.frontier — the exact state a follow-up that
+            // drops this turn's generation needs. Copy it to the side store
+            // (keyed by the continuation slot this turn publishes to) so a
+            // later eviction can still serve checkpoint-level restores.
+            if (fork_collapsed_to_source && state.rewrite_checkpoint.valid &&
+                state.rewrite_checkpoint.frontier != 0 &&
+                continuation_index < continuation_capacity && state_store && state_images) {
+                const std::size_t capture_bytes = state_images->host_layout().image_bytes;
+                if (capture_bytes > 0 &&
+                    state_store->residency(state.state.read) != StateReplicaResidency::None &&
+                    state_store->residency(state.state.read) != StateReplicaResidency::HostOnly) {
+                    DroppedCheckpointCapture capture;
+                    capture.slot_generation = continuation_slots[continuation_index].generation;
+                    capture.checkpoint_frontier = state.rewrite_checkpoint.frontier;
+                    capture.state_bytes = capture_bytes;
+                    capture.state_host.resize(capture_bytes);
+                    const std::int32_t slot_num = state_store->physical_slot(state.state.read);
+                    const HostStateImageView capture_view{
+                        .data = capture.state_host.data(),
+                        .layout = &state_images->host_layout()};
+                    state_images->copy_to_host(slot_num, capture_view, device.transfer_stream);
+                    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+                    constexpr std::size_t kMaxCaptures = 8;
+                    while (dropped_checkpoint_captures_.size() >= kMaxCaptures) {
+                        auto oldest = dropped_checkpoint_captures_.begin();
+                        for (auto it = dropped_checkpoint_captures_.begin();
+                             it != dropped_checkpoint_captures_.end(); ++it) {
+                            if (it->second.captured < oldest->second.captured) { oldest = it; }
+                        }
+                        dropped_checkpoint_captures_.erase(oldest);
+                    }
+                    dropped_checkpoint_captures_[continuation_index] = std::move(capture);
+                }
+            }
+            // Materialize a real rewrite checkpoint image. In the
+            // fork_collapsed_to_source case, state.read IS the turn-
+            // boundary state. Copy it to a dedicated CheckpointImmutable
+            // image so the rewrite checkpoint has its own backing state.
+            // This preserves the shortlist key for follow-up prompts.
+            const std::int32_t source_slot = state_store->physical_slot(state.state.read);
+            std::optional<StateImageHandle> new_rewrite = state_store->reserve_destination();
+            if (new_rewrite) {
+                state_store->activate_reset(*new_rewrite, device.transfer_stream);
+                state_images->copy_slot(source_slot, state_store->physical_slot(*new_rewrite),
+                                       device.transfer_stream);
+                CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+                state_store->freeze(*new_rewrite);
+                state_store->retain_checkpoint_reference(*new_rewrite);
+                state_store->release_checkpoint_reference(*state.rewrite_state);
+                state.rewrite_state = *new_rewrite;
+            } else {
+                // Cannot reserve a new CheckpointImmutable image for the
+                // rewrite state.  Keep the existing reference rather than
+                // dropping the checkpoint — the state.read image is still
+                // valid and retains the turn-boundary state.
+            }
         }
         if (state_store->role(state.state.read) == StateImageRole::ActiveMutable) {
             state_store->freeze(state.state.read);
@@ -8894,6 +9467,22 @@ FinishResult ProgramImplCore::finish(SequenceHandle sequence) noexcept {
     request.lifecycle                           = Lifecycle::Empty;
     request.pending                             = {};
     continuation_slots[continuation_index].role = ContinuationSlotRole::Catalogued;
+    state.session_key = request.session_key;
+    // compact_prefix was set during prefill completion (publish_active_capture),
+    // before request.prefill was reset. If it wasn't set (edge case), leave it empty
+    // and prefix matching will fall back to the ledger.
+    {
+        std::uint64_t cp_hash = 1469598103934665603ULL;
+        for (const TokenId t : state.compact_prefix) {
+            cp_hash ^= static_cast<std::uint64_t>(t);
+            cp_hash *= 1099511628211ULL;
+        }
+        std::fprintf(stderr,
+                     "[compact-prefix] finish: index=%u size=%zu hash=%llu frontier=%u\n",
+                     continuation_index, state.compact_prefix.size(),
+                     static_cast<unsigned long long>(cp_hash),
+                     state.rewrite_checkpoint.valid ? state.rewrite_checkpoint.frontier : 0);
+    }
     active_continuations[lane]                  = continuation_capacity;
     invalidate_lane(lane);
     out.continuation.emplace(ContractAccess::make_continuation(
@@ -8933,6 +9522,13 @@ ReleaseResult ProgramImplCore::release_continuation(ContinuationHandle&& continu
                        valid_continuation(continuation) && !materialization_pins(index, generation);
     ContractAccess::consume(continuation);
     if (!valid) { return out; }
+    // Catalog-rotation eviction path: this is how most evictions happen
+    // (release_materialization_victim covers only the planner's pressure
+    // work). Spill to the safety net before freeing — if the continuation
+    // was actively reused (catalog rotation of a live session), the next
+    // request restores from host instead of re-prefilling. If the session
+    // ended, the spilled entry just ages out of the LRU.
+    spill_victim_to_host_kv_safety_net(index);
     release_continuation_slot(index);
     advance_resource_revision();
     out.status = runtime::ConsumeStatus::Consumed;
@@ -9396,6 +9992,14 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
         };
         if (request_plan.reuse == ReusePath::Root) {
             sequence.rewrite_checkpoint = {};
+            // Safety-net restore: reserve_materialization skipped the state
+            // activation (frontier > 0), so the slot is still ReservedDestination
+            // here. ordered_reset requires ActiveMutable — activate now, on the
+            // transfer stream so the zeroing orders before the restore's H2D
+            // copy on the same stream. The restore block below only copies.
+            if (transaction.host_kv_restore_frontier > 0) {
+                state_store->activate_reset(sequence.state.write, device.transfer_stream);
+            }
             ordered_reset(sequence);
             sequence.ledger.clear();
             sequence.prefix_digests.clear();
@@ -9510,9 +10114,26 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
             if (!preserve_rewrite) {
                 state_store->release_checkpoint_reference(checkpoint);
                 sequence.rewrite_state.reset();
-                sequence.rewrite_checkpoint = {};
             }
             activate_consumed_state(checkpoint);
+            if (!preserve_rewrite && sequence.rewrite_checkpoint.valid && state_images) {
+                std::optional<StateImageHandle> new_rewrite =
+                    state_store->reserve_destination();
+                if (new_rewrite) {
+                    const std::int32_t src_slot =
+                        state_store->physical_slot(sequence.state.read);
+                    state_store->activate_reset(*new_rewrite, device.transfer_stream);
+                    state_images->copy_slot(src_slot,
+                        state_store->physical_slot(*new_rewrite),
+                        device.transfer_stream);
+                    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+                    state_store->freeze(*new_rewrite);
+                    state_store->retain_checkpoint_reference(*new_rewrite);
+                    sequence.rewrite_state = *new_rewrite;
+                } else {
+                    sequence.rewrite_checkpoint = {};
+                }
+            }
             sequence.text_kv_valid = base;
             if (speculative_backend == SpeculativeBackend::Mtp) {
                 const std::uint32_t mtp_base = base == 0 ? 0 : base - 1;
@@ -9543,6 +10164,156 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
         sequence.endpoint_valid = false;
         if (!preserving_source) { trim_sequence_kv(sequence, base, backend_kv_valid(sequence)); }
         bind_sequence_kv(sequence);
+
+        // Host-KV safety net restore: if the root materialization found a safety net
+        // match, restore the cached prefix KV from host RAM to device. This replaces
+        // the first N tokens of prefill with a bulk H2D copy.
+        if (transaction.host_kv_restore_frontier > 0 && sequence.kv) {
+         try {
+            std::fprintf(stderr, "[restore] frontier=%u entry=%s checkpoint=%d\n",
+                         transaction.host_kv_restore_frontier,
+                         transaction.host_kv_restore_entry_index ? "pinned" : "missing",
+                         static_cast<int>(transaction.host_kv_restore_checkpoint));
+            const std::uint32_t restore_frontier = transaction.host_kv_restore_frontier;
+            // The entry was pinned (not removed) at reserve time. Take it now
+            // for the H2D copy — the pin prevented LRU eviction during the
+            // reserve→prepare→start pipeline.
+            if (!transaction.host_kv_restore_entry_index) {
+                transaction.host_kv_restore_frontier = 0;
+            } else {
+            HostKVSafetyNetEntry entry = host_kv_safety_net.take_pinned(*transaction.host_kv_restore_entry_index);
+            transaction.host_kv_restore_entry_index.reset();
+            // Text KV restore: materialize pages for the cached prefix and copy H2D.
+            // Handles both single-allocation and scatter-gather (multi-extent) entries.
+            if (!entry.text_allocations.empty() && restore_frontier > 0) {
+                const std::uint32_t text_pages = kv_pages_for_frontier(restore_frontier);
+                if (text_pages > 0 && text_pages <= entry.text_page_count) {
+                    text_kv_addresses->materialize_to_tokens(
+                        sequence.kv->text, restore_frontier, device.transfer_stream);
+                    // Copy H2D for each allocation (scatter-gather).
+                    std::uint32_t page_offset = 0;
+                    for (const auto& alloc : entry.text_allocations) {
+                        const std::uint32_t alloc_pages = std::min(alloc.page_count(), text_pages - page_offset);
+                        if (alloc_pages == 0) { break; }
+                        std::vector<DeviceKVPageHandle> text_destinations(alloc_pages);
+                        for (std::uint32_t page = 0; page < alloc_pages; ++page) {
+                            text_destinations[page] =
+                                text_kv_addresses->physical_page(sequence.kv->text, page_offset + page);
+                        }
+                        text_kv_pages->physical_pool().copy_from_host(
+                            host_kv_arena->view(alloc).subview(0, alloc_pages),
+                            text_destinations, device.transfer_stream);
+                        page_offset += alloc_pages;
+                    }
+                    text_kv_addresses->commit_frontier(sequence.kv->text, restore_frontier);
+                }
+            }
+
+            // Backend KV restore.
+            if (entry.backend_host && sequence.kv->backend && backend_kv_addresses) {
+                const std::uint32_t backend_frontier =
+                    speculative_backend == SpeculativeBackend::Mtp && restore_frontier > 0
+                        ? restore_frontier - 1U
+                        : restore_frontier;
+                const std::uint32_t backend_pages = kv_pages_for_frontier(backend_frontier);
+                if (backend_pages > 0 && backend_pages <= entry.backend_page_count) {
+                    backend_kv_addresses->materialize_to_tokens(
+                        *sequence.kv->backend, backend_frontier, device.transfer_stream);
+                    std::vector<DeviceKVPageHandle> backend_destinations(backend_pages);
+                    for (std::uint32_t page = 0; page < backend_pages; ++page) {
+                        backend_destinations[page] =
+                            backend_kv_addresses->physical_page(*sequence.kv->backend, page);
+                    }
+                    backend_kv_pages->physical_pool().copy_from_host(
+                        host_kv_arena->view(*entry.backend_host).subview(0, backend_pages),
+                        backend_destinations, device.transfer_stream);
+                    backend_kv_addresses->commit_frontier(*sequence.kv->backend, backend_frontier);
+                }
+            }
+
+            // Restore the continuation state image from the host buffer.
+            // Reuse the existing Root path state slot — it was reserved at
+            // start_sequence entry (reserved_states[0]). Copy the host image
+            // directly into it without freeze (must stay ActiveMutable for inplace prefill).
+            // A checkpoint-level match restores the CHECKPOINT state image
+            // (the state at restore_frontier); an endpoint match restores the
+            // endpoint image. Using the wrong one would continue prefill from
+            // a state belonging to a different frontier.
+            const bool checkpoint_level = transaction.host_kv_restore_checkpoint;
+            const std::vector<std::byte>& state_src =
+                checkpoint_level ? entry.checkpoint_state_host : entry.state_host;
+            const std::size_t state_src_bytes =
+                checkpoint_level ? entry.checkpoint_state_bytes : entry.state_bytes;
+            // The slot was activated (zeroed) in the root branch above, on the
+            // transfer stream. Only the H2D copy remains; a missing state
+            // source just falls back to a plain root prefill (the slot is
+            // already zeroed).
+            if (state_src_bytes > 0 && !state_src.empty() && state_store && state_images) {
+                const std::int32_t slot_num = state_store->physical_slot(sequence.state.write);
+                const HostStateImageConstView state_view{
+                    .data = state_src.data(),
+                    .layout = &state_images->host_layout()};
+                state_images->copy_from_host(state_view, slot_num, device.transfer_stream);
+            } else {
+                transaction.host_kv_restore_frontier = 0;
+            }
+
+            std::fprintf(stderr, "[restore] KV+state copied, syncing transfer_stream\n");
+            // Synchronize the transfer stream so H2D copies complete before prefill.
+            CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+
+            // Advance the prefill base past the restored prefix.
+            staged.base = restore_frontier;
+            staged.cursor = restore_frontier;
+            // Skip capture groups that fall within the restored range.
+            // These were planned for the full prefill, but the restore
+            // already placed KV for those tokens — a zero-prefill capture
+            // at the restore frontier would violate the shared-base invariant.
+            std::uint32_t skipped_captures = 0;
+            while (staged.next_capture < staged.capture_groups.size() &&
+                   staged.capture_groups[staged.next_capture].frontier <= restore_frontier) {
+                std::fprintf(stderr,
+                             "[capture] skip restore: frontier=%u <= restore_frontier=%u "
+                             "shared=%d rewrite=%d long_anchor=%d\n",
+                             staged.capture_groups[staged.next_capture].frontier,
+                             restore_frontier,
+                             static_cast<int>(staged.capture_groups[staged.next_capture].shared),
+                             staged.capture_groups[staged.next_capture].rewrite ? 1 : 0,
+                             staged.capture_groups[staged.next_capture].long_anchor ? 1 : 0);
+                ++staged.next_capture;
+                ++skipped_captures;
+            }
+            if (skipped_captures > 0) {
+                std::fprintf(stderr, "[capture] restore skipped %u capture groups at restore_frontier=%u\n",
+                             skipped_captures, restore_frontier);
+            }
+            sequence.text_kv_valid = restore_frontier;
+            if (speculative_backend == SpeculativeBackend::Mtp && restore_frontier > 0) {
+                sequence.mtp_kv_valid = restore_frontier - 1U;
+            } else if (speculative_backend == SpeculativeBackend::DFlash) {
+                sequence.dflash_context_frontier = restore_frontier;
+            }
+
+            // Re-add the entry to the safety net so the same session's next
+            // root-path request can still match. The H2D copy did not modify
+            // the host KV buffers; the entry is still valid for future restores.
+            // Refresh the timestamp so LRU eviction treats it as recently used.
+            entry.pinned = false;
+            entry.created = std::chrono::steady_clock::now();
+            host_kv_safety_net.add(std::move(entry));
+            }
+         } catch (...) {
+            // Restore failed (OOM, CUDA error, etc.). Fall back to root
+            // prefill — the slot is already activated/zeroed. Sync any
+            // in-flight H2D copies before continuing.
+            try { cudaStreamSynchronize(device.transfer_stream); } catch (...) {}
+            transaction.host_kv_restore_frontier = 0;
+            staged.base = 0;
+            staged.cursor = 0;
+            std::fprintf(stderr, "[restore] FAILED: falling back to root prefill\n");
+         }
+        }
+
         const std::uint32_t backend_materialized =
             speculative_backend == SpeculativeBackend::Mtp
                 ? std::min(capacity,
@@ -9860,7 +10631,16 @@ void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& reques
     const auto* begin            = continuation_states.data();
     const auto* end              = begin + continuation_capacity;
     if (&sequence >= begin && &sequence < end) {
-        release_continuation_slot(static_cast<std::uint32_t>(&sequence - begin));
+        const std::uint32_t idx = static_cast<std::uint32_t>(&sequence - begin);
+        // Spill Active and Catalogued slots — both have KV data that could
+        // be restored. ReservedMaterialization and Free slots have no data.
+        // The spill function's own guards (kv null, identity empty, etc.)
+        // protect against spilling inconsistent state.
+        if (continuation_slots[idx].role != ContinuationSlotRole::Free &&
+            continuation_slots[idx].role != ContinuationSlotRole::ReservedMaterialization) {
+            spill_victim_to_host_kv_safety_net(idx);
+        }
+        release_continuation_slot(idx);
     }
 }
 
@@ -10764,14 +11544,29 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                 !staged.capture_groups[staged.next_capture].shared ||
                 staged.capture_groups[staged.next_capture].rewrite ||
                 staged.capture_groups[staged.next_capture].long_anchor) {
-                throw std::logic_error("zero-prefill capture is not a shared base promotion");
-            }
+                // Defense-in-depth: the restore skip loop above should have
+                // consumed all capture groups with frontier <= restore_frontier.
+                // If a group still sits at cursor == base here, the skip loop
+                // missed it (e.g. a future code path changes base without
+                // re-running the skip). Skip it and fall through to normal
+                // prefill instead of crashing the engine.
+                std::fprintf(stderr,
+                             "[capture] skip zero-prefill non-shared: cursor=%u base=%u "
+                             "frontier=%u shared=%d rewrite=%d long_anchor=%d\n",
+                             staged.cursor, staged.base,
+                             staged.capture_groups[staged.next_capture].frontier,
+                             static_cast<int>(staged.capture_groups[staged.next_capture].shared),
+                             staged.capture_groups[staged.next_capture].rewrite ? 1 : 0,
+                             staged.capture_groups[staged.next_capture].long_anchor ? 1 : 0);
+                ++staged.next_capture;
+            } else {
             if (++next_capture_offer_id_ == 0) { ++next_capture_offer_id_; }
             staged.pending_capture_offer = next_capture_offer_id_;
             return runtime::PrefillStepResult{
                 .summary = summary,
                 .timing  = timing.finish(),
             };
+            }
         }
         StateImageSelectors selectors = state_selectors(sequence);
         Tensor rewrite_capture_hidden;
@@ -10943,6 +11738,52 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
             if (staged.cursor != staged.prompt_tokens) {
                 throw std::logic_error("staged prefill sampled before the prompt frontier");
             }
+            // Prefill-completion state capture: for ROOT-path turns (fresh
+            // prefill or transparent safety-net restore) there is no rewrite
+            // checkpoint — the root branch cleared it, and the state image
+            // advances in-place through decode, so the prompt-boundary state
+            // exists ONLY at this moment. The follow-up request rewinds to
+            // this boundary; capture the state image now so the safety net can
+            // serve checkpoint-level restores after eviction.
+            // NOTE: staged.cursor == staged.prompt_tokens is already verified
+            // above; sequence.execution_frontier is NOT yet updated at this point
+            // (it's committed with the prefill result), so don't check it here.
+            // NOTE: staged.cursor == staged.prompt_tokens is already verified
+            // above; sequence.execution_frontier is NOT yet updated at this point
+            // (it's committed with the prefill result), so don't check it here.
+            if (!sequence.rewrite_checkpoint.valid && state_store && state_images) {
+                const std::uint32_t capture_index = active_continuations[sequence.lane];
+                if (capture_index < continuation_capacity) {
+                    const std::size_t capture_bytes = state_images->host_layout().image_bytes;
+                    const StateReplicaResidency residency =
+                        state_store->residency(sequence.state.write);
+                    if (capture_bytes > 0 &&
+                        (residency == StateReplicaResidency::DeviceOnly ||
+                         residency == StateReplicaResidency::Both)) {
+                        DroppedCheckpointCapture capture;
+                        capture.slot_generation = continuation_slots[capture_index].generation;
+                        capture.checkpoint_frontier = staged.prompt_tokens;
+                        capture.state_bytes = capture_bytes;
+                        capture.state_host.resize(capture_bytes);
+                        const std::int32_t capture_slot = state_store->physical_slot(sequence.state.write);
+                        const HostStateImageView capture_view{
+                            .data = capture.state_host.data(),
+                            .layout = &state_images->host_layout()};
+                        state_images->copy_to_host(capture_slot, capture_view, device.transfer_stream);
+                        CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+                        constexpr std::size_t kMaxCaptures = 8;
+                        while (dropped_checkpoint_captures_.size() >= kMaxCaptures) {
+                            auto oldest = dropped_checkpoint_captures_.begin();
+                            for (auto it = dropped_checkpoint_captures_.begin();
+                                 it != dropped_checkpoint_captures_.end(); ++it) {
+                                if (it->second.captured < oldest->second.captured) { oldest = it; }
+                            }
+                            dropped_checkpoint_captures_.erase(oldest);
+                        }
+                        dropped_checkpoint_captures_[capture_index] = std::move(capture);
+                    }
+                }
+            }
             timing.resume_submit();
             copy_tail(sequence, prefill_hidden.slice(
                                     1, static_cast<std::int32_t>(final_chunk_tokens) - 1, 1));
@@ -11022,7 +11863,10 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
         const bool prompt_frontier_capture =
             staged.next_capture < staged.capture_groups.size() &&
             staged.capture_groups[staged.next_capture].frontier == prompt_tokens;
-        if (!prompt_frontier_capture) { request.prefill.reset(); }
+        if (!prompt_frontier_capture) {
+            sequence.compact_prefix = staged.prompt.token_ids;
+            request.prefill.reset();
+        }
         request.pending   = PendingCandidate{.kind          = PendingKind::Begin,
                                              .base_E        = 0,
                                              .base_S        = 0,

@@ -806,6 +806,10 @@ struct RuntimeStats {
     std::uint64_t pressure_searches                    = 0;
     std::uint64_t pressure_search_budget_exhaustions   = 0;
     std::uint64_t pressure_maximal_fallback_selections = 0;
+    // Admission path counters: catalog hits found via the session-key fallback,
+    // and restores served from the host-KV safety net.
+    std::uint64_t admission_catalog_hits        = 0;
+    std::uint64_t admission_safety_net_restores = 0;
     std::uint32_t shared_active_references             = 0;
     std::uint64_t historical_fork_hits                 = 0;
     double actual_context_transfer_seconds             = 0.0;

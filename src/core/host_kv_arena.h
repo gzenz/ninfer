@@ -216,6 +216,14 @@ public:
     [[nodiscard]] std::optional<HostKVAllocation> allocate(const HostKVPageLayout& layout,
                                                            std::uint32_t pages) noexcept;
 
+    // Allocate across multiple free extents when no single extent is large enough.
+    // Returns a vector of allocations whose total page count equals `pages`, or
+    // an empty vector if the total free space is insufficient. Each allocation
+    // covers a contiguous range of pages; the caller must map page offsets to
+    // the correct allocation when copying.
+    [[nodiscard]] std::vector<HostKVAllocation>
+    allocate_multi(const HostKVPageLayout& layout, std::uint32_t pages) noexcept;
+
     [[nodiscard]] std::optional<HostKVAllocationRecipe>
     plan_after_releases(std::span<const HostKVAllocationHandle> proposed_releases,
                         std::span<const HostKVAllocationRequest> target_allocations) const;

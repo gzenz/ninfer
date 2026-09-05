@@ -14,6 +14,7 @@
 #include "targets/qwen3_6/impl/runtime/layouts.h"
 #include "targets/qwen3_6/impl/runtime/dflash_context.h"
 #include "targets/qwen3_6/impl/runtime/host_kv_extent_store.h"
+#include "targets/qwen3_6/impl/runtime/host_kv_safety_net.h"
 #include "targets/qwen3_6/impl/runtime/logical_kv_store.h"
 #include "targets/qwen3_6/impl/runtime/state_image_store.h"
 #include "targets/qwen3_6/impl/runtime/prefix_identity.h"
@@ -22,6 +23,8 @@
 #include "targets/qwen3_6/impl/runtime/vision_prefill.h"
 
 #include <algorithm>
+#include <chrono>
+#include <unordered_map>
 #include <cstdint>
 #include <array>
 #include <limits>
@@ -304,6 +307,7 @@ struct AdmissionCandidateImpl<NINFER_QWEN36_VARIANT> {
     bool backend_retained_tail_release = false;
     bool needs_transfer                = false;
     bool capture_pressure              = false;
+    std::optional<qwen3_6::PreparedSessionKey> session_key;
     std::vector<qwen3_6::detail::PressureDecision> pressure_options;
     std::vector<std::uint32_t> pressure_indices;
     std::vector<std::uint64_t> pressure_generations;
@@ -347,6 +351,13 @@ const runtime::IdentityMaterializationAssessment&
 AdmissionCandidate<NINFER_QWEN36_VARIANT>::identity_assessment() const noexcept {
     static const runtime::IdentityMaterializationAssessment empty;
     return impl_ != nullptr ? impl_->identity_assessment : empty;
+}
+
+template <>
+void
+AdmissionCandidate<NINFER_QWEN36_VARIANT>::set_session_key(
+    std::optional<qwen3_6::PreparedSessionKey> key) noexcept {
+    if (impl_ != nullptr) { impl_->session_key = std::move(key); }
 }
 
 } // namespace ninfer::targets::qwen3_6
@@ -460,6 +471,21 @@ struct SequenceState {
     std::vector<std::uint32_t> shared_prefix_references;
     runtime::PrefillWork rebuild_work;
     std::uint32_t rebuild_tail_begin = 0;
+
+    // Session key from the request that published this continuation.
+    // Stored at finish() time, used by the spill to tag the safety net
+    // entry so the safety-find can match by session identity when
+    // prefix matching fails (thinking mode drops reasoning).
+    std::optional<qwen3_6::PreparedSessionKey> session_key;
+
+    // Compact prefix: the prompt token IDs WITHOUT reasoning tokens.
+    // At finish time, this is request.prefill->prompt.token_ids (the stored
+    // context that follow-ups will send). The full ledger has ALL tokens
+    // (including reasoning); compact_prefix has only the non-reasoning tokens.
+    // Used for prefix matching and shortlist key computation so thinking-mode
+    // follow-ups (preserve_thinking=off) can find the continuation.
+    // Device KV operations use the full ledger (unchanged).
+    std::vector<TokenId> compact_prefix;
 };
 
 struct SharedPrefixState {
@@ -497,6 +523,7 @@ struct RequestControl {
     detail::PhysicalResources active_resources;
     detail::PhysicalResources optional_resources;
     bool publish_continuation = true;
+    std::optional<qwen3_6::PreparedSessionKey> session_key;
 
     struct Prefill {
         PreparedPromptData prompt;
@@ -533,6 +560,10 @@ public:
         const ContinuationHandle* source, const SharedPrefixHandle* shared_source,
         std::optional<runtime::CheckpointRef> checkpoint, bool must_retain_private_source,
         const runtime::ContextMachineCostModel& machine_cost);
+    // Copy a victim continuation's device KV to host RAM before eviction.
+    void spill_victim_to_host_kv_safety_net(std::uint32_t index) noexcept;
+    [[nodiscard]] std::uint64_t safety_net_restore_count() const noexcept;
+
     [[nodiscard]] std::optional<AdmissionCandidate> seal_materialization(
         const AdmissionCandidate& admission, const PreparedPromptData& prompt,
         std::span<const ContinuationHandle* const> pressure_owners,
@@ -656,6 +687,26 @@ public:
     std::unique_ptr<LogicalKVPageStore> backend_kv_pages;
     std::unique_ptr<KVAddressSpaceStore> backend_kv_addresses;
     std::unique_ptr<HostKVExtentStore> host_kv_extents;
+    HostKVSafetyNet host_kv_safety_net;
+    std::uint64_t safety_net_restore_count_ = 0;
+
+    // Drop-time checkpoint capture: the pressure planner's demote path may DROP
+    // a continuation's rewrite checkpoint (releasing its state image) while
+    // the continuation stays catalogued. If that continuation is later evicted,
+    // the spill would find no rewrite state and the safety-net entry could not
+    // serve checkpoint-level restores (follow-up prompts diverge at the
+    // generation boundary). At drop time we copy the checkpoint state image to
+    // a host buffer keyed by (slot index, slot generation); the spill attaches
+    // it when the continuation is evicted, and release_continuation_slot erases
+    // it when the slot is freed.
+    struct DroppedCheckpointCapture {
+        std::uint64_t slot_generation = 0;
+        std::uint32_t checkpoint_frontier = 0;
+        std::vector<std::byte> state_host;
+        std::size_t state_bytes = 0;
+        std::chrono::steady_clock::time_point captured = std::chrono::steady_clock::now();
+    };
+    std::unordered_map<std::uint32_t, DroppedCheckpointCapture> dropped_checkpoint_captures_;
     std::size_t text_host_kv_page_stride    = 0;
     std::size_t backend_host_kv_page_stride = 0;
     std::unique_ptr<qwen3_6::StateImageDevicePool> state_images;
@@ -871,6 +922,20 @@ private:
         std::uint8_t transfer_timer_mask    = 0;
         bool prefix_tail_submitted          = false;
         bool retained_tail_backup_submitted = false;
+        // Host-KV safety net restore: when set, the root materialization restores
+        // KV pages from host RAM instead of doing a full prefill. The matched
+        // entry is PINNED (not removed) at reserve time — it stays in the net
+        // so its arena bytes remain counted as net entries (not held hostage).
+        // The spill's LRU eviction skips pinned entries. start_sequence takes
+        // the pinned entry for the H2D copy, then re-adds it with a refreshed
+        // timestamp. If the transaction is aborted before start_sequence, the
+        // entry is unpinned.
+        std::optional<std::uint64_t> host_kv_restore_entry_index;
+        std::uint32_t host_kv_restore_frontier = 0;
+        // True when the restore matched at the rewrite-checkpoint frontier:
+        // start_sequence must restore the checkpoint state image, not the
+        // endpoint state (they differ).
+        bool host_kv_restore_checkpoint = false;
         bool prefix_forks_ready             = false;
         bool source_prepared                = false;
         bool cancel_pending                 = false;

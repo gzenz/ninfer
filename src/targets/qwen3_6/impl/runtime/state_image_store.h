@@ -235,6 +235,17 @@ public:
         return *object.device_slot;
     }
 
+    // Read-only view of a state image's host replica (aliases pool-owned
+    // memory, valid while the image keeps its host replica). nullopt when the
+    // image is DeviceOnly. Used for host-side copies of demoted (HostOnly)
+    // checkpoint states, e.g. the safety-net spill.
+    [[nodiscard]] std::optional<qwen3_6::HostStateImageConstView>
+    host_replica_view(StateImageHandle handle) const {
+        const Object& object = require(handle);
+        if (!object.host_slot || host_ == nullptr) { return std::nullopt; }
+        return host_->view(*object.host_slot);
+    }
+
     void move_checkpoint_to_active(StateImageHandle handle) {
         Object& object = require(handle);
         if (object.role != StateImageRole::CheckpointImmutable || !object.device_slot ||

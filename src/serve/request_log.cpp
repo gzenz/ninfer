@@ -576,6 +576,7 @@ std::string format_request_done(const RequestLogContext& context,
         << " cache=" << metrics.prefix_cache_hit_tokens
         << " reuse=" << prefix_reuse_path_name(metrics.prefix_reuse_path) << " ttft=" << std::fixed
         << std::setprecision(0) << ttft_ms << "ms"
+        << " queue=" << std::setprecision(0) << (metrics.engine_timing.queue_wait_seconds * 1000.0) << "ms"
         << " prefill=" << rate(computed_prefill_tokens, metrics.prefill_seconds)
         << " decode=" << rate(decode_tokens, metrics.decode_seconds)
         << " wall=" << seconds_str(metrics.total_seconds) << " host=" << std::setprecision(2)

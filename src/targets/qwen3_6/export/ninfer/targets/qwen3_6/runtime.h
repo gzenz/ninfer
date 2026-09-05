@@ -217,6 +217,10 @@ public:
     [[nodiscard]] const runtime::IdentityMaterializationAssessment&
     identity_assessment() const noexcept;
 
+    // Set the session key for safety-net session-based matching.
+    // Called by the resource manager before passing the candidate to the Program.
+    void set_session_key(std::optional<qwen3_6::PreparedSessionKey> key) noexcept;
+
 public:
     // Family-private construction/storage seam. Exact packages expose only the completed alias;
     // Engine code can inspect summary() but not target planning state.
@@ -701,6 +705,10 @@ public:
                       std::optional<runtime::CheckpointRef> checkpoint,
                       bool must_retain_private_source,
                       const runtime::ContextMachineCostModel& machine_cost);
+    // Restore a continuation from the host-KV safety net and produce an admission candidate.
+    // Count of safety net restores (for stats).
+    [[nodiscard]] std::uint64_t safety_net_restore_count() const noexcept;
+
     [[nodiscard]] std::optional<ResourcePlan<Variant>>
     seal_identity(const AdmissionCandidate<Variant>& candidate, const PreparedPrompt& prompt);
     [[nodiscard]] PressurePlanningSession<Variant>

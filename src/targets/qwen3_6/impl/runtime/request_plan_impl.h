@@ -493,7 +493,33 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
         plan->source_disposition              = must_retain_private_source
                                                     ? runtime::ClaimDisposition::Retained
                                                     : runtime::ClaimDisposition::ConsumedToActive;
-        if (!base.allow_prefix_reuse || !prompt.identity.reusable) { return std::nullopt; }
+        if (!base.allow_prefix_reuse || !prompt.identity.reusable) {
+            std::fprintf(stderr, "[inspect] skip: allow_reuse=%d reusable=%d\n",
+                         static_cast<int>(base.allow_prefix_reuse),
+                         static_cast<int>(prompt.identity.reusable));
+            return std::nullopt;
+        }
+        {
+            std::uint64_t cp_hash = 1469598103934665603ULL;
+            for (const TokenId t : source->compact_prefix) {
+                cp_hash ^= static_cast<std::uint64_t>(t);
+                cp_hash *= 1099511628211ULL;
+            }
+            std::uint64_t prompt_hash = 1469598103934665603ULL;
+            for (const TokenId t : prompt.token_ids) {
+                prompt_hash ^= static_cast<std::uint64_t>(t);
+                prompt_hash *= 1099511628211ULL;
+            }
+            std::fprintf(stderr,
+                         "[inspect] source: cp_size=%zu cp_hash=%llu ckpt_frontier=%u "
+                         "prompt_tokens=%zu prompt_hash=%llu ledger_size=%zu\n",
+                         source->compact_prefix.size(),
+                         static_cast<unsigned long long>(cp_hash),
+                         selected.frontier,
+                         prompt.token_ids.size(),
+                         static_cast<unsigned long long>(prompt_hash),
+                         source->ledger.size());
+        }
         if (selected.kind == runtime::CheckpointKind::SessionEndpoint) {
             if (selected.ordinal != 0) {
                 throw std::logic_error("private endpoint checkpoint ordinal is invalid");
@@ -501,10 +527,14 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
             if (selected.frontier == 0 || selected.frontier != source->execution_frontier) {
                 throw std::logic_error("catalog endpoint summary disagrees with Program state");
             }
-            if (!qwen3_6::detail::prefix_matches(prompt, source->ledger, source->prefix_identity,
+            if (!qwen3_6::detail::prefix_matches(prompt,
+                                                  source->compact_prefix.empty() ? source->ledger : source->compact_prefix,
+                                                  source->prefix_identity,
                                                  selected.frontier)) {
+                std::fprintf(stderr, "[inspect] prefix MISS (endpoint): frontier=%u\n", selected.frontier);
                 return std::nullopt;
             }
+            std::fprintf(stderr, "[inspect] prefix HIT (endpoint): frontier=%u\n", selected.frontier);
             plan->reuse      = ReusePath::PrivateEndpoint;
             plan->reuse_base = selected.frontier;
         } else if (selected.kind == runtime::CheckpointKind::LongAnchor) {
@@ -517,10 +547,14 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
             if (anchor == source->long_anchors.end() || selected.frontier == 0) {
                 throw std::logic_error("catalog long-anchor summary disagrees with Program state");
             }
-            if (!qwen3_6::detail::prefix_matches(prompt, source->ledger, source->prefix_identity,
+            if (!qwen3_6::detail::prefix_matches(prompt,
+                                                  source->compact_prefix.empty() ? source->ledger : source->compact_prefix,
+                                                  source->prefix_identity,
                                                  selected.frontier)) {
+                std::fprintf(stderr, "[inspect] prefix MISS (long_anchor): frontier=%u\n", selected.frontier);
                 return std::nullopt;
             }
+            std::fprintf(stderr, "[inspect] prefix HIT (long_anchor): frontier=%u\n", selected.frontier);
             plan->reuse              = ReusePath::PrivateLongAnchor;
             plan->reuse_base         = selected.frontier;
             plan->source_disposition = runtime::ClaimDisposition::Retained;
@@ -534,10 +568,15 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
                 selected.frontier != source->rewrite_checkpoint.frontier) {
                 throw std::logic_error("catalog rewrite summary disagrees with Program state");
             }
-            if (!qwen3_6::detail::prefix_matches(prompt, source->ledger, source->prefix_identity,
+            if (!qwen3_6::detail::prefix_matches(prompt,
+                                                  source->compact_prefix.empty() ? source->ledger : source->compact_prefix,
+                                                  source->prefix_identity,
                                                  selected.frontier)) {
+                std::fprintf(stderr, "[inspect] prefix MISS (rewrite): frontier=%u\n", selected.frontier);
                 return std::nullopt;
             }
+            std::fprintf(stderr, "[inspect] prefix HIT (rewrite): frontier=%u reuse=%d\n",
+                         selected.frontier, static_cast<int>(restore_path(source->rewrite_checkpoint.kind)));
             plan->reuse      = restore_path(source->rewrite_checkpoint.kind);
             plan->reuse_base = selected.frontier;
         }
@@ -670,8 +709,12 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
 
     plan->capture_groups.reserve(base.capture_groups.size());
     for (CaptureGroup group : base.capture_groups) {
-        if (group.frontier <= plan->reuse_base) { continue; }
+        // Skip capture groups below reuse_base, but allow rewrite checkpoint
+        // captures at reuse_base (the turn boundary for follow-ups).
+        if (group.frontier < plan->reuse_base) { continue; }
+        if (group.frontier == plan->reuse_base && !group.rewrite && !group.shared) { continue; }
         if (group.rewrite &&
+            group.frontier != plan->reuse_base &&
             (plan->rewrite_disposition !=
                  RewriteCheckpointDisposition::ReplaceAtCommittedFrontier ||
              !desired || group.frontier != desired->frontier || *group.rewrite != desired->kind)) {
@@ -679,6 +722,49 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
         }
         if (!group.rewrite && !group.shared && !group.long_anchor) { continue; }
         plan->capture_groups.push_back(std::move(group));
+    }
+    // If the source has a valid rewrite checkpoint but the base plan
+    // did not include a rewrite capture group (prompt.identity.rewrite_checkpoint
+    // was not set), add one from the source so install_private_capture
+    // sets rewrite_state for the new continuation.
+    if (source != nullptr && source->rewrite_checkpoint.valid &&
+        !base.rewrite_checkpoint &&
+        source->rewrite_checkpoint.frontier == plan->reuse_base &&
+        source->rewrite_checkpoint.frontier > 0 &&
+        base.prefix_digests.size() > static_cast<std::size_t>(plan->reuse_base) &&
+        !source->compact_prefix.empty()) {
+        const bool has_rewrite = std::any_of(
+            plan->capture_groups.begin(), plan->capture_groups.end(),
+            [&](const CaptureGroup& g) {
+                return g.rewrite && g.frontier == plan->reuse_base;
+            });
+        if (!has_rewrite) {
+            CaptureGroup group;
+            group.frontier = source->rewrite_checkpoint.frontier;
+            group.input_order = 0;
+            group.rewrite = source->rewrite_checkpoint.kind;
+            auto backing = std::make_shared<PreparedCaptureBacking>();
+            // Use compact_prefix (prompt-only, no reasoning) for prefix
+            // matching consistency with thinking mode (preserve_thinking=off).
+            backing->ledger = source->compact_prefix;
+            backing->prefix_identity = source->prefix_identity;
+            auto identity = std::make_shared<PreparedCaptureIdentity>();
+            identity->backing = std::move(backing);
+            identity->shortlist_key = {
+                .digests = base.prefix_digests.at(group.frontier),
+                .frontier = group.frontier,
+                .identity_tag = base.prefix_identity_tag,
+            };
+            identity->rebuild_work = source->rewrite_checkpoint.rebuild_work;
+            group.identity = std::move(identity);
+            plan->capture_groups.push_back(std::move(group));
+            // Re-sort by frontier to maintain the sorted invariant.
+            std::sort(plan->capture_groups.begin(), plan->capture_groups.end(),
+                      [](const CaptureGroup& l, const CaptureGroup& r) {
+                          return std::tie(l.frontier, l.input_order) <
+                                 std::tie(r.frontier, r.input_order);
+                      });
+        }
     }
     plan->shared_candidates.reserve(base.shared_candidates.size());
     for (CaptureGroup group : base.shared_candidates) {

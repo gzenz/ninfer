@@ -183,6 +183,11 @@ resolve_openai_responses_prompt(const OpenAIResponsesPromptRequest& request,
         if (parent_record) {
             resolved.session_key = parent_record->session_key;
         } else if (store_response) {
+            // No previous_response_id (client sends full context as input_turns).
+            // Use *response_id as session_key — satisfies LiveSession retention.
+            // The session-key fallback in safety-find won't match across turns
+            // (different response_id each turn), but compact_prefix matching
+            // (content-based) correctly distinguishes sessions by their token prefix.
             resolved.session_key = *response_id;
         }
         resolved.cache_hints.session_key = resolved.session_key;

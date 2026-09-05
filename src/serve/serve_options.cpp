@@ -114,6 +114,9 @@ std::string serve_usage_text(const char* argv0) {
            "control tokens count toward the request output limit\n"
            "       --preserve-thinking retains closed-turn assistant reasoning in later prompts\n"
            "       sampler defaults come from the loaded model and resolved thinking mode; "
+           "       --chat-template PATH loads a jinja template from disk, overriding the artifact\n"
+           "       --chat-template-semantics MODE: auto (default) | froggeric | thinking-toggle | reasoning-effort | generic\n"
+           "       --weights-profile PROFILE: auto (default) | qwen36-nvfp4 | qwen38-nvfp4 | qwen36-groupwise-int | qwen38-groupwise-int\n"
            "server flags and request fields override individual values.\n"
            "       --greedy forces temperature 0 (exact argmax).\n"
            "       --rope-scaling-factor applies YaRN position scaling (1.0 = disabled); "
@@ -315,6 +318,12 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.enable_thinking = false;
         } else if (arg == "--preserve-thinking") {
             options.preserve_thinking = true;
+        } else if (arg == "--chat-template") {
+            options.chat_template_path = require_value("--chat-template");
+        } else if (arg == "--chat-template-semantics") {
+            options.chat_template_semantics = require_value("--chat-template-semantics");
+        } else if (arg == "--weights-profile") {
+            options.weights_profile_override = require_value("--weights-profile");
         } else if (arg == "--cors") {
             options.enable_cors = true;
         } else if (arg == "--temperature") {

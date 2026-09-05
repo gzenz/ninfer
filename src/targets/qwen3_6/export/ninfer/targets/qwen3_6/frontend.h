@@ -21,6 +21,8 @@ struct FrontendOptions {
     std::size_t media_cache_bytes          = kDefaultMediaCacheBytes;
     std::size_t media_live_bytes           = kDefaultMediaLiveBytes;
     std::uint32_t media_preprocess_threads = 0;
+    std::filesystem::path chat_template_path;      // override artifact template
+    std::string chat_template_semantics;            // override semantics detection
 };
 
 struct FrontendResources;

@@ -18,6 +18,7 @@
 #include <chrono>
 #include <cctype>
 #include <cstddef>
+#include <fstream>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -224,11 +225,25 @@ void validate_tokenizer_config(const FrontendResources& resources) {
     }
 }
 
-fi::CompiledChatTemplate compile_chat_template(const FrontendResources& resources) {
+fi::CompiledChatTemplate compile_chat_template(const FrontendResources& resources,
+                                             const FrontendOptions& options) {
     validate_tokenizer_config(resources);
-    return fi::CompiledChatTemplate::resolve(resources.chat_template_jinja);
+    std::string template_source = resources.chat_template_jinja;
+    if (!options.chat_template_path.empty()) {
+        std::ifstream file(options.chat_template_path);
+        if (!file) {
+            throw std::runtime_error("cannot open --chat-template file: " +
+                                     options.chat_template_path.string());
+        }
+        template_source.assign(std::istreambuf_iterator<char>(file),
+                               std::istreambuf_iterator<char>());
+    }
+    if (!options.chat_template_semantics.empty()) {
+        return fi::CompiledChatTemplate::resolve_with_semantics(
+            template_source, options.chat_template_semantics);
+    }
+    return fi::CompiledChatTemplate::resolve(template_source);
 }
-
 [[noreturn]] void throw_processor_error(const fi::ProcessorError& error) {
     switch (error.kind()) {
     case fi::ProcessorErrorKind::BudgetExceeded:
@@ -841,7 +856,7 @@ PreparedContextCache prepare_context_cache(
 class Frontend::Impl {
 public:
     Impl(const FrontendResources& resources, bool registered_checkpoint, FrontendOptions options)
-        : chat_template(compile_chat_template(resources)),
+        : chat_template(compile_chat_template(resources, options)),
           tokenizer(std::make_shared<const fi::Tokenizer>(
               fi::TokenizerResources{.tokenizer_json         = resources.tokenizer_json,
                                      .tokenizer_config_json  = resources.tokenizer_config_json,

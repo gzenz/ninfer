@@ -92,7 +92,9 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
                                        artifact::Reader& reader, Clock::time_point load_start,
                                        std::string_view target_key) {
     const auto& identity                          = reader.identity();
-    const auto weights_profile                    = Target::resolve_weights(identity);
+    const auto weights_profile                    = options.weights_profile_override.empty()
+        ? Target::resolve_weights(identity)
+        : Target::resolve_weights_override(options.weights_profile_override);
     const ModelSamplingDefaults sampling_defaults = Target::sampling_defaults(identity.model_id);
     const runtime::ContextCostIdentity context_cost_identity{
         .hardware_class = runtime::context_cost_hardware_class(

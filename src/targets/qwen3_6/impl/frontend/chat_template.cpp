@@ -558,6 +558,28 @@ CompiledChatTemplate CompiledChatTemplate::resolve(std::string_view source) {
                                 sha256_hex(digest) + ")");
 }
 
+CompiledChatTemplate CompiledChatTemplate::resolve_with_semantics(
+    std::string_view source, std::string_view semantics_name) {
+    if (semantics_name == "froggeric") {
+        return CompiledChatTemplate(ChatTemplateSemantics::FroggericV22);
+    }
+    if (semantics_name == "thinking-toggle") {
+        return CompiledChatTemplate(ChatTemplateSemantics::ThinkingToggle);
+    }
+    if (semantics_name == "reasoning-effort") {
+        return CompiledChatTemplate(ChatTemplateSemantics::ReasoningEffort);
+    }
+    if (semantics_name == "auto") {
+        return resolve(source);
+    }
+    if (semantics_name == "generic") {
+        // Accept any template with ThinkingToggle semantics (the most common Qwen behavior).
+        return CompiledChatTemplate(ChatTemplateSemantics::ThinkingToggle);
+    }
+    throw std::invalid_argument("unknown --chat-template-semantics '" + std::string(semantics_name) +
+                                "'; use auto, froggeric, thinking-toggle, reasoning-effort, or generic");
+}
+
 PromptCapabilities CompiledChatTemplate::capabilities() const noexcept {
     PromptCapabilities result;
     result.enable_thinking = true;

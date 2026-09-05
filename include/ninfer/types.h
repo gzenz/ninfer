@@ -128,6 +128,17 @@ struct EngineOptions {
     ContextCacheOptions context_cache;
     ContextCostOptions context_cost;
     LoadProgress load_progress;
+    // Override the artifact's embedded chat template with a jinja file from disk.
+    std::filesystem::path chat_template_path;
+    // Explicitly select chat template semantics instead of hash-matching.
+    // Empty = auto-detect from hash (throws on unknown). "froggeric", "thinking-toggle",
+    // "reasoning-effort" = force the named semantics. "generic" = accept unknown templates
+    // with ThinkingToggle semantics.
+    std::string chat_template_semantics;
+    // Override the weights profile resolved from artifact identity.
+    // Empty = auto-detect. "qwen36-nvfp4", "qwen38-nvfp4", "qwen36-groupwise-int",
+    // "qwen38-groupwise-int" = force the named profile.
+    std::string weights_profile_override;
 };
 
 enum class SamplingMode : std::uint8_t {

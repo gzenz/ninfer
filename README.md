@@ -19,6 +19,8 @@ This fork targets **reliable 555k-context inference with 3 concurrent agentic se
 - **YaRN context extension** (`--rope-scaling-factor`, `--rope-scaling-original-context`): linear RoPE scaling to 555k context (c=3+vision) or 600k (c=1). No quality loss measured up to 600k.
 - **NVFP4 KV cache** (`--kv-dtype nvfp4`): 4-bit E2M1 codes + E4M3 group-16 scales. 45% less KV VRAM than int8.
 - **Froggeric v22 chat template**: C++ renderer with no-dangling-intent rule, stricter tool-call instructions, and think-close variant handling.
+- **Dynamic template loading** (`--chat-template`, `--chat-template-semantics`): load jinja templates from disk instead of patching artifacts. Supports any Qwen3.8-27B NVFP4 image (Ostfralla, QUASAR, etc.) without artifact modification.
+- **Explicit weights profile** (`--weights-profile`): override artifact identity routing. Use `qwen36-nvfp4` for Ostfralla/QUASAR artifacts that carry the Qwen3.6 NVFP4 tensor layout.
 - **Tolerant tool-call recovery** (`--tolerant-tool-calls`): recovers complete Qwen calls with malformed wrappers.
 - **Reasoning-effort tier mapping**: High/Max map to XHigh instead of rejecting.
 - **Ostfralla artifact routing**: maps qwen3.8/nvfp4 to Qwen36Nvfp4 (W8G32) profile.
@@ -69,8 +71,15 @@ an existing `.ninfer` artifact:
 
 3. **Serve**:
    ```bash
-   ./build/apps/ninfer-serve out/qwen3_8_27b_nvfp4-froggeric.ninfer      --host 0.0.0.0 --port 8080 --kv-dtype nvfp4 --vision      --spec mtp --draft-tokens 5 --lm-head-draft      --tolerant-tool-calls --host-kv-mib <sysmem MiB to spare for host KV>      --rope-scaling-factor 2.12 --rope-scaling-original-context 262144
+   ./build/apps/ninfer-serve out/qwen3_8_27b_nvfp4-froggeric.ninfer       --host 0.0.0.0 --port 8080 --kv-dtype nvfp4 --vision       --spec mtp --draft-tokens 5 --lm-head-draft       --tolerant-tool-calls --host-kv-mib <sysmem MiB to spare for host KV>       --rope-scaling-factor 2.12 --rope-scaling-original-context 262144
    ```
+
+   Alternatively, load the froggeric template from disk (no artifact patching needed):
+   ```bash
+   ./build/apps/ninfer-serve <model.ninfer>       --chat-template /path/to/froggeric_v22_chat_template.jinja       --chat-template-semantics froggeric       --weights-profile qwen36-nvfp4       ... (other flags)
+   ```
+
+   **`--chat-template PATH`** loads a jinja template from disk, overriding the artifact's embedded template. **`--chat-template-semantics MODE`** selects semantics explicitly (`auto`, `froggeric`, `thinking-toggle`, `reasoning-effort`, `generic`). **`--weights-profile PROFILE`** overrides the weights profile resolved from artifact identity (`qwen36-nvfp4`, `qwen38-nvfp4`, `qwen36-groupwise-int`, `qwen38-groupwise-int`). Use `--weights-profile qwen36-nvfp4` for Ostfralla/QUASAR artifacts that carry the Qwen3.6 NVFP4 tensor layout.
 
 The engine matches the template by SHA256 digest at load time and activates
 `ChatTemplateSemantics::FroggericV22` — an optimized C++ renderer that replaces

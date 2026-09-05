@@ -139,6 +139,8 @@ enum class ChatTemplateSemantics : std::uint8_t {
 class CompiledChatTemplate {
 public:
     [[nodiscard]] static CompiledChatTemplate resolve(std::string_view source);
+    [[nodiscard]] static CompiledChatTemplate resolve_with_semantics(
+        std::string_view source, std::string_view semantics_name);
 
     [[nodiscard]] PromptCapabilities capabilities() const noexcept;
     [[nodiscard]] RenderedChat render(const std::vector<ChatMessage>& messages,

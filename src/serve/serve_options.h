@@ -66,6 +66,9 @@ struct ServeOptions {
     // fields. An omitted seed is replaced per request with a fresh random seed.
     SamplingOverrides sampling_overrides;
     bool greedy = false; // --greedy: force temperature 0 (exact argmax)
+    std::filesystem::path chat_template_path;      // --chat-template PATH
+    std::string chat_template_semantics;            // --chat-template-semantics MODE
+    std::string weights_profile_override;           // --weights-profile PROFILE
 
     // Exact process argv for the server-start record. Secret-bearing option values are redacted
     // while parsing; this is provenance only and never affects execution.

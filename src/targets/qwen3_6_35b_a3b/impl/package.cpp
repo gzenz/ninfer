@@ -72,6 +72,12 @@ Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentit
                              "' is not supported by target '" + std::string(target_key) + "'");
 }
 
+Package::WeightsProfile Package::resolve_weights_override(std::string_view name) {
+    if (name == "groupwise-int") { return WeightsProfile::GroupwiseInt; }
+    throw std::invalid_argument("unknown --weights-profile '" + std::string(name) +
+                                "'; 35B-A3B only supports groupwise-int");
+}
+
 Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptions& options,
                                      WeightsProfile weights_profile) {
     return LoadPlan(std::make_unique<LoadPlan::Impl>(
@@ -96,6 +102,8 @@ Package::Frontend Package::make_frontend(const LoadedModel& model, const EngineO
                                       .media_cache_bytes        = options.media_cache_bytes,
                                       .media_live_bytes         = options.media_live_bytes,
                                       .media_preprocess_threads = options.media_preprocess_threads,
+                                       .chat_template_path       = options.chat_template_path,
+                                       .chat_template_semantics  = options.chat_template_semantics,
                                   });
 }
 

@@ -304,12 +304,19 @@ void bind_nvfp4_text_layers(artifact::Binder& binder, BindingPlan& out) {
                                                                   NumericFormat::FP32, {48});
             target.gdn.convolution = artifact::bind_device_tensor(
                 binder, prefix + "gdn/convolution", NumericFormat::BF16, {4, 10240});
-            target.gdn.control_projection = SplitGdnControlProjectionPlan{
-                .a_projection = bind_weight(binder, prefix + "gdn/a_projection",
-                                            NumericFormat::BF16, {48, 5120}),
-                .b_projection = bind_weight(binder, prefix + "gdn/b_projection",
-                                            NumericFormat::BF16, {48, 5120}),
-            };
+            if (binder.has_tensor(prefix + "gdn/a_b_projection")) {
+                target.gdn.control_projection = FusedGdnControlProjectionPlan{
+                    .a_b_projection = bind_weight(binder, prefix + "gdn/a_b_projection",
+                                                  NumericFormat::BF16, {96, 5120}),
+                };
+            } else {
+                target.gdn.control_projection = SplitGdnControlProjectionPlan{
+                    .a_projection = bind_weight(binder, prefix + "gdn/a_projection",
+                                                NumericFormat::BF16, {48, 5120}),
+                    .b_projection = bind_weight(binder, prefix + "gdn/b_projection",
+                                                NumericFormat::BF16, {48, 5120}),
+                };
+            }
             target.gdn.input_projection = FusedGdnInputProjectionPlan{
                 .query_key_value_z =
                     bind_nvfp4_weight(binder, prefix + "gdn/query_key_value_z", 16384, 5120,

@@ -275,13 +275,13 @@ void bind_nvfp4_text_layers(artifact::Binder& binder, BindingPlan& out) {
         target.is_full_attention = is_full_layer(layer);
         if (target.is_full_attention) {
             WeightPlan input;
-            if (is_early_attention_input(layer)) {
-                input = bind_weight(binder, prefix + "attention/query_key_gate_value",
-                                    NumericFormat::BF16, {14336, 5120});
-            } else {
+            if (binder.has_tensor(prefix + "attention/input_projection/input_scale_divisor")) {
                 input = bind_nvfp4_weight(
                     binder, prefix + "attention/query_key_gate_value", 14336, 5120,
                     prefix + "attention/input_projection/input_scale_divisor");
+            } else {
+                input = bind_weight(binder, prefix + "attention/query_key_gate_value",
+                                    NumericFormat::BF16, {14336, 5120});
             }
             target.attention.projection =
                 FusedAttentionProjectionPlan{.query_key_gate_value = input};
@@ -289,13 +289,13 @@ void bind_nvfp4_text_layers(artifact::Binder& binder, BindingPlan& out) {
                 binder, prefix + "attention/query_norm", NumericFormat::BF16, {256});
             target.attention.key_norm = artifact::bind_device_tensor(
                 binder, prefix + "attention/key_norm", NumericFormat::BF16, {256});
-            if (is_bf16_attention_output(layer)) {
-                target.attention.output = bind_weight(binder, prefix + "attention/output",
-                                                      NumericFormat::BF16, {5120, 6144});
-            } else {
+            if (binder.has_tensor(prefix + "attention/output_projection/input_scale_divisor")) {
                 target.attention.output =
                     bind_nvfp4_weight(binder, prefix + "attention/output", 5120, 6144,
                                       prefix + "attention/output_projection/input_scale_divisor");
+            } else {
+                target.attention.output = bind_weight(binder, prefix + "attention/output",
+                                                      NumericFormat::BF16, {5120, 6144});
             }
         } else {
             target.gdn.a_log       = artifact::bind_device_tensor(binder, prefix + "gdn/a_log",
@@ -324,13 +324,13 @@ void bind_nvfp4_text_layers(artifact::Binder& binder, BindingPlan& out) {
             };
             target.gdn.norm = artifact::bind_device_tensor(binder, prefix + "gdn/norm",
                                                            NumericFormat::BF16, {128});
-            if (is_bf16_gdn_output(layer)) {
-                target.gdn.output =
-                    bind_weight(binder, prefix + "gdn/output", NumericFormat::BF16, {5120, 6144});
-            } else {
+            if (binder.has_tensor(prefix + "gdn/output_projection/input_scale_divisor")) {
                 target.gdn.output =
                     bind_nvfp4_weight(binder, prefix + "gdn/output", 5120, 6144,
                                       prefix + "gdn/output_projection/input_scale_divisor");
+            } else {
+                target.gdn.output =
+                    bind_weight(binder, prefix + "gdn/output", NumericFormat::BF16, {5120, 6144});
             }
         }
         target.post_attention_norm = artifact::bind_device_tensor(

@@ -30,10 +30,12 @@ struct AnthropicCountTokensRequest {
 
 AnthropicMessagesRequest parse_anthropic_messages_request(const nlohmann::json& body,
                                                           const RequestLimits& limits,
-                                                          const AnthropicThinkingSigner& signer);
+                                                          const AnthropicThinkingSigner& signer,
+                                                          bool server_preserve_thinking);
 AnthropicCountTokensRequest
 parse_anthropic_count_tokens_request(const nlohmann::json& body,
-                                     const AnthropicThinkingSigner& signer);
+                                     const AnthropicThinkingSigner& signer,
+                                     bool server_preserve_thinking);
 
 struct AnthropicResponseIdentity {
     std::string request_id;

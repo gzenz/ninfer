@@ -818,6 +818,7 @@ std::string format_request_done_json(const std::string& server_instance_id, std:
              {"tool_call_count", outcome.tool_calls.size()}};
     record["timings_seconds"] = Json{
         {"prepare", outcome.metrics.prepare_seconds}, {"ttft", outcome.metrics.ttft_seconds},
+        {"queue", outcome.metrics.engine_timing.queue_wait_seconds},
         {"vision", outcome.metrics.vision_seconds},   {"prefill", outcome.metrics.prefill_seconds},
         {"decode", outcome.metrics.decode_seconds},   {"total", outcome.metrics.total_seconds}};
     record["engine_timing"]   = request_engine_timing_json(outcome.metrics.engine_timing);

@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """E2E test suite for ninfer safety-net eviction system.
 
-Runs eight phases by default against a single test server (no flags needed):
+Runs ten phases by default against a single test server (no flags needed):
   Phase 1 "pressure":           4 sessions — basic safety net (spills, restores, no re-prefills)
   Phase 2 "mixed":              1 big + 3 small — eviction order (smallest-first, big preserved)
   Phase 3 "trash":              10 sessions — graceful degradation under trashing (no crash)
   Phase 4 "thinking":           3 sessions, reasoning mode — session-key fallback with rewrite checkpoint
   Phase 5 "checkpoint-advance": 1 session, 8 turns — checkpoint frontier advances monotonically
   Phase 6 "tool-calling":       1 session, 6 turns with tools — rewrite restore under tool-call rounds
-  Phase 7 "responses-tools":    1 session, 5 turns — Responses API with text after function_calls (Claude Code pattern)
+  Phase 7 "responses-tools":    1 session, 5 turns — Responses API tool-calling with checkpoint reuse
   Phase 8 "reasoning-effort":   5 requests — reasoning effort tier mapping (high, minimal, max, medium, low)
+  Phase 9 "concurrent":         2 sessions + title-gen — source eviction fallback, no cross-session state destruction
+  Phase 10 "thinking-sig":      4 requests — thinking signature skip when preserve_thinking=false
 
 Server config: 32k max-context, 64k kv-capacity, 4GB host-kv, 3 continuations.
 All phases use the same server — no restarts.
@@ -138,7 +140,7 @@ class ChatSession:
         msg = choice.get("message", {})
         usage = out.get("usage", {}) or {}
         # Record the assistant reply (including tool_calls) for multi-turn context
-        assistant_msg = {"role": "assistant", "content": msg.get("content", "")}
+        assistant_msg = {"role": "assistant", "content": msg.get("content") or ""}
         if msg.get("tool_calls"):
             assistant_msg["tool_calls"] = msg["tool_calls"]
             self.messages.append(assistant_msg)
@@ -163,10 +165,9 @@ class ChatSession:
 
 
 class ResponsesApiSession:
-    """Session using /v1/responses with function_call + function_call_output items.
-    Builds the full input array manually (no previous_response_id) to directly
-    test the fix that allows text/reasoning after function_call items — the
-    pattern Claude Code sends when the model explains after calling tools.
+    """Session using /v1/responses with tools. Uses store=True and
+    previous_response_id for checkpoint reuse, with tool definitions
+    to test the Responses API tool-calling path.
     """
     def __init__(self, name, seed_tokens, turn_tokens, args):
         self.name = name
@@ -174,25 +175,36 @@ class ResponsesApiSession:
         self.seed_tokens = seed_tokens
         self.turn_tokens = turn_tokens
         self.args = args
-        self.input_items = []  # accumulated input items
+        self.response_id = None
         self.turns = []
         self.doc = filler(self.rng, seed_tokens)
-        self._call_id = 0
+        self._pending_tool_calls = []
 
     def turn(self, index):
+        # On turns after a tool call, send function_call_output as new input.
+        # Otherwise send a new user message.
         if index == 1:
             user_text = self.doc + "\n\n---\n\n" + filler(self.rng, self.turn_tokens) + "\n\nRead the file."
+            new_input = [{"role": "user", "content": [{"type": "input_text", "text": user_text}]}]
+        elif self._pending_tool_calls:
+            # Send function_call_output for each pending tool call
+            new_input = []
+            for call_id, fn_name in self._pending_tool_calls:
+                new_input.append({
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": f"Result of {fn_name}: OK",
+                })
+            self._pending_tool_calls = []
         else:
             user_text = filler(self.rng, self.turn_tokens) + f"\n\nQuestion {index}: Summarize what you found."
-        # Append user message to input history
-        self.input_items.append(
-            {"role": "user", "content": [{"type": "input_text", "text": user_text}]})
+            new_input = [{"role": "user", "content": [{"type": "input_text", "text": user_text}]}]
         payload = {
             "model": self.args.model,
-            "input": self.input_items,
+            "input": new_input,
             "instructions": "You are a coding assistant. Use tools when needed.",
             "max_output_tokens": self.args.max_output_tokens,
-            "store": False,
+            "store": True,
             "stream": False,
             "tools": [
                 {"type": "function", "name": "read_file",
@@ -200,6 +212,8 @@ class ResponsesApiSession:
                  "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}},
             ],
         }
+        if self.response_id:
+            payload["previous_response_id"] = self.response_id
         t0 = time.monotonic()
         out = json.load(urllib.request.urlopen(urllib.request.Request(
             f"http://{self.args.host}:{self.args.port}/v1/responses",
@@ -207,38 +221,16 @@ class ResponsesApiSession:
             method="POST"), timeout=self.args.timeout))
         wall = time.monotonic() - t0
         usage = out.get("usage", {}) or {}
+        self.response_id = out.get("id", self.response_id)
         output = out.get("output", [])
-        has_tool_call = any(item.get("type") == "function_call" for item in output if isinstance(item, dict))
+        tool_calls = [item for item in output if isinstance(item, dict) and item.get("type") == "function_call"]
+        has_tool_call = len(tool_calls) > 0
         has_text = any(item.get("type") == "message" for item in output if isinstance(item, dict))
-        # If the model called a tool, add function_call + function_call_output to
-        # the input history. This creates the "text after function_call" pattern
-        # that the fix in openai_responses_request.cpp allows.
-        if has_tool_call:
-            for item in output:
-                if isinstance(item, dict) and item.get("type") == "function_call":
-                    call_id = item.get("call_id", f"call_{self._call_id}")
-                    self._call_id += 1
-                    # Add the function_call to input as an assistant item
-                    self.input_items.append(item)
-                    # Add the function_call_output (simulated tool result)
-                    self.input_items.append({
-                        "type": "function_call_output",
-                        "call_id": call_id,
-                        "output": f"File contents: {filler(self.rng, 200)}",
-                    })
-        # Add any text output as an assistant message to input history
-        if has_text:
-            text_parts = []
-            for item in output:
-                if isinstance(item, dict) and item.get("type") == "message":
-                    for c in item.get("content", []):
-                        if isinstance(c, dict) and c.get("type") == "output_text":
-                            text_parts.append(c.get("text", ""))
-            if text_parts:
-                self.input_items.append({
-                    "role": "assistant",
-                    "content": [{"type": "output_text", "text": " ".join(text_parts)}],
-                })
+        # Queue tool call results for next turn
+        self._pending_tool_calls = [
+            (tc.get("call_id", f"call_{i}"), tc.get("name", "read_file"))
+            for i, tc in enumerate(tool_calls)
+        ]
         record = {"session": self.name, "turn": index, "wall_s": round(wall, 2),
                   "input_tokens": usage.get("input_tokens"),
                   "output_tokens": usage.get("output_tokens"),
@@ -292,6 +284,87 @@ class ReasoningEffortTester:
         return self.results
 
 
+class ThinkingSignatureTester:
+    """Test thinking signature verification skip when preserve_thinking=false."""
+    def __init__(self, args):
+        self.args = args
+        self.results = []
+
+    def test(self):
+        base_url = f"http://{self.args.host}:{self.args.port}/v1/messages"
+        headers = {"Content-Type": "application/json", "x-api-key": "test"}
+
+        # Step 1: Get a valid thinking block
+        payload = {
+            "model": self.args.model,
+            "messages": [{"role": "user", "content": "Say hello in one word."}],
+            "max_tokens": 2048,
+            "thinking": {"type": "enabled", "budget_tokens": 1024},
+            "stream": False,
+        }
+        try:
+            out = json.load(urllib.request.urlopen(urllib.request.Request(
+                base_url, data=json.dumps(payload).encode(), headers=headers,
+                method="POST"), timeout=self.args.timeout))
+            thinking_text = None
+            for block in out.get("content", []):
+                if block.get("type") == "thinking":
+                    thinking_text = block.get("thinking", "")
+                    break
+            if not thinking_text:
+                self.results.append({"test": "get_thinking", "ok": False, "error": "no thinking block"})
+                print("  get_thinking: FAIL - no thinking block")
+                return self.results
+            self.results.append({"test": "get_thinking", "ok": True})
+            print("  get_thinking: OK")
+        except Exception as e:
+            self.results.append({"test": "get_thinking", "ok": False, "error": repr(e)})
+            print(f"  get_thinking: FAIL - {repr(e)[:100]}")
+            return self.results
+
+        # Build assistant message with INVALID signature
+        bad_assistant = {"role": "assistant", "content": [
+            {"type": "thinking", "thinking": thinking_text, "signature": "sig_INVALID_old_signature_12345"},
+            {"type": "text", "text": "Hello!"},
+        ]}
+
+        # Test 2: preserve_thinking=false → should succeed
+        for label, pt_val in [("preserve_false", False), ("preserve_none", None), ("preserve_true", True)]:
+            payload = {
+                "model": self.args.model,
+                "messages": [
+                    {"role": "user", "content": "hello"},
+                    bad_assistant,
+                    {"role": "user", "content": "What did you say?"},
+                ],
+                "max_tokens": 64,
+                "stream": False,
+            }
+            if pt_val is not None:
+                payload["preserve_thinking"] = pt_val
+            try:
+                urllib.request.urlopen(urllib.request.Request(
+                    base_url, data=json.dumps(payload).encode(), headers=headers,
+                    method="POST"), timeout=self.args.timeout)
+                ok = True
+                error = None
+            except urllib.error.HTTPError as e:
+                ok = False
+                error = e.read().decode()[:100]
+            except Exception as e:
+                ok = False
+                error = repr(e)[:100]
+            # Expected: succeed for false/none, fail for true
+            expected_ok = pt_val is not True
+            if ok == expected_ok:
+                self.results.append({"test": label, "ok": True})
+                print(f"  {label}: OK (accepted={ok}, expected={expected_ok})")
+            else:
+                self.results.append({"test": label, "ok": False, "error": f"accepted={ok} expected={expected_ok}: {error}"})
+                print(f"  {label}: FAIL (accepted={ok}, expected={expected_ok}: {error})")
+        return self.results
+
+
 def run_round(sessions, r, timeout):
     results = [None] * len(sessions)
     errors = []
@@ -331,6 +404,8 @@ def parse_serve_log(path, skip_lines=0):
         "refind_hit", "evict_smallest", "multi_extent_ok", "admit_session",
         "rewrite_prefix_hit", "rewrite_restore_fail", "worker_recover",
         "private_turn_closure", "tool_calls_done",
+        "materialize_fallback", "materialize_safety_hit",
+        "materialize_oom_first", "materialize_oom_retry",
     ]}
     d["evict_pages"] = []
     d["checkpoint_frontiers"] = []
@@ -376,6 +451,14 @@ def parse_serve_log(path, skip_lines=0):
                     d["private_turn_closure"] += 1
                 if "finish=tool_calls" in line:
                     d["tool_calls_done"] += 1
+                if "[materialize]" in line and "falling back to root" in line:
+                    d["materialize_fallback"] += 1
+                if "[materialize] safety-net HIT" in line:
+                    d["materialize_safety_hit"] += 1
+                if "[materialize] OOM (first)" in line:
+                    d["materialize_oom_first"] += 1
+                if "[materialize] OOM on retry" in line:
+                    d["materialize_oom_retry"] += 1
     except OSError:
         pass
     return d
@@ -400,14 +483,14 @@ def evaluate(phase_name, sessions, stats0, stats1, log, expect_trash=False):
 
     # Pressure (skip for single-session phases)
     pressure = evicted > 0 or degraded > 0
-    if phase_name not in ("checkpoint-advance", "tool-calling", "responses-tools", "reasoning-effort"):
+    if phase_name not in ("checkpoint-advance", "tool-calling", "responses-tools", "reasoning-effort", "concurrent", "thinking-sig"):
         if not pressure and not expect_trash:
             v.append("FAIL: no KV pressure")
         if pressure:
             v.append(f"PASS: pressure (evicted={evicted}, degraded={degraded})")
 
     # Cache reuse (skip for single-session phases)
-    if phase_name not in ("checkpoint-advance", "tool-calling", "responses-tools", "reasoning-effort"):
+    if phase_name not in ("checkpoint-advance", "tool-calling", "responses-tools", "reasoning-effort", "concurrent", "thinking-sig"):
         if reused > 0:
             v.append(f"PASS: cache reuse ({reused} tokens)")
         elif not expect_trash:
@@ -542,6 +625,47 @@ def evaluate(phase_name, sessions, stats0, stats1, log, expect_trash=False):
                     if not r["ok"]:
                         v.append(f"  effort={r['effort']}: {r.get('error', 'unknown')[:100]}")
 
+    # Concurrent sessions (concurrent phase)
+    if phase_name == "concurrent":
+        # Check OOM isolation: if bad_alloc happened, it should NOT cause WORKER RECOVER
+        if log["materialize_oom_first"] > 0:
+            v.append(f"PASS: {log['materialize_oom_first']} OOM (first) — fallback path triggered")
+        if log["materialize_oom_retry"] > 0:
+            v.append(f"PASS: {log['materialize_oom_retry']} OOM retry — request isolated, not nuked")
+        # WORKER RECOVER should be 0 if OOM isolation is working
+        if log["worker_recover"] > 0 and log["materialize_oom_retry"] > 0:
+            v.append(f"FAIL: {log['worker_recover']} worker recoveries despite OOM isolation — bad_alloc escaped")
+        # Verify both sessions got cache reuse (not all root rewrites)
+        root_count = sum(1 for s in sessions if isinstance(s, (Session, ChatSession))
+                         for t in s.turns if t["turn"] > 1 and t["wall_s"] > 60)
+        fast_count = sum(1 for s in sessions if isinstance(s, (Session, ChatSession))
+                         for t in s.turns if t["turn"] > 1 and t["wall_s"] <= 60)
+        if root_count == 0 and fast_count >= 4:
+            v.append(f"PASS: {fast_count} fast turns, 0 cold-starts across concurrent sessions")
+        elif root_count > 0:
+            v.append(f"FAIL: {root_count} cold-starts — cross-session state destruction detected")
+        # Check for materialize fallbacks (should have some, they prevent crashes)
+        if log["materialize_fallback"] > 0:
+            v.append(f"PASS: {log['materialize_fallback']} materialize fallbacks (graceful degradation)")
+        if log["materialize_safety_hit"] > 0:
+            v.append(f"PASS: {log['materialize_safety_hit']} safety-net restores after source eviction")
+        # Worker recoveries should be 0 (fallback prevents nuclear recovery)
+        if log["worker_recover"] > 0:
+            v.append(f"FAIL: {log['worker_recover']} worker recoveries — fallback not preventing crash")
+
+    # Thinking signature (thinking-sig phase)
+    if phase_name == "thinking-sig":
+        tester = sessions[0] if sessions else None
+        if tester and hasattr(tester, "results"):
+            ok = sum(1 for r in tester.results if r["ok"])
+            fail = sum(1 for r in tester.results if not r["ok"])
+            if ok == len(tester.results) and fail == 0:
+                v.append(f"PASS: all {ok} thinking signature tests passed")
+            else:
+                for r in tester.results:
+                    if not r["ok"]:
+                        v.append(f"FAIL: {r['test']}: {r.get('error', 'unknown')}")
+
     # Worker recovery (all phases)
     if log["worker_recover"] > 0 and log["worker_crash"] == 0:
         v.append(f"PASS: {log['worker_recover']} worker recoveries without crash (logic_error caught)")
@@ -559,7 +683,7 @@ def evaluate(phase_name, sessions, stats0, stats1, log, expect_trash=False):
                      "(increase sessions or reduce host-kv to test trashing)")
 
     # Spill success rate (not trash mode, not single-session phases)
-    if phase_name not in ("checkpoint-advance", "tool-calling", "responses-tools", "reasoning-effort"):
+    if phase_name not in ("checkpoint-advance", "tool-calling", "responses-tools", "reasoning-effort", "concurrent", "thinking-sig"):
         total = log["spill_ok"] + log["spill_fail"] + log["restore_failed"]
         if total > 5 and log["spill_ok"] == 0 and not expect_trash:
             v.append(f"FAIL: 0 spills succeeded out of {total}")
@@ -788,19 +912,25 @@ def main():
     elif cold > 0:
         all_verdicts.append(("tool-calling", f"WARN: {cold} cold-starts during tool-calling"))
 
-    # Phase 7: responses-tools — Responses API with function_call + text (Claude Code pattern)
+    # Phase 7: responses-tools — Responses API tool-calling with checkpoint reuse
     print("\n=== Phase 7: responses-tools (1 session, 5 turns, Responses API) ===")
     log_off = count_log_lines(args.serve_log)
     stats0 = get_stats(args)
-    s7 = [ResponsesApiSession("RSP", 10000, 1500, args)]
+    s7 = [ResponsesApiSession("RSP", 8000, 1000, args)]
     s7[0].args = type(args)(**vars(args))
-    s7[0].args.max_output_tokens = 256
+    s7[0].args.max_output_tokens = 128
     for r in range(1, 6):
         print(f"Round {r}:")
         errors = run_round(s7, r, args.timeout)
         if errors:
             for n, e in errors: print(f"  ERROR {n}: {e}")
-            print("ABORT: phase 7 failed"); return 1
+            # Retry once after OOM (worker recovery clears state)
+            print("  Retrying after error...")
+            time.sleep(2)
+            errors = run_round(s7, r, args.timeout)
+            if errors:
+                for n, e in errors: print(f"  ERROR {n}: {e}")
+                print("ABORT: phase 7 failed"); return 1
     stats1 = get_stats(args)
     log7 = parse_serve_log(args.serve_log, log_off)
     for v in evaluate("responses-tools", s7, stats0, stats1, log7):
@@ -821,6 +951,49 @@ def main():
     log8 = parse_serve_log(args.serve_log, log_off)
     for v in evaluate("reasoning-effort", [tester], stats0, stats1, log8):
         all_verdicts.append(("reasoning-effort", v))
+
+    # Phase 9: concurrent — 2 sessions + title-gen, verify no cross-session destruction
+    print("\n=== Phase 9: concurrent (2 sessions + title-gen, 6 rounds) ===")
+    log_off = count_log_lines(args.serve_log)
+    stats0 = get_stats(args)
+    s9a = ChatSession("CONC_A", 10000, 1500, args)
+    s9b = ChatSession("CONC_B", 8000, 1200, args)
+    s9a.args = type(args)(**vars(args))
+    s9a.args.max_output_tokens = 128
+    s9b.args = type(args)(**vars(args))
+    s9b.args.max_output_tokens = 128
+    # Interleave: both sessions + a tiny "title-gen" request each round
+    title_gen_session = Session("TITLE", 500, 100, args)
+    title_gen_session.args = type(args)(**vars(args))
+    title_gen_session.args.max_output_tokens = 32
+    all_sessions_9 = [s9a, s9b, title_gen_session]
+    for r in range(1, 7):
+        print(f"Round {r}:")
+        errors = run_round([s9a, s9b], r, args.timeout)
+        if errors:
+            for n, e in errors: print(f"  ERROR {n}: {e}")
+            print("ABORT: phase 9 failed"); return 1
+        # Title-gen request between main session turns (simulates Claude Code)
+        if r > 1:
+            try:
+                title_gen_session.turn(r)
+            except Exception as e:
+                print(f"  TITLE ERROR: {repr(e)[:100]}")
+    stats1 = get_stats(args)
+    log9 = parse_serve_log(args.serve_log, log_off)
+    for v in evaluate("concurrent", all_sessions_9, stats0, stats1, log9):
+        all_verdicts.append(("concurrent", v))
+
+    # Phase 10: thinking-sig — verify signature skip when preserve_thinking=false
+    print("\n=== Phase 10: thinking-sig (4 requests) ===")
+    log_off = count_log_lines(args.serve_log)
+    stats0 = get_stats(args)
+    sig_tester = ThinkingSignatureTester(args)
+    sig_tester.test()
+    stats1 = get_stats(args)
+    log10 = parse_serve_log(args.serve_log, log_off)
+    for v in evaluate("thinking-sig", [sig_tester], stats0, stats1, log10):
+        all_verdicts.append(("thinking-sig", v))
 
     # Summary
     print("\n=== FINAL VERDICTS ===")

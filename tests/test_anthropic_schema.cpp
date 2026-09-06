@@ -50,7 +50,7 @@ const AnthropicThinkingSigner& thinking_signer() {
 }
 
 AnthropicMessagesRequest parse(const Json& body) {
-    return parse_anthropic_messages_request(body, limits(), thinking_signer());
+    return parse_anthropic_messages_request(body, limits(), thinking_signer(), true);
 }
 
 std::string api_code(const std::function<void()>& action) {
@@ -308,7 +308,7 @@ int test_tool_history() {
     failures += check(api_code([&] { (void)parse(body); }) == "invalid_tool_history",
                       "duplicate tool_use ID was accepted");
     failures += check(api_code([&] {
-                          (void)parse_anthropic_count_tokens_request(body, thinking_signer());
+                          (void)parse_anthropic_count_tokens_request(body, thinking_signer(), true);
                       }) == "invalid_tool_history",
                       "Count Tokens did not share Messages tool-history validation");
     return failures;
@@ -398,7 +398,7 @@ int test_thinking_and_count_tokens() {
     body["temperature"]   = "ignored for counting";
     body["output_config"] = Json{{"format", Json{{"type", "json_schema"}}}};
     const AnthropicCountTokensRequest counted =
-        parse_anthropic_count_tokens_request(body, thinking_signer());
+        parse_anthropic_count_tokens_request(body, thinking_signer(), true);
     failures += check(counted.generation.enable_thinking == true,
                       "Count Tokens did not share prompt-affecting Thinking parsing");
 
@@ -478,7 +478,7 @@ int test_thinking_history_integrity() {
                       "signed Thinking block was accepted at a changed content position");
     failures +=
         check(api_code([&] {
-                  (void)parse_anthropic_count_tokens_request(missing_signature, thinking_signer());
+                  (void)parse_anthropic_count_tokens_request(missing_signature, thinking_signer(), true);
               }) == "invalid_thinking_signature",
               "Count Tokens bypassed Thinking signature validation");
     return failures;

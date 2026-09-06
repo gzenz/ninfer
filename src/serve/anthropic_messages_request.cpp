@@ -305,7 +305,8 @@ std::vector<ParsedUserBlock> parse_user_blocks(const Json& content) {
     return result;
 }
 
-ChatTurn parse_assistant_blocks(const Json& content, const AnthropicThinkingSigner& signer) {
+ChatTurn parse_assistant_blocks(const Json& content, const AnthropicThinkingSigner& signer,
+                                  bool skip_signature_verification) {
     ChatTurn assistant;
     assistant.role = ChatRole::Assistant;
     for (std::size_t index = 0; index < content.size(); ++index) {
@@ -322,12 +323,14 @@ ChatTurn parse_assistant_blocks(const Json& content, const AnthropicThinkingSign
             }
             const std::string thinking =
                 require_string(block, "thinking", "messages", "thinking block");
-            if (!block.contains("signature") || !block.at("signature").is_string()) {
-                invalid_thinking_signature();
-            }
-            const std::string signature = block.at("signature").get<std::string>();
-            if (signature.empty() || !signer.verify(thinking, index, signature)) {
-                invalid_thinking_signature();
+            if (!skip_signature_verification) {
+                if (!block.contains("signature") || !block.at("signature").is_string()) {
+                    invalid_thinking_signature();
+                }
+                const std::string signature = block.at("signature").get<std::string>();
+                if (signature.empty() || !signer.verify(thinking, index, signature)) {
+                    invalid_thinking_signature();
+                }
             }
             assistant.reasoning_content += thinking;
         } else if (type == "redacted_thinking") {
@@ -543,7 +546,8 @@ void lower_messages(std::vector<ParsedMessage> messages, GenerationRequest& requ
 }
 
 void parse_messages(const Json& body, GenerationRequest& request,
-                    const AnthropicThinkingSigner& signer) {
+                    const AnthropicThinkingSigner& signer,
+                    bool skip_signature_verification) {
     if (!body.contains("messages")) { bad_request("missing required field: messages", "messages"); }
     const Json& messages = body.at("messages");
     if (!messages.is_array() || messages.empty()) {
@@ -614,7 +618,7 @@ void parse_messages(const Json& body, GenerationRequest& request,
             bad_request("message content must be a string or an array", "messages");
         }
         if (role == ChatRole::Assistant) {
-            message.turn = parse_assistant_blocks(content, signer);
+            message.turn = parse_assistant_blocks(content, signer, skip_signature_verification);
         } else {
             message.user_blocks = parse_user_blocks(content);
         }
@@ -1012,10 +1016,24 @@ void apply_anthropic_prompt_cache_policy(const Json& body, GenerationRequest& re
 }
 
 void parse_common_prompt(const Json& body, GenerationRequest& request, ParsePurpose purpose,
-                         int effective_max_tokens, const AnthropicThinkingSigner& signer) {
+                         int effective_max_tokens, const AnthropicThinkingSigner& signer,
+                         bool server_preserve_thinking) {
+    // Parse preserve_thinking BEFORE messages so signature verification
+    // can be skipped when thinking blocks will be dropped anyway.
+    if (body.contains("preserve_thinking") && !body.at("preserve_thinking").is_null()) {
+        if (!body.at("preserve_thinking").is_boolean()) {
+            bad_request("preserve_thinking must be a boolean", "preserve_thinking");
+        }
+        request.preserve_thinking = body.at("preserve_thinking").get<bool>();
+    }
+    // Resolve the effective preserve_thinking: if the request doesn't set it,
+    // use the server default. Skip signature verification when thinking will
+    // be dropped (preserve_thinking resolves to false).
+    const bool effective_preserve_thinking =
+        request.preserve_thinking.value_or(server_preserve_thinking);
     lower_tools(body, request);
     parse_system(body, request);
-    parse_messages(body, request, signer);
+    parse_messages(body, request, signer, !effective_preserve_thinking);
     parse_thinking(body, request, purpose, effective_max_tokens);
     parse_effort(body, request, purpose);
     apply_anthropic_prompt_cache_policy(body, request);
@@ -1024,19 +1042,14 @@ void parse_common_prompt(const Json& body, GenerationRequest& request, ParsePurp
                     "provide",
                     "container", "container_not_supported");
     }
-    if (body.contains("preserve_thinking") && !body.at("preserve_thinking").is_null()) {
-        if (!body.at("preserve_thinking").is_boolean()) {
-            bad_request("preserve_thinking must be a boolean", "preserve_thinking");
-        }
-        request.preserve_thinking = body.at("preserve_thinking").get<bool>();
-    }
 }
 
 } // namespace
 
 AnthropicMessagesRequest parse_anthropic_messages_request(const Json& body,
                                                           const RequestLimits& limits,
-                                                          const AnthropicThinkingSigner& signer) {
+                                                          const AnthropicThinkingSigner& signer,
+                                                          bool server_preserve_thinking) {
     require_object(body);
     AnthropicMessagesRequest result;
     result.model                           = parse_model(body);
@@ -1058,19 +1071,20 @@ AnthropicMessagesRequest parse_anthropic_messages_request(const Json& body,
     }
 
     parse_common_prompt(body, result.generation, ParsePurpose::Messages,
-                        result.generation.max_tokens, signer);
+                        result.generation.max_tokens, signer, server_preserve_thinking);
     parse_generation_fields(body, result.generation);
     return result;
 }
 
 AnthropicCountTokensRequest
-parse_anthropic_count_tokens_request(const Json& body, const AnthropicThinkingSigner& signer) {
+parse_anthropic_count_tokens_request(const Json& body, const AnthropicThinkingSigner& signer,
+                                      bool server_preserve_thinking) {
     require_object(body);
     AnthropicCountTokensRequest result;
     result.model                           = parse_model(body);
     result.generation.tool_name_max_length = kMaxToolNameLength;
     parse_common_prompt(body, result.generation, ParsePurpose::CountTokens,
-                        std::numeric_limits<int>::max(), signer);
+                        std::numeric_limits<int>::max(), signer, server_preserve_thinking);
     return result;
 }
 

@@ -10216,8 +10216,16 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
             }
             activate_consumed_state(checkpoint);
             if (!preserve_rewrite && sequence.rewrite_checkpoint.valid && state_images) {
+                // Check slot budget BEFORE creating a new checkpoint.
+                // If the new checkpoint won't fit, skip creation and keep
+                // the old checkpoint metadata (frontier). The next request
+                // will find the checkpoint via inspect, discover no resident
+                // state, and fall back to root prefill or safety-net restore.
+                const bool can_fit_new_checkpoint =
+                    state_footprint(sequence) + 1 <= state_slots;
                 std::optional<StateImageHandle> new_rewrite =
-                    state_store->reserve_destination();
+                    can_fit_new_checkpoint ? state_store->reserve_destination()
+                                           : std::nullopt;
                 if (new_rewrite) {
                     const std::int32_t src_slot =
                         state_store->physical_slot(sequence.state.read);
@@ -10229,18 +10237,13 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
                     state_store->freeze(*new_rewrite);
                     state_store->retain_checkpoint_reference(*new_rewrite);
                     sequence.rewrite_state = *new_rewrite;
-                    // If the new rewrite_state would exceed the slot budget,
-                    // release it and drop the checkpoint. The prefill will
-                    // proceed without a rewrite checkpoint for this turn.
-                    if (state_footprint(sequence) + 1 > state_slots) {
-                        state_store->release_checkpoint_reference(*new_rewrite);
-                        if (!state_store->release(*new_rewrite)) {
-                            std::fprintf(stderr, "[rewrite-restore] WARNING: leaked state slot\n");
-                        }
-                        sequence.rewrite_state.reset();
-                        sequence.rewrite_checkpoint = {};
-                    }
                 } else {
+                    // No slot for new checkpoint — clear checkpoint metadata.
+                    // The pre-check avoids wasting a state slot on a checkpoint
+                    // that would be immediately released by the post-creation guard.
+                    std::fprintf(stderr,
+                        "[rewrite-restore] slot budget: no room for checkpoint, frontier=%u cleared\n",
+                        sequence.rewrite_checkpoint.frontier);
                     sequence.rewrite_checkpoint = {};
                 }
             }

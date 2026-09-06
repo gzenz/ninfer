@@ -2023,6 +2023,22 @@ private:
                 // iteration as a fresh scheduling boundary (no decode continuity).
                 previous_unit_was_decode = false;
                 continue;
+            } catch (const std::logic_error& logic_err) {
+                // Recoverable logic error (e.g. stale checkpoint state image).
+                // Fail the active/materializing requests but keep the worker alive.
+                std::fprintf(stderr, "[engine] WORKER RECOVER: %s\n", logic_err.what());
+                if (++oom_recovery_count_ > kOomMaxRecoveries) {
+                    std::fprintf(stderr, "[engine] WORKER: %u consecutive recoveries — failing all\n",
+                                 oom_recovery_count_ - 1);
+                    fail_all_locked(std::current_exception());
+                    return;
+                }
+                HostPhaseMeasurement cleanup = begin_host_phase();
+                recover_from_oom_locked(std::current_exception());
+                finish_engine_phase(cleanup, EngineHostPhase::Maintenance);
+                oom_backoff_ = kOomBackoffIterations;
+                previous_unit_was_decode = false;
+                continue;
             } catch (...) {
                 const std::exception_ptr error = std::current_exception();
                 try { std::rethrow_exception(error); }

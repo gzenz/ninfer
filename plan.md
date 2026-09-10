@@ -1,377 +1,260 @@
-# Unified Checkpoint Host Demotion — Architecture & Implementation Plan
-
-## Problem
-
-With 3 concurrent sessions on the production server (RTX 5090, 32 GB VRAM):
-- Weights: 16.3 GB
-- Device state images: 6 slots x 2 GB = 12 GB (3-cache + 3-active)
-- KV + workspace: ~3.7 GB
-- Total: ~32 GB — completely full
-
-Each session needs 2 device state slots (1 active + 1 checkpoint). With 3
-sessions, all 6 slots are used. When a session advances its turn, it needs
-a 7th slot for the new checkpoint — none available.
-
-## Root Cause
-
-The pressure planner and the KV safety net were two separate systems that
-fought each other. The pressure planner would DROP rewrite checkpoints
-(state only, keep KV on device) when it needed device state slots. The
-dropped checkpoint state was captured to a side store
-(`dropped_checkpoint_captures_`) that the inspect couldn't search. Follow-up
-requests couldn't find the checkpoint and had to re-prefill (12-32s per
-request instead of 0-1s).
-
-## Architecture
-
-**Key principle: KV and checkpoint state move together to host, or not at all.**
-
-### Pressure planner: no rewrite checkpoint drops
-
-The pressure planner no longer generates drop successors for rewrite
-checkpoints. When it needs a device state slot occupied by a rewrite
-checkpoint, it must evict the entire continuation (KV + state together
-to the safety net). This is more destructive (frees the KV too) but
-preserves the checkpoint on host.
-
-Endpoint and long-anchor checkpoints can still be dropped (they don't
-serve follow-up prompt matching).
-
-### Safety net: single host-side store with state-only entries
-
-The safety net (`host_kv_arena`) handles:
-1. **Full entries** (KV + state) from eviction — existing behavior
-2. **State-only entries** (no KV) from checkpoint capture — NEW
-
-State-only entries are created at three points:
-- `publish_pressure_host_releases`: when a checkpoint is dropped (endpoint
-  or long anchor — rewrite checkpoints are no longer dropped)
-- `finish()`: when fork_collapsed_to_source captures the turn-boundary state
-- `advance_prefill`: when a root-path turn completes (no rewrite checkpoint)
-
-State-only entries store the checkpoint state bytes in a heap vector
-(~2GB each), bounded by continuation count (no artificial limit).
-
-### Spill merge
-
-When a continuation with a dropped checkpoint is later evicted, the spill
-function merges the state-only entry's checkpoint state into the full
-safety net entry. This uses `take_state_only_by_session` to find and remove
-the state-only entry, then attaches its state to the full entry.
-
-### Inspect and restore
-
-The inspect finds evicted continuations via the existing safety-find
-(full entries with KV + state). The root restore path H2D copies both
-KV and state. No new inspect or restore logic needed.
-
-State-only entries are NOT found by `find()` (they have no KV). They are
-only found by `take_state_only_by_session` during the spill merge.
-
-## Implementation Steps
-
-### Step 1: State-only safety net entries (DONE)
-
-- Add `state_only` flag to `HostKVSafetyNetEntry`
-- `find()` skips state-only entries (no KV to restore)
-- `add()` no longer bounds state-only entries (removed artificial LRU limit)
-- `take_state_only_by_session()` finds and removes by session_key
-- `remove_state_only()` cleans up on slot recycling
-
-### Step 2: Replace dropped_checkpoint_captures_ (DONE)
-
-- Replace 3 capture sites with state-only safety net entries:
-  - `publish_pressure_host_releases` (pressure planner drop)
-  - `finish()` fork-collapsed capture
-  - `advance_prefill` root-path capture
-- Remove `DroppedCheckpointCapture` struct and `dropped_checkpoint_captures_` member
-- Spill function merges state-only entries via `take_state_only_by_session`
-
-### Step 3: Pressure planner no longer drops rewrite checkpoints (DONE)
-
-- In `inspect_pressure_successors`, don't generate drop successors for
-  rewrite checkpoints
-- The planner evicts the entire continuation instead
-- This upholds the principle: KV and state move together
-
-### Step 4: E2e tests (DONE)
-
-- Parse `[checkpoint-demoted]` and `[safety-spill] merged dropped` patterns
-- Demotion phase evaluates checkpoint demotions and restores
-- Verify no re-prefills after cold start
-
-### Step 5: Eliminate host_state_images dependency in finish() (DONE)
-
-finish() demotion now uses direct D2H to buffer + safety net capture
-(demoted_host_buffer). host_state_images still exists for StateImageStore
-internals (D2H/H2D transfers) — eliminating it entirely would require
-reworking StateImageStore, which is beyond the current scope.
-
-### Step 6: Remove finish() demotion hack (DONE)
-
-finish() demotion no longer uses begin_device_to_host/publish_transfer.
-Uses direct D2H to buffer, H2D to new slot, then moves buffer to safety
-net. The HostOnly restore in start_sequence remains as fallback for
-pressure planner endpoint/long-anchor demotions.
-
-## What's already done (reusable)
-
-- [x] Spill function handles HostOnly endpoint state (safety net captures it)
-- [x] E2e test infrastructure (11 phases, parse patterns, server config guard)
-- [x] Pre-commit hook fix for git worktrees
-- [x] Materialize fallback (root prefill when source state evicted)
-- [x] Bad_alloc isolation (fail one request, not all)
-- [x] Thinking signature skip
-- [x] Monitor queue timing
-- [x] Worker recovery (logic_error catch)
-- [x] State-only safety net entries (Steps 1-2)
-- [x] Pressure planner no rewrite drops (Step 3)
-- [x] E2e test updates (Step 4)
-- [x] finish() demotion via safety net (Steps 5-6)
-- [x] Pressure accounting: stop overwriting committed_delta (Step 1)
-- [x] Pressure accounting: bad_alloc retry partial-allocation cleanup (Step 3)
-- [x] Backend scatter-gather (eliminates spill fragmentation failures)
-- [x] max_fragments and state-only LRU limits removed (no artificial caps)
-
-
-## Final Status (commit 3e5f4179)
-
-### E2e Results: 58 PASS, 4 WARN, 1 FAIL
-- All 11 phases completed without crashes
-- No OOM failures (bad_alloc is WARN for trash phase)
-- 0 cold-starts across all phases
-- Checkpoint state preserved via safety net (demoted + spill_ckpt)
-- Spill merges working (state-only entries consolidated into full entries)
-
-### The 1 FAIL (pre-existing)
-- responses-tools: frontiers [9446, 9446, 9446, 9446] — all same
-- This is a pre-existing Responses API checkpoint issue, not related to
-  the unified demotion architecture
-- The Responses API may not advance checkpoints when using previous_response_id
-  with the safety-net root restore path
-
-### Architecture Delivered
-1. State-only safety net entries replace dropped_checkpoint_captures_
-2. Pressure planner evicts entire continuations (no rewrite drops)
-3. KV and checkpoint state move together to host (key principle upheld)
-4. Spill merge consolidates state-only entries via source_continuation_index
-5. Safety net handles checkpoint state; host_state_images remains for
-   StateImageStore internals (D2H/H2D transfers)
-
-
-## Pressure Accounting Refactoring (DONE — bad_alloc Made Non-Fatal)
-
-### Problem
-
-`complete_pressure_delta` (program_impl.h:6432-6436) silently overwrites
-the actual committed delta with the planned delta:
-
-```cpp
-const auto complete_pressure_delta = [&](PressureWork& work) {
-    (void)checked_resource_difference(work.option.effect.removed, work.committed_delta.removed);
-    (void)checked_resource_difference(work.option.effect.added, work.committed_delta.added);
-    work.committed_delta = work.option.effect;  // overwrites actual with planned
-};
-```
-
-The `(void)` casts discard the difference between planned and actual.
-This means the system BELIEVES it freed as much memory as the pressure
-planner planned, even when the actual freed memory is less (e.g., a
-victim was partially truncated by a prior KV operation, or a spill
-captured fewer pages than expected).
-
-### Consequence
-
-1. The admission check (`physical_peak_fits`) passes because it uses
-   `physical_occupancy()` (actual) + `physical_peak_additional` (planned).
-   But the planned peak assumed the planned freed resources, not the
-   actual freed resources.
-
-2. After pressure work completes, `physical_occupancy()` reflects the
-   ACTUAL state (correctly). But the system's accounting (committed_delta)
-   claims the PLANNED state. The discrepancy is silently erased.
-
-3. When `prepare_materialization` or `advance_prefill` tries to allocate
-   device KV pages, the pool is fuller than expected → `std::bad_alloc`.
-
-### Fix: Use Actual Freed Resources
-
-**Step 1: Stop overwriting committed_delta. (DONE)**
-
-Replace `work.committed_delta = work.option.effect` with code that
-computes the ACTUAL delta from the pressure work's results:
-
-```cpp
-const auto complete_pressure_delta = [&](PressureWork& work) {
-    // Compute actual delta from what was actually freed/added
-    detail::PhysicalDelta actual;
-    for (const auto& state_change : work.state_changes) {
-        if (state_change.host_released) {
-            actual.removed.host.state_slots++;
-        }
-    }
-    for (const auto& kv_change : work.main_kv_changes) {
-        if (kv_change.host_released) {
-            actual.removed.device.main_kv_pages += kv_change.pages.size();
-        }
-    }
-    // ... same for backend_kv_changes
-    // Track added resources from transfers/activations
-    work.committed_delta = actual;
-};
-```
-
-**Step 2: Post-pressure verification. (REJECTED — NOT NEEDED — Steps 1+3 eliminated all bad_alloc
-without post-pressure verification. The admission check (physical_peak_fits)
-remains the sole guard. The committed_delta is now accurate but write-only
-— no downstream consumer reads it.)**
-
-After all pressure work completes, verify that the ACTUAL freed memory
-is sufficient for the request's peak demand:
-
-```cpp
-detail::PhysicalResources actual_freed = {};
-for (const auto& work : transaction.pressure) {
-    actual_freed = checked_resource_sum(actual_freed, work.committed_delta.removed);
-}
-detail::PhysicalResources actual_occupancy_after = 
-    checked_resource_difference(physical_occupancy(), actual_freed);
-if (!fits_within(actual_occupancy_after, transaction.peak_demand, admission_capacity())) {
-    // Actual freed memory insufficient — abort, don't proceed to execution
-    abort_transaction();
-    return out;
-}
-```
-
-**Step 3: Fix the bad_alloc retry partial-allocation bug. (DONE)**
-
-The `catch (const std::bad_alloc& oom)` handler retries
-`prepare_materialization` without cleaning up partial allocations
-from the failed first attempt. If the first attempt allocated 1 of 2
-state slots, `reserved_state_count = 1`. The retry's guard check
-`state_count > reserved_states.size() - reserved_state_count` throws
-`logic_error` (not `bad_alloc`), which escapes the catch and crashes
-the worker.
-
-**Fix:** Add a targeted cleanup function that releases ONLY the partial
-allocations from `prepare_materialization` (reserved states, KV
-activations, fork destinations) WITHOUT touching reservation-level
-state (prefill, root_continuation_index, ledgers).
-
-The `logic_error` handler at L6719 shows the correct pattern: it does
-targeted cleanup (releases specific slots, resets the plan to root)
-without calling `release_materialization_staging` (which is a full
-teardown that destroys everything).
-
-```cpp
-const auto release_partial_preparation = [&]() {
-    // Release partially reserved state images (can throw at L4754)
-    for (std::uint32_t i = 0; i < transaction.reserved_state_count; ++i) {
-        state_store->release(transaction.reserved_states[i]);
-    }
-    transaction.reserved_state_count = 0;
-    // Release state fork destination (can throw at L4734)
-    if (transaction.state_fork_destination) {
-        state_store->release(*transaction.state_fork_destination);
-        transaction.state_fork_destination.reset();
-    }
-    // Release partially activated KV pages (can throw at L4836/L4846)
-    if (transaction.text_activation) {
-        text_kv_addresses->release_activation(*transaction.text_activation);
-        transaction.text_activation.reset();
-    }
-    if (transaction.backend_activation) {
-        backend_kv_addresses->release_activation(*transaction.backend_activation);
-        transaction.backend_activation.reset();
-    }
-    // Do NOT touch:
-    // - requests[lane].prefill (needed by retry)
-    // - transaction.root_continuation_index (needed by retry)
-    // - materialization_ledger_/identity_/prefix_digests_ (needed by start_sequence)
-    // - transaction.source_prepared (needed by retry guard)
-    // - transaction.root_text_address / root_backend_address (reserved at reserve time)
-    // - transaction.text_prefix_fork / backend_prefix_fork (logic_error, not bad_alloc)
-    // - transaction.text_retained_tail* (allocated by enqueue, not prepare)
-    // - transaction.text_source_restore_reservation (allocated by enqueue, not prepare)
-    // - Pressure work (already completed before prepare)
-};
-```
-
-**Scope analysis:** Only 4 resource types can be partially allocated
-when bad_alloc throws during prepare_materialization:
-1. reserved_states (state_store->reserve_destination at L4754)
-2. state_fork_destination (state_store->reserve_destination at L4734)
-3. text_activation (text_kv_addresses->prepare_activation at L4836)
-4. backend_activation (backend_kv_addresses->prepare_activation at L4846)
-
-Other resources (prefix forks, retained tails, source restore reservations,
-transfers) are either:
-- Logic_error, not bad_alloc (prefix forks at L4785/L4791)
-- Allocated by enqueue_materialization_transfers, which runs AFTER
-  prepare_materialization and is not reached if prepare throws
-- Allocated before the bad_alloc throw point and fully committed
-
-Call `release_partial_preparation()` before the retry in the bad_alloc
-catch handler.
-
-### Risk Assessment
-
-- Step 1 (stop overwriting): LOW risk. The committed_delta is used for
-  accounting/diagnostics, not for functional decisions. Changing it
-  to reflect reality should not break anything.
-
-- Step 2 (post-pressure verification): MEDIUM risk. Needs careful
-  accounting of staging resources (reserved by prepare_materialization)
-  to avoid double-counting. The previous attempt failed because it
-  used `physical_peak_fits` which includes staging in occupancy.
-
-- Step 3 (partial-allocation cleanup): MEDIUM risk. The targeted
-  cleanup function must release exactly what prepare_materialization
-  allocated, nothing more. Missing a cleanup path leaks resources;
-  releasing too much corrupts the transaction state.
-
-### Expected Outcome
-
-- bad_alloc made non-fatal (caught and recovered, no crashes)
-- 0 spill failures (backend scatter-gather fixed)
-- 0 checkpoint advancement failures (fixed)
-- 0 cold-starts across all phases
-- 0 new FAILs in e2e tests (1 pre-existing intermittent FAIL in responses-tools) (intermittent WARNs from spills-missing-ckpt
-  edge cases in extreme pressure phases)
-
-
-## Model Download and Prod Verification (DEFERRED — requires upstream rebase)
-
-> **Deferred:** The HF model (neroued/Qwen3.8-27B-nvfp4-NInfer) requires
-> minimum revision 385b30ce which is not in our fork. The model's tensor
-> descriptor format (text/token_embedding) doesn't match our current build.
-> Rebase on upstream first, then retry. Not part of this plan's scope.
-
-### Download the NInfer model artifact
-
-Source: https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer
-
-This is the official NInfer-format NVFP4 checkpoint for Qwen3.8-27B.
-Download and verify the server can launch with it in production settings
-(QUASAR model, c=3, 555k context, YaRN 2.12, --thinking).
-
-### Steps
-
-1. Download the model artifact using the HuggingFace CLI:
-   ```
-   huggingface-cli download neroued/Qwen3.8-27B-nvfp4-NInfer \
-     --local-dir ~/ninfer-models/qwen3_8_27b_QUASAR_nvfp4.ninfer
-   ```
-2. Place it in ~/ninfer-models/ on strix.lan
-3. Launch the production server with ninfer-start.sh
-4. Verify the server starts and reports the correct model identity
-5. Run a smoke test (single inference request) to confirm the model loads
-6. Verify the chat template and weights profile are correct for QUASAR
-
-### Verification criteria
-
-- Server starts without errors
-- Model identity reports qwen3.8-27b/nvfp4
-- KV cache allocates correctly (nvfp4 KV)
-- First inference request succeeds (non-empty output)
-- No numerical errors or NaN in output
+# Frontend Template Execution — jinja engine integration + froggeric v22.5 (2026-09-10)
+
+> Replaces the "Upstream Sync 2026-09-09" plan (dual-recipe NVFP4 KV),
+> which is **not executed** as of today: verified absent from master and
+> both local checkouts (no `kv-recipe` in src, no `local/up-sync-2026-09`
+> branch, master still at d6ae7d2f = PR #3 checkpoint-host-demotion merge).
+> That sync remains a separate pending effort and is deferred by this plan.
+>
+> What did land from the leak-incident line:
+> - the tool-call leak fix shipped (3c0b4dc5, `--tolerant-tool-calls` last-close
+>   recovery + empty-tools contract) and is deployed on the production server
+> - the pi-plan client fix (never wipe the active tool set) landed
+> - the A/B leak battery now has a permanent no-tools condition (D_notools)
+>   verified RECOVERED end-to-end
+
+## Context: the template file is a digest label, not executable behavior
+
+Verified state (2026-09-10):
+
+- `frontend/chat_template.jinja` in the artifact is consumed only as (1) a
+  SHA-256 digest that selects the C++ renderer semantics, or is bypassed
+  entirely by `--chat-template-semantics`; (2) a byte-consistency check
+  against `tokenizer_config.json.chat_template`; (3) a raw resource in the
+  artifact.
+- No jinja interpreter exists anywhere in the repo (code, tests, history).
+  All rendering is the hand-written C++ port in
+  `src/targets/qwen3_6/impl/frontend/chat_template.cpp` (~40 KB, the
+  "port froggeric v22 chat template semantics" lineage plus local adoptions:
+  multi-variant think-close handling, no-dangling-intent rule, tool-example
+  fixes).
+- The README "Chat template loading" section promises that `--chat-template`
+  loads any jinja template and changes behavior. It does not: pointing the
+  flag at a different file changes the rendered output by zero bytes. The
+  documented feature is a fake.
+
+Decision (user, 2026-09-10): make the promise real — add a real jinja engine
+so `--chat-template` genuinely loads and executes the specified file. The
+froggeric v22.5 merge (Phase 3) then becomes a template content change
+instead of a C++ porting project.
+
+## Phase 1 — Engine selection (done, 2026-09-10)
+
+Selected: `wangzhaode/jinja.cpp` — Apache-2.0, single 80 KB header + 25 KB
+JSON bridge (`ujson.hpp`), nlohmann backend (already vendored in
+`third_party/nlohmann`). Purpose-built for LLM chat templates; validated by
+its authors against Python transformers on Qwen 2.5/3, DeepSeek, Llama.
+
+Rejected: `jinja2cpp/Jinja2Cpp` (599 stars, broader conformance) — requires
+Boost >= 1.65 + fmt + four nonstd-lite libraries; contradicts the repo's
+three-small-libs `third_party` discipline. `hughperkins/Jinja2CppLight` —
+dead since 2020.
+
+Proof (byte-exact parity, oracle = Python jinja2 3.1.6, keep_trailing_
+newline, rendering the actual v22.5 template): 24/24 contexts identical,
+including tool definitions (xml + json formats), tool-history replay,
+reasoning replay, all effort aliases, error-tiering (text + JSON payload),
+truncation (text path + v22.5 JSON-payload-skip), inline effort tags,
+image/video/vision-id media, auto-disable, multi-call turns, the literal
+think-close-tag incident case, and both raise_exception error paths
+(error-message parity).
+
+Five contained patches to the vendored header (each verified in the parity
+harness):
+1. `make_unique` polyfill collides with `std::make_unique` under modern
+   standards -> guard with `__cpp_lib_make_unique`.
+2. `join` filter missing (20 uses in the template) -> added.
+3. `tojson` used a custom tool-canonical key order -> aligned to jinja2
+   semantics (sort_keys, `", "`/`": "` separators, UTF-8 preserved).
+4. String slicing missing (`content[:n]`, `[:1]`) — the truncation and
+   error-tiering branches were silent no-ops -> added string-slice branch.
+5. Tuple literals (`x in ('a', 'low')`) parsed as function calls — the
+   effort-alias branches misrouted -> parenthesized comma lists parse as
+   arrays.
+Plus one registration: `raise_exception` via the engine's `add_function`
+API as a throwing function (render() propagates exceptions — verified).
+
+Harness lives at `/tmp/jinja_parity` (24-context suite, render drivers for
+both engines, patched header). Promote into the repo in Phase 2.
+
+## Phase 2a — Perf gate (measured 2026-09-10, Mac, -O2, C++20)
+
+~200.7k-token context (802,896 chars, 311 messages: system + 40 tool rounds
+with generated code arguments/results + xhigh thinking), 5 timed renders:
+
+| renderer | best | mean | output |
+|---|---|---|---|
+| hand-written C++ port, v22 | 5.78 ms | 6.44 ms | 861,908 B |
+| jinja engine, v22 template | 5.37 ms | 5.56 ms | 830,711 B |
+| jinja engine, v22.5 template | 7.46 ms | 7.61 ms | 833,637 B |
+
+One-time (startup, not per request): template compile 6.2–8.6 ms, context
+JSON parse 3.4 ms (real integration builds the context in-memory — no parse).
+
+- Engine vs port at equal scale: engine is faster (no regression; the port's
+  per-message span tracking costs more than the expression walk).
+- v22.5 template complexity: +1.9 ms/render vs v22 (template delta, not engine).
+- Against prefill (2–4 s at 200k tokens) render is <0.1% of wall time.
+- Confirmed: the port's output is 31 KB larger than the engine rendering the
+  v22 file — the local adoptions (stricter IMPORTANT block, no-dangling-intent,
+  think-first example) are NOT in the v22 fixture and are re-emitted per tool
+  round (~775 B/round). Phase 2.4 (move adoptions into the template) is
+  mandatory for cutover; otherwise the rendered prompt changes and prefix
+  reuse breaks.
+- Final confirmation on strix with a real 200k request is part of Phase 2
+  validation (absolute numbers will differ; relative comparison is the gate).
+
+## Phase 2 — Integration
+
+1. Vendor `third_party/jinja/` (header + ujson bridge, pinned version, the
+   five patches, LICENSE).
+2. CMake target, linked into `ninfer_engine`.
+3. Frontend rewiring:
+   - `CompiledChatTemplate` = compiled jinja template + registered globals
+     (raise_exception) + identity digest.
+   - Context construction maps PromptInput to the template variables
+     (enable_thinking, reasoning_effort, tool_call_format, preserve_
+     thinking, add_vision_id, max_tool_arg_chars, max_tool_response_chars,
+     auto_disable_thinking_with_tools, messages, tools). The current C++
+     port's option mapping is the reference for required keys.
+   - **Structured output reconstruction (the open piece, do first):**
+     `RenderedChat` needs literal spans, media placeholder spans with
+     item_index, and message/cache byte boundaries. A plain render is a
+     string. Approach: media tokens are emitted by the template in item
+     order, so item_index = occurrence order via an ordered placeholder
+     scan; cache/message boundaries via sentinel markers injected at
+     boundary positions and stripped post-render. Parity-validate against
+     the current renderer's structured output (all three registered
+     semantics) before cutover.
+4. Move our local adoptions into the template file (they live in the C++
+   port, not the v22 fixture): multi-variant think-close handling,
+   no-dangling-intent rule, tool-instruction example fixes. Small template
+   edits to our fixture.
+5. Retire the hand-written C++ render path (~40 KB) — one renderer, not two.
+   The digest/semantics flag surface shrinks accordingly (decide at cutover:
+   keep `--chat-template-semantics` only if distinct behavior remains).
+6. Docs: README "Chat template loading" now describes real behavior;
+   update `docs/serving.md` and the artifact docs.
+
+Verification:
+- Unit: the 24-context parity suite promoted to `tests/` (C++ render vs
+  Python-oracle reference outputs, byte-exact).
+- Structured-output parity vs the current renderer on a fixed corpus
+  (media, boundaries, tool history) — gate for cutover.
+- E2E on the GPU box: existing e2e suite + the tool-leak A/B battery
+  (D_notools must stay RECOVERED) + the live server under the new path.
+- Performance: render-time measurement on the prefill hot path (large
+  prompts, 500k+ context) vs the current port. The port is O(n) string
+  assembly; the engine adds parse overhead. No acceptable regression —
+  this is a gating measurement, not a follow-up.
+
+Risks:
+- Engine maturity (20-star library): mitigated by the byte-exact parity
+  proof, vendoring at a pin, and all five patches being small and local.
+- Structured boundary reconstruction: main engineering risk — build and
+  validate it before rewiring anything else.
+- Hot-path throughput: measured, not assumed.
+
+## Phase 3 — Froggeric v22.5 (after Phase 2)
+
+With a real engine, the v22.5 "merge" stops being a C++ port and becomes a
+template content change:
+
+1. New fixture `froggeric_v22.5_chat_template.jinja` = upstream v22.5 + our
+   local adoptions from Phase 2.4 (same file, no split ownership).
+2. Register as the template identity (v22 -> v22.5 is a semantic upgrade of
+   the same identity: digest update, fixture replacement in the artifact).
+3. All v22.1->v22.5 semantics come from the template itself — effort
+   aliases, default-medium, leading system-prompt merge, explicit reasoning
+   field variants (reasoning_content/thinking/reasoning) + lead-strip,
+   error tiering, multi-tool token parity, non-thinking tool-prompt
+   alignment, video_url, JSON-payload truncation protection. No C++ work.
+4. Verification: parity suite re-run at v22.5, tool-leak A/B, e2e suite on
+   the GPU box.
+
+Standing caveat: upstream v22.5 still extracts in-content thinking at the
+FIRST think-close occurrence. Our local hardening (close-tag handling that
+does not split on a quoted literal) stays in the template as our deviation,
+and the deployed server-side tolerant parser remains the backstop for
+already-emitted text-form calls.
+
+## Effort
+
+- Phase 2: ~2-3 days (structured-output reconstruction is the bulk).
+- Phase 3: ~0.5-1 day (template edit + validation) once Phase 2 lands.
+
+
+## Post-Merge Findings — Arena Fragmentation & Eviction Strategy (2026-09-10)
+
+Production testing under extreme pressure (single 371k-token session, 1016
+messages, arena exhausted to 14MB free) revealed two issues in the host KV
+safety net arena that were not visible under moderate load.
+
+### Finding A — Arena fragmentation from scatter-gather allocations
+
+The scatter-gather multi-extent allocation (added to work around single-
+allocation failures) is **causing the fragmentation it was meant to solve**:
+
+1. Single contiguous allocation fails (free space split into small chunks)
+2. Scatter-gather splits into 2-3 smaller allocations
+3. These create separate used regions in the arena
+4. When freed, they leave separate small free holes
+5. Next allocation can't fit in any single hole → more scatter-gather
+6. Feedback loop: more fragmentation → more scatter-gather → more fragmentation
+
+**Evidence (from systemd journal, 16725 lines):**
+- 144 single-allocation failures with avg 7.90GB free (needing only 5.6GB)
+- Worst case: 14.22GB free, 6.72GB needed — couldn't allocate contiguously
+- 137 double-allocations, 6 triple-allocations (scatter-gather splitting)
+- Arena free hit 14MB despite 30GB capacity and only ~15GB used
+- 278 FALLBACK (state-only) events as a direct consequence
+- 1 bad_alloc (caught by WORKER OOM handler, server survived)
+
+**Root cause:** The arena allocator does not coalesce adjacent free regions.
+It appears to use a simple free-list or bump allocator that fragments under
+multi-size allocation patterns. The scatter-gather workaround creates the
+multi-size pattern that triggers fragmentation.
+
+**Fix needed:** Arena allocator must coalesce adjacent free blocks (like a
+proper malloc) or implement compaction when free space is fragmented below
+a threshold. Alternatively, use a slab/buddy allocator that naturally
+avoids fragmentation for power-of-two allocation sizes.
+
+### Finding B — evict-smallest evicts only ONE entry
+
+When the arena is full and a new spill needs space, `evict-smallest`
+evicts only ONE entry. If that entry is small (e.g., 2 pages = ~2MB),
+freeing it does not provide enough space for the new allocation (e.g.,
+5-7GB). The spill then falls through to scatter-gather (which may
+succeed by splitting) or to state-only FALLBACK (which loses KV).
+
+**Evidence:**
+- 276 evict-smallest operations
+- Evicted entry sizes range from 2 pages (~2MB) to 12106 pages (~12.8GB)
+- Most common `remaining` count after eviction: 3 (91 times)
+- With 3 entries of ~12.5GB each = 37.5GB > 30GB arena → still full
+- Min free after eviction: 14MB — evicting one small entry barely helped
+
+**Fix needed:** `evict-smallest` should loop: keep evicting entries
+(smallest first) until `free >= need`, not just evict one and stop.
+This is a simple loop change in the spill function. The current
+single-eviction design assumes entries are roughly uniform in size,
+which is false for mixed session sizes (a 371k session's checkpoint
+is 50x larger than a 5k session's checkpoint).
+
+### Impact
+
+Both issues compound: fragmentation prevents single allocations (Finding A),
+which triggers scatter-gather, which worsens fragmentation, which eventually
+makes even scatter-gather fail, which triggers state-only FALLBACK, which
+loses KV and causes re-prefills. The bad_alloc at the end of this chain
+was caught by the OOM handler (server survived), but the re-prefills
+(278 FALLBACK events) are the real cost.
+
+### Verification after fix
+
+- Arena should reach 0 single-allocation failures when free >= need
+- Scatter-gather should only fire for genuine large allocations (>50% arena)
+- State-only FALLBACK should only fire when arena is genuinely full
+  (total used >= 90% of capacity), not when fragmented
+- evict-smallest should free enough space for the new allocation in one pass

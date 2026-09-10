@@ -8,11 +8,12 @@ This fork targets **reliable 555k-context inference with 3 concurrent agentic se
 - **Host-KV safety net** (`--host-kv-mib`, `--host-state-slots`): when device KV is full, evicted continuations are spilled to a pinned host arena (D2H) and restored via H2D on cache reuse. Scatter-gather allocation handles arena fragmentation. Smallest-first eviction with pinned-entry protection. Verified across 140+ requests with 3 concurrent 330k–470k sessions.
 - **Rewrite checkpoint at turn boundary**: checkpoint is captured where the prompt ends (before reasoning begins), not at the execution frontier. Follow-up prompts with `preserve_thinking=off` match the stored ledger up to the checkpoint.
 - **Token stability with `preserve_thinking=off`**: reasoning is dropped from ALL assistant messages when `preserve_thinking=off`, keeping prompt tokens stable across turns. Without this, the last assistant message's reasoning was kept on its turn but dropped on the next, shifting all subsequent tokens and breaking prefix reuse.
-- **Checkpoint lifecycle preservation**: rewrite checkpoint is retained when state slot reservation fails during `finish()` instead of being silently dropped. The aliased state image is still valid.
+- **Unified checkpoint host demotion**: KV and checkpoint state move together to host, or not at all. The pressure planner evicts entire continuations (KV + state) instead of dropping rewrite checkpoints. State-only safety net entries replace the old `dropped_checkpoint_captures_` side store. Backend KV spill uses scatter-gather (no fragmentation failures). No artificial count or fragment limits.
+- **Pressure accounting fix**: `complete_pressure_delta` no longer overwrites actual freed resources with planned values. Bad_alloc retry path cleans up partial allocations (state images, KV activations, root addresses, restore vectors) before retrying.
 
 ### Engine robustness
 
-- **OOM recovery** (`std::bad_alloc` catch): materialization reserve and worker loop catch OOM, clear active state while preserving pending requests, back off admission for 4 iterations, fail all after 8 consecutive recoveries.
+- **OOM recovery** (`std::bad_alloc` catch): materialization reserve and worker loop catch OOM, clear active state while preserving pending requests, back off admission for 4 iterations, fail all after 8 consecutive recoveries. Bad_alloc retry cleans up partial allocations before retrying `prepare_materialization`.
 
 ### Context and model
 
@@ -36,11 +37,22 @@ Details: [docs/maintainer/kv-nvfp4-yarn.md](docs/maintainer/kv-nvfp4-yarn.md)
 
 ## Supported Models and Templates
 
-This fork works with any Qwen3.8-27B NVFP4 `.ninfer` artifact, including images
-from different converters (Ostfralla, QUASAR, etc.) that use different tensor
-layouts. The binding auto-detects the GDN control layout (split `a_projection`/
-`b_projection` vs fused `a_b_projection`) and quantization format (NVFP4 vs BF16)
-per layer, so both Ostfralla and QUASAR images work with `--weights-profile qwen36-nvfp4`.
+> **⚠️ Artifact incompatibility notice:** This fork is **NOT compatible** with the
+> maintainer's upstream artifact
+> [neroued/Qwen3.8-27B-nvfp4-NInfer](https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer)
+> (23.7 GB). That artifact requires upstream revision `385b30ce` and uses a newer
+> tensor descriptor format that this fork does not support.
+>
+> **Use QUASAR or Ostfralla artifacts instead.** Both maintain quality at a
+> significantly smaller size (~17.5 GB vs 23.7 GB):
+> - [QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4](https://huggingface.co/QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4/)
+> - [Ostfralla/Qwen3.8-27B-NVFP4-NInfer](https://huggingface.co/Ostfralla/Qwen3.8-27B-NVFP4-NInfer)
+
+This fork works with any Qwen3.8-27B NVFP4 `.ninfer` artifact from QUASAR or
+Ostfralla converters. The binding auto-detects the GDN control layout (split
+`a_projection`/`b_projection` vs fused `a_b_projection`) and quantization format
+(NVFP4 vs BF16) per layer, so both Ostfralla and QUASAR images work with
+`--weights-profile qwen36-nvfp4`.
 
 ### Quick start
 
@@ -98,13 +110,19 @@ cmake --build build -j
 Tests, benchmarks, and maintainer tools are excluded from the default build. There is no install
 target or packaged binary distribution; run NInfer from its source build tree.
 
-Download the artifact used by this example with the Hugging Face CLI:
+Download a compatible QUASAR or Ostfralla artifact with the Hugging Face CLI:
 
 ```bash
-hf download neroued/Qwen3.8-27B-nvfp4-NInfer \
-  qwen3_8_27b_nvfp4.ninfer \
+# QUASAR (recommended — smaller, tuned for agentic workloads)
+hf download QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4 \
+  --local-dir models
+
+# Ostfralla (abliterated variant)
+hf download Ostfralla/Qwen3.8-27B-NVFP4-NInfer \
   --local-dir models
 ```
+
+After download, pass the `.ninfer` file to `ninfer-serve` (filename varies by repo).
 
 Start a long-running text/agent server with two active-request lanes and explicit Device/Host
 checkpoint capacity:
@@ -201,6 +219,12 @@ in the performance document.
 | Qwen3.8-27B `nvfp4` | 8,340.4 tok/s | 2,203.1 tok/s | 219.8 tok/s |
 
 ## Evaluation
+
+> **Note:** The scores below were measured with the upstream maintainer's artifact.
+> QUASAR and Ostfralla artifacts use the same base model (Qwen3.8-27B) and are
+> expected to produce comparable results (Ostfralla is an abliterated variant with
+> modified refusal behavior). The upstream artifact is not compatible with this
+> fork's current build — see the [artifact notice](#supported-models-and-templates) above.
 
 Capability scores were measured through NInfer's OpenAI-compatible serving route with thinking
 enabled, MTP3, and EvalScope 1.9.0 (0-shot, rule scoring, one sample per problem):
@@ -322,10 +346,15 @@ NInfer is licensed under the [Apache License 2.0](LICENSE).
 The published artifacts are derived from
 [Qwen/Qwen3.6-27B](https://huggingface.co/Qwen/Qwen3.6-27B),
 [Qwen/Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B), and
-[Qwen/Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B). The Qwen3.6-27B NVFP4 artifact
+[Qwen/Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B). This fork uses QUASAR and
+Ostfralla NVFP4 artifacts for Qwen3.8-27B, which maintain quality at a significantly smaller
+size than the upstream maintainer's artifact:
+[QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4](https://huggingface.co/QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4/)
+and
+[Ostfralla/Qwen3.8-27B-NVFP4-NInfer](https://huggingface.co/Ostfralla/Qwen3.8-27B-NVFP4-NInfer).
+The Qwen3.8-27B NVFP4 weights are derived from
+[unsloth/Qwen3.8-27B-NVFP4](https://huggingface.co/unsloth/Qwen3.8-27B-NVFP4). The Qwen3.6-27B NVFP4 artifact
 also uses the fixed packed weights from
 [rdtand/Qwen3.6-27B-PrismaSCOUT-Blackwell-NVFP4-BF16-vllm](https://huggingface.co/rdtand/Qwen3.6-27B-PrismaSCOUT-Blackwell-NVFP4-BF16-vllm).
-The Qwen3.8-27B NVFP4 artifact also uses the fixed mixed FP8/NVFP4 weights from
-[unsloth/Qwen3.8-27B-NVFP4](https://huggingface.co/unsloth/Qwen3.8-27B-NVFP4). These source
-repositories are distributed under Apache-2.0. Vendored dependencies retain their own license files
+These source repositories are distributed under Apache-2.0. Vendored dependencies retain their own license files
 under `third_party/`.

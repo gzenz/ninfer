@@ -64,7 +64,9 @@ struct HostKVSafetyNetEntry {
 
     std::vector<HostKVAllocation> text_allocations;
 
-    std::optional<HostKVAllocation> backend_host;
+    // Scatter-gather backend KV allocations. Uses allocate_multi when
+    // the arena is fragmented and no single contiguous block is available.
+    std::vector<HostKVAllocation> backend_allocations;
 
 
 
@@ -120,7 +122,16 @@ struct HostKVSafetyNetEntry {
 
     bool pinned = false;
 
+    // State-only entry: created by demotion (not eviction). Contains
+    // checkpoint state bytes but NO KV allocations (KV stays on device
+    // in the catalogued continuation). The restore path H2D copies only
+    // the state, not KV.
+    bool state_only = false;
 
+    // Continuation index that created this state-only entry. Used by
+    // the spill to match state-only entries to the continuation being
+    // evicted (for sessions without a session_key, e.g. OpenAI API).
+    std::uint32_t source_continuation_index = 0;
 
     // Unique ID for stable reference across vector modifications.
 
@@ -253,6 +264,11 @@ public:
         for (std::size_t index = 0; index < entries_.size(); ++index) {
 
             const HostKVSafetyNetEntry& entry = entries_[index];
+
+            // Skip state-only entries: they have no KV and cannot serve
+            // a full root materialization restore. They are only found
+            // via take_state_only() (direct lookup by session_key).
+            if (entry.state_only) { continue; }
 
             {
 
@@ -470,12 +486,121 @@ public:
 
     void add(HostKVSafetyNetEntry entry) {
 
+        // State-only entries are bounded by the continuation count
+        // (at most one per continuation, enforced by remove_state_only_*
+        // cleanup at checkpoint creation and slot recycling).
+        // No artificial count limit — entries use heap memory which is
+        // naturally bounded by the number of active continuations.
+
         entry.entry_id = ++next_entry_id_;
 
         entry.pinned = false;  // re-added entries are unpinned
 
         entries_.push_back(std::move(entry));
 
+    }
+
+    // Find and remove a state-only entry matching the given session_key
+    // and checkpoint_frontier. Currently unused (reserved for future
+    // Step 5-6 work: start_sequence H2D restore from safety net).
+    [[nodiscard]] std::optional<HostKVSafetyNetEntry> take_state_only(
+        const qwen3_6::PreparedSessionKey& session_key,
+        std::uint32_t checkpoint_frontier) {
+        for (std::size_t i = 0; i < entries_.size(); ++i) {
+            HostKVSafetyNetEntry& entry = entries_[i];
+            if (!entry.state_only || !entry.checkpoint_valid ||
+                entry.checkpoint_frontier != checkpoint_frontier ||
+                !entry.session_key || !(*entry.session_key == session_key)) {
+                continue;
+            }
+            if (entry.checkpoint_state_bytes == 0 || entry.checkpoint_state_host.empty()) {
+                continue;
+            }
+            HostKVSafetyNetEntry result = std::move(entry);
+            entries_.erase(entries_.begin() + static_cast<std::ptrdiff_t>(i));
+            std::fprintf(stderr,
+                         "[safety-take-state-only] found entry: frontier=%u state_bytes=%zu\n",
+                         result.checkpoint_frontier, result.checkpoint_state_bytes);
+            return result;
+        }
+        std::fprintf(stderr,
+                     "[safety-take-state-only] NOT FOUND: frontier=%u\n",
+                     checkpoint_frontier);
+        return std::nullopt;
+    }
+
+    // Find and remove any state-only entry for a given session_key
+    // (regardless of checkpoint_frontier). Used during eviction when the
+    // continuation's rewrite_checkpoint was already cleared.
+    [[nodiscard]] std::optional<HostKVSafetyNetEntry> take_state_only_by_session(
+        const qwen3_6::PreparedSessionKey& session_key) {
+        for (std::size_t i = 0; i < entries_.size(); ++i) {
+            HostKVSafetyNetEntry& entry = entries_[i];
+            if (!entry.state_only || !entry.checkpoint_valid ||
+                !entry.session_key || !(*entry.session_key == session_key)) {
+                continue;
+            }
+            if (entry.checkpoint_state_bytes == 0 || entry.checkpoint_state_host.empty()) {
+                continue;
+            }
+            HostKVSafetyNetEntry result = std::move(entry);
+            entries_.erase(entries_.begin() + static_cast<std::ptrdiff_t>(i));
+            std::fprintf(stderr,
+                "[safety-take-state-only-by-session] found entry: frontier=%u state_bytes=%zu\n",
+                result.checkpoint_frontier, result.checkpoint_state_bytes);
+            return result;
+        }
+        return std::nullopt;
+    }
+
+    // Find and remove any state-only entry for a given continuation index.
+    // Used during eviction when the continuation has no session_key
+    // (e.g. OpenAI /v1/chat/completions API without session tracking).
+    [[nodiscard]] std::optional<HostKVSafetyNetEntry> take_state_only_by_index(
+        std::uint32_t continuation_index) {
+        for (std::size_t i = 0; i < entries_.size(); ++i) {
+            HostKVSafetyNetEntry& entry = entries_[i];
+            if (!entry.state_only || !entry.checkpoint_valid ||
+                entry.source_continuation_index != continuation_index) {
+                continue;
+            }
+            if (entry.checkpoint_state_bytes == 0 || entry.checkpoint_state_host.empty()) {
+                continue;
+            }
+            HostKVSafetyNetEntry result = std::move(entry);
+            entries_.erase(entries_.begin() + static_cast<std::ptrdiff_t>(i));
+            std::fprintf(stderr,
+                "[safety-take-state-only-by-index] found entry: idx=%u frontier=%u state_bytes=%zu\n",
+                continuation_index, result.checkpoint_frontier,
+                result.checkpoint_state_bytes);
+            return result;
+        }
+        return std::nullopt;
+    }
+
+    // Remove all state-only entries for a given session_key or index.
+    // Remove all state-only entries for a given session_key or index.
+    void remove_state_only(const qwen3_6::PreparedSessionKey& session_key) {
+        for (std::size_t i = 0; i < entries_.size(); ) {
+            if (entries_[i].state_only && entries_[i].session_key &&
+                *entries_[i].session_key == session_key) {
+                entries_.erase(entries_.begin() + static_cast<std::ptrdiff_t>(i));
+            } else {
+                ++i;
+            }
+        }
+    }
+
+    // Remove all state-only entries for a given continuation index.
+    void remove_state_only_by_index(std::uint32_t continuation_index) {
+        for (std::size_t i = 0; i < entries_.size(); ) {
+            if (entries_[i].state_only &&
+                entries_[i].source_continuation_index == continuation_index) {
+                entries_.erase(entries_.begin() + static_cast<std::ptrdiff_t>(i));
+            } else {
+                ++i;
+            }
+        }
     }
 
 

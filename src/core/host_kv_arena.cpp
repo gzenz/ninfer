@@ -320,12 +320,12 @@ HostKVArena::allocate_multi(const HostKVPageLayout& layout, std::uint32_t pages)
         // Check total free space first.
         if (free_bytes() < page_stride * static_cast<std::size_t>(pages)) { return result; }
 
-        // Limit scatter-gather to 8 fragments — more indicates extreme
-        // fragmentation where the overhead outweighs the benefit.
-        constexpr std::uint32_t max_fragments = 8;
+        // No artificial fragment limit — the number of fragments is
+        // naturally bounded by the number of free extents, which is
+        // bounded by the arena capacity / page size. Each fragment is
+        // a separate HostKVAllocation tracked in the descriptors vector.
         std::uint32_t remaining = pages;
-        std::uint32_t fragments = 0;
-        while (remaining > 0 && fragments < max_fragments) {
+        while (remaining > 0) {
             // Find the largest free extent.
             std::size_t best_index = std::numeric_limits<std::size_t>::max();
             std::size_t best_bytes = 0;
@@ -348,7 +348,6 @@ HostKVArena::allocate_multi(const HostKVPageLayout& layout, std::uint32_t pages)
             if (!block) { break; }
             result.push_back(std::move(*block));
             remaining -= fit_pages;
-            ++fragments;
         }
 
         if (remaining > 0) {

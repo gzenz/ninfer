@@ -1648,6 +1648,39 @@ public:
         return pages_->physical(membership(address, logical_page));
     }
 
+    // Like physical_page() but returns nullopt instead of throwing when the
+    // page's device replica has been cleared (e.g., by release_reference on
+    // a shared COW page whose source was released). Used by the safety-net
+    // spill to skip unavailable pages instead of aborting the entire copy.
+    [[nodiscard]] std::optional<DeviceKVPageHandle> physical_page_if_resident(
+        KVAddressSpaceHandle handle, std::uint32_t logical_page) const {
+        const Address& address = require(handle);
+        if (logical_page >= address.page_count) { return std::nullopt; }
+        const LogicalKVPageHandle logical = membership(address, logical_page);
+        if (!pages_->valid(logical)) {
+            std::fprintf(stderr, "[kv-not-resident] logical_page=%u STALE_HANDLE\n", logical_page);
+            return std::nullopt;
+        }
+        if (!pages_->device_resident(logical)) {
+            std::fprintf(stderr, "[kv-not-resident] logical_page=%u VALID_BUT_NO_DEVICE\n", logical_page);
+            return std::nullopt;
+        }
+        return pages_->physical(logical);
+    }
+
+    // Check if a page has a current host replica (device replica was demoted).
+    // Returns the host replica if available.
+    [[nodiscard]] std::optional<HostKVPageReplica> host_replica_if_available(
+        KVAddressSpaceHandle handle, std::uint32_t logical_page) const {
+        const Address& address = require(handle);
+        if (logical_page >= address.page_count) { return std::nullopt; }
+        const LogicalKVPageHandle logical = membership(address, logical_page);
+        if (!pages_->valid(logical) || !pages_->host_replica_current(logical)) {
+            return std::nullopt;
+        }
+        return pages_->host_replica(logical);
+    }
+
     [[nodiscard]] std::uint64_t content_epoch(KVAddressSpaceHandle handle,
                                               std::uint32_t logical_page) const {
         const Address& address = require(handle);

@@ -1340,7 +1340,9 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     message_roles.reserve(input.messages.size());
     for (const ChatMessage& message : input.messages) { message_roles.push_back(message.role); }
     const auto tool_call_output =
-        fi::build_tool_call_output_contract(options.tool_jsons, !options.tool_jsons.empty());
+        fi::build_tool_call_output_contract(options.tool_jsons,
+                                            !options.tool_jsons.empty() ||
+                                            options.tolerant_tool_calls);
     const std::optional<std::uint32_t> leading_boundary =
         leading_instruction_boundary(message_roles);
     std::vector<PromptCacheMarker> rendered_markers = cache_hints.markers;

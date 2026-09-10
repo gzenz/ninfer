@@ -53,12 +53,15 @@ std::size_t find_next_marker(std::string_view text, std::size_t from,
 }
 
 // Scan `text` from `from`, tracking a depth counter (open markers increment,
-// close markers decrement) that starts at `start_depth`. Return the position
-// of the close marker that returns the depth to `target_depth`, or npos if the
-// depth never reaches it (unbalanced). Used to locate a region's true closing
-// marker when its value may contain balanced nested markers.
+// close markers decrement) that starts at `start_depth`. Return the position of
+// the close marker that returns the depth to `target_depth`, provided that
+// marker is exactly `expected_close`; return npos if the depth never reaches it
+// or a close of another type reaches it first (type-unbalanced content). Used to
+// locate a region's true closing marker when its value may contain balanced
+// nested markers.
 std::size_t find_matching_close(std::string_view text, std::size_t from,
-                                int start_depth, int target_depth) {
+                                int start_depth, int target_depth,
+                                std::string_view expected_close) {
     int depth = start_depth;
     std::size_t pos = from;
     while (pos < text.size()) {
@@ -70,11 +73,30 @@ std::size_t find_matching_close(std::string_view text, std::size_t from,
             ++depth;
         } else {
             --depth;
-            if (depth == target_depth) { return next; }
+            if (depth == target_depth) {
+                if (text.substr(next, marker_len) == expected_close) { return next; }
+                return std::string_view::npos;
+            }
         }
         pos = next + marker_len;
     }
     return std::string_view::npos;
+}
+
+// Find the last occurrence of `needle` at or after `from`, or npos if none. Tolerant-mode
+// recovery anchors: a parameter value or function body that quotes unbalanced tool-call
+// markers breaks depth matching, but the final structural close is still the real boundary.
+std::size_t last_occurrence_at_or_after(std::string_view text, std::size_t from,
+                                        std::string_view needle) {
+    std::size_t last   = std::string_view::npos;
+    std::size_t search = from;
+    while (search <= text.size()) {
+        const std::size_t found = text.find(needle, search);
+        if (found == std::string_view::npos) { return last; }
+        last   = found;
+        search = found + needle.size();
+    }
+    return last;
 }
 
 std::string trim_ascii(std::string_view text) {
@@ -227,7 +249,8 @@ std::string_view remove_parameter_framing_newlines(std::string_view text) {
 }
 
 bool parse_parameter(std::string_view inner, std::size_t& pos, Json& args,
-                     std::string_view tool_name, const ToolArgumentTypeContracts& contracts) {
+                     std::string_view tool_name, const ToolArgumentTypeContracts& contracts,
+                     bool last_close) {
     constexpr std::string_view kParamOpen  = "<parameter=";
     constexpr std::string_view kParamClose = "</parameter>";
     if (!starts_with_at(inner, pos, kParamOpen)) { return false; }
@@ -238,8 +261,23 @@ bool parse_parameter(std::string_view inner, std::size_t& pos, Json& args,
     pos                         = name_end + 1;
     // The value may contain balanced nested markers (e.g. code that quotes the
     // tool-call format), so locate the matching close by depth rather than the
-    // first occurrence.
-    const std::size_t value_end = find_matching_close(inner, pos, 1, 0);
+    // first occurrence. In tolerant mode an unbalanced quoted marker breaks the
+    // depth scan; anchor on the last structural close before the next parameter.
+    std::size_t value_end = std::string_view::npos;
+    if (last_close) {
+        const std::size_t next_param = inner.find(kParamOpen, name_end + 1);
+        const std::size_t limit      =
+            next_param == std::string_view::npos ? inner.size() : next_param;
+        std::size_t search = pos;
+        while (search <= limit) {
+            const std::size_t found = inner.find(kParamClose, search);
+            if (found == std::string_view::npos || found >= limit) { break; }
+            value_end = found;
+            search    = found + kParamClose.size();
+        }
+    } else {
+        value_end = find_matching_close(inner, pos, 1, 0, kParamClose);
+    }
     if (value_end == std::string_view::npos) { return false; }
     const std::string_view encoded_value = inner.substr(pos, value_end - pos);
     const ToolArgumentTypeContracts::Parameter* contract =
@@ -277,29 +315,35 @@ bool parse_one_tool_call(std::string_view block, std::size_t max_name_length,
     if (!valid_function_name(name, max_name_length) || !declares_tool(contracts, name)) {
         return false;
     }
-    pos = name_end + 1;
+    const std::size_t body_begin = name_end + 1;
 
-    // The function body may contain balanced nested markers (e.g. a parameter
-    // value quoting the tool-call format), so locate the matching close by
-    // depth rather than the first occurrence.
-    const std::size_t function_end = find_matching_close(block, pos, 1, 0);
+    // The primary path locates the function close by depth (the body may contain balanced
+    // nested markers), validated against the function-close marker. A body quoting
+    // unbalanced markers fails that scan instead of misparsing.
+    std::size_t function_end = find_matching_close(block, body_begin, 1, 0, kFunctionClose);
+    const bool recovered = function_end == std::string_view::npos;
+    if (recovered && tolerant) {
+        // Tolerant recovery: anchor on the last structural close, which is still the real
+        // boundary when a parameter value quotes unbalanced call markers.
+        function_end = last_occurrence_at_or_after(block, body_begin, kFunctionClose);
+    }
     if (function_end == std::string_view::npos) { return false; }
-    const std::string_view params = block.substr(pos, function_end - pos);
+    const std::string_view params = block.substr(body_begin, function_end - body_begin);
     Json args                     = Json::object();
-    std::size_t param_pos         = 0;
+    std::size_t param_pos          = 0;
     for (;;) {
         skip_ws(params, param_pos);
         if (param_pos >= params.size()) { break; }
-        if (!parse_parameter(params, param_pos, args, name, contracts)) { return false; }
+        if (!parse_parameter(params, param_pos, args, name, contracts, recovered)) {
+            return false;
+        }
     }
-
-    pos = function_end + kFunctionClose.size();
-    skip_ws(block, pos);
-    // Qwen occasionally emits a duplicate closing tag or explanatory text after a
-    // complete function. Only discard that suffix in explicit tolerant mode; the
-    // strict parser retains its all-or-nothing behavior.
-    if (!tolerant && pos != block.size()) { return false; }
-
+    std::size_t after = function_end + kFunctionClose.size();
+    skip_ws(block, after);
+    // Qwen occasionally emits a duplicate closing tag or explanatory text after a complete
+    // function. Only discard that suffix in explicit tolerant mode; the strict parser
+    // retains its all-or-nothing behavior.
+    if (!tolerant && after != block.size()) { return false; }
     out.name           = name;
     out.arguments_json = args.dump();
     return true;
@@ -317,7 +361,9 @@ std::shared_ptr<const ToolCallOutputContract>
 build_tool_call_output_contract(std::span<const std::string> tool_jsons, bool enabled) {
     if (!enabled) { return {}; }
     auto contract                                   = std::make_shared<ToolCallOutputContract>();
-    contract->argument_types.enforce_declared_names = true;
+    // With no declared tools a tolerant contract accepts any syntactically valid name so a
+    // well-formed text-form call can be recovered; with declared tools names stay enforced.
+    contract->argument_types.enforce_declared_names = !tool_jsons.empty();
     contract->argument_types.tools.reserve(tool_jsons.size());
     for (const std::string& tool_json : tool_jsons) {
         const Json definition = Json::parse(tool_json, nullptr, false);
@@ -353,7 +399,7 @@ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
         // The call may contain balanced nested markers (e.g. a parameter value
         // quoting the tool-call format), so locate the matching close by depth
         // rather than the first occurrence.
-        const std::size_t close = find_matching_close(text, inner_begin, 1, 0);
+        const std::size_t close = find_matching_close(text, inner_begin, 1, 0, kToolClose);
         if (close == std::string::npos && !tolerant) { return fallback(text); }
         const std::size_t block_end = close == std::string::npos ? text.size() : close;
         GeneratedToolCall call;

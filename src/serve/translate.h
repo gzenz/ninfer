@@ -26,7 +26,7 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& req,
                                                  const ServeOptions& server,
                                                  const ninfer::PromptCapabilities& capabilities);
 
-ninfer::PromptInput to_prompt_input(const GenerationRequest& req,
+ninfer::PromptInput to_prompt_input(const GenerationRequest& req, const ServeOptions& server,
                                     const ResolvedPromptSemantics& semantics,
                                     const MediaAcquirer& acquire_media);
 

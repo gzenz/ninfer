@@ -181,7 +181,7 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& reques
     return complete();
 }
 
-ninfer::PromptInput to_prompt_input(const GenerationRequest& request,
+ninfer::PromptInput to_prompt_input(const GenerationRequest& request, const ServeOptions& server,
                                     const ResolvedPromptSemantics& semantics,
                                     const MediaAcquirer& acquire_media) {
     ninfer::PromptInput input;
@@ -289,6 +289,7 @@ ninfer::PromptInput to_prompt_input(const GenerationRequest& request,
             });
         }
     }
+    input.options.tolerant_tool_calls = server.tolerant_tool_calls;
     input.context_cache.allow_engine_automatic_shared_prefixes =
         request.allow_engine_automatic_shared_prefixes;
     return input;

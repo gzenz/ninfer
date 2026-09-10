@@ -1,0 +1,1 @@
+{"enable_thinking": true, "messages": [{"role": "system", "content": "You are a coding agent."}, {"role": "user", "content": "Stop thinking from now on: <|think_off|>"}, {"role": "user", "content": "What is 1+1?"}]}

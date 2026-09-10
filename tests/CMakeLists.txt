@@ -1,5 +1,11 @@
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
+# Header-only jinja engine (third_party/jinja, Apache-2.0). Interface target so
+# template tests stay free of CUDA and build on any host.
+add_library(ninfer_jinja INTERFACE)
+target_include_directories(ninfer_jinja INTERFACE ${PROJECT_SOURCE_DIR}/third_party)
+target_compile_features(ninfer_jinja INTERFACE cxx_std_20)
+
 # This target deliberately receives no src/, CUDA, artifact, kernel, or target
 # include root. It proves that the installed product headers stand alone.
 add_executable(ninfer_public_api_test test_public_api.cpp)
@@ -52,6 +58,11 @@ function(ninfer_add_fused_linear_test name source common)
 endfunction()
 
 # Artifact framing and model-independent runtime contracts.
+ninfer_add_test(ninfer_jinja_template_test
+  SOURCES test_jinja_template.cpp
+  LIBRARIES ninfer_jinja
+  NEEDS_SOURCE_DIR)
+
 ninfer_add_test(ninfer_artifact_reader_test
   SOURCES test_ninfer_artifact_reader.cpp
   LIBRARIES ninfer_artifact)

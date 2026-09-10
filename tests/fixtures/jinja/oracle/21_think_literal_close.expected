@@ -1,0 +1,14 @@
+<|im_start|>system
+Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.
+
+You are a coding agent.<|im_end|>
+<|im_start|>user
+Why did the parser split?<|im_end|>
+<|im_start|>assistant
+<think>
+The parser splits on the first close tag </think> it finds, which is wrong when the thinking quotes that tag.
+</think>
+
+Because it splits on first occurrence.<|im_end|>
+<|im_start|>user
+How to fix?<|im_end|>

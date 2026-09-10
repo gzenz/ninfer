@@ -1,0 +1,1 @@
+{"enable_thinking": true, "messages": [{"role": "system", "content": "You are a coding agent."}, {"role": "user", "content": "Why does X fail?"}, {"role": "assistant", "reasoning_content": "The failure comes from a missing guard clause in the loop.", "content": "Because the guard is missing."}, {"role": "user", "content": "How to fix it?"}]}

@@ -1,0 +1,1 @@
+{"enable_thinking": true, "messages": [{"role": "system", "content": "You are a coding agent."}, {"role": "user", "content": "What files are here?"}, {"role": "assistant", "content": "Let me check."}, {"role": "user", "content": "And what is in tests/?"}]}

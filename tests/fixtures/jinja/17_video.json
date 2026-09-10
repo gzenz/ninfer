@@ -1,0 +1,1 @@
+{"enable_thinking": true, "messages": [{"role": "system", "content": "You are a multimodal coding agent."}, {"role": "user", "content": [{"type": "text", "text": "What happens in this video?"}, {"type": "video", "video_url": {"url": "http://x/v.mp4"}}]}]}

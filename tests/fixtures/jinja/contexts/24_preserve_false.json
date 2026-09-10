@@ -1,0 +1,1 @@
+{"enable_thinking": true, "preserve_thinking": false, "messages": [{"role": "system", "content": "You are a coding agent."}, {"role": "user", "content": "Why does X fail?"}, {"role": "assistant", "reasoning_content": "Missing guard clause.", "content": "Because the guard is missing."}, {"role": "user", "content": "How to fix it?"}]}

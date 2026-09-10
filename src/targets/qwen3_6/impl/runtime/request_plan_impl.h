@@ -622,6 +622,9 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
         plan->rewrite_disposition = RewriteCheckpointDisposition::RetainExisting;
     } else if (desired->frontier > plan->reuse_base) {
         plan->rewrite_disposition = RewriteCheckpointDisposition::ReplaceAtCommittedFrontier;
+        if (source != nullptr) {
+            ++plan->active_optional_resources.device.state_slots;
+        }
     } else {
         plan->rewrite_disposition = RewriteCheckpointDisposition::DropOptional;
     }
@@ -1282,6 +1285,18 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
     const detail::PhysicalDeviceResources exclusive_additional =
         additional_resources(exclusive_active, conversions);
     detail::PhysicalResources reservation_added{.device = exclusive_additional};
+    // ReplaceAtCommittedFrontier needs a net-new device state slot for the
+    // checkpoint that start_sequence creates. The +1 in active_optional_resources
+    // is consumed as a conversion (cancelling out in additional_resources), so we
+    // add it back here as a net reservation. This tells the pressure planner to
+    // demote/evict other sessions' checkpoints to make room.
+    // ReplaceAtCommittedFrontier implies ConsumedToActive (not Retained), so
+    // this code is only reached via the consumed path, not the retained
+    // early-return at L1170.
+    if (plan->rewrite_disposition == RewriteCheckpointDisposition::ReplaceAtCommittedFrontier &&
+        source != nullptr) {
+        ++reservation_added.device.state_slots;
+    }
     if (shared_replica_additions.device.main_kv_pages >
             std::numeric_limits<std::uint32_t>::max() - reservation_added.device.main_kv_pages ||
         shared_replica_additions.device.backend_kv_pages >

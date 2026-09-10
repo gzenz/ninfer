@@ -601,6 +601,43 @@ void DeviceKVPagePool::copy_to_host(std::span<const DeviceKVPageHandle> source,
     }
 }
 
+void DeviceKVPagePool::copy_to_host_partial(std::span<const DeviceKVPageHandle> source,
+                                            HostKVAllocationView destination, cudaStream_t stream) const {
+    if (!destination.valid() || destination.page_count() != source.size() ||
+        destination.layout().geometry != geometry()) {
+        throw std::invalid_argument("Paged KV D2H partial geometry or extent is inconsistent");
+    }
+    const HostKVPageLayout& host = destination.layout();
+    // Copy only pages with valid handles. Skip invalid ones (already filled
+    // via memcpy from host_replica by the caller).
+    for (std::size_t page = 0; page < source.size(); ++page) {
+        if (!source[page].valid()) { continue; }
+        const std::int32_t phys = physical_index(source[page]);
+        for (std::size_t plane_index = 0; plane_index < planes_.size(); ++plane_index) {
+            const Tensor& plane = planes_[plane_index];
+            const HostKVPlaneLayout& host_plane = host.planes[plane_index];
+            auto* host_base = destination.data() + page * host.page_stride + host_plane.offset;
+            const auto* device_base = static_cast<const unsigned char*>(plane.data);
+            if (geometry().device_plane_order == PagedKVPlaneOrder::PageMajor) {
+                CUDA_CHECK(cudaMemcpy2DAsync(
+                    host_base, host.page_stride,
+                    device_base + static_cast<std::int64_t>(phys) * plane.nb[3], plane.nb[3],
+                    host_plane.page_payload_bytes, 1, cudaMemcpyDeviceToHost, stream));
+            } else {
+                for (std::int32_t head = 0; head < plane.ne[3]; ++head) {
+                    CUDA_CHECK(cudaMemcpy2DAsync(
+                        host_base + static_cast<std::size_t>(head) * host_plane.head_payload_bytes,
+                        host.page_stride,
+                        device_base + static_cast<std::int64_t>(head) * plane.nb[3] +
+                            static_cast<std::int64_t>(phys) * plane.nb[2],
+                        plane.nb[2], host_plane.head_payload_bytes, 1, cudaMemcpyDeviceToHost,
+                        stream));
+                }
+            }
+        }
+    }
+}
+
 void DeviceKVPagePool::copy_from_host(HostKVAllocationConstView source,
                                       std::span<const DeviceKVPageHandle> destination,
                                       cudaStream_t stream) const {

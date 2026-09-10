@@ -623,7 +623,8 @@ private:
 
     struct FoldedCost {
         std::uint64_t now_ns                    = 0;
-        std::uint64_t future_loss_ns            = 0;
+        std::uint64_t future_loss_ns            = 0;  // discounted (used for decisions)
+        std::uint64_t raw_future_loss_ns        = 0;  // undiscounted (used for diagnostics)
         std::uint64_t total_ns                  = 0;
         std::uint64_t lower_bound_ns            = 0;
         std::uint64_t affected_selected_hits    = 0;
@@ -802,6 +803,7 @@ private:
         FoldedCost cost;
         cost.now_ns                   = assessment.machine.immediate_ns;
         cost.total_ns                 = cost.now_ns;
+        cost.raw_future_loss_ns       = 0;
         cost.lower_bound_ns           = assessment.machine.minimum_request_ns;
         cost.copy_operations          = assessment.machine.copy_operations;
         cost.transferred_bytes        = assessment.machine.transferred_bytes;
@@ -943,12 +945,50 @@ private:
             portfolio_value_.fold(portfolio_owner_scratch_, portfolio_checkpoint_scratch_);
         if (portfolio.saturated && portfolio_degraded) {
             cost.future_loss_ns = std::numeric_limits<std::uint64_t>::max();
+            cost.raw_future_loss_ns = std::numeric_limits<std::uint64_t>::max();
         } else {
-            cost.future_loss_ns =
+            // Separate future loss into eviction-uncertain (owners fully
+            // evicted — may not return, may find free slots later, or may
+            // be restored from the host KV safety net) and degradation-certain
+            // (owners still resident but with worse recovery). Only the
+            // eviction-uncertain portion is discounted.
+            const std::uint64_t raw_public_loss =
                 portfolio.baseline_public_value > portfolio.target_public_value
                     ? portfolio.baseline_public_value - portfolio.target_public_value
                     : 0;
-            planning_saturating_add(cost.future_loss_ns, portfolio.private_transition_loss);
+            const std::uint64_t raw_private_loss = portfolio.private_transition_loss;
+
+            // Compute the fraction of owner_outcomes that are full evictions.
+            std::uint32_t evicted_owners = 0;
+            std::uint32_t total_owners = 0;
+            for (const PressureOwnerOutcome& outcome : assessment.owner_outcomes) {
+                ++total_owners;
+                if (outcome.disposition == ClaimDisposition::Evicted) { ++evicted_owners; }
+            }
+            // Evicted sessions may not return, may find free device slots
+            // when other sessions finish, or may be restored from the host
+            // KV safety net (H2D instead of full re-prefill). Only 25% of
+            // the eviction-weighted future loss is counted as certain cost.
+            std::uint64_t future_loss = raw_public_loss;
+            planning_saturating_add(future_loss, raw_private_loss);
+            cost.raw_future_loss_ns = future_loss;
+            if (total_owners > 0 && evicted_owners > 0) {
+                const std::uint32_t evicted_fraction = (evicted_owners * 100) / total_owners;
+                // Overflow-safe: (future_loss / 100) * evicted_fraction cannot
+                // overflow since future_loss/100 <= MAX/100 and evicted_fraction <= 100.
+                const std::uint64_t eviction_loss =
+                    future_loss > (std::numeric_limits<std::uint64_t>::max() / 100)
+                        ? (future_loss / 100) * evicted_fraction
+                        : (future_loss * evicted_fraction) / 100;
+                const std::uint64_t certain_loss = future_loss - eviction_loss;
+                // 90% discount on eviction-uncertain loss: evicted sessions
+                // may not return, may find free slots, or may be restored
+                // from the host KV safety net (H2D instead of full re-prefill).
+                // Only 10% of the eviction loss is counted as certain cost.
+                cost.future_loss_ns = certain_loss + eviction_loss / 10;
+            } else {
+                cost.future_loss_ns = future_loss;
+            }
         }
         cost.total_ns = cost.now_ns;
         planning_saturating_add(cost.total_ns, cost.future_loss_ns);
@@ -1136,7 +1176,7 @@ private:
                                       : cost.total_ns - best_remaining_lower_bound_ns;
         return MaterializationDiagnostics{
             .predicted_now_ns              = cost.now_ns,
-            .predicted_future_loss_ns      = cost.future_loss_ns,
+            .predicted_future_loss_ns      = cost.raw_future_loss_ns,
             .predicted_total_ns            = cost.total_ns,
             .targets_evaluated             = targets_evaluated,
             .projection_work               = projection_work,

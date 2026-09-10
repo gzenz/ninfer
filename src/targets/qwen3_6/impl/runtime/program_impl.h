@@ -1804,7 +1804,15 @@ std::vector<qwen3_6::detail::PressureDecision> ProgramImplCore::inspect_pressure
             combine_checkpoint_and_replica_target(std::move(*drop), std::move(explicit_target)));
     };
     if (summary.endpoint) { append_checkpoint_successor(summary.endpoint->ref); }
-    if (summary.rewrite) { append_checkpoint_successor(summary.rewrite->ref); }
+    // Do NOT generate drop successors for rewrite checkpoints.
+    // Principle: KV and checkpoint state move together to host, or not at all.
+    // Dropping a rewrite checkpoint (state only, keep KV on device) loses
+    // the checkpoint for the inspect — the follow-up must re-prefill.
+    // Instead, the pressure planner evicts the entire continuation
+    // (KV + state together to the safety net) when it needs the slot.
+    // The state-only safety net entry created at drop time (if any) is
+    // merged into the full entry by the spill function.
+    // if (summary.rewrite) { append_checkpoint_successor(summary.rewrite->ref); }
     for (const qwen3_6::CheckpointSummary& anchor : summary.long_anchors) {
         append_checkpoint_successor(anchor.ref);
     }
@@ -5418,20 +5426,28 @@ void ProgramImplCore::publish_pressure_host_releases(
         for (const runtime::CheckpointRef checkpoint : work.option.dropped_checkpoints) {
             // Drop-time checkpoint capture: publish_checkpoint_drop releases the
             // rewrite state image below; copy it to host first so a later
-            // eviction of this continuation can still serve checkpoint-level
-            // safety-net restores. Device-resident images copy D2H; demoted
-            // (HostOnly) images copy host-to-host from the pool view.
+            // session return can restore the checkpoint via H2D from the safety
+            // net. Device-resident images copy D2H; demoted (HostOnly) images
+            // copy host-to-host from the pool view.
+            //
+            // The captured state goes directly into a state-only
+            // HostKVSafetyNetEntry (not the old
+            // dropped_checkpoint_captures_ side store). The state-only
+            // entry is NOT findable by find() (it has no KV). It is
+            // merged into a full entry by the spill function when the
+            // continuation is later evicted. The continuation stays
+            // catalogued (KV on device) until eviction.
+            // Note: rewrite checkpoints (TurnClosure/ResponseReplay) are no
+            // longer dropped by the pressure planner (Step 3). This branch
+            // is currently unreachable but kept as defensive code in case
+            // rewrite drops are re-enabled in the future.
             if ((checkpoint.kind == runtime::CheckpointKind::TurnClosure ||
                  checkpoint.kind == runtime::CheckpointKind::ResponseReplay) &&
                 sequence->rewrite_state && state_store &&
                 state_store->valid(*sequence->rewrite_state) && state_images) {
                 const std::size_t capture_bytes = state_images->host_layout().image_bytes;
                 if (capture_bytes > 0) {
-                    DroppedCheckpointCapture capture;
-                    capture.slot_generation = continuation_slots[work.continuation_index].generation;
-                    capture.checkpoint_frontier = checkpoint.frontier;
-                    capture.state_bytes = capture_bytes;
-                    capture.state_host.resize(capture_bytes);
+                    std::vector<std::byte> state_host(capture_bytes);
                     const StateReplicaResidency residency =
                         state_store->residency(*sequence->rewrite_state);
                     bool captured = false;
@@ -5440,30 +5456,43 @@ void ProgramImplCore::publish_pressure_host_releases(
                         const std::int32_t slot =
                             state_store->physical_slot(*sequence->rewrite_state);
                         const HostStateImageView capture_view{
-                            .data = capture.state_host.data(),
+                            .data = state_host.data(),
                             .layout = &state_images->host_layout()};
                         state_images->copy_to_host(slot, capture_view, device.transfer_stream);
                         captured = true;
                     } else if (const std::optional<qwen3_6::HostStateImageConstView> host_view =
                                    state_store->host_replica_view(*sequence->rewrite_state);
                                host_view && host_view->data != nullptr) {
-                        std::memcpy(capture.state_host.data(), host_view->data, capture_bytes);
+                        std::memcpy(state_host.data(), host_view->data, capture_bytes);
                         captured = true;
                     }
                     if (captured) {
-                        // Bound the side-store: keep the most recent captures
-                        // (LRU by capture time) so pinned host memory stays
-                        // bounded under repeated drops.
-                        constexpr std::size_t kMaxCaptures = 8;
-                        while (dropped_checkpoint_captures_.size() >= kMaxCaptures) {
-                            auto oldest = dropped_checkpoint_captures_.begin();
-                            for (auto it = dropped_checkpoint_captures_.begin();
-                                 it != dropped_checkpoint_captures_.end(); ++it) {
-                                if (it->second.captured < oldest->second.captured) { oldest = it; }
-                            }
-                            dropped_checkpoint_captures_.erase(oldest);
+                        // Create a state-only safety net entry. The continuation
+                        // stays catalogued (KV on device), so we COPY (not move)
+                        // the matching metadata. The safety-find will match by
+                        // checkpoint_frontier / session_key / compact_prefix.
+                        HostKVSafetyNetEntry entry;
+                        entry.state_only = true;
+                        entry.source_continuation_index = work.continuation_index;
+                        entry.checkpoint_valid = true;
+                        entry.checkpoint_frontier = checkpoint.frontier;
+                        entry.checkpoint_state_host = std::move(state_host);
+                        entry.checkpoint_state_bytes = capture_bytes;
+                        // Copy matching metadata — continuation still needs these.
+                        entry.session_key = sequence->session_key;
+                        entry.execution_frontier = 0;  // no KV spilled
+                        // Remove stale state-only entries before adding.
+                        host_kv_safety_net.remove_state_only_by_index(work.continuation_index);
+                        if (sequence->session_key) {
+                            host_kv_safety_net.remove_state_only(*sequence->session_key);
                         }
-                        dropped_checkpoint_captures_[work.continuation_index] = std::move(capture);
+                        std::fprintf(stderr,
+                                     "[checkpoint-demoted] index=%u frontier=%u ckpt_frontier=%u "
+                                     "state_bytes=%zu\n",
+                                     work.continuation_index,
+                                     sequence->execution_frontier,
+                                     checkpoint.frontier, capture_bytes);
+                        host_kv_safety_net.add(std::move(entry));
                         capture_added_this_work = true;
                     }
                 }
@@ -5814,6 +5843,11 @@ void ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index) no
 
         // Determine page counts from the address spaces.
         const std::uint32_t text_pages = text_kv_addresses->mapped_pages(kv.text);
+        std::fprintf(stderr,
+                     "[safety-spill] guard: index=%u kv=%d text_valid=%d mapped=%u active=%d\n",
+                     index, sequence.kv ? 1 : 0,
+                     text_kv_addresses->valid(kv.text) ? 1 : 0,
+                     text_pages, text_kv_addresses->active(kv.text) ? 1 : 0);
         if (text_pages == 0) {
             std::fprintf(stderr, "[safety-spill] SKIP: text_pages=0 index=%u\n", index);
             return;
@@ -5840,6 +5874,7 @@ void ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index) no
                     : nullptr;
             return text_bytes + (bl != nullptr ? bl->page_stride * backend_pages : 0);
         }();
+        bool kv_copy_ok = true;  // set false by capacity/host fallbacks
         // Pre-check: would evicting ALL entries (pinned + unpinned) free enough
         // space? If not, bail before evicting anything — don't destroy the
         // entire safety net for a spill that will fail anyway.
@@ -5847,6 +5882,8 @@ void ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index) no
             std::size_t reclaimable = 0;
             const std::size_t per_page = text_bytes / std::max(1U, text_pages);
             for (std::size_t i = 0; i < host_kv_safety_net.size(); ++i) {
+                // State-only entries use heap, not arena — no reclaimable bytes.
+                if (host_kv_safety_net.at(i).state_only) { continue; }
                 reclaimable += per_page *
                     (host_kv_safety_net.at(i).text_page_count +
                      host_kv_safety_net.at(i).backend_page_count);
@@ -5854,9 +5891,9 @@ void ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index) no
             if (host_kv_arena->free_bytes() + reclaimable < needed_total) {
                 std::fprintf(stderr,
                              "[safety-spill] FAIL: insufficient capacity even after evicting all "
-                             "(free=%zu reclaimable=%zu need=%zu)\n",
+                             "(free=%zu reclaimable=%zu need=%zu) — falling back to state-only\n",
                              host_kv_arena->free_bytes(), reclaimable, needed_total);
-                return;
+                kv_copy_ok = false;
             }
         }
         // Evict smallest entries first (fewest total pages). Bigger sessions are
@@ -5871,12 +5908,15 @@ void ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index) no
         // there is no use-after-free. The cudaStreamSynchronize is a safety
         // landmine guard in case the protocol ever changes.
         bool pinned_eviction_started = false;
-        while (host_kv_arena->free_bytes() < needed_total && host_kv_safety_net.size() > 0) {
+        if (kv_copy_ok) while (host_kv_arena->free_bytes() < needed_total && host_kv_safety_net.size() > 0) {
             std::optional<std::size_t> victim;
             std::uint64_t victim_pages = 0;
             for (std::size_t i = 0; i < host_kv_safety_net.size(); ++i) {
                 // Phase 1: only evict unpinned. Phase 2: also evict pinned.
                 if (!pinned_eviction_started && host_kv_safety_net.at(i).pinned) { continue; }
+                // Skip state-only entries: they use heap memory, not arena
+                // memory. Evicting them frees no arena bytes.
+                if (host_kv_safety_net.at(i).state_only) { continue; }
                 const std::uint64_t pages = static_cast<std::uint64_t>(host_kv_safety_net.at(i).text_page_count)
                                           + host_kv_safety_net.at(i).backend_page_count;
                 if (!victim || pages < victim_pages ||
@@ -5908,25 +5948,29 @@ void ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index) no
             host_kv_safety_net.remove(victim.value());
         }
 
-        // Check backend capacity.
+        // Check backend capacity (skip if kv_copy_ok is false).
         const HostKVPageLayout* backend_layout = nullptr;
         std::size_t backend_bytes = 0;
-        if (backend_pages != 0) {
+        if (kv_copy_ok && backend_pages != 0) {
             backend_layout =
                 host_kv_arena->layout_for(backend_kv_pages->physical_pool().geometry());
-            if (backend_layout == nullptr) { return; }
-            backend_bytes = backend_layout->page_stride * backend_pages;
-            if (host_kv_arena->free_bytes() < text_bytes + backend_bytes) {
-                std::fprintf(stderr, "[safety-spill] FAIL: backend capacity free=%zu need=%zu\n",
-                             host_kv_arena->free_bytes(), text_bytes + backend_bytes);
-                return;
+            if (backend_layout == nullptr) { kv_copy_ok = false; }
+            else {
+                backend_bytes = backend_layout->page_stride * backend_pages;
+                if (host_kv_arena->free_bytes() < text_bytes + backend_bytes) {
+                    std::fprintf(stderr, "[safety-spill] FAIL: backend capacity free=%zu need=%zu — state-only\n",
+                                 host_kv_arena->free_bytes(), text_bytes + backend_bytes);
+                    kv_copy_ok = false;
+                }
             }
         }
 
+        std::vector<HostKVAllocation> text_allocations;
+        std::vector<HostKVAllocation> backend_allocations;
+        if (kv_copy_ok) {
         // Allocate host memory and copy D2H for text KV.
         // Try single contiguous allocation first; fall back to scatter-gather
         // (multi-extent) when the arena is fragmented.
-        std::vector<HostKVAllocation> text_allocations;
         {
             std::optional<HostKVAllocation> single =
                 host_kv_arena->allocate(*text_layout, text_pages);
@@ -5947,38 +5991,152 @@ void ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index) no
             }
         }
         // Copy D2H for text KV, iterating over allocations (scatter-gather).
-        {
+        // If device pages are unavailable (device_replica cleared by a prior
+        // release_reference), skip the KV copy and fall back to state-only entry.
+        kv_copy_ok = kv_copy_ok && !text_allocations.empty();
+        std::fprintf(stderr,
+                     "[safety-spill] D2H text: index=%u pages=%u allocations=%zu active=%d\n",
+                     index, text_pages, text_allocations.size(),
+                     text_kv_addresses->active(kv.text) ? 1 : 0);
+        if (kv_copy_ok) {
             std::uint32_t page_offset = 0;
             for (auto& alloc : text_allocations) {
                 const std::uint32_t alloc_pages = alloc.page_count();
                 std::vector<DeviceKVPageHandle> device_pages(alloc_pages);
+                std::uint32_t resident_pages = 0;
+                std::uint32_t host_copy_pages = 0;
                 for (std::uint32_t p = 0; p < alloc_pages; ++p) {
-                    device_pages[p] = text_kv_addresses->physical_page(kv.text, page_offset + p);
+                    const auto page_handle = text_kv_addresses->physical_page_if_resident(
+                        kv.text, page_offset + p);
+                    if (page_handle) {
+                        device_pages[p] = *page_handle;
+                        ++resident_pages;
+                    } else if (host_kv_extents) {
+                        // Device replica was demoted to host. Try host replica.
+                        const auto host_replica = text_kv_addresses->host_replica_if_available(
+                            kv.text, page_offset + p);
+                        if (host_replica) {
+                            const auto extent_view = host_kv_extents->view(host_replica->extent);
+                            if (extent_view.valid()) {
+                                const std::size_t page_stride = extent_view.layout().page_stride;
+                                const std::byte* src = extent_view.data() +
+                                    static_cast<std::size_t>(host_replica->page_offset) * page_stride;
+                                std::byte* dst = host_kv_arena->writable_view(alloc).data() +
+                                    static_cast<std::size_t>(p) * page_stride;
+                                std::memcpy(dst, src, page_stride);
+                                ++host_copy_pages;
+                            }
+                        }
+                    }
                 }
-                text_kv_pages->physical_pool().copy_to_host(
-                    device_pages, host_kv_arena->writable_view(alloc), device.transfer_stream);
+                if (resident_pages + host_copy_pages < alloc_pages) {
+                    // Some pages have neither device nor host replica.
+                    try { cudaStreamSynchronize(device.transfer_stream); } catch (...) {}
+                    std::fprintf(stderr,
+                                 "[safety-spill] KV_COPY_SKIP: index=%u — %u device + %u host / %u pages, "
+                                 "falling back to state-only entry\n",
+                                 index, resident_pages, host_copy_pages, alloc_pages);
+                    text_allocations.clear();
+                    kv_copy_ok = false;
+                    break;
+                }
+                if (resident_pages == alloc_pages) {
+                    // All pages device-resident — standard D2H copy.
+                    text_kv_pages->physical_pool().copy_to_host(
+                        device_pages, host_kv_arena->writable_view(alloc), device.transfer_stream);
+                } else if (resident_pages == 0 && host_copy_pages == alloc_pages) {
+                    // All pages from host_replica — already copied via memcpy.
+                    std::fprintf(stderr,
+                                 "[safety-spill] host_copy_ok: index=%u — %u/%u pages from host\n",
+                                 index, host_copy_pages, alloc_pages);
+                } else {
+                    // Mixed: some device, some host. Use copy_to_host_partial
+                    // to copy device-resident pages (skip invalid handles).
+                    // Host-replica pages already filled via memcpy.
+                    text_kv_pages->physical_pool().copy_to_host_partial(
+                        device_pages, host_kv_arena->writable_view(alloc), device.transfer_stream);
+                    std::fprintf(stderr,
+                                 "[safety-spill] mixed_copy_ok: index=%u — %u device + %u host / %u\n",
+                                 index, resident_pages, host_copy_pages, alloc_pages);
+                }
                 page_offset += alloc_pages;
             }
         }
         // Allocate host memory and copy D2H for backend KV if present.
-        std::optional<HostKVAllocation> backend_host;
-        std::vector<DeviceKVPageHandle> backend_device_pages;
-        if (backend_pages != 0) {
-            backend_host = host_kv_arena->allocate(*backend_layout, backend_pages);
-            if (!backend_host) {
-                std::fprintf(stderr, "[safety-spill] FAIL: backend allocate (fragmentation) need=%zu\n",
-                             backend_bytes);
-                cudaStreamSynchronize(device.transfer_stream);
-                return;
+        // Skip when KV copy failed (state-only fallback).
+        if (kv_copy_ok && backend_pages != 0) {
+            std::fprintf(stderr,
+                         "[safety-spill] D2H backend: index=%u pages=%u\n",
+                         index, backend_pages);
+            std::optional<HostKVAllocation> single =
+                host_kv_arena->allocate(*backend_layout, backend_pages);
+            if (single) {
+                backend_allocations.push_back(std::move(*single));
+            } else {
+                backend_allocations = host_kv_arena->allocate_multi(*backend_layout, backend_pages);
+                if (backend_allocations.empty()) {
+                    std::fprintf(stderr, "[safety-spill] FAIL: backend allocate (fragmentation) need=%zu free=%zu\n",
+                                 backend_bytes, host_kv_arena->free_bytes());
+                    cudaStreamSynchronize(device.transfer_stream);
+                    return;
+                }
+                std::fprintf(stderr, "[safety-spill] backend multi-extent OK: %zu allocations for %u pages\n",
+                             backend_allocations.size(), backend_pages);
             }
-            backend_device_pages.resize(backend_pages);
-            for (std::uint32_t page = 0; page < backend_pages; ++page) {
-                backend_device_pages[page] = backend_kv_addresses->physical_page(*kv.backend, page);
+            // Copy D2H for each backend allocation (scatter-gather).
+            // Use physical_page_if_resident to handle demoted backend pages.
+            std::uint32_t backend_page_offset = 0;
+            for (auto& alloc : backend_allocations) {
+                const std::uint32_t alloc_pages = alloc.page_count();
+                std::vector<DeviceKVPageHandle> alloc_device_pages(alloc_pages);
+                std::uint32_t be_resident = 0, be_host = 0;
+                for (std::uint32_t p = 0; p < alloc_pages; ++p) {
+                    const auto be_handle = backend_kv_addresses->physical_page_if_resident(
+                        *kv.backend, backend_page_offset + p);
+                    if (be_handle) {
+                        alloc_device_pages[p] = *be_handle;
+                        ++be_resident;
+                    } else if (host_kv_extents) {
+                        const auto be_replica = backend_kv_addresses->host_replica_if_available(
+                            *kv.backend, backend_page_offset + p);
+                        if (be_replica) {
+                            const auto be_view = host_kv_extents->view(be_replica->extent);
+                            if (be_view.valid()) {
+                                const std::size_t be_stride = be_view.layout().page_stride;
+                                const std::byte* be_src = be_view.data() +
+                                    static_cast<std::size_t>(be_replica->page_offset) * be_stride;
+                                std::byte* be_dst = host_kv_arena->writable_view(alloc).data() +
+                                    static_cast<std::size_t>(p) * be_stride;
+                                std::memcpy(be_dst, be_src, be_stride);
+                                ++be_host;
+                            }
+                        }
+                    }
+                }
+                if (be_resident == alloc_pages) {
+                    backend_kv_pages->physical_pool().copy_to_host(
+                        alloc_device_pages, host_kv_arena->writable_view(alloc),
+                        device.transfer_stream);
+                } else if (be_resident == 0 && be_host == alloc_pages) {
+                    std::fprintf(stderr,
+                                 "[safety-spill] host_copy_ok: index=%u backend — %u/%u pages from host\n",
+                                 index, be_host, alloc_pages);
+                } else if (be_resident + be_host == alloc_pages) {
+                    backend_kv_pages->physical_pool().copy_to_host_partial(
+                        alloc_device_pages, host_kv_arena->writable_view(alloc),
+                        device.transfer_stream);
+                } else {
+                    // Pages missing — can't recover. Fall back to state-only.
+                    try { cudaStreamSynchronize(device.transfer_stream); } catch (...) {}
+                    text_allocations.clear();
+                    backend_allocations.clear();
+                    kv_copy_ok = false;
+                    break;
+                }
+                backend_page_offset += alloc_pages;
             }
-            backend_kv_pages->physical_pool().copy_to_host(
-                backend_device_pages, host_kv_arena->writable_view(*backend_host),
-                device.transfer_stream);
         }
+        }  // end if (kv_copy_ok)
 
         // Copy the continuation state image to a pinned host buffer.
         std::size_t state_bytes = 0;
@@ -5986,12 +6144,25 @@ void ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index) no
         if (state_store && state_store->valid(sequence.state.read) && state_images) {
             state_bytes = state_images->host_layout().image_bytes;
             if (state_bytes > 0) {
-                state_host.resize(state_bytes);
-                const std::int32_t slot = state_store->physical_slot(sequence.state.read);
-                const HostStateImageView state_view{
-                    .data = state_host.data(),
-                    .layout = &state_images->host_layout()};
-                state_images->copy_to_host(slot, state_view, device.transfer_stream);
+                const StateReplicaResidency endpoint_residency =
+                    state_store->residency(sequence.state.read);
+                if (endpoint_residency == StateReplicaResidency::HostOnly) {
+                    // Endpoint was demoted to host — copy host-to-host
+                    const auto host_view = state_store->host_replica_view(sequence.state.read);
+                    if (host_view && host_view->data != nullptr) {
+                        state_host.resize(state_bytes);
+                        std::memcpy(state_host.data(), host_view->data, state_bytes);
+                    } else {
+                        state_bytes = 0;  // skip entry if host view is invalid
+                    }
+                } else {
+                    state_host.resize(state_bytes);
+                    const std::int32_t slot = state_store->physical_slot(sequence.state.read);
+                    const HostStateImageView state_view{
+                        .data = state_host.data(),
+                        .layout = &state_images->host_layout()};
+                    state_images->copy_to_host(slot, state_view, device.transfer_stream);
+                }
             }
         }
 
@@ -6042,27 +6213,32 @@ void ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index) no
             }
         }
 
-        // Drop-time capture fallback: the demote path may have DROPPED the rewrite
-        // checkpoint (releasing its state image) before this eviction. If the
-        // side-store holds a capture for this slot (generation-matched), attach
-        // it so the entry still serves checkpoint-level restores.
+        // When the checkpoint was dropped (rewrite_checkpoint cleared),
+        // a state-only safety net entry was created at capture time with the
+        // checkpoint state. Merge it into this full entry so the safety
+        // net can serve checkpoint-level restores after eviction.
+        // Match by continuation index first (always available), then by
+        // session_key (for Responses API sessions).
         if (!checkpoint_valid) {
-            const auto capture_it = dropped_checkpoint_captures_.find(index);
-            if (capture_it != dropped_checkpoint_captures_.end() &&
-                capture_it->second.slot_generation == continuation_slots[index].generation &&
-                capture_it->second.state_bytes > 0 &&
-                !capture_it->second.state_host.empty()) {
+            auto sn_entry = host_kv_safety_net.take_state_only_by_index(index);
+            if (!sn_entry && sequence.session_key) {
+                sn_entry = host_kv_safety_net.take_state_only_by_session(
+                    *sequence.session_key);
+            }
+            if (sn_entry) {
                 checkpoint_valid = true;
-                checkpoint_frontier = capture_it->second.checkpoint_frontier;
-                checkpoint_state_bytes = capture_it->second.state_bytes;
-                checkpoint_state_host = std::move(capture_it->second.state_host);
-                dropped_checkpoint_captures_.erase(capture_it);
+                checkpoint_frontier = sn_entry->checkpoint_frontier;
+                checkpoint_state_bytes = sn_entry->checkpoint_state_bytes;
+                checkpoint_state_host = std::move(sn_entry->checkpoint_state_host);
+                std::fprintf(stderr,
+                    "[safety-spill] merged dropped checkpoint state from state-only entry "
+                    "(frontier=%u bytes=%zu)\n",
+                    checkpoint_frontier, checkpoint_state_bytes);
             }
         }
 
         // Diagnostic: log WHY checkpoint capture failed, but only after all
-        // three capture hooks (rewrite_checkpoint, host-replica, side-store)
-        // have been attempted. Previously this fired before the captures ran.
+        // capture hooks have been attempted.
         if (!checkpoint_valid) {
             const char* reason = "rewrite_checkpoint_invalid";
             if (sequence.rewrite_checkpoint.valid && sequence.rewrite_checkpoint.frontier != 0) {
@@ -6083,6 +6259,10 @@ void ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index) no
 
         // Synchronize the transfer stream so the D2H copies complete before
         // the device pages are released.
+        std::fprintf(stderr,
+                     "[safety-spill] sync: index=%u frontier=%u state_bytes=%zu ckpt_valid=%d\n",
+                     index, sequence.execution_frontier, state_bytes,
+                     static_cast<int>(checkpoint_valid));
         CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
 
         // Build the safety net entry.
@@ -6104,26 +6284,56 @@ void ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index) no
                          static_cast<unsigned long long>(cp_hash),
                          entry.execution_frontier, entry.checkpoint_frontier);
         }
-        entry.text_page_count = text_pages;
-        entry.backend_page_count = backend_pages;
-        entry.text_allocations = std::move(text_allocations);
-        if (backend_host) {
-            entry.backend_host = std::move(*backend_host);
+        // If KV copy was skipped (device pages unavailable), mark as state-only.
+        // The entry has checkpoint state but no KV — find() will skip it for
+        // full KV restore, but take_state_only_by_session/index can still
+        // merge it during a later spill that succeeds.
+        if (text_allocations.empty()) {
+            entry.state_only = true;
+            entry.source_continuation_index = index;
+            entry.execution_frontier = 0;  // no KV spilled
         }
+        entry.text_page_count = text_allocations.empty() ? 0 : text_pages;
+        entry.backend_page_count = backend_allocations.empty() ? 0 : backend_pages;
+        entry.text_allocations = std::move(text_allocations);
+        entry.backend_allocations = std::move(backend_allocations);
         entry.state_host = std::move(state_host);
         entry.state_bytes = state_bytes;
         entry.checkpoint_valid = checkpoint_valid;
         entry.checkpoint_frontier = checkpoint_frontier;
         entry.checkpoint_state_host = std::move(checkpoint_state_host);
         entry.checkpoint_state_bytes = checkpoint_state_bytes;
-        // An entry without a captured endpoint state image cannot be restored
-        // (the transparent restore would advance prefill past the KV with no
-        // state, or fail mid-restore after committing KV pages). Net entries
-        // therefore always carry a state image; a state-less spill is dropped.
+        // An entry needs at least one state image for restore. Prefer the
+        // endpoint state; if missing (state store evicted the endpoint),
+        // fall back to the checkpoint state as the restore state.
         if (entry.state_bytes == 0 || entry.state_host.empty()) {
-            std::fprintf(stderr,
-                         "[safety-spill] SKIP: no endpoint state image (index=%u frontier=%u)\n",
-                         index, entry.execution_frontier);
+            // Endpoint state missing — fall back to checkpoint state.
+            // For state-only entries (KV copy failed), keep checkpoint state
+            // as-is so take_state_only_by_index can still find it.
+            // For full entries, move checkpoint to endpoint (existing behavior).
+            if (!entry.state_only &&
+                entry.checkpoint_valid && entry.checkpoint_state_bytes > 0 &&
+                !entry.checkpoint_state_host.empty()) {
+                entry.state_bytes = entry.checkpoint_state_bytes;
+                entry.state_host = std::move(entry.checkpoint_state_host);
+                entry.checkpoint_valid = false;
+                entry.checkpoint_state_bytes = 0;
+                if (!entry.state_only) {
+                    entry.execution_frontier = checkpoint_frontier;
+                }
+                std::fprintf(stderr,
+                             "[safety-spill] FALLBACK: using checkpoint state as endpoint "
+                             "(index=%u frontier=%u ckpt_frontier=%u)\n",
+                             index, entry.execution_frontier, checkpoint_frontier);
+            } else {
+                std::fprintf(stderr,
+                             "[safety-spill] SKIP: no endpoint or checkpoint state image "
+                             "(index=%u frontier=%u)\n",
+                             index, entry.execution_frontier);
+            }
+        }
+        if (entry.state_bytes == 0 || entry.state_host.empty()) {
+            // Still no state after fallback — skip this entry.
         } else {
             std::fprintf(stderr,
                          "[safety-spill] OK: index=%u frontier=%u ckpt_valid=%d ckpt_frontier=%u "
@@ -6132,10 +6342,22 @@ void ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index) no
                          checkpoint_frontier, entry.ledger.size(), entry.prefix_identity.size());
             host_kv_safety_net.add(std::move(entry));
         }
+    } catch (const std::exception& e) {
+        // Safety net is best-effort. Log the error so silent failures are
+        // visible — large D2H copies (3.7GB+) can fail if the device KV
+        // was invalidated or CUDA reports an async error at sync.
+        // Sync any in-flight D2H copies before the host allocations are
+        // freed by destructors — a stale copy writing into reused arena
+        // bytes corrupts a later allocation silently.
+        std::fprintf(stderr,
+                     "[safety-spill] FAIL: index=%u frontier=%u what=%s\n",
+                     index, continuation_states[index].execution_frontier, e.what());
+        try { cudaStreamSynchronize(device.transfer_stream); } catch (...) {}
     } catch (...) {
-        // Safety net is best-effort. Sync any in-flight D2H copies before the
-        // host allocations are freed by destructors — a stale copy writing
-        // into reused arena bytes corrupts a later allocation silently.
+        // Same sync rationale as above.
+        std::fprintf(stderr,
+                     "[safety-spill] FAIL: index=%u frontier=%u what=unknown\n",
+                     index, continuation_states[index].execution_frontier);
         try { cudaStreamSynchronize(device.transfer_stream); } catch (...) {}
     }
 }
@@ -6364,9 +6586,13 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
     }
 
     const auto complete_pressure_delta = [&](MaterializationTransaction::PressureWork& work) {
+        // Don't overwrite committed_delta with planned values.
+        // The actual delta was set by release_materialization_victim (L8871)
+        // and other release paths. The planned values (work.option.effect)
+        // may differ from actual when a victim was partially truncated.
+        // Keeping the actual delta ensures accurate pressure accounting.
         (void)checked_resource_difference(work.option.effect.removed, work.committed_delta.removed);
         (void)checked_resource_difference(work.option.effect.added, work.committed_delta.added);
-        work.committed_delta = work.option.effect;
     };
 
     const auto for_each_pending_pressure = [&](auto&& callback) {
@@ -6623,6 +6849,44 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
         }
         transaction.host_kv_restore_frontier = 0;
         std::fprintf(stderr, "[safety-find] re-find OOM: falling back to root prefill\n");
+        // Clean up partial allocations from the failed prepare_materialization
+        // attempt before retrying. Without this, stale reserved_state_count
+        // causes a logic_error crash in the retry's guard check.
+        for (std::uint32_t i = 0; i < transaction.reserved_state_count; ++i) {
+            try { state_store->release(transaction.reserved_states[i]); } catch (...) {}
+        }
+        transaction.reserved_state_count = 0;
+        if (transaction.state_fork_destination) {
+            try { state_store->release(*transaction.state_fork_destination); } catch (...) {}
+            transaction.state_fork_destination.reset();
+        }
+        transaction.text_activation.reset();
+        transaction.backend_activation.reset();
+        // Release root KV addresses (created by prepare_materialization, not reserve)
+        if (transaction.root_text_address && text_kv_addresses) {
+            try { (void)text_kv_addresses->release(*transaction.root_text_address); } catch (...) {}
+            transaction.root_text_address.reset();
+        }
+        if (transaction.root_backend_address && backend_kv_addresses) {
+            try { (void)backend_kv_addresses->release(*transaction.root_backend_address); } catch (...) {}
+            transaction.root_backend_address.reset();
+        }
+        // Clear restore vectors (populated by prepare_kv_restores)
+        transaction.text_restores.clear();
+        transaction.text_restore_destinations.clear();
+        transaction.backend_restores.clear();
+        transaction.backend_restore_destinations.clear();
+        // Release source restore reservations (allocated by prepare_materialization)
+        if (transaction.text_source_restore_reservation) {
+            transaction.text_source_restore_reservation.reset();
+        }
+        if (transaction.backend_source_restore_reservation) {
+            transaction.backend_source_restore_reservation.reset();
+        }
+        // Release prefix forks (logic_error path, but may be set before bad_alloc)
+        transaction.text_prefix_fork.reset();
+        transaction.backend_prefix_fork.reset();
+        transaction.prepared = false;
         // Re-run prepare without the restore frontier. Wrap in try-catch:
         // if the retry also OOMs (e.g., device state slots exhausted),
         // fail this ONE request instead of nuking the worker.
@@ -6741,6 +7005,19 @@ ProgramImplCore::progress_materialization_transaction(runtime::CancellationFlagV
         materialization_ledger_.clear();
         materialization_identity_.clear();
         materialization_prefix_digests_.clear();
+    } catch (const std::logic_error& e) {
+        // HostOnly restore failure ("no resident state") — the host replica
+        // was evicted from host_state_images (LRU). Abort the transaction
+        // gracefully so the engine re-queues as root prefill.
+        if (std::strstr(e.what(), "no resident state") != nullptr) {
+            std::fprintf(stderr,
+                "[materialize] HostOnly restore failed -- aborting to root prefill: %s\n",
+                e.what());
+            abort_transaction();
+            return out;
+        }
+        release_materialization_staging(transaction);
+        throw;
     } catch (...) {
         release_materialization_staging(transaction);
         throw;
@@ -6955,9 +7232,12 @@ void ProgramImplCore::release_continuation_slot(std::uint32_t index) noexcept {
     ContinuationSlot& slot = continuation_slots[index];
     slot.role              = ContinuationSlotRole::Free;
     if (++slot.generation == 0) { ++slot.generation; }
-    // A stale drop-time capture must not survive slot recycling — its bytes
-    // belong to a released continuation and a reused index would misattach.
-    dropped_checkpoint_captures_.erase(index);
+    // Clean up any state-only safety net entries for this slot to
+    // prevent stale entries from matching a recycled slot.
+    host_kv_safety_net.remove_state_only_by_index(index);
+    if (continuation_states[index].session_key) {
+        host_kv_safety_net.remove_state_only(*continuation_states[index].session_key);
+    }
 }
 
 detail::PhysicalResources
@@ -9498,27 +9778,36 @@ FinishResult ProgramImplCore::finish(SequenceHandle sequence) noexcept {
                 if (capture_bytes > 0 &&
                     state_store->residency(state.state.read) != StateReplicaResidency::None &&
                     state_store->residency(state.state.read) != StateReplicaResidency::HostOnly) {
-                    DroppedCheckpointCapture capture;
-                    capture.slot_generation = continuation_slots[continuation_index].generation;
-                    capture.checkpoint_frontier = state.rewrite_checkpoint.frontier;
-                    capture.state_bytes = capture_bytes;
-                    capture.state_host.resize(capture_bytes);
+                    // Unified architecture: create a state-only safety net entry
+                    // instead of using the dropped_checkpoint_captures_ side store.
+                    std::vector<std::byte> capture_host(capture_bytes);
                     const std::int32_t slot_num = state_store->physical_slot(state.state.read);
                     const HostStateImageView capture_view{
-                        .data = capture.state_host.data(),
+                        .data = capture_host.data(),
                         .layout = &state_images->host_layout()};
                     state_images->copy_to_host(slot_num, capture_view, device.transfer_stream);
                     CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
-                    constexpr std::size_t kMaxCaptures = 8;
-                    while (dropped_checkpoint_captures_.size() >= kMaxCaptures) {
-                        auto oldest = dropped_checkpoint_captures_.begin();
-                        for (auto it = dropped_checkpoint_captures_.begin();
-                             it != dropped_checkpoint_captures_.end(); ++it) {
-                            if (it->second.captured < oldest->second.captured) { oldest = it; }
-                        }
-                        dropped_checkpoint_captures_.erase(oldest);
+                    HostKVSafetyNetEntry sn_entry;
+                    sn_entry.state_only = true;
+                    sn_entry.source_continuation_index = continuation_index;
+                    sn_entry.checkpoint_valid = true;
+                    sn_entry.checkpoint_frontier = state.rewrite_checkpoint.frontier;
+                    sn_entry.checkpoint_state_host = std::move(capture_host);
+                    sn_entry.checkpoint_state_bytes = capture_bytes;
+                    sn_entry.session_key = state.session_key;
+                    sn_entry.execution_frontier = 0;
+                    // Remove stale state-only entries for this slot/session
+                    // before adding -- ensures at most one entry per session.
+                    host_kv_safety_net.remove_state_only_by_index(continuation_index);
+                    if (state.session_key) {
+                        host_kv_safety_net.remove_state_only(*state.session_key);
                     }
-                    dropped_checkpoint_captures_[continuation_index] = std::move(capture);
+                    std::fprintf(stderr,
+                        "[checkpoint-demoted] finish: index=%u frontier=%u ckpt_frontier=%u "
+                        "state_bytes=%zu\n",
+                        continuation_index, state.execution_frontier,
+                        state.rewrite_checkpoint.frontier, capture_bytes);
+                    host_kv_safety_net.add(std::move(sn_entry));
                 }
             }
             // Materialize a real rewrite checkpoint image. In the
@@ -9527,21 +9816,162 @@ FinishResult ProgramImplCore::finish(SequenceHandle sequence) noexcept {
             // image so the rewrite checkpoint has its own backing state.
             // This preserves the shortlist key for follow-up prompts.
             const std::int32_t source_slot = state_store->physical_slot(state.state.read);
+            bool demoted_from_host = false;
+            std::vector<std::byte> demoted_host_buffer;
             std::optional<StateImageHandle> new_rewrite = state_store->reserve_destination();
+            if (!new_rewrite && state.rewrite_state && state_store && state_images &&
+                state_store->residency(*state.rewrite_state) == StateReplicaResidency::DeviceOnly) {
+                // No device slot for the new checkpoint. Capture the OLD
+                // checkpoint state to a host buffer (D2H), then release
+                // its device slot for the new checkpoint. The captured
+                // state goes into a state-only safety net entry.
+                // Unified architecture — no host_state_images dependency.
+                std::fprintf(stderr,
+                    "[checkpoint] demoting old checkpoint to host (frontier=%u)\n",
+                    state.rewrite_checkpoint.frontier);
+                const std::size_t capture_bytes = state_images->host_layout().image_bytes;
+                demoted_host_buffer.resize(capture_bytes);
+                const std::int32_t old_slot =
+                    state_store->physical_slot(*state.rewrite_state);
+                const HostStateImageView capture_view{
+                    .data = demoted_host_buffer.data(),
+                    .layout = &state_images->host_layout()};
+                state_images->copy_to_host(old_slot, capture_view, device.transfer_stream);
+                CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+                // Release old checkpoint device slot.
+                state_store->release_checkpoint_reference(*state.rewrite_state);
+                state.rewrite_state.reset();
+                // Reserve the freed slot for the new checkpoint.
+                new_rewrite = state_store->reserve_destination();
+                demoted_from_host = true;
+            }
             if (new_rewrite) {
                 state_store->activate_reset(*new_rewrite, device.transfer_stream);
-                state_images->copy_slot(source_slot, state_store->physical_slot(*new_rewrite),
-                                       device.transfer_stream);
+                if (demoted_from_host && !demoted_host_buffer.empty()) {
+                    // Copy from host buffer (source device slot was freed)
+                    const HostStateImageConstView host_src{
+                        .data = demoted_host_buffer.data(),
+                        .layout = &state_images->host_layout()};
+                    state_images->copy_from_host(host_src,
+                        state_store->physical_slot(*new_rewrite),
+                        device.transfer_stream);
+                } else {
+                    // Normal path: copy from device source slot
+                    state_images->copy_slot(source_slot,
+                        state_store->physical_slot(*new_rewrite),
+                        device.transfer_stream);
+                }
                 CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
                 state_store->freeze(*new_rewrite);
                 state_store->retain_checkpoint_reference(*new_rewrite);
-                state_store->release_checkpoint_reference(*state.rewrite_state);
+                if (state.rewrite_state) {
+                    state_store->release_checkpoint_reference(*state.rewrite_state);
+                }
                 state.rewrite_state = *new_rewrite;
+                // Move the captured state to the safety net AFTER the
+                // H2D copy is complete (the buffer was needed for copy).
+                if (demoted_from_host && !demoted_host_buffer.empty()) {
+                    host_kv_safety_net.remove_state_only_by_index(continuation_index);
+                    if (state.session_key) {
+                        host_kv_safety_net.remove_state_only(*state.session_key);
+                    }
+                    HostKVSafetyNetEntry sn_entry;
+                    sn_entry.state_only = true;
+                    sn_entry.source_continuation_index = continuation_index;
+                    sn_entry.checkpoint_valid = true;
+                    sn_entry.checkpoint_frontier = state.rewrite_checkpoint.frontier;
+                    sn_entry.checkpoint_state_host = std::move(demoted_host_buffer);
+                    sn_entry.checkpoint_state_bytes = state_images->host_layout().image_bytes;
+                    sn_entry.session_key = state.session_key;
+                    sn_entry.execution_frontier = 0;
+                    std::fprintf(stderr,
+                        "[checkpoint-demoted] finish: index=%u frontier=%u ckpt_frontier=%u "
+                        "state_bytes=%zu\n",
+                        continuation_index, state.execution_frontier,
+                        state.rewrite_checkpoint.frontier,
+                        static_cast<std::size_t>(state_images->host_layout().image_bytes));
+                    host_kv_safety_net.add(std::move(sn_entry));
+                } else if (!fork_collapsed_to_source) {
+                    // Normal path: capture old checkpoint state to safety net
+                    // before cleaning up. Skip if fork_collapsed_to_source
+                    // already captured (avoids redundant D2H copy).
+                    // This ensures the spill can merge checkpoint state
+                    // even after DropOptional clears the new rewrite_state.
+                    if (state_images && continuation_index < continuation_capacity &&
+                        state.rewrite_checkpoint.valid &&
+                        state.rewrite_checkpoint.frontier != 0) {
+                        // rewrite_checkpoint is valid — capture the old state.
+                        const std::size_t cap_bytes = state_images->host_layout().image_bytes;
+                        // rewrite_state was already released at L9657, but
+                        // state.state.read still has the turn-boundary state.
+                        // Use it as the checkpoint state source.
+                        const StateReplicaResidency cap_residency =
+                            state_store->residency(state.state.read);
+                        if (cap_bytes > 0 && state_store->valid(state.state.read) &&
+                            (cap_residency == StateReplicaResidency::DeviceOnly ||
+                             cap_residency == StateReplicaResidency::Both)) {
+                            std::vector<std::byte> cap_host(cap_bytes);
+                            const std::int32_t cap_slot =
+                                state_store->physical_slot(state.state.read);
+                            const HostStateImageView cap_view{
+                                .data = cap_host.data(),
+                                .layout = &state_images->host_layout()};
+                            state_images->copy_to_host(cap_slot, cap_view, device.transfer_stream);
+                            CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+                            host_kv_safety_net.remove_state_only_by_index(continuation_index);
+                            if (state.session_key) {
+                                host_kv_safety_net.remove_state_only(*state.session_key);
+                            }
+                            HostKVSafetyNetEntry sn_entry;
+                            sn_entry.state_only = true;
+                            sn_entry.source_continuation_index = continuation_index;
+                            sn_entry.checkpoint_valid = true;
+                            sn_entry.checkpoint_frontier = state.rewrite_checkpoint.frontier;
+                            sn_entry.checkpoint_state_host = std::move(cap_host);
+                            sn_entry.checkpoint_state_bytes = cap_bytes;
+                            sn_entry.session_key = state.session_key;
+                            sn_entry.execution_frontier = 0;
+                            std::fprintf(stderr,
+                                "[checkpoint-demoted] finish-normal: index=%u frontier=%u ckpt_frontier=%u "
+                                "state_bytes=%zu\n",
+                                continuation_index, state.execution_frontier,
+                                state.rewrite_checkpoint.frontier, cap_bytes);
+                            host_kv_safety_net.add(std::move(sn_entry));
+                        }
+                    } else {
+                        // rewrite_checkpoint not valid (DropOptional cleared it).
+                        // DON'T clean up state-only entries — the advance_prefill
+                        // capture may have created one that the spill needs.
+                        // Cleanup happens via spill merge or slot recycling.
+                    }
+                }
             } else {
                 // Cannot reserve a new CheckpointImmutable image for the
-                // rewrite state.  Keep the existing reference rather than
-                // dropping the checkpoint — the state.read image is still
-                // valid and retains the turn-boundary state.
+                // rewrite state. If demotion happened, save the captured
+                // state to the safety net so it is not lost.
+                if (demoted_from_host && !demoted_host_buffer.empty()) {
+                    host_kv_safety_net.remove_state_only_by_index(continuation_index);
+                    if (state.session_key) {
+                        host_kv_safety_net.remove_state_only(*state.session_key);
+                    }
+                    HostKVSafetyNetEntry sn_entry;
+                    sn_entry.state_only = true;
+                    sn_entry.source_continuation_index = continuation_index;
+                    sn_entry.checkpoint_valid = true;
+                    sn_entry.checkpoint_frontier = state.rewrite_checkpoint.frontier;
+                    sn_entry.checkpoint_state_host = std::move(demoted_host_buffer);
+                    sn_entry.checkpoint_state_bytes = state_images->host_layout().image_bytes;
+                    sn_entry.session_key = state.session_key;
+                    sn_entry.execution_frontier = 0;
+                    std::fprintf(stderr,
+                        "[checkpoint-demoted] finish-fallback: index=%u ckpt_frontier=%u "
+                        "state_bytes=%zu (reserve_destination failed after demotion)\n",
+                        continuation_index, state.rewrite_checkpoint.frontier,
+                        static_cast<std::size_t>(state_images->host_layout().image_bytes));
+                    host_kv_safety_net.add(std::move(sn_entry));
+                }
+                // state.read image is still valid and retains the
+                // turn-boundary state for in-place continuation.
             }
         }
         if (state_store->role(state.state.read) == StateImageRole::ActiveMutable) {
@@ -10204,28 +10634,45 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
                 throw std::logic_error("resident rewrite StateImage is not movable");
             }
             const StateImageHandle checkpoint = *sequence.rewrite_state;
+            // Clear any stale reserved_state from a previous turn.
+            // The rewrite-restore path gets its active state from the source,
+            // not from reserved_states.
+            if (sequence.reserved_state) {
+                state_store->release(*sequence.reserved_state);
+                sequence.reserved_state.reset();
+            }
             if (sequence.endpoint_valid && sequence.state.read == checkpoint) {
                 throw std::logic_error("resident endpoint aliases its rewrite StateImage");
             }
             if (sequence.endpoint_valid && !state_store->release(sequence.state.read)) {
                 throw std::logic_error("superseded endpoint StateImage could not be released");
             }
+            // If the checkpoint was demoted to host (HostOnly), restore it
+            // to device via H2D copy before consuming it.
+            if (state_store->residency(checkpoint) == StateReplicaResidency::HostOnly &&
+                host_state_images) {
+                std::fprintf(stderr,
+                    "[rewrite-restore] restoring HostOnly checkpoint to device (frontier=%u)\n",
+                    sequence.rewrite_checkpoint.frontier);
+                auto restore = state_store->begin_host_to_device(checkpoint, device.transfer_stream);
+                if (!restore) {
+                    throw std::logic_error("materialization source has no resident state");
+                }
+                CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+                state_store->publish_transfer(std::move(*restore), true);
+            }
             if (!preserve_rewrite) {
+                // Release the checkpoint reference (needed for Move path).
+                // Keep the handle in rewrite_state — if we can't create a
+                // new checkpoint, finish() will handle it via the alias
+                // check (rewrite_state == state.read).
                 state_store->release_checkpoint_reference(checkpoint);
-                sequence.rewrite_state.reset();
             }
             activate_consumed_state(checkpoint);
-            if (!preserve_rewrite && sequence.rewrite_checkpoint.valid && state_images) {
-                // Check slot budget BEFORE creating a new checkpoint.
-                // If the new checkpoint won't fit, skip creation and keep
-                // the old checkpoint metadata (frontier). The next request
-                // will find the checkpoint via inspect, discover no resident
-                // state, and fall back to root prefill or safety-net restore.
-                const bool can_fit_new_checkpoint =
-                    state_footprint(sequence) + 1 <= state_slots;
+            if (!preserve_rewrite && sequence.rewrite_checkpoint.valid && state_images &&
+                request_plan.rewrite_disposition == RewriteCheckpointDisposition::ReplaceAtCommittedFrontier) {
                 std::optional<StateImageHandle> new_rewrite =
-                    can_fit_new_checkpoint ? state_store->reserve_destination()
-                                           : std::nullopt;
+                    state_store->reserve_destination();
                 if (new_rewrite) {
                     const std::int32_t src_slot =
                         state_store->physical_slot(sequence.state.read);
@@ -10237,15 +10684,26 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
                     state_store->freeze(*new_rewrite);
                     state_store->retain_checkpoint_reference(*new_rewrite);
                     sequence.rewrite_state = *new_rewrite;
+                    // Clean up stale state-only safety net entries — the
+                    // new rewrite checkpoint supersedes them.
+                    host_kv_safety_net.remove_state_only_by_index(active_continuations[sequence.lane]);
+                    if (sequence.session_key) {
+                        host_kv_safety_net.remove_state_only(*sequence.session_key);
+                    }
                 } else {
-                    // No slot for new checkpoint — clear checkpoint metadata.
-                    // The pre-check avoids wasting a state slot on a checkpoint
-                    // that would be immediately released by the post-creation guard.
+                    // No device slot for the new checkpoint. The pressure
+                    // planner should have made room (via request_plan_impl.h
+                    // demand reservation). If we still can't fit, clear the
+                    // checkpoint — the materialize fallback will handle it.
                     std::fprintf(stderr,
                         "[rewrite-restore] slot budget: no room for checkpoint, frontier=%u cleared\n",
                         sequence.rewrite_checkpoint.frontier);
+                    sequence.rewrite_state.reset();
                     sequence.rewrite_checkpoint = {};
                 }
+            } else if (!preserve_rewrite) {
+                sequence.rewrite_state.reset();
+                sequence.rewrite_checkpoint = {};
             }
             sequence.text_kv_valid = base;
             if (speculative_backend == SpeculativeBackend::Mtp) {
@@ -10326,8 +10784,8 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
                 }
             }
 
-            // Backend KV restore.
-            if (entry.backend_host && sequence.kv->backend && backend_kv_addresses) {
+            // Backend KV restore (handles both single and scatter-gather).
+            if (!entry.backend_allocations.empty() && sequence.kv->backend && backend_kv_addresses) {
                 const std::uint32_t backend_frontier =
                     speculative_backend == SpeculativeBackend::Mtp && restore_frontier > 0
                         ? restore_frontier - 1U
@@ -10336,14 +10794,22 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
                 if (backend_pages > 0 && backend_pages <= entry.backend_page_count) {
                     backend_kv_addresses->materialize_to_tokens(
                         *sequence.kv->backend, backend_frontier, device.transfer_stream);
-                    std::vector<DeviceKVPageHandle> backend_destinations(backend_pages);
-                    for (std::uint32_t page = 0; page < backend_pages; ++page) {
-                        backend_destinations[page] =
-                            backend_kv_addresses->physical_page(*sequence.kv->backend, page);
+                    // Copy H2D for each allocation (scatter-gather).
+                    std::uint32_t backend_page_offset = 0;
+                    for (const auto& alloc : entry.backend_allocations) {
+                        const std::uint32_t alloc_pages = std::min(alloc.page_count(),
+                            backend_pages - backend_page_offset);
+                        if (alloc_pages == 0) { break; }
+                        std::vector<DeviceKVPageHandle> backend_destinations(alloc_pages);
+                        for (std::uint32_t page = 0; page < alloc_pages; ++page) {
+                            backend_destinations[page] = backend_kv_addresses->physical_page(
+                                *sequence.kv->backend, backend_page_offset + page);
+                        }
+                        backend_kv_pages->physical_pool().copy_from_host(
+                            host_kv_arena->view(alloc).subview(0, alloc_pages),
+                            backend_destinations, device.transfer_stream);
+                        backend_page_offset += alloc_pages;
                     }
-                    backend_kv_pages->physical_pool().copy_from_host(
-                        host_kv_arena->view(*entry.backend_host).subview(0, backend_pages),
-                        backend_destinations, device.transfer_stream);
                     backend_kv_addresses->commit_frontier(*sequence.kv->backend, backend_frontier);
                 }
             }
@@ -11877,27 +12343,35 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                     if (capture_bytes > 0 &&
                         (residency == StateReplicaResidency::DeviceOnly ||
                          residency == StateReplicaResidency::Both)) {
-                        DroppedCheckpointCapture capture;
-                        capture.slot_generation = continuation_slots[capture_index].generation;
-                        capture.checkpoint_frontier = staged.prompt_tokens;
-                        capture.state_bytes = capture_bytes;
-                        capture.state_host.resize(capture_bytes);
+                        // Unified architecture: create a state-only safety net entry
+                        // instead of using the dropped_checkpoint_captures_ side store.
+                        std::vector<std::byte> capture_host(capture_bytes);
                         const std::int32_t capture_slot = state_store->physical_slot(sequence.state.write);
                         const HostStateImageView capture_view{
-                            .data = capture.state_host.data(),
+                            .data = capture_host.data(),
                             .layout = &state_images->host_layout()};
                         state_images->copy_to_host(capture_slot, capture_view, device.transfer_stream);
                         CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
-                        constexpr std::size_t kMaxCaptures = 8;
-                        while (dropped_checkpoint_captures_.size() >= kMaxCaptures) {
-                            auto oldest = dropped_checkpoint_captures_.begin();
-                            for (auto it = dropped_checkpoint_captures_.begin();
-                                 it != dropped_checkpoint_captures_.end(); ++it) {
-                                if (it->second.captured < oldest->second.captured) { oldest = it; }
-                            }
-                            dropped_checkpoint_captures_.erase(oldest);
+                        HostKVSafetyNetEntry sn_entry;
+                        sn_entry.state_only = true;
+                        sn_entry.source_continuation_index = capture_index;
+                        sn_entry.checkpoint_valid = true;
+                        sn_entry.checkpoint_frontier = staged.prompt_tokens;
+                        sn_entry.checkpoint_state_host = std::move(capture_host);
+                        sn_entry.checkpoint_state_bytes = capture_bytes;
+                        sn_entry.session_key = sequence.session_key;
+                        sn_entry.execution_frontier = 0;
+                        // Remove stale state-only entries before adding.
+                        host_kv_safety_net.remove_state_only_by_index(capture_index);
+                        if (sequence.session_key) {
+                            host_kv_safety_net.remove_state_only(*sequence.session_key);
                         }
-                        dropped_checkpoint_captures_[capture_index] = std::move(capture);
+                        std::fprintf(stderr,
+                            "[checkpoint-demoted] prefill: index=%u frontier=%u ckpt_frontier=%u "
+                            "state_bytes=%zu\n",
+                            capture_index, sequence.execution_frontier,
+                            static_cast<unsigned>(staged.prompt_tokens), capture_bytes);
+                        host_kv_safety_net.add(std::move(sn_entry));
                     }
                 }
             }

@@ -231,6 +231,11 @@ public:
 
     void copy_to_host(std::span<const DeviceKVPageHandle> source, HostKVAllocationView destination,
                       cudaStream_t stream = nullptr) const;
+    // Like copy_to_host but skips pages with invalid (default-constructed) handles.
+    // Used by the safety-net spill when some pages are on device and others
+    // were demoted to host (filled via memcpy from host_replica).
+    void copy_to_host_partial(std::span<const DeviceKVPageHandle> source, HostKVAllocationView destination,
+                              cudaStream_t stream = nullptr) const;
     void copy_from_host(HostKVAllocationConstView source,
                         std::span<const DeviceKVPageHandle> destination,
                         cudaStream_t stream = nullptr) const;

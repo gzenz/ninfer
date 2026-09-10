@@ -690,23 +690,9 @@ public:
     HostKVSafetyNet host_kv_safety_net;
     std::uint64_t safety_net_restore_count_ = 0;
 
-    // Drop-time checkpoint capture: the pressure planner's demote path may DROP
-    // a continuation's rewrite checkpoint (releasing its state image) while
-    // the continuation stays catalogued. If that continuation is later evicted,
-    // the spill would find no rewrite state and the safety-net entry could not
-    // serve checkpoint-level restores (follow-up prompts diverge at the
-    // generation boundary). At drop time we copy the checkpoint state image to
-    // a host buffer keyed by (slot index, slot generation); the spill attaches
-    // it when the continuation is evicted, and release_continuation_slot erases
-    // it when the slot is freed.
-    struct DroppedCheckpointCapture {
-        std::uint64_t slot_generation = 0;
-        std::uint32_t checkpoint_frontier = 0;
-        std::vector<std::byte> state_host;
-        std::size_t state_bytes = 0;
-        std::chrono::steady_clock::time_point captured = std::chrono::steady_clock::now();
-    };
-    std::unordered_map<std::uint32_t, DroppedCheckpointCapture> dropped_checkpoint_captures_;
+    // Checkpoint state captures go to the safety net as state-only entries
+    // (unified architecture). The old DroppedCheckpointCapture side store
+    // has been removed.
     std::size_t text_host_kv_page_stride    = 0;
     std::size_t backend_host_kv_page_stride = 0;
     std::unique_ptr<qwen3_6::StateImageDevicePool> state_images;

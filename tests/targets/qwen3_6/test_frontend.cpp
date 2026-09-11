@@ -114,11 +114,14 @@ const fi::CompiledChatTemplate& reasoning_effort_template() {
     return value;
 }
 
+FrontendResources resources(const std::string& chat_template = thinking_toggle_template_source());
+
 // Directory holding the official Qwen3.6-27B base checkpoint resources (tokenizer.json,
 // tokenizer_config.json, generation_config.json). NINFER_QWEN3_6_27B_BASE overrides the
 // legacy maintainer-checkout location.
 std::optional<std::filesystem::path> official_base_dir() {
-    static const std::optional<std::filesystem::path> dir = [] {
+    static const std::optional<std::filesystem::path> dir =
+        []() -> std::optional<std::filesystem::path> {
         const auto complete = [](const std::filesystem::path& dir) {
             return std::filesystem::is_regular_file(dir / "tokenizer.json") &&
                    std::filesystem::is_regular_file(dir / "tokenizer_config.json") &&
@@ -193,7 +196,7 @@ std::string byte_level_symbol(std::uint8_t target) {
     throw std::logic_error("byte-level test symbol is outside one byte");
 }
 
-FrontendResources resources(const std::string& chat_template = thinking_toggle_template_source()) {
+FrontendResources resources(const std::string& chat_template) {
     FrontendResources result;
     result.chat_template_jinja  = chat_template;
     const nlohmann::json tokens = nlohmann::json::array(

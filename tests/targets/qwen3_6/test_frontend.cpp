@@ -154,10 +154,11 @@ FrontendResources official_resources() {
 const fi::Tokenizer& official_tokenizer() {
     static const fi::Tokenizer tokenizer = [] {
         const FrontendResources res = official_resources();
-        return fi::Tokenizer{
-            .tokenizer_json         = std::move(res.tokenizer_json),
-            .tokenizer_config_json  = std::move(res.tokenizer_config_json),
-            .generation_config_json = std::move(res.generation_config_json)};
+        const fi::TokenizerResources resources{
+            .tokenizer_json         = res.tokenizer_json,
+            .tokenizer_config_json  = res.tokenizer_config_json,
+            .generation_config_json = res.generation_config_json};
+        return fi::Tokenizer(resources);
     }();
     return tokenizer;
 }

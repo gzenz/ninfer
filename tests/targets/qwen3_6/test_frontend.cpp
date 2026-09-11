@@ -17,9 +17,12 @@
 #include <bit>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <fstream>
+#include <optional>
 #include <future>
 #include <iostream>
 #include <iterator>
@@ -111,16 +114,51 @@ const fi::CompiledChatTemplate& reasoning_effort_template() {
     return value;
 }
 
+// Directory holding the official Qwen3.6-27B base checkpoint resources (tokenizer.json,
+// tokenizer_config.json, generation_config.json). NINFER_QWEN3_6_27B_BASE overrides the
+// legacy maintainer-checkout location.
+std::optional<std::filesystem::path> official_base_dir() {
+    static const std::optional<std::filesystem::path> dir = [] {
+        const auto complete = [](const std::filesystem::path& dir) {
+            return std::filesystem::is_regular_file(dir / "tokenizer.json") &&
+                   std::filesystem::is_regular_file(dir / "tokenizer_config.json") &&
+                   std::filesystem::is_regular_file(dir / "generation_config.json");
+        };
+        if (const char* base = std::getenv("NINFER_QWEN3_6_27B_BASE"); base != nullptr && *base != '\0') {
+            const std::filesystem::path candidate(base);
+            if (complete(candidate)) { return candidate; }
+        }
+        const std::filesystem::path legacy("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16");
+        if (complete(legacy)) { return legacy; }
+        return std::nullopt;
+    }();
+    return dir;
+}
+
+std::string official_tokenizer_file(const char* name) {
+    const auto dir = official_base_dir();
+    if (!dir) {
+        throw std::runtime_error("official Qwen3.6-27B tokenizer resources are unavailable");
+    }
+    return read_file((dir->string() + "/" + name).c_str());
+}
+
+FrontendResources official_resources() {
+    FrontendResources res = resources();
+    res.tokenizer_json         = official_tokenizer_file("tokenizer.json");
+    res.tokenizer_config_json  = official_tokenizer_file("tokenizer_config.json");
+    res.generation_config_json = official_tokenizer_file("generation_config.json");
+    return res;
+}
+
 const fi::Tokenizer& official_tokenizer() {
-    static const std::string tokenizer_json =
-        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/tokenizer.json");
-    static const std::string tokenizer_config_json =
-        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/tokenizer_config.json");
-    static const std::string generation_config_json =
-        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/generation_config.json");
-    static const fi::Tokenizer tokenizer({.tokenizer_json         = tokenizer_json,
-                                          .tokenizer_config_json  = tokenizer_config_json,
-                                          .generation_config_json = generation_config_json});
+    static const fi::Tokenizer tokenizer = [] {
+        const FrontendResources res = official_resources();
+        return fi::Tokenizer{
+            .tokenizer_json         = std::move(res.tokenizer_json),
+            .tokenizer_config_json  = std::move(res.tokenizer_config_json),
+            .generation_config_json = std::move(res.generation_config_json)};
+    }();
     return tokenizer;
 }
 
@@ -1221,13 +1259,7 @@ int test_literal_control_tokens_with_media() {
             "<|im_start|>user\n<tool_response>\nimported result\n</tool_response><|im_end|>\n",
         "leading tool result was rendered without its user-role envelope");
 
-    FrontendResources official = resources();
-    official.tokenizer_json =
-        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/tokenizer.json");
-    official.tokenizer_config_json =
-        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/tokenizer_config.json");
-    official.generation_config_json =
-        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/generation_config.json");
+    FrontendResources official = official_resources();
     const Frontend frontend = FrontendFactory::create_component(official);
 
     auto text_part = [](std::string text) {
@@ -1372,13 +1404,7 @@ int test_image_resize_rejection_policy() {
 }
 
 int test_explicit_leading_instruction_cache_boundary() {
-    FrontendResources official = resources();
-    official.tokenizer_json =
-        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/tokenizer.json");
-    official.tokenizer_config_json =
-        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/tokenizer_config.json");
-    official.generation_config_json =
-        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/generation_config.json");
+    FrontendResources official = official_resources();
     const Frontend frontend           = FrontendFactory::create_component(official, false);
     constexpr std::string_view stable = "stable cache section.";
     ninfer::ChatMessage system;
@@ -1621,13 +1647,7 @@ int test_terminal_flush(const Frontend& frontend) {
 }
 
 int test_structured_tool_output() {
-    FrontendResources owned = resources();
-    owned.tokenizer_json =
-        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/tokenizer.json");
-    owned.tokenizer_config_json =
-        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/tokenizer_config.json");
-    owned.generation_config_json =
-        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/generation_config.json");
+    FrontendResources owned = official_resources();
     const Frontend frontend = FrontendFactory::create_component(owned);
 
     ninfer::ChatMessage message;
@@ -2201,6 +2221,11 @@ int test_media_preparation_cancellation() {
 } // namespace
 
 int main() {
+    if (!official_base_dir()) {
+        std::cerr << "SKIP: Qwen3.6-27B base tokenizer resources not found; "
+                     "set NINFER_QWEN3_6_27B_BASE to a base-hf-bf16 directory\n";
+        return 77;
+    }
     const FrontendResources owned = resources();
     const Frontend frontend       = FrontendFactory::create_component(owned);
     int failures                  = 0;

@@ -22,6 +22,10 @@ This fork targets **reliable 555k-context inference with 3 concurrent agentic se
 - **Froggeric v22.5 chat template**: executed from the template file with no-dangling-intent enforcement, effort aliases, leading system-message merge, tool-error tiering, and think-close variant handling.
 - **Tolerant tool-call recovery** (`--tolerant-tool-calls`): recovers complete Qwen calls with malformed wrappers.
 - **Reasoning-effort tier mapping**: High/Max map to XHigh instead of rejecting.
+- **Post-thinking sampling**: a thinking request switches to a dedicated lower-temperature preset
+  from the token after the model closes its reasoning block (e.g. temperature 1.0 while
+  reasoning, 0.2 for the answer). Registered per model; override with
+  `--post-thinking-temperature/-top-p/-top-k` or the request's `post_thinking` field.
 
 ### Monitoring and tooling
 
@@ -93,6 +97,38 @@ identity: `qwen36-nvfp4`, `qwen38-nvfp4`, `qwen36-groupwise-int`, `qwen38-groupw
 Use `qwen36-nvfp4` for Ostfralla and QUASAR artifacts that carry the Qwen3.6 NVFP4
 tensor layout (W8G32 embedding + NVFP4 quantization). The binding auto-detects
 per-layer layout differences (fused vs split GDN control, NVFP4 vs BF16 attention).
+
+### Post-thinking sampling
+
+Registered Qwen models carry a **post-thinking preset** (temperature 0.2, top-p 0.95,
+top-k 20). For a thinking request, the engine resolves the normal thinking preset at
+submission and switches to the post-thinking preset from the token after the model closes
+its reasoning block. The answer and tool calls are therefore sampled with the lower
+temperature while reasoning keeps the higher one. Non-thinking requests and models
+without a registered preset are unaffected.
+
+Override per request or per server:
+
+```bash
+# CLI: explicit post-thinking fields, or the combined form
+./build/apps/ninfer model.ninfer --prompt "..." \
+  --post-thinking-temperature 0.2 --post-thinking-top-p 0.95 --post-thinking-top-k 20
+#   --post-thinking-sampler temp=0.2,top_p=0.95,top_k=20
+
+# HTTP: optional post_thinking object (OpenAI Chat, OpenAI Responses, Anthropic Messages)
+curl http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{
+    "model": "qwen3.8-27b",
+    "messages": [{"role": "user", "content": "Hello"}],
+    "temperature": 1.0,
+    "post_thinking": {"temperature": 0.2, "top_p": 0.95, "top_k": 20}
+  }'
+```
+
+Omitted `post_thinking` fields fall back to the model's registered preset; an omitted
+seed inherits the request's resolved seed. `--greedy` forces both phases to exact argmax.
+See [docs/cli.md](docs/cli.md) and [docs/serving.md](docs/serving.md) for the full field
+list and ranges.
 
 
 ## Quick start
@@ -308,7 +344,8 @@ All registered model IDs support:
 - BF16, INT8 group-64, and row-scaled FP8 E4M3 KV storage;
 - offline causal-perplexity scoring with the same Text model and selectable KV storage;
 - private and shared exact-prefix reuse with Device/Host State and KV retention;
-- model-aware sampling defaults and explicit sampler overrides;
+- model-aware sampling defaults, explicit sampler overrides, and a registered post-thinking
+  preset that takes over from the token after the model closes its reasoning block;
 - OpenAI Responses Core, OpenAI Chat Completions, and Anthropic Messages, including streaming,
   tools, local response state, token counting, and usage accounting.
 

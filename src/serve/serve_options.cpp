@@ -106,6 +106,7 @@ std::string serve_usage_text(const char* argv0) {
            " MiB of sizing headroom\n"
            "       --no-prefix-reuse disables compatible-prefix caching (enabled by default)\n"
            "       --tolerant-tool-calls recovers complete Qwen calls with malformed wrapper/suffix output\n"
+"       or when the request declared no tools (any syntactically valid tool name is accepted)\n"
            "       context cache defaults: device-state=max-concurrency, private=2x concurrency, "
            "shared=concurrency, anchors=2; Host state=8 slots, Host KV=8192 MiB\n"
            "       --device-state-slots is extra checkpoint capacity beyond active lanes; "

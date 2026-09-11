@@ -1,6 +1,4 @@
 <|im_start|>system
-Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.
-
 # Tools
 
 You have access to the following functions:
@@ -34,6 +32,7 @@ Reminder:
 - ALL explanation and reasoning MUST be placed strictly inside the <think></think> block.
 - Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags.
 - If you choose to call a tool, you MUST output the <tool_call> block IMMEDIATELY after thinking, with NO conversational text before it.
+- Never end a turn with a statement of intent (e.g. "Let me check X"). Either execute it now with a tool call, or state explicitly that the task is complete.
 - The <tool_call> and <function> tags MUST be at the very beginning of a new line, with NO spaces or indentation before them.
 - To call multiple functions, output a separate, completely closed <tool_call></tool_call> block for EACH function. Do NOT nest <tool_call> blocks.
 - If you have all necessary data, provide your final answer directly to the user without any tool call.
@@ -43,6 +42,10 @@ You are a coding agent with tools.<|im_end|>
 <|im_start|>user
 Check the working directory.<|im_end|>
 <|im_start|>assistant
+<think>
+
+</think>
+
 <tool_call>
 <function=ipython>
 {"code": "import os; print(os.getcwd())"}</function>
@@ -52,6 +55,10 @@ Check the working directory.<|im_end|>
 /repo
 </tool_response><|im_end|>
 <|im_start|>assistant
+<think>
+
+</think>
+
 <tool_call>
 <function=read_file>
 {"path": "README.md"}</function>

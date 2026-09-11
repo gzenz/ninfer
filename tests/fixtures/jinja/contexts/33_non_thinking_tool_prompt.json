@@ -1,0 +1,51 @@
+{
+ "enable_thinking": false,
+ "tools": [
+  {
+   "type": "function",
+   "function": {
+    "name": "ipython",
+    "description": "Run python code in a REPL",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "code": {
+       "type": "string",
+       "description": "python code to run"
+      }
+     },
+     "required": [
+      "code"
+     ]
+    }
+   }
+  }
+ ],
+ "messages": [
+  {
+   "role": "user",
+   "content": "run it"
+  },
+  {
+   "role": "assistant",
+   "content": null,
+   "tool_calls": [
+    {
+     "id": "c1",
+     "type": "function",
+     "function": {
+      "name": "ipython",
+      "arguments": {
+       "code": "print(1)"
+      }
+     }
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "c1",
+   "content": "1"
+  }
+ ]
+}

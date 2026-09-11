@@ -1,0 +1,24 @@
+{
+ "enable_thinking": true,
+ "messages": [
+  {
+   "role": "system",
+   "content": "You are a multimodal agent."
+  },
+  {
+   "role": "user",
+   "content": [
+    {
+     "type": "text",
+     "text": "What happens?"
+    },
+    {
+     "type": "video_url",
+     "video_url": {
+      "url": "http://x/v.mp4"
+     }
+    }
+   ]
+  }
+ ]
+}

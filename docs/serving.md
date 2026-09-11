@@ -159,7 +159,9 @@ move later instructions to the beginning of the conversation. A leading instruct
 artifact template's existing tool/reasoning-instruction composition.
 
 At startup, NInfer resolves prompt capabilities from the exact `frontend/chat_template.jinja`
-resource embedded in the loaded artifact. It does not infer them from the request's `model` field,
+resource embedded in the loaded artifact, and renders every prompt by executing that file
+with the vendored Jinja engine (`third_party/jinja`). The rendered text therefore follows the
+template, not a C++ reimplementation of it. It does not infer them from the request's `model` field,
 the artifact identity, or a target profile. A recognized effort-capable template exposes `low`,
 `medium`, and `xhigh`; omitting effort uses that template's declared default. An explicit effort
 not exposed by the loaded template returns HTTP 400 with code

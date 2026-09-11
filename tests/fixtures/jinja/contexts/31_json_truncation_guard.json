@@ -1,0 +1,53 @@
+{
+ "enable_thinking": true,
+ "tool_call_format": "json",
+ "max_tool_response_chars": 200,
+ "tools": [
+  {
+   "type": "function",
+   "function": {
+    "name": "ipython",
+    "description": "Run python code in a REPL",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "code": {
+       "type": "string",
+       "description": "python code to run"
+      }
+     },
+     "required": [
+      "code"
+     ]
+    }
+   }
+  }
+ ],
+ "messages": [
+  {
+   "role": "user",
+   "content": "list items"
+  },
+  {
+   "role": "assistant",
+   "content": null,
+   "tool_calls": [
+    {
+     "id": "c1",
+     "type": "function",
+     "function": {
+      "name": "ipython",
+      "arguments": {
+       "code": "list_items()"
+      }
+     }
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "c1",
+   "content": "{\"status\": \"ok\", \"items\": [{\"id\": 0, \"name\": \"item-0\"}, {\"id\": 1, \"name\": \"item-1\"}, {\"id\": 2, \"name\": \"item-2\"}, {\"id\": 3, \"name\": \"item-3\"}, {\"id\": 4, \"name\": \"item-4\"}, {\"id\": 5, \"name\": \"item-5\"}, {\"id\": 6, \"name\": \"item-6\"}, {\"id\": 7, \"name\": \"item-7\"}, {\"id\": 8, \"name\": \"item-8\"}, {\"id\": 9, \"name\": \"item-9\"}, {\"id\": 10, \"name\": \"item-10\"}, {\"id\": 11, \"name\": \"item-11\"}, {\"id\": 12, \"name\": \"item-12\"}, {\"id\": 13, \"name\": \"item-13\"}, {\"id\": 14, \"name\": \"item-14\"}, {\"id\": 15, \"name\": \"item-15\"}, {\"id\": 16, \"name\": \"item-16\"}, {\"id\": 17, \"name\": \"item-17\"}, {\"id\": 18, \"name\": \"item-18\"}, {\"id\": 19, \"name\": \"item-19\"}, {\"id\": 20, \"name\": \"item-20\"}, {\"id\": 21, \"name\": \"item-21\"}, {\"id\": 22, \"name\": \"item-22\"}, {\"id\": 23, \"name\": \"item-23\"}, {\"id\": 24, \"name\": \"item-24\"}, {\"id\": 25, \"name\": \"item-25\"}, {\"id\": 26, \"name\": \"item-26\"}, {\"id\": 27, \"name\": \"item-27\"}, {\"id\": 28, \"name\": \"item-28\"}, {\"id\": 29, \"name\": \"item-29\"}, {\"id\": 30, \"name\": \"item-30\"}, {\"id\": 31, \"name\": \"item-31\"}, {\"id\": 32, \"name\": \"item-32\"}, {\"id\": 33, \"name\": \"item-33\"}, {\"id\": 34, \"name\": \"item-34\"}, {\"id\": 35, \"name\": \"item-35\"}, {\"id\": 36, \"name\": \"item-36\"}, {\"id\": 37, \"name\": \"item-37\"}, {\"id\": 38, \"name\": \"item-38\"}, {\"id\": 39, \"name\": \"item-39\"}, {\"id\": 40, \"name\": \"item-40\"}, {\"id\": 41, \"name\": \"item-41\"}, {\"id\": 42, \"name\": \"item-42\"}, {\"id\": 43, \"name\": \"item-43\"}, {\"id\": 44, \"name\": \"item-44\"}, {\"id\": 45, \"name\": \"item-45\"}, {\"id\": 46, \"name\": \"item-46\"}, {\"id\": 47, \"name\": \"item-47\"}, {\"id\": 48, \"name\": \"item-48\"}, {\"id\": 49, \"name\": \"item-49\"}, {\"id\": 50, \"name\": \"item-50\"}, {\"id\": 51, \"name\": \"item-51\"}, {\"id\": 52, \"name\": \"item-52\"}, {\"id\": 53, \"name\": \"item-53\"}, {\"id\": 54, \"name\": \"item-54\"}, {\"id\": 55, \"name\": \"item-55\"}, {\"id\": 56, \"name\": \"item-56\"}, {\"id\": 57, \"name\": \"item-57\"}, {\"id\": 58, \"name\": \"item-58\"}, {\"id\": 59, \"name\": \"item-59\"}, {\"id\": 60, \"name\": \"item-60\"}, {\"id\": 61, \"name\": \"item-61\"}, {\"id\": 62, \"name\": \"item-62\"}, {\"id\": 63, \"name\": \"item-63\"}, {\"id\": 64, \"name\": \"item-64\"}, {\"id\": 65, \"name\": \"item-65\"}, {\"id\": 66, \"name\": \"item-66\"}, {\"id\": 67, \"name\": \"item-67\"}, {\"id\": 68, \"name\": \"item-68\"}, {\"id\": 69, \"name\": \"item-69\"}, {\"id\": 70, \"name\": \"item-70\"}, {\"id\": 71, \"name\": \"item-71\"}, {\"id\": 72, \"name\": \"item-72\"}, {\"id\": 73, \"name\": \"item-73\"}, {\"id\": 74, \"name\": \"item-74\"}, {\"id\": 75, \"name\": \"item-75\"}, {\"id\": 76, \"name\": \"item-76\"}, {\"id\": 77, \"name\": \"item-77\"}, {\"id\": 78, \"name\": \"item-78\"}, {\"id\": 79, \"name\": \"item-79\"}, {\"id\": 80, \"name\": \"item-80\"}, {\"id\": 81, \"name\": \"item-81\"}, {\"id\": 82, \"name\": \"item-82\"}, {\"id\": 83, \"name\": \"item-83\"}, {\"id\": 84, \"name\": \"item-84\"}, {\"id\": 85, \"name\": \"item-85\"}, {\"id\": 86, \"name\": \"item-86\"}, {\"id\": 87, \"name\": \"item-87\"}, {\"id\": 88, \"name\": \"item-88\"}, {\"id\": 89, \"name\": \"item-89\"}, {\"id\": 90, \"name\": \"item-90\"}, {\"id\": 91, \"name\": \"item-91\"}, {\"id\": 92, \"name\": \"item-92\"}, {\"id\": 93, \"name\": \"item-93\"}, {\"id\": 94, \"name\": \"item-94\"}, {\"id\": 95, \"name\": \"item-95\"}, {\"id\": 96, \"name\": \"item-96\"}, {\"id\": 97, \"name\": \"item-97\"}, {\"id\": 98, \"name\": \"item-98\"}, {\"id\": 99, \"name\": \"item-99\"}, {\"id\": 100, \"name\": \"item-100\"}, {\"id\": 101, \"name\": \"item-101\"}, {\"id\": 102, \"name\": \"item-102\"}, {\"id\": 103, \"name\": \"item-103\"}, {\"id\": 104, \"name\": \"item-104\"}, {\"id\": 105, \"name\": \"item-105\"}, {\"id\": 106, \"name\": \"item-106\"}, {\"id\": 107, \"name\": \"item-107\"}, {\"id\": 108, \"name\": \"item-108\"}, {\"id\": 109, \"name\": \"item-109\"}, {\"id\": 110, \"name\": \"item-110\"}, {\"id\": 111, \"name\": \"item-111\"}, {\"id\": 112, \"name\": \"item-112\"}, {\"id\": 113, \"name\": \"item-113\"}, {\"id\": 114, \"name\": \"item-114\"}, {\"id\": 115, \"name\": \"item-115\"}, {\"id\": 116, \"name\": \"item-116\"}, {\"id\": 117, \"name\": \"item-117\"}, {\"id\": 118, \"name\": \"item-118\"}, {\"id\": 119, \"name\": \"item-119\"}]}"
+  }
+ ]
+}

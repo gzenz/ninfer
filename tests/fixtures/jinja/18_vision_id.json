@@ -1,1 +1,0 @@
-{"enable_thinking": true, "add_vision_id": true, "messages": [{"role": "system", "content": "You are a multimodal coding agent."}, {"role": "user", "content": [{"type": "text", "text": "Two images:"}, {"type": "image_url", "image_url": {"url": "http://x/a.png"}}, {"type": "image_url", "image_url": {"url": "http://x/b.png"}}]}]}

@@ -1,1 +1,0 @@
-{"enable_thinking": true, "messages": [{"role": "system", "content": "You are a coding agent."}, {"role": "user", "content": "<|think_xhigh|> Deep dive into MoE routing."}]}

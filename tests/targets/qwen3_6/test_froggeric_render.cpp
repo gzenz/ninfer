@@ -1,4 +1,7 @@
-// Render checks for the froggeric v22 template semantics (ported official-template fixes).
+// Render checks for the froggeric v22 template. The template file is executed by the
+// vendored Jinja engine, so these checks pin the prompt contract that the file produces:
+// think-first tool examples, the stricter IMPORTANT block, the no-dangling-intent rule,
+// consecutive tool-error warnings, and reasoning replay behaviour.
 
 #include "targets/qwen3_6/impl/frontend/chat_template.h"
 
@@ -52,7 +55,7 @@ const std::string kToolJson =
 
 int main() {
     const std::string source = read_fixture(
-        NINFER_SOURCE_DIR "/tests/fixtures/frontend/froggeric_v22_chat_template.jinja");
+        NINFER_SOURCE_DIR "/tests/fixtures/frontend/froggeric_v225_chat_template.jinja");
     int failures = 0;
 
     fi::CompiledChatTemplate tpl = fi::CompiledChatTemplate::resolve(source); // must not throw
@@ -97,7 +100,9 @@ int main() {
                           "second-error warning missing");
     }
 
-    // 3. no empty think blocks on replay (preserve_thinking=true, empty reasoning)
+    // 3. replay keeps the reasoning block (preserve_thinking=true, empty reasoning): the
+    //    generation prologue opens a reasoning block, so a replayed turn must carry the same
+    //    block or the generated prefix stops matching.
     {
         std::vector<fi::ChatMessage> msgs;
         msgs.push_back(chat_message(ninfer::ChatRole::User, "q"));
@@ -108,13 +113,17 @@ int main() {
         options.add_generation_prompt = false;
         options.preserve_thinking     = true;
         const std::string out         = tpl.render(msgs, options).text;
-        failures += check(out.find("<think>") == std::string::npos,
-                          "empty think block emitted on replay");
-        failures += check(out.find("<|im_start|>assistant\nanswer one") != std::string::npos,
+        // The body must not follow the assistant opener directly: an empty reasoning block
+        // sits between them, matching the prologue the previous turn was generated from.
+        failures += check(out.find("<|im_start|>assistant\nanswer one") == std::string::npos &&
+                              out.find("<|im_start|>assistant\nanswer two") == std::string::npos,
+                          "replay dropped the reasoning block (breaks prefix reuse)");
+        failures += check(out.find("answer one") != std::string::npos &&
+                              out.find("answer two") != std::string::npos,
                           "history body missing");
     }
 
-    // 4. multiple tool calls separated by a blank line
+    // 4. consecutive tool calls are separated by a single newline
     {
         std::vector<fi::ChatMessage> msgs;
         msgs.push_back(chat_message(ninfer::ChatRole::User, "q"));
@@ -124,8 +133,8 @@ int main() {
         fi::ChatRenderOptions options;
         options.add_generation_prompt = false;
         const std::string out         = tpl.render(msgs, options).text;
-        failures += check(out.find("</tool_call>\n\n<tool_call>") != std::string::npos,
-                          "calls not blank-line separated");
+        failures += check(out.find("</tool_call>\n<tool_call>") != std::string::npos,
+                          "calls not separated by a single newline");
     }
 
     // 5. generation prompt with thinking disabled

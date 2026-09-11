@@ -1,0 +1,8 @@
+<|im_start|>system
+You are a coding agent.<|im_end|>
+<|im_start|>user
+What files are here?<|im_end|>
+<|im_start|>assistant
+Let me check.<|im_end|>
+<|im_start|>user
+And what is in tests/?<|im_end|>

@@ -337,6 +337,9 @@ struct PromptOptions {
     bool preserve_thinking = false;
     bool add_vision_id     = false;
     std::vector<std::string> tool_jsons;
+    // Recover well-formed text-form tool calls even when no tools are declared (the
+    // contract then accepts any syntactically valid tool name).
+    bool tolerant_tool_calls = false;
 };
 
 enum class CacheRetentionHint : std::uint8_t {

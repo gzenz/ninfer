@@ -1,0 +1,8 @@
+<|im_start|>system
+You are a coding agent.<|im_end|>
+<|im_start|>user
+Why did the parser split?<|im_end|>
+<|im_start|>assistant
+Because it splits on first occurrence.<|im_end|>
+<|im_start|>user
+How to fix?<|im_end|>

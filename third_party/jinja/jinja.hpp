@@ -53,6 +53,56 @@ using Argument = std::pair<std::string, json>;
 using UserFunction = std::function<json(const std::vector<Argument>&)>;
 
 /**
+ * @brief Optional render trace.
+ *
+ * Records where control flow placed output, so a caller can recover structured
+ * information (per-message byte frontiers, printed-value provenance) from a
+ * single render instead of re-deriving it from the concatenated text.
+ */
+struct RenderTrace {
+    struct LoopIteration {
+        std::string loop;              // iterable expression, e.g. "_msgs"
+        std::vector<std::string> vars; // loop variable names
+        std::size_t index = 0;         // position within the iterated sequence
+        std::size_t begin = 0;         // output offset at iteration start
+        std::size_t end = 0;           // output offset at iteration end
+        bool item_is_object = false;
+        std::string item_role;         // item["role"] when the item has one
+    };
+    struct ValuePart {
+        std::string expr;   // leaf expression source text
+        std::size_t length = 0;
+    };
+    struct PrintSpan {
+        std::string expr;              // expression source text
+        std::size_t begin = 0;
+        std::size_t end = 0;
+        // Leaf string operands of this printed value, in output order. Their lengths
+        // sum to (end - begin) when the value was assembled by concatenation.
+        std::vector<ValuePart> parts;
+    };
+    std::vector<LoopIteration> loop_iterations;
+    std::vector<PrintSpan> prints;
+    // One frame per expression currently being printed by a PrintNode.
+    std::vector<std::vector<ValuePart>> value_stack;
+    void clear() {
+        loop_iterations.clear();
+        prints.clear();
+        value_stack.clear();
+    }
+    void begin_value() { value_stack.emplace_back(); }
+    [[nodiscard]] std::vector<ValuePart> end_value() {
+        if (value_stack.empty()) { return {}; }
+        std::vector<ValuePart> parts = std::move(value_stack.back());
+        value_stack.pop_back();
+        return parts;
+    }
+    void add_part(const std::string& expr, std::size_t length) {
+        if (!value_stack.empty()) { value_stack.back().push_back(ValuePart{expr, length}); }
+    }
+};
+
+/**
  * @brief A lightweight, C++11 compatible Jinja2 template renderer.
  *
  * Designed specifically for LLM chat templates (HuggingFace style).
@@ -84,7 +134,7 @@ public:
     /**
      * @brief Core rendering function.
      */
-    inline std::string render(const json& context) const;
+    inline std::string render(const json& context, RenderTrace* trace = nullptr) const;
 
     /**
      * @brief Register a custom function.
@@ -152,6 +202,81 @@ inline std::string token_type_to_string(int type) {
         case 10: return "Eof";
         default: return "Unknown";
     }
+}
+
+// jinja2's trim/strip whitespace is Python's str.strip() default: the characters for
+// which str.isspace() is true. Python's set includes form feed, vertical tab and the
+// Unicode space separators, which the upstream ASCII-only set drops.
+inline bool is_python_whitespace_code_point(std::uint32_t code_point) {
+    if (code_point >= 0x2000U && code_point <= 0x200AU) { return true; }
+    switch (code_point) {
+    case 0x09U: case 0x0AU: case 0x0BU: case 0x0CU: case 0x0DU:
+    case 0x1CU: case 0x1DU: case 0x1EU: case 0x1FU:
+    case 0x20U: case 0x85U: case 0xA0U: case 0x1680U:
+    case 0x2028U: case 0x2029U: case 0x202FU: case 0x205FU: case 0x3000U:
+        return true;
+    default:
+        return false;
+    }
+}
+
+// Decodes the code point starting at `offset`. Returns 0 and leaves `offset` untouched
+// when the bytes are not a valid sequence.
+inline std::uint32_t utf8_code_point_at(const std::string& text, std::size_t& offset) {
+    const auto lead = static_cast<unsigned char>(text[offset]);
+    std::size_t extra = 0;
+    std::uint32_t code_point = 0;
+    if (lead < 0x80U) {
+        code_point = lead;
+    } else if ((lead & 0xE0U) == 0xC0U) {
+        extra = 1; code_point = lead & 0x1FU;
+    } else if ((lead & 0xF0U) == 0xE0U) {
+        extra = 2; code_point = lead & 0x0FU;
+    } else if ((lead & 0xF8U) == 0xF0U) {
+        extra = 3; code_point = lead & 0x07U;
+    } else {
+        return 0;
+    }
+    if (offset + extra >= text.size()) { return 0; }
+    for (std::size_t i = 1; i <= extra; ++i) {
+        const auto next = static_cast<unsigned char>(text[offset + i]);
+        if ((next & 0xC0U) != 0x80U) { return 0; }
+        code_point = (code_point << 6U) | (next & 0x3FU);
+    }
+    offset += extra + 1U;
+    return code_point;
+}
+
+// Decodes the code point ending at `offset` (exclusive). Returns 0 and leaves `offset`
+// untouched when the bytes are not a valid sequence.
+inline std::uint32_t utf8_code_point_before(const std::string& text, std::size_t& offset) {
+    if (offset == 0) { return 0; }
+    std::size_t begin = offset - 1U;
+    while (begin > 0 && (static_cast<unsigned char>(text[begin]) & 0xC0U) == 0x80U) { --begin; }
+    std::size_t cursor = begin;
+    const std::uint32_t code_point = utf8_code_point_at(text, cursor);
+    if (code_point == 0 || cursor != offset) { return 0; }
+    offset = begin;
+    return code_point;
+}
+
+// Python str.strip() bounds for text that contains no explicit character set.
+inline std::pair<std::size_t, std::size_t> python_strip_bounds(const std::string& text) {
+    std::size_t begin = 0;
+    while (begin < text.size()) {
+        std::size_t cursor = begin;
+        const std::uint32_t code_point = utf8_code_point_at(text, cursor);
+        if (code_point == 0 || !is_python_whitespace_code_point(code_point)) { break; }
+        begin = cursor;
+    }
+    std::size_t end = text.size();
+    while (end > begin) {
+        std::size_t cursor = end;
+        const std::uint32_t code_point = utf8_code_point_before(text, cursor);
+        if (code_point == 0 || !is_python_whitespace_code_point(code_point)) { break; }
+        end = cursor;
+    }
+    return {begin, end};
 }
 
 inline std::string to_python_repr(const json& val) {
@@ -603,18 +728,26 @@ inline bool is_truthy(const json& val) {
 
 
 class Context {
-    std::vector<json> scopes;
+    // Variables live in C++ containers, never inside the JSON documents that hold
+    // template data: writing a variable into a shared document can relocate the
+    // document's storage and invalidate values the template is iterating.
+    using Scope = std::map<std::string, json>;
+    std::vector<Scope> scopes;
     std::map<std::string, Macro*> macros;
     const std::map<std::string, UserFunction>* functions = nullptr;
+    RenderTrace* trace_ = nullptr;
 
 public:
     explicit Context(const json& global) {
-        scopes.push_back(global);
+        push_scope(global);
     }
 
     void set_functions(const std::map<std::string, UserFunction>* funcs) {
         functions = funcs;
     }
+
+    void set_trace(RenderTrace* trace) { trace_ = trace; }
+    [[nodiscard]] RenderTrace* trace() const { return trace_; }
 
     UserFunction get_function(const std::string& name) const {
         if (functions && functions->count(name)) {
@@ -635,8 +768,9 @@ public:
     json get(const std::string& name) {
         // Search from top to bottom
         for (auto it = scopes.rbegin(); it != scopes.rend(); ++it) {
-            if (it->contains(name)) {
-                return (*it)[name];
+            auto found = it->find(name);
+            if (found != it->end()) {
+                return found->second;
             }
         }
         JINJA_LOG("Context: Variable '" << name << "' not found, returning UNDEFINED");
@@ -646,22 +780,28 @@ public:
     json get(const std::string& name) const {
         // Const version
         for (auto it = scopes.rbegin(); it != scopes.rend(); ++it) {
-            if (it->contains(name)) {
-                return (*it)[name];
+            auto found = it->find(name);
+            if (found != it->end()) {
+                return found->second;
             }
         }
         return UNDEFINED;
     }
 
     void set(const std::string& name, json val) {
-        // Set in current scope
         scopes.back()[name] = std::move(val);
     }
 
     // For modifying a variable in place (e.g. namespace), we rely on get() returning a reference.
 
     void push_scope(json scope = json::object()) {
-        scopes.push_back(std::move(scope));
+        Scope converted;
+        if (scope.is_object()) {
+            for (auto it = scope.begin(); it != scope.end(); ++it) {
+                converted[it.key()] = it.value();
+            }
+        }
+        scopes.push_back(std::move(converted));
     }
 
     void pop_scope() {
@@ -936,20 +1076,27 @@ struct MethodCallExpr : Expr {
                  arr.push_back(s.substr(pos));
                  return arr;
             } else if (method == "lstrip") {
-                // Simplified lstrip (whitespace or chars?)
-                // Python lstrip() removes whitespace, lstrip(chars) removes chars.
-                 std::string chars = " \n\r\t";
-                 if (!args.empty()) chars = args[0]->evaluate(context).get<std::string>();
+                 if (args.empty()) {
+                     const auto [begin, end] = python_strip_bounds(s);
+                     return s.substr(begin);
+                 }
+                 const std::string chars = args[0]->evaluate(context).get<std::string>();
                  size_t start = s.find_first_not_of(chars);
                  return (start == std::string::npos) ? "" : s.substr(start);
             } else if (method == "rstrip") {
-                 std::string chars = " \n\r\t";
-                 if (!args.empty()) chars = args[0]->evaluate(context).get<std::string>();
+                 if (args.empty()) {
+                     const auto [begin, end] = python_strip_bounds(s);
+                     return s.substr(0, end);
+                 }
+                 const std::string chars = args[0]->evaluate(context).get<std::string>();
                  size_t end = s.find_last_not_of(chars);
                  return (end == std::string::npos) ? "" : s.substr(0, end + 1);
             } else if (method == "strip") {
-                 std::string chars = " \n\r\t";
-                 if (!args.empty()) chars = args[0]->evaluate(context).get<std::string>();
+                 if (args.empty()) {
+                     const auto [begin, end] = python_strip_bounds(s);
+                     return s.substr(begin, end - begin);
+                 }
+                 const std::string chars = args[0]->evaluate(context).get<std::string>();
                  size_t start = s.find_first_not_of(chars);
                  if (start == std::string::npos) return "";
                  size_t end = s.find_last_not_of(chars);
@@ -985,39 +1132,42 @@ struct FilterExpr : Expr {
         json val = left->evaluate(context);
         if (name == "tojson") {
              // jinja2 semantics: sort_keys=True, separators (", ", ": "), ensure_ascii=False
-             std::string out;
-             std::function<void(const json&)> ser = [&](const json& v) {
-                 if (v.is_null()) { out += "null"; }
-                 else if (v.is_boolean()) { out += (v.get<bool>() ? "true" : "false"); }
-                 else if (v.is_number()) { out += v.dump(); }
-                 else if (v.is_string()) { out += v.dump(); }
-                 else if (v.is_array()) {
-                     if (v.empty()) { out += "[]"; return; }
-                     out += "[";
+             std::function<std::string(const json&)> ser = [&](const json& v) -> std::string {
+                 if (v.is_null()) { return "null"; }
+                 if (v.is_boolean()) { return v.get<bool>() ? "true" : "false"; }
+                 if (v.is_number() || v.is_string()) { return v.dump(); }
+                 if (v.is_array()) {
+                     std::string out = "[";
                      bool first = true;
-                     for (const auto& el : v) { if (!first) out += ", "; ser(el); first = false; }
-                     out += "]";
-                 } else {
-                     if (v.empty()) { out += "{}"; return; }
-                     std::vector<std::pair<std::string, json>> kv;
-                     for (auto it = v.begin(); it != v.end(); ++it) {
-                         kv.emplace_back(it.key(), it.value());
-                     }
-                     std::sort(kv.begin(), kv.end(),
-                               [](const auto& a, const auto& b) { return a.first < b.first; });
-                     out += "{";
-                     bool first = true;
-                     for (const auto& p : kv) {
+                     for (const auto& el : v) {
                          if (!first) out += ", ";
-                         json k = p.first; out += k.dump(); out += ": ";
-                         ser(p.second);
+                         out += ser(el);
                          first = false;
                      }
-                     out += "}";
+                     return out + "]";
                  }
+                 if (!v.is_object()) { return v.dump(); }
+                 // Serialize the members as plain strings before sorting: the JSON
+                 // wrappers are reference-like, so sorting wrappers in place would
+                 // assign through them and corrupt the underlying documents.
+                 std::vector<std::pair<std::string, std::string>> members;
+                 for (auto it = v.begin(); it != v.end(); ++it) {
+                     members.emplace_back(it.key(), ser(it.value()));
+                 }
+                 std::sort(members.begin(), members.end(),
+                           [](const auto& x, const auto& y) { return x.first < y.first; });
+                 std::string out = "{";
+                 bool first = true;
+                 for (const auto& m : members) {
+                     if (!first) out += ", ";
+                     out += json(m.first).dump();
+                     out += ": ";
+                     out += m.second;
+                     first = false;
+                 }
+                 return out + "}";
              };
-             ser(val);
-             return out;
+             return ser(val);
         } else if (name == "join") {
              std::string sep;
              bool have_sep = false;
@@ -1052,13 +1202,9 @@ struct FilterExpr : Expr {
             return 0;
         } else if (name == "trim") {
             if (val.is_string()) {
-                std::string s = val.get<std::string>();
-                // Trim logic from MethodCallExpr?
-                // Minimal trim:
-                auto start = s.find_first_not_of(" \n\r\t");
-                if (start == std::string::npos) return "";
-                auto end = s.find_last_not_of(" \n\r\t");
-                return s.substr(start, end - start + 1);
+                const std::string s = val.get<std::string>();
+                const auto [begin, end] = python_strip_bounds(s);
+                return s.substr(begin, end - begin);
             }
         } else if (name == "items") {
              if (val.is_object()) {
@@ -1109,8 +1255,31 @@ struct FilterExpr : Expr {
                  }
                  return res;
              }
+        } else if (name == "default" || name == "d") {
+             // jinja2 default(value, default_value='', boolean=False): replace an undefined
+             // value, or with boolean=true any falsy value.
+             json fallback;
+             bool has_fallback = false;
+             bool use_boolean  = false;
+             for (const auto& arg : args) {
+                 if (arg.first.empty()) {
+                     fallback     = arg.second->evaluate(context);
+                     has_fallback = true;
+                 } else if (arg.first == "boolean") {
+                     use_boolean = is_truthy(arg.second->evaluate(context));
+                 }
+             }
+             if (has_fallback && (is_undefined(val) || (use_boolean && !is_truthy(val)))) {
+                 return fallback;
+             }
+             return val;
+        } else if (name == "safe") {
+             // Autoescaping is off, so the value is already emitted verbatim.
+             return val;
         }
-        return val; // Unknown filter pass-through
+        // An unimplemented filter must not silently pass its input through: a prompt rendered
+        // with the wrong text is worse than a loud failure.
+        throw std::runtime_error("jinja: unsupported filter '" + name + "'");
     }
     std::string dump() const override { return left->dump() + "|" + name; }
 };
@@ -1122,13 +1291,42 @@ struct BinaryExpr : Expr {
         : op(std::move(o)), left(std::move(l)), right(std::move(r)) {}
 
     json evaluate(Context& context) override {
-        json l = left->evaluate(context);
-        json r = right->evaluate(context);
+        RenderTrace* trace = context.trace();
+        // Evaluate one operand while capturing the leaf string parts it published, so a
+        // concatenation can re-publish its own leaves instead of double counting them.
+        const auto eval_operand = [&](Expr* operand,
+                                      std::vector<RenderTrace::ValuePart>& parts) {
+            if (trace == nullptr) { return operand->evaluate(context); }
+            trace->begin_value();
+            json value = operand->evaluate(context);
+            parts      = trace->end_value();
+            return value;
+        };
+        const auto publish_parts = [&](Expr* operand, const json& value,
+                                       std::vector<RenderTrace::ValuePart> parts,
+                                       std::size_t length) {
+            if (trace == nullptr) { return; }
+            (void)value;
+            if (parts.empty()) {
+                parts.push_back(RenderTrace::ValuePart{operand->dump(), length});
+            }
+            for (const auto& part : parts) { trace->add_part(part.expr, part.length); }
+        };
 
+        std::vector<RenderTrace::ValuePart> left_parts;
+        std::vector<RenderTrace::ValuePart> right_parts;
+        json l = eval_operand(left.get(), left_parts);
+        json r = eval_operand(right.get(), right_parts);
 
         // Basic ops
         if (op == "+") {
-            if (l.is_string() && r.is_string()) return l.get<std::string>() + r.get<std::string>();
+            if (l.is_string() && r.is_string()) {
+                publish_parts(left.get(), l, std::move(left_parts),
+                              l.get<std::string>().size());
+                publish_parts(right.get(), r, std::move(right_parts),
+                              r.get<std::string>().size());
+                return l.get<std::string>() + r.get<std::string>();
+            }
             if (l.is_number() && r.is_number()) {
                  if (l.is_number_float() || r.is_number_float()) return l.get<double>() + r.get<double>();
                  return l.get<int64_t>() + r.get<int64_t>();
@@ -1202,10 +1400,11 @@ struct BinaryExpr : Expr {
              return is_truthy(l) || is_truthy(r);
         }
         if (op == "~") {
-             std::ostringstream ss;
-             ss << to_python_string(l);
-             ss << to_python_string(r);
-             return ss.str();
+             const std::string lhs = to_python_string(l);
+             const std::string rhs = to_python_string(r);
+             publish_parts(left.get(), l, std::move(left_parts), lhs.size());
+             publish_parts(right.get(), r, std::move(right_parts), rhs.size());
+             return lhs + rhs;
         }
 
         return "";
@@ -1306,11 +1505,9 @@ struct Macro {
     std::string name;
     std::vector<std::string> args;
     std::vector<std::unique_ptr<Node>> body;
-    ~Macro(); // Defined just below
+    // Inline: this header is included by more than one translation unit.
+    inline ~Macro() = default;
 };
-
-// Macro implementation
-Macro::~Macro() = default;
 
 struct MacroNode : Node {
     Macro macro;
@@ -1373,10 +1570,22 @@ struct PrintNode : Node {
     std::unique_ptr<Expr> expr;
     explicit PrintNode(std::unique_ptr<Expr> e) : expr(std::move(e)) {}
     void render(Context& context, std::string& out) override {
+        std::vector<RenderTrace::ValuePart> parts;
+        if (auto* trace = context.trace()) { trace->begin_value(); }
         json val = expr->evaluate(context);
+        if (auto* trace = context.trace()) { parts = trace->end_value(); }
         if (is_undefined(val)) return; // Print nothing
+        const std::size_t begin = out.size();
         if (val.is_string()) out += val.get<std::string>();
         else out += val.dump();
+        if (auto* trace = context.trace()) {
+            RenderTrace::PrintSpan span;
+            span.expr  = expr->dump();
+            span.begin = begin;
+            span.end   = out.size();
+            span.parts = std::move(parts);
+            trace->prints.push_back(std::move(span));
+        }
     }
 };
 
@@ -1408,7 +1617,14 @@ struct SetNode : Node {
             if (auto* var = dynamic_cast<VarExpr*>(attr->object.get())) {
                  json obj = context.get(var->name);
                  if (!obj.is_null()) {
-                     obj[attr->name] = val;
+                     if (val.shares_document(obj)) {
+                         // Copy first: inserting the key can relocate the object
+                         // that `val` points into.
+                         json detached(val.raw());
+                         obj[attr->name] = std::move(detached);
+                     } else {
+                         obj[attr->name] = val;
+                     }
                  }
             }
         }
@@ -1443,8 +1659,8 @@ struct ForStmt : Node {
             for (json::iterator it = iter_val.begin(); it != iter_val.end(); ++it) {
                 keys.push_back(it.key());
             }
-            // Sort keys to be deterministic/consistent with map behavior
-            std::sort(keys.begin(), keys.end());
+            // jinja2 iterates mappings in insertion order; the ordered JSON backend
+            // preserves it, so do not sort here.
             for (const auto& key : keys) items.push_back(key);
         }
 
@@ -1505,11 +1721,31 @@ struct ForStmt : Node {
              loop_obj["first"] = (index == 0);
              loop_obj["last"] = (index == len - 1);
              loop_obj["length"] = len;
+             // jinja2 exposes the neighbouring items; templates group consecutive tool
+             // results with them. The first and last iteration leave the value undefined,
+             // which is falsy exactly as in jinja2.
+             if (index > 0) { loop_obj["previtem"] = filtered_items[index - 1U]; }
+             if (index + 1U < len) { loop_obj["nextitem"] = filtered_items[index + 1U]; }
              loop_scope["loop"] = loop_obj;
 
+             const std::size_t iteration_begin = out.size();
              context.push_scope(std::move(loop_scope));
              for (const auto& node : body) node->render(context, out);
              context.pop_scope();
+             if (auto* trace = context.trace()) {
+                 RenderTrace::LoopIteration record;
+                 record.loop            = iterable->dump();
+                 record.vars            = loop_vars;
+                 record.index           = index;
+                 record.begin           = iteration_begin;
+                 record.end             = out.size();
+                 record.item_is_object  = item.is_object();
+                 if (item.is_object() && item.contains("role")) {
+                     json role = item["role"];
+                     if (role.is_string()) { record.item_role = role.get<std::string>(); }
+                 }
+                 trace->loop_iterations.push_back(std::move(record));
+             }
              index++;
         }
     }
@@ -2238,9 +2474,10 @@ inline Template::~Template() = default;
 inline Template::Template(Template&& other) noexcept = default;
 inline Template& Template::operator=(Template&& other) noexcept = default;
 
-inline std::string Template::render(const json& context) const {
+inline std::string Template::render(const json& context, RenderTrace* trace) const {
     Context ctx(m_impl->default_context);
     ctx.set_functions(&m_impl->functions);
+    ctx.set_trace(trace);
     if (!context.empty()) {
         ctx.push_scope(context);
     }

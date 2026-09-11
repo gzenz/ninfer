@@ -1,0 +1,10 @@
+{
+ "enable_thinking": true,
+ "reasoning_effort": "minimal",
+ "messages": [
+  {
+   "role": "user",
+   "content": "q"
+  }
+ ]
+}

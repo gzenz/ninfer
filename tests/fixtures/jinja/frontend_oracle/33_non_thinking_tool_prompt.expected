@@ -1,0 +1,51 @@
+<|im_start|>system
+# Tools
+
+You have access to the following functions:
+
+<tools>
+{"function": {"description": "Run python code in a REPL", "name": "ipython", "parameters": {"properties": {"code": {"description": "python code to run", "type": "string"}}, "required": ["code"], "type": "object"}}, "type": "function"}
+</tools>
+
+If you choose to call a function ONLY reply in the following format with NO suffix:
+
+<tool_call>
+<function=example_function_name>
+<parameter=example_parameter_1>
+value_1
+</parameter>
+<parameter=example_parameter_2>
+This is the value for the second parameter
+that can span
+multiple lines
+</parameter>
+</function>
+</tool_call>
+
+<IMPORTANT>
+Reminder:
+- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags.
+- If you choose to call a tool, you MUST output the <tool_call> block IMMEDIATELY, with NO conversational text before it.
+- Never end a turn with a statement of intent (e.g. "Let me check X"). Either execute it now with a tool call, or state explicitly that the task is complete.
+- The <tool_call> and <function> tags MUST be at the very beginning of a new line, with NO spaces or indentation before them.
+- To call multiple functions, output a separate, completely closed <tool_call></tool_call> block for EACH function. Do NOT nest <tool_call> blocks.
+- If you have all necessary data, provide your final answer directly to the user without any tool call.
+</IMPORTANT><|im_end|>
+<|im_start|>user
+run it<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+<tool_call>
+<function=ipython>
+<parameter=code>
+print(1)
+</parameter>
+</function>
+</tool_call><|im_end|>
+<|im_start|>user
+<tool_response>
+1
+</tool_response><|im_end|>

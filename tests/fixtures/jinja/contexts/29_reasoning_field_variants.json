@@ -1,0 +1,23 @@
+{
+ "enable_thinking": true,
+ "messages": [
+  {
+   "role": "user",
+   "content": "q"
+  },
+  {
+   "role": "assistant",
+   "content": "a1",
+   "thinking": "thought one"
+  },
+  {
+   "role": "user",
+   "content": "q2"
+  },
+  {
+   "role": "assistant",
+   "content": "a2",
+   "reasoning": "thought two"
+  }
+ ]
+}

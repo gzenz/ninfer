@@ -1,0 +1,6 @@
+<|im_start|>system
+You are a coding agent.<|im_end|>
+<|im_start|>user
+Stop thinking from now on: <|think_off|><|im_end|>
+<|im_start|>user
+What is 1+1?<|im_end|>

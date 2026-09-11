@@ -411,7 +411,7 @@ struct json_getter<std::vector<T>> {
 
 class json {
 public:
-    using nlohmann_json = nlohmann::json;
+    using nlohmann_json = nlohmann::ordered_json;
 
     // Constructors
     json() : m_doc(std::make_shared<nlohmann_json>()), m_val(m_doc.get()) {}
@@ -593,6 +593,10 @@ public:
 
     const nlohmann_json& raw() const { return *m_val; }
     nlohmann_json& raw() { return *m_val; }
+
+    // True when both wrappers live inside the same document. Storing one into the
+    // other can invalidate it, because inserting a key may reallocate the document.
+    bool shares_document(const json& other) const { return m_doc == other.m_doc; }
 
 private:
     // Internal constructor

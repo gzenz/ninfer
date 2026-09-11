@@ -1,0 +1,4 @@
+<|im_start|>system
+You are a multimodal agent.<|im_end|>
+<|im_start|>user
+What happens?<|vision_start|><|video_pad|><|vision_end|><|im_end|>

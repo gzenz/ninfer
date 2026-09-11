@@ -63,6 +63,13 @@ if(NINFER_BUILD_MEDIA_ACQUIRE)
 endif()
 find_package(Threads REQUIRED)
 
+# --- Vendored header-only dependencies ---------------------------------------
+# Jinja2 subset engine that executes the registered chat template
+# (third_party/jinja, Apache-2.0, locally patched; see third_party/jinja/NOTES.md).
+add_library(ninfer_jinja INTERFACE)
+target_include_directories(ninfer_jinja INTERFACE ${PROJECT_SOURCE_DIR}/third_party)
+target_compile_features(ninfer_jinja INTERFACE cxx_std_20)
+
 # --- Subdirectories ----------------------------------------------------------
 add_subdirectory(src)
 if(NINFER_BUILD_APPS)

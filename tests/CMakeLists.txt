@@ -1,10 +1,7 @@
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
-# Header-only jinja engine (third_party/jinja, Apache-2.0). Interface target so
-# template tests stay free of CUDA and build on any host.
-add_library(ninfer_jinja INTERFACE)
-target_include_directories(ninfer_jinja INTERFACE ${PROJECT_SOURCE_DIR}/third_party)
-target_compile_features(ninfer_jinja INTERFACE cxx_std_20)
+# ninfer_jinja (the header-only jinja engine) is defined at the top level so the
+# engine and these tests share one interface target.
 
 # This target deliberately receives no src/, CUDA, artifact, kernel, or target
 # include root. It proves that the installed product headers stand alone.
@@ -125,6 +122,16 @@ ninfer_add_test(ninfer_qwen3_6_froggeric_render_test
   NEEDS_SOURCE_DIR
   LIBRARIES ninfer_engine ninfer_core)
 target_include_directories(ninfer_qwen3_6_froggeric_render_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/impl)
+# Executes the registered template through the vendored engine and validates the
+# context builder and the structured render description against the Python oracle
+# and the incumbent renderer.
+ninfer_add_test(ninfer_qwen3_6_jinja_frontend_render_test
+  SOURCES targets/qwen3_6/test_jinja_frontend_render.cpp
+  NEEDS_SOURCE_DIR
+  LIBRARIES ninfer_engine ninfer_core)
+target_include_directories(ninfer_qwen3_6_jinja_frontend_render_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/impl)
 ninfer_add_test(ninfer_qwen3_6_runtime_mechanisms_test

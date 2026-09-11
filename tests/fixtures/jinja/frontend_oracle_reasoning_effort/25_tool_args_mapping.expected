@@ -1,0 +1,90 @@
+<|im_start|>system
+Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.
+
+# Tools
+
+You have access to the following functions:
+
+<tools>
+{"function": {"description": "Run python code in a REPL", "name": "ipython", "parameters": {"properties": {"code": {"description": "python code to run", "type": "string"}}, "required": ["code"], "type": "object"}}, "type": "function"}
+{"function": {"description": "Read a file", "name": "read_file", "parameters": {"properties": {"path": {"description": "file path", "type": "string"}}, "required": ["path"], "type": "object"}}, "type": "function"}
+</tools>
+
+If you choose to call a function ONLY reply in the following format with NO suffix:
+
+<tool_call>
+<function=example_function_name>
+<parameter=example_parameter_1>
+value_1
+</parameter>
+<parameter=example_parameter_2>
+This is the value for the second parameter
+that can span
+multiple lines
+</parameter>
+</function>
+</tool_call>
+
+<IMPORTANT>
+Reminder:
+- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags
+- Required parameters MUST be specified
+- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after
+- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls
+</IMPORTANT>
+
+You are a coding agent with tools.<|im_end|>
+<|im_start|>user
+Check the working directory.<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+<tool_call>
+<function=write_file>
+<parameter=zeta_arg>
+Z1
+</parameter>
+<parameter=alpha_arg>
+A1
+</parameter>
+<parameter=mid_arg>
+7
+</parameter>
+</function>
+</tool_call>
+<tool_call>
+<function=read_file>
+<parameter=path>
+/repo/main.cpp
+</parameter>
+</function>
+</tool_call><|im_end|>
+<|im_start|>user
+<tool_response>
+/repo
+</tool_response><|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+<tool_call>
+<function=read_file>
+<parameter=path>
+README.md
+</parameter>
+</function>
+</tool_call><|im_end|>
+<|im_start|>user
+<tool_response>
+# Repo
+NInfer engine.
+</tool_response><|im_end|>
+<|im_start|>user
+Now summarize it.<|im_end|>
+<|im_start|>user
+<tool_response>
+// file body
+</tool_response><|im_end|>

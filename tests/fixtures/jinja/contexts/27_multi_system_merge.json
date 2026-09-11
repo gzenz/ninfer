@@ -1,0 +1,17 @@
+{
+ "enable_thinking": true,
+ "messages": [
+  {
+   "role": "system",
+   "content": "You are a coding agent."
+  },
+  {
+   "role": "developer",
+   "content": "Be concise."
+  },
+  {
+   "role": "user",
+   "content": "hi"
+  }
+ ]
+}

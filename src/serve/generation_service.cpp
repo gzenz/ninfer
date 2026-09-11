@@ -324,7 +324,8 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
         std::size_t remaining_media_bytes =
             std::min(options_.max_request_bytes, ninfer::kMaximumPromptMediaBytes);
         ninfer::PromptInput input =
-            to_prompt_input(request, semantics, [&](const ContentPart& part) {
+            to_prompt_input(request, options_, semantics,
+                            [&](const ContentPart& part) {
                 return acquire_media(part, prepared.lifetime->deadline, is_cancelled,
                                      remaining_media_bytes);
             });
@@ -380,7 +381,8 @@ int GenerationService::count_prompt_tokens(const GenerationRequest& request,
         std::size_t remaining_media_bytes =
             std::min(options_.max_request_bytes, ninfer::kMaximumPromptMediaBytes);
         ninfer::PromptInput input =
-            to_prompt_input(request, semantics, [&](const ContentPart& part) {
+            to_prompt_input(request, options_, semantics,
+                            [&](const ContentPart& part) {
                 return acquire_media(part, deadline, is_cancelled, remaining_media_bytes);
             });
         check_preparation_control(deadline, is_cancelled);

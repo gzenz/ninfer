@@ -6,6 +6,7 @@
 #include <ninfer/types.h>
 
 #include <cstddef>
+#include <memory>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -42,12 +43,6 @@ struct MediaTokenRunByteSpec {
     Modality modality       = Modality::Image;
     std::size_t item_index  = 0;
     std::size_t frame_index = 0;
-};
-
-struct RenderedFragment {
-    std::string text;
-    std::vector<ByteSpan> literal_spans;
-    std::vector<MediaPlaceholderByteSpec> media_placeholders;
 };
 
 struct MediaData {
@@ -91,10 +86,6 @@ struct ChatMessage {
     std::string tool_call_id;
 
     [[nodiscard]] bool has_media() const noexcept;
-    [[nodiscard]] RenderedFragment
-    rendered_content(bool add_vision_id = false, int* image_count = nullptr,
-                     int* video_count = nullptr, std::size_t* media_count = nullptr,
-                     std::vector<std::size_t>* part_boundaries = nullptr) const;
 };
 
 struct ChatRenderOptions {
@@ -136,6 +127,11 @@ enum class ChatTemplateSemantics : std::uint8_t {
     FroggericV22,
 };
 
+class JinjaChatTemplate;
+
+// A registered chat template, compiled once and executed for every render. The template
+// file is the renderer: the semantics value only selects the advertised capabilities and
+// keeps the registered-template diagnostic.
 class CompiledChatTemplate {
 public:
     [[nodiscard]] static CompiledChatTemplate resolve(std::string_view source);
@@ -146,10 +142,13 @@ public:
     [[nodiscard]] RenderedChat render(const std::vector<ChatMessage>& messages,
                                       ChatRenderOptions options = {}) const;
 
-private:
-    explicit CompiledChatTemplate(ChatTemplateSemantics semantics) noexcept
-        : semantics_(semantics) {}
+    [[nodiscard]] const std::string& source() const noexcept;
 
+private:
+    CompiledChatTemplate(std::shared_ptr<const JinjaChatTemplate> compiled,
+                         ChatTemplateSemantics semantics) noexcept;
+
+    std::shared_ptr<const JinjaChatTemplate> compiled_;
     ChatTemplateSemantics semantics_;
 };
 

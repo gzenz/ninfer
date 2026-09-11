@@ -1,0 +1,12 @@
+<|im_start|>user
+<|think_xhigh|>hard question<|im_end|>
+<|im_start|>assistant
+a<|im_end|>
+<|im_start|>user
+<|think_low|>easy question<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+b<|im_end|>

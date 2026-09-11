@@ -19,7 +19,7 @@ This fork targets **reliable 555k-context inference with 3 concurrent agentic se
 
 - **YaRN context extension** (`--rope-scaling-factor`, `--rope-scaling-original-context`): linear RoPE scaling to 555k context (c=3+vision) or 600k (c=1). No quality loss measured up to 600k.
 - **NVFP4 KV cache** (`--kv-dtype nvfp4`): 4-bit E2M1 codes + E4M3 group-16 scales. 45% less KV VRAM than int8.
-- **Froggeric v22 chat template**: C++ renderer with no-dangling-intent rule, stricter tool-call instructions, and think-close variant handling.
+- **Froggeric v22.5 chat template**: executed from the template file with no-dangling-intent enforcement, effort aliases, leading system-message merge, tool-error tiering, and think-close variant handling.
 - **Tolerant tool-call recovery** (`--tolerant-tool-calls`): recovers complete Qwen calls with malformed wrappers.
 - **Reasoning-effort tier mapping**: High/Max map to XHigh instead of rejecting.
 
@@ -62,7 +62,7 @@ Ostfralla converters. The binding auto-detects the GDN control layout (split
    --spec mtp --draft-tokens 5 --lm-head-draft \
    --tolerant-tool-calls --host-kv-mib 30720 \
    --rope-scaling-factor 2.12 --rope-scaling-original-context 262144 \
-   --chat-template tests/fixtures/frontend/froggeric_v22_chat_template.jinja \
+   --chat-template tests/fixtures/frontend/froggeric_v225_chat_template.jinja \
    --chat-template-semantics froggeric \
    --weights-profile qwen36-nvfp4
 ```
@@ -71,13 +71,18 @@ Ostfralla converters. The binding auto-detects the GDN control layout (split
 
 **`--chat-template PATH`** loads a jinja template from disk, overriding the artifact's
 embedded template. No artifact patching needed — any `.ninfer` image works with any
-template.
+template. The file is executed: it is the renderer, so its prompt text, tool-instruction
+wording, and message composition are what the engine emits. The engine implements the
+HuggingFace Jinja environment plus the constructs these templates use; an unsupported
+filter fails loudly at load instead of silently rendering different text.
 
-**`--chat-template-semantics MODE`** selects the C++ renderer semantics explicitly:
-`auto` (hash-match, default), `froggeric`, `thinking-toggle`, `reasoning-effort`,
-`generic` (accept any template with ThinkingToggle behavior).
+**`--chat-template-semantics MODE`** selects the advertised prompt capabilities and the
+registered-template diagnostic: `auto` (hash-match, default), `froggeric`,
+`thinking-toggle`, `reasoning-effort`, `generic` (accept any template with ThinkingToggle
+capabilities). It no longer selects a separate C++ renderer, because the template is the
+only renderer.
 
-The Froggeric v22 template (`tests/fixtures/frontend/froggeric_v22_chat_template.jinja`)
+The Froggeric v22.5 template (`tests/fixtures/frontend/froggeric_v225_chat_template.jinja`)
 improves tool-call reliability for agentic workloads with stricter instructions,
 no-dangling-intent enforcement, and think-close variant handling.
 

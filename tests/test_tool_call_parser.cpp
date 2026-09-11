@@ -369,6 +369,176 @@ int test_nested_markers_in_value() {
     return failures;
 }
 
+
+int test_tolerant_no_tools_declared() {
+    // When the request declares no tools but --tolerant-tool-calls is on,
+    // build_tool_call_output_contract is called with an empty tool_jsons span
+    // and enabled=true. The resulting contract must accept any tool name
+    // (enforce_declared_names=false) so the parser can recover the call.
+    const std::shared_ptr<const fi::ToolCallOutputContract> contract =
+        fi::build_tool_call_output_contract(std::span<const std::string>(), true);
+
+    const fi::ParsedToolCallOutput parsed =
+        fi::parse_qwen_tool_call_output(
+            "<tool_call>\n"
+            "<function=bash>\n"
+            "<parameter=command>\ngit log --oneline -5\n</parameter>\n"
+            "</function>\n"
+            "</tool_call>",
+            64, contract->argument_types, /*tolerant=*/true);
+
+    int failures = 0;
+    failures += check(parsed.is_tool_call_response,
+                      "tolerant no-tools: well-formed call parsed as tool response");
+    failures += check(parsed.tool_calls.size() == 1,
+                      "tolerant no-tools: exactly one call");
+    if (parsed.tool_calls.size() == 1) {
+        failures += check(parsed.tool_calls[0].name == "bash",
+                          "tolerant no-tools: undeclared name accepted");
+        const Json args = Json::parse(parsed.tool_calls[0].arguments_json);
+        failures += check(args.at("command") == "git log --oneline -5",
+                          "tolerant no-tools: argument value preserved");
+    }
+    return failures;
+}
+
+int test_tolerant_no_tools_decoder_incremental() {
+    // Streaming path: the decoder must also accept any tool name when the
+    // contract was built with an empty tool list and tolerant=true.
+    const std::shared_ptr<const fi::ToolCallOutputContract> contract =
+        fi::build_tool_call_output_contract(std::span<const std::string>(), true);
+    fi::ToolCallOutputDecoder decoder(contract, 64, /*tolerant=*/true);
+
+    std::string visible;
+    visible += decoder.feed("Running build.\n<tool_call>\n<function=bash>\n");
+    visible += decoder.feed("<parameter=command>\nmake -j4\n</parameter>\n");
+    visible += decoder.feed("</function>\n</tool_call>");
+    auto terminal = decoder.finish();
+    visible += terminal.content;
+
+    int failures = 0;
+    failures += check(terminal.tool_calls.size() == 1,
+                      "tolerant no-tools decoder: one structured call");
+    failures += check(visible == "Running build.",
+                      "tolerant no-tools decoder: prefix content streamed");
+    if (terminal.tool_calls.size() == 1) {
+        failures += check(terminal.tool_calls[0].name == "bash",
+                          "tolerant no-tools decoder: name accepted");
+        const Json args = Json::parse(terminal.tool_calls[0].arguments_json);
+        failures += check(args.at("command") == "make -j4",
+                          "tolerant no-tools decoder: argument preserved");
+    }
+    return failures;
+}
+
+
+int test_tolerant_unbalanced_marker_in_value() {
+    const std::shared_ptr<const fi::ToolCallOutputContract> contract =
+        fi::build_tool_call_output_contract(std::span<const std::string>(), true);
+    // The parameter value quotes an open tool-call marker with no matching close.
+    const std::string text =
+        "<tool_call>\n"
+        "<function=ipython>\n"
+        "<parameter=code>\n"
+        "print('the open marker tag is <tool_call>')\n"
+        "</parameter>\n"
+        "</function>\n"
+        "</tool_call>";
+    const fi::ParsedToolCallOutput parsed =
+        fi::parse_qwen_tool_call_output(text, 64, contract->argument_types, /*tolerant=*/true);
+    int failures = 0;
+    failures += check(parsed.is_tool_call_response,
+                      "unbalanced marker in value: tolerant parse recovered the call");
+    failures += check(parsed.tool_calls.size() == 1, "unbalanced marker in value: one call");
+    if (parsed.tool_calls.size() == 1) {
+        failures += check(parsed.tool_calls[0].name == "ipython", "unbalanced marker: name");
+        const Json args = Json::parse(parsed.tool_calls[0].arguments_json);
+        failures += check(args.at("code") == "print('the open marker tag is <tool_call>')",
+                          "unbalanced marker: value preserved verbatim");
+    }
+    // Strict mode must still fall back to text for the same input.
+    const fi::ParsedToolCallOutput strict =
+        fi::parse_qwen_tool_call_output(text, 64, contract->argument_types, /*tolerant=*/false);
+    failures += check(!strict.is_tool_call_response, "strict mode: unbalanced input stays text");
+    return failures;
+}
+
+int test_tolerant_incident_fixture() {
+    // The exact text that leaked into a user session: prose prefix, then a call whose
+    // code argument quotes one open tool-call marker (unbalanced) in addition to the
+    // real wrapper markers.
+    const std::string text = R"LEAK(Retrying the memory update, then continuing the hypothesis test in the request log.
+
+<tool_call>
+<function=ipython>
+<parameter=code>
+state = """SESSION STATE (ninfer tool-call leak: root cause established; hypothesis test in progress; test-first fix pending):
+
+ROOT CAUSE (reproduced, established): pi-plan extension setActiveTools name mismatch
+(NORMAL_MODE_TOOLS=["read","bash","edit","write"] vs this agent's registry {ipython,
+read_file, ask_user, todo}) -> empty active tools -> outgoing request tools=0 -> no
+server-side tool-call contract -> model emits tool-call markup as plain text
+(finish_reason=stop, tool_calls=null) -> harness renders it as text ("leak").
+
+NEW EVENT 2026-09-10 ~16:30 CEST: leak recurred. User restarted PRIME AGENT (not
+ninfer). HYPOTHESIS UNDER TEST: PA restart (re-syncing active tool list) fixes it;
+the earlier ninfer restart was incidental. Verification via /home/zenz/ninfer-requests.jsonl
+(live, 54MB, rotated .1/.2/...): find leak window (tools=0 + tool_history + finish=stop +
+content containing <tool_call>), confirm tools count returns to normal (~8) after the PA
+restart, and confirm the ninfer server was NOT restarted in between (journal -u ninfer.service;
+server pid 703 started 15:15). Probe helper works: ssh gideon@strix.lan with
+wsl bash -c "echo <b64> | base64 -d | bash" (remote default shell is cmd.exe — the whole
+WSL command must be one quoted argument).
+
+SERVER-SIDE FIX (--tolerant-tool-calls extension), test-first, IN PROGRESS:
+Branch feat/tolerant-tool-calls-no-tools (from fix/checkpoint-host-demotion 6df4f011) in
+/Users/gzenz/ninfer-checkpoint-work. WROTE 2 new tests in tests/test_tool_call_parser.cpp
+(uncommitted): test_tolerant_no_tools_declared (build_tool_call_output_contract(empty span,
+true) -> parse <function=bash> tolerant -> expect structured call) and
+test_tolerant_no_tools_decoder_incremental (same via ToolCallOutputDecoder streaming).
+Standalone Mac compile (no CMake): clang++ -std=c++20 -O0 -I src -I include -I third_party
+tests/test_tool_call_parser.cpp src/targets/qwen3_6/impl/frontend/tool_call_parser.cpp -o /tmp/tcpt
+&& /tmp/tcpt. First run: new tests FAILED AS EXPECTED (diagnosis confirmed: empty tool list +
+enforce_declared_names=true -> declares_tool rejects 'bash' -> fallback to text); guards added
+so failure exits cleanly (was segfaulting on tool_calls[0]).
+NEXT: recompile + run /tmp/tcpt; expect exit(1) with ONLY the new tolerant-no-tools FAIL lines
+and all pre-existing tests passing; then report to user and WAIT for go-ahead on the 2-line fix
+(frontend.cpp:1343 gate: enabled = !tool_jsons.empty() || tolerant_tool_calls; and
+build_tool_call_output_contract sets enforce_declared_names=false when tool_jsons empty).
+
+CONSTRAINTS: do NOT commit plan.md (user said so; a commit attempt was also blocked by the
+review lock). Never touch the live server /home/zenz/ninfer. Global memory
+ninfer_build_test_reality... created (ninfer/build)."""
+
+try:
+    res = rlm.harness.update_memory(
+        id='ninfer_toolcall_leak_rootcause_repair_pending',
+        title="ninfer/qwen tool-call leak: root cause + PA-restart hypothesis test + test-first --tolerant-tool-calls state",
+        content=state,
+    )
+    print('memory updated:', res.id if res else res)
+except Exception as e:
+    print('MEMORY UPDATE FAILED:', type(e).__name__, e)
+
+</parameter>
+</function>
+</tool_call>)LEAK";
+    const std::shared_ptr<const fi::ToolCallOutputContract> contract =
+        fi::build_tool_call_output_contract(std::span<const std::string>(), true);
+    const fi::ParsedToolCallOutput parsed =
+        fi::parse_qwen_tool_call_output(text, 64, contract->argument_types, /*tolerant=*/true);
+    int failures = 0;
+    failures += check(parsed.is_tool_call_response, "incident fixture: call recovered");
+    failures += check(parsed.tool_calls.size() == 1, "incident fixture: exactly one call");
+    if (parsed.tool_calls.size() == 1) {
+        failures += check(parsed.tool_calls[0].name == "ipython", "incident fixture: name");
+        const Json args = Json::parse(parsed.tool_calls[0].arguments_json);
+        failures += check(args.contains("code") && args.at("code").is_string(),
+                          "incident fixture: code argument preserved as string");
+    }
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -386,6 +556,10 @@ int main() {
     failures += test_incremental_filter_valid_tool();
     failures += test_incremental_filter_fallback();
     failures += test_nested_markers_in_value();
+    failures += test_tolerant_no_tools_declared();
+    failures += test_tolerant_no_tools_decoder_incremental();
+    failures += test_tolerant_unbalanced_marker_in_value();
+    failures += test_tolerant_incident_fixture();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

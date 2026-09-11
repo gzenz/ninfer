@@ -2,6 +2,7 @@ target_sources(ninfer_engine PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/frontend/chat_template.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/frontend/digest.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/frontend/frontend.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/impl/frontend/jinja_chat_render.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/frontend/media_cache.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/frontend/processor.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/frontend/resources.cpp
@@ -17,3 +18,5 @@ target_sources(ninfer_engine PRIVATE
 
 target_include_directories(ninfer_engine PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/export)
+
+target_link_libraries(ninfer_engine PRIVATE ninfer_jinja)

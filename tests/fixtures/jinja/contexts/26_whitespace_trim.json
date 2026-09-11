@@ -1,0 +1,18 @@
+{
+ "enable_thinking": true,
+ "messages": [
+  {
+   "role": "user",
+   "content": "  \f\u000bHello\u00a0 "
+  },
+  {
+   "role": "assistant",
+   "content": "Answer\u3000",
+   "reasoning_content": "  \fReason\u00a0 "
+  },
+  {
+   "role": "user",
+   "content": "\u3000<|think_off|>\u000bnext\f  "
+  }
+ ]
+}

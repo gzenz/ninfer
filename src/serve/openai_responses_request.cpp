@@ -1293,10 +1293,19 @@ OpenAIResponsesCreateRequest parse_openai_responses_create_request(const Json& b
             out_pt.frequency_penalty = *pt_frequency;
         }
         if (pt.contains("seed") && !pt.at("seed").is_null()) {
-            if (!pt.at("seed").is_number_unsigned()) {
-                bad_request("post_thinking seed must be a non-negative integer", "post_thinking");
+            const Json& seed = pt.at("seed");
+            if (!seed.is_number_integer()) {
+                bad_request("post_thinking seed must be an integer", "post_thinking");
             }
-            out_pt.seed = pt.at("seed").get<std::uint64_t>();
+            if (seed.is_number_unsigned()) {
+                out_pt.seed = seed.get<std::uint64_t>();
+            } else {
+                const std::int64_t value = seed.get<std::int64_t>();
+                if (value < 0) {
+                    bad_request("post_thinking seed must be non-negative", "post_thinking");
+                }
+                out_pt.seed = static_cast<std::uint64_t>(value);
+            }
         }
     }
     if (const std::optional<int> max_output = optional_int(body, "max_output_tokens")) {

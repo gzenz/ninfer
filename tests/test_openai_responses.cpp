@@ -321,7 +321,7 @@ int test_typed_items_and_cache_markers() {
                           resolved.generation.messages[1].tool_call_id == "call_1",
                       "typed Items survive call-graph normalization");
     const ninfer::PromptInput translated = to_prompt_input(
-        resolved.generation, ResolvedPromptSemantics{}, [](const ContentPart& part) {
+        resolved.generation, ServeOptions{}, ResolvedPromptSemantics{}, [](const ContentPart& part) {
             ninfer::OwnedMedia media;
             media.kind  = part.kind == ContentKind::Image ? ninfer::MediaKind::Image
                                                           : ninfer::MediaKind::Video;

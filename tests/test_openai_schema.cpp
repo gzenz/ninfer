@@ -57,7 +57,8 @@ ResolvedPromptSemantics semantics(const GenerationRequest& request) {
 }
 
 ninfer::PromptInput prompt(const GenerationRequest& request) {
-    return to_prompt_input(request, semantics(request), {});
+    ServeOptions server;
+    return to_prompt_input(request, server, semantics(request), {});
 }
 
 ninfer::RequestOptions options(const GenerationRequest& request) {

@@ -1691,6 +1691,38 @@ int test_reasoning_split(const Frontend& frontend) {
     return failures;
 }
 
+// The post-thinking sampler switch keys off this transition: the output session reports the
+// reasoning block closed only after the round carrying the close marker is committed.
+int test_post_thinking_phase_switch(const Frontend& frontend) {
+    ninfer::ChatMessage message;
+    message.role = ninfer::ChatRole::User;
+    message.parts.push_back(
+        ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x", .media = {}});
+    ninfer::PromptInput input;
+    input.messages.push_back(std::move(message));
+    input.options.continuation    = ninfer::PromptContinuationMode::NewAssistantTurn;
+    input.options.enable_thinking = true;
+    const auto prompt = frontend.prepare(std::move(input));
+    auto session      = frontend.make_output_session(prompt, {});
+
+    int failures = check(!session.reasoning_closed(),
+                         "thinking session reports the reasoning block closed before any output");
+    // Fixture tokens 3+4 decode to the reasoning text, the close marker, and the answer.
+    const std::array<ninfer::TokenId, 2> tokens{3, 4};
+    const auto decision = session.preview_model(tokens, 8, ninfer::FinishReason::OutputLimit);
+    failures += check(decision.accepted_tokens == 2 && !decision.finished(),
+                      "reasoning-close round did not accept both tokens");
+    failures += check(!session.reasoning_closed(),
+                         "reasoning close reported before the preview was committed");
+    const auto output = session.commit_preview();
+    failures += check(session.reasoning_closed(),
+                      "committed close marker did not open the post-thinking phase");
+    failures += check(channel_text(output, ninfer::OutputChannel::Reasoning) == "thought" &&
+                          channel_text(output, ninfer::OutputChannel::Content) == "answer",
+                      "post-thinking round did not route the channels around the close marker");
+    return failures;
+}
+
 ninfer::targets::qwen3_6::PreparedPrompt thinking_prompt(const Frontend& frontend) {
     ninfer::ChatMessage message;
     message.role = ninfer::ChatRole::User;
@@ -2200,6 +2232,7 @@ int main() {
     failures += test_terminal_flush(frontend);
     failures += test_structured_tool_output();
     failures += test_reasoning_split(frontend);
+    failures += test_post_thinking_phase_switch(frontend);
     failures += test_thinking_budget_control(frontend);
     failures += test_utf8_and_hidden_eos(frontend);
     failures += test_media_cache_reuses_immutable_payload();

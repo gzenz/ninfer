@@ -41,6 +41,9 @@ struct Options {
 
     // Omitted fields are resolved from the loaded model and rendered prompt mode by Engine.
     SamplingOverrides sampling;
+    // Overrides applied from the token after the model closes its reasoning block. Omitted
+    // fields fall back to the model's post-thinking preset.
+    SamplingOverrides post_thinking_sampling;
     bool greedy = false;
 };
 

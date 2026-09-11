@@ -86,6 +86,54 @@ ninfer::SamplingOverrides resolve_sampling_overrides(const SamplingParams& reque
     return sampling;
 }
 
+// Post-thinking overrides have no server default: only the request's own fields apply, and
+// omitted fields fall back to the model's post-thinking preset at the Engine boundary.
+ninfer::SamplingOverrides resolve_post_thinking_overrides(const SamplingParams& request,
+                                                          const ServeOptions& server) {
+    ninfer::SamplingOverrides sampling;
+    if (request.temperature) { sampling.temperature = static_cast<float>(*request.temperature); }
+    if (request.top_p) { sampling.top_p = static_cast<float>(*request.top_p); }
+    if (request.min_p) { sampling.min_p = static_cast<float>(*request.min_p); }
+    if (request.top_k) { sampling.top_k = static_cast<std::int32_t>(*request.top_k); }
+    if (request.presence_penalty) {
+        sampling.presence_penalty = static_cast<float>(*request.presence_penalty);
+    }
+    if (request.frequency_penalty) {
+        sampling.frequency_penalty = static_cast<float>(*request.frequency_penalty);
+    }
+    if (request.seed) { sampling.seed = *request.seed; }
+
+    const auto finite = [](const std::optional<float>& value) {
+        return !value || std::isfinite(*value);
+    };
+    if (!finite(sampling.temperature) || !finite(sampling.top_p) || !finite(sampling.min_p) ||
+        !finite(sampling.presence_penalty) || !finite(sampling.frequency_penalty)) {
+        invalid_sampling("post-thinking sampling parameters must be finite", "post_thinking");
+    }
+    if (sampling.temperature && (*sampling.temperature < 0.0F || *sampling.temperature > 2.0F)) {
+        invalid_sampling("post-thinking temperature must be in [0,2]", "post_thinking");
+    }
+    if (sampling.top_p && (*sampling.top_p < 0.0F || *sampling.top_p > 1.0F)) {
+        invalid_sampling("post-thinking top_p must be in [0,1]", "post_thinking");
+    }
+    if (sampling.top_k && (*sampling.top_k < 0 || *sampling.top_k > 20)) {
+        invalid_sampling("post-thinking top_k must be in [0,20]", "post_thinking");
+    }
+    if (sampling.min_p && (*sampling.min_p < 0.0F || *sampling.min_p > 1.0F)) {
+        invalid_sampling("post-thinking min_p must be in [0,1]", "post_thinking");
+    }
+    if (sampling.presence_penalty &&
+        (*sampling.presence_penalty < -2.0F || *sampling.presence_penalty > 2.0F)) {
+        invalid_sampling("post-thinking presence_penalty must be in [-2,2]", "post_thinking");
+    }
+    if (sampling.frequency_penalty &&
+        (*sampling.frequency_penalty < -2.0F || *sampling.frequency_penalty > 2.0F)) {
+        invalid_sampling("post-thinking frequency_penalty must be in [-2,2]", "post_thinking");
+    }
+    if (server.greedy) { sampling.temperature = 0.0F; }
+    return sampling;
+}
+
 std::vector<const ToolDefinition*> effective_tools(const GenerationRequest& request) {
     std::vector<const ToolDefinition*> tools;
     if (!request.uses_tools()) { return tools; }
@@ -307,6 +355,13 @@ ninfer::RequestOptions to_request_options(const GenerationRequest& request,
             request.thinking_budget ? request.thinking_budget : server.default_thinking_budget;
     }
     options.execution.sampling             = resolve_sampling_overrides(request.sampling, server);
+    // An explicit post-thinking seed wins; otherwise the request's resolved seed carries over so
+    // both phases share one random stream.
+    options.execution.post_thinking_sampling =
+        resolve_post_thinking_overrides(request.post_thinking, server);
+    if (!options.execution.post_thinking_sampling.seed) {
+        options.execution.post_thinking_sampling.seed = options.execution.sampling.seed;
+    }
     options.output.raw                     = false;
     options.output.preserve_special_tokens = request.uses_tools() || request.has_tool_history();
     options.output.tool_name_max_length = static_cast<std::uint32_t>(request.tool_name_max_length);

@@ -239,15 +239,33 @@ allocation failures) is **causing the fragmentation it was meant to solve**:
 - 278 FALLBACK (state-only) events as a direct consequence
 - 1 bad_alloc (caught by WORKER OOM handler, server survived)
 
-**Root cause:** The arena allocator does not coalesce adjacent free regions.
-It appears to use a simple free-list or bump allocator that fragments under
-multi-size allocation patterns. The scatter-gather workaround creates the
-multi-size pattern that triggers fragmentation.
+**Root cause (corrected, verified against the deployed tree):** This is NOT a
+missing-coalescing bug. `HostKVArena::insert_free_extent` has coalesced
+adjacent free extents on every free since the safety net landed (2026-08-24),
+and the journal evidence above was collected from a build that includes it.
+The real mechanism is external fragmentation: large live spill entries
+(6-12.5GB each) interleaved with small live entries partition the free space
+into non-adjacent extents, and coalescing can only merge adjacent free
+regions — it cannot merge across a live block. When no single extent is large
+enough, the single-allocation path fails despite sufficient total free. The
+scatter-gather workaround then allocates across multiple extents; when those
+allocations are freed they add more live regions, so under churn the loop is
+self-reinforcing (Finding A's feedback chain holds, driven by live-entry
+interleaving rather than a missing coalesce).
 
-**Fix needed:** Arena allocator must coalesce adjacent free blocks (like a
-proper malloc) or implement compaction when free space is fragmented below
-a threshold. Alternatively, use a slab/buddy allocator that naturally
-avoids fragmentation for power-of-two allocation sizes.
+**Fix needed:** Coalescing is not the fix — it already exists and is not the
+gap. The real options, in order of directness:
+1. **Compaction:** when the fragmentation ratio (largest free extent / total
+   free) drops below a threshold, relocate live extents to the back of the
+   arena (copy + repoint) so free space re-merges into one contiguous
+   region. This is the only option that can fix external fragmentation
+   caused by live entries.
+2. **Uniform entry sizes:** make spill entries smaller and uniform so free
+   holes fit each other — the Level 1 "drop backend_kv" change below does
+   exactly this (12.5GB -> 6.2GB entries, half the size and more uniform).
+3. **Buddy/slab allocator:** naturally avoids fragmentation for
+   power-of-two sizes, but is a larger rewrite for a problem 1+2 already
+   address.
 
 ### Finding B — evict-smallest evicts only ONE entry
 
@@ -280,13 +298,74 @@ loses KV and causes re-prefills. The bad_alloc at the end of this chain
 was caught by the OOM handler (server survived), but the re-prefills
 (278 FALLBACK events) are the real cost.
 
-### Verification after fix
+### Fragmentation measurement — extend the existing `/stats` endpoint
 
-- Arena should reach 0 single-allocation failures when free >= need
-- Scatter-gather should only fire for genuine large allocations (>50% arena)
-- State-only FALLBACK should only fire when arena is genuinely full
-  (total used >= 90% of capacity), not when fragmented
-- evict-smallest should free enough space for the new allocation in one pass
+No new endpoint: `/stats` (`src/serve/stats_json.cpp`) already exposes
+`host_kv_capacity_bytes` / `host_kv_occupied_bytes`. Add fragmentation
+fields so the fix is measured instead of log-grepped.
+
+Instantaneous (into `MemorySummary`):
+- `host_kv_free_bytes`
+- `host_kv_largest_free_extent_bytes`
+- `host_kv_free_extent_count`
+- `host_kv_fragmentation_ratio` = largest extent / total free (1.0 = one
+  contiguous extent; lower = more shredded). The arena already tracks
+  `free_extents_`; this is a small read-only accessor.
+
+Cumulative counters (plumbed into `RuntimeStats`, incremented at the spill
+path in `program_impl.h`, which today only `fprintf(stderr)`s):
+- `host_kv_single_alloc_failures`
+- `host_kv_scatter_gather_allocations` and `host_kv_scatter_gather_extents`
+  (total extents across all scatter-gather allocations)
+- `host_kv_state_only_fallbacks`
+- `host_kv_evictions` (evict-smallest invocations)
+
+Land the metrics first, before the allocator fix: they are additive and
+give us the "before" baseline immediately.
+
+### Verification after fix (quantified against the metrics above)
+
+- `host_kv_single_alloc_failures` with `host_kv_free_bytes >= need` = 0
+  (incident baseline: 144)
+- `host_kv_scatter_gather_allocations` only fire for genuine large
+  allocations (need > 50% of arena capacity); otherwise 0
+- `host_kv_state_only_fallbacks` only when total used >= 90% of capacity
+  (incident baseline: 278 at ~50% occupancy)
+- evict-smallest frees enough space for the new allocation in one pass
+  (`host_kv_evictions` does not climb to drain the safety net)
+- `host_kv_fragmentation_ratio` stays at or above 0.9 during the evaluation
+  run
+
+### Evaluation — demonstrate the defrag fix in a real scenario
+
+Run the same pressure workload against pre-fix and post-fix builds and
+compare the counters above.
+
+Workload (reproduces the production shape that triggered the incident):
+- one long multi-turn thinking session, 371k tokens / ~1000 messages
+  (drives repeated 6-12.5GB checkpoint spills), plus several small
+  interleaved sessions (~5k tokens each) so the arena holds mixed-size
+  live entries — the exact allocation pattern that produced the 144
+  single-alloc failures and 278 FALLBACKs.
+- 30GB arena, same seed, thinking with `--preserve-reasoning` on.
+
+Method:
+1. Pre-fix build (metrics only): run the workload, poll `/stats` through
+   the run; record worst-case `host_kv_fragmentation_ratio` and the four
+   cumulative counters.
+2. Post-fix build: identical run.
+3. Compare. Pass = all four verification criteria hold in the post-fix run
+   and fail (as in the incident) in the pre-fix run.
+
+Configurations: pre-fix, fix-only, fix + Level 1 (drop `backend_kv`) — the
+third isolates how much of the improvement comes from uniform entry sizes
+versus the allocator change itself.
+
+Fast regression: a `HostKVArena` unit test that replays the mixed-size
+allocate/free sequence (interleaved 6GB / 2MB shapes) and asserts 0
+single-alloc failures with sufficient total free and a fragmentation ratio at
+the threshold. CI-runnable without a GPU; the real-scenario run is the
+end-to-end evidence, the unit test keeps it in the suite.
 
 
 ## Architecture Optimization — Exploit Hybrid SSM+Attention Topology (2026-09-10)

@@ -11982,6 +11982,39 @@ void ProgramImplCore::prepare_graphs() {
     release_capture_rows(*text_kv_addresses, text_capture_allocations);
 }
 
+void ProgramImplCore::update_sampling(SequenceHandle sequence_handle,
+                                      const runtime::ResolvedSamplingParameters& sampling) {
+    if (!valid_sequence(sequence_handle)) {
+        throw std::logic_error("update_sampling sequence capability is invalid");
+    }
+    const std::uint32_t lane = ContractAccess::lane(sequence_handle).value;
+    if (lane >= max_concurrency || requests[lane].lifecycle != Lifecycle::Active) {
+        throw std::logic_error("update_sampling target is not active");
+    }
+    ops::SamplingConfig config;
+    config.temperature       = sampling.temperature;
+    config.top_k             = sampling.top_k;
+    config.top_p             = sampling.top_p;
+    config.min_p             = sampling.min_p;
+    config.presence_penalty  = sampling.presence_penalty;
+    config.frequency_penalty = sampling.frequency_penalty;
+    config.seed              = sampling.seed;
+    config.token_counts      = nullptr;
+    RequestControl& request = requests[lane];
+    request.sampling_host   = config;
+    const bool penalties = config.presence_penalty != 0.0F || config.frequency_penalty != 0.0F;
+    if (penalties) {
+        Tensor counts = token_counts.slice(1, static_cast<std::int32_t>(lane), 1)
+                            .view({TextConfig::token_domain});
+        CUDA_CHECK(cudaMemsetAsync(counts.data, 0, counts.bytes(), device.stream));
+        request.sampling_host.token_counts = static_cast<std::int32_t*>(counts.data);
+    }
+    Tensor config_lane = sampling_config.slice(1, static_cast<std::int32_t>(lane), 1);
+    CUDA_CHECK(cudaMemcpyAsync(config_lane.data, &request.sampling_host,
+                               sizeof(request.sampling_host), cudaMemcpyHostToDevice,
+                               device.stream));
+}
+
 void ProgramImplCore::install_sampling(SequenceState& sequence, RequestControl& request,
                                        const ops::SamplingConfig& config) {
     Tensor counts = token_counts.slice(1, static_cast<std::int32_t>(sequence.lane), 1)

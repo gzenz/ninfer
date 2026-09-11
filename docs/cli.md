@@ -205,6 +205,8 @@ The table lists executable defaults. The examples above select FP8 KV and MTP3.
 | `--presence-penalty F` | presence-penalty override | registered model/mode default |
 | `--frequency-penalty F` | frequency-penalty override | registered model/mode default (`0`) |
 | `--seed N` | sampling seed | `0` |
+| `--post-thinking-temperature F` / `--post-thinking-top-p F` / `--post-thinking-top-k N` | post-thinking phase overrides applied from the token after the model closes its reasoning block | model post-thinking preset |
+| `--post-thinking-sampler temp=F,top_p=F,top_k=N` | combined form of the three post-thinking overrides (also accepts `min_p`, `presence`, `frequency`) | model post-thinking preset |
 
 When a sampling flag is omitted, Engine selects the official general-task preset registered for
 the loaded model and the rendered prompt mode. The current presets are:
@@ -212,13 +214,18 @@ the loaded model and the rendered prompt mode. The current presets are:
 | Model | Prompt mode | Temperature | Top-p | Top-k | Min-p | Presence penalty |
 |---|---|---:|---:|---:|---:|---:|
 | Qwen3.6-27B | thinking | `1.0` | `0.95` | `20` | `0` | `0` |
+| Qwen3.6-27B | post-thinking | `0.2` | `0.95` | `20` | `0` | `0` |
 | Qwen3.6-27B | non-thinking | `0.7` | `0.80` | `20` | `0` | `1.5` |
 | Qwen3.8-27B | thinking | `1.0` | `0.95` | `20` | `0` | `0` |
+| Qwen3.8-27B | post-thinking | `0.2` | `0.95` | `20` | `0` | `0` |
 | Qwen3.8-27B | non-thinking | `0.7` | `0.80` | `20` | `0` | `1.5` |
 | Qwen3.6-35B-A3B | thinking | `1.0` | `0.95` | `20` | `0` | `1.5` |
+| Qwen3.6-35B-A3B | post-thinking | `0.2` | `0.95` | `20` | `0` | `1.5` |
 | Qwen3.6-35B-A3B | non-thinking | `0.7` | `0.80` | `20` | `0` | `1.5` |
 
-Frequency penalty is `0` in every registered preset. Task-specific profiles such as Qwen's
+Frequency penalty is `0` in every registered thinking/post-thinking preset. The post-thinking
+phase applies from the token after the model closes its reasoning block; it is not tracked under
+`--raw-output`, where channel detection is disabled. Task-specific profiles such as Qwen's
 precise-coding profile use explicit sampling overrides.
 
 Repeat `--stop-token-id`, `--stop`, or `--reasoning-stop` to add stop conditions. Use

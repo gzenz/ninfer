@@ -161,6 +161,48 @@ int test_basic_request_and_resolution() {
     return failures;
 }
 
+int test_post_thinking_sampling() {
+    const Json body = {{"model", "m"},
+                       {"input", "hello"},
+                       {"post_thinking",
+                        Json{{"temperature", 0.2},
+                             {"top_p", 0.9},
+                             {"top_k", 7},
+                             {"min_p", 0.1},
+                             {"presence_penalty", 0.5},
+                             {"frequency_penalty", -0.25},
+                             {"seed", 42}}}};
+    const OpenAIResponsesCreateRequest request =
+        parse_openai_responses_create_request(body, limits());
+    const SamplingParams& pt = request.prompt.generation.post_thinking;
+    int failures = check(pt.temperature && *pt.temperature == 0.2 &&
+                             pt.top_k && *pt.top_k == 7 && pt.min_p && *pt.min_p == 0.1 &&
+                             pt.presence_penalty && *pt.presence_penalty == 0.5 &&
+                             pt.frequency_penalty && *pt.frequency_penalty == -0.25 &&
+                             pt.seed && *pt.seed == 42,
+                         "post_thinking object parsed with the full field set");
+
+    const Json null_body = {{"model", "m"}, {"input", "hello"}, {"post_thinking", nullptr}};
+    failures += check(!parse_openai_responses_create_request(null_body, limits())
+                          .prompt.generation.post_thinking.temperature,
+                      "post_thinking null treated as unset");
+
+    const Json range_body = {{"model", "m"},
+                             {"input", "hello"},
+                             {"post_thinking", Json{{"temperature", 3.0}}}};
+    failures += check(
+        api_error([&] { (void)parse_openai_responses_create_request(range_body, limits()); })
+            .param == "post_thinking",
+        "out-of-range post_thinking temperature rejected");
+
+    const Json bad_body = {{"model", "m"}, {"input", "hello"}, {"post_thinking", "text"}};
+    failures += check(
+        api_error([&] { (void)parse_openai_responses_create_request(bad_body, limits()); })
+            .message.find("post_thinking") != std::string::npos,
+        "non-object post_thinking rejected");
+    return failures;
+}
+
 int test_budgets_and_nonsemantic_hints() {
     const Json base = {{"model", "m"}, {"input", "hello"}};
     int failures    = 0;
@@ -963,6 +1005,7 @@ int test_input_tokens_uses_shared_state_path() {
 int main() {
     int failures = 0;
     failures += test_basic_request_and_resolution();
+    failures += test_post_thinking_sampling();
     failures += test_budgets_and_nonsemantic_hints();
     failures += test_typed_items_and_cache_markers();
     failures += test_contiguous_assistant_items();

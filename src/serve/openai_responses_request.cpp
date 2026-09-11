@@ -1114,6 +1114,7 @@ void validate_common_top_level(const Json& body, bool create) {
                                                                   "model",
                                                                   "moderation",
                                                                   "parallel_tool_calls",
+                                                                  "post_thinking",
                                                                   "previous_response_id",
                                                                   "preserve_thinking",
                                                                   "prompt",
@@ -1250,6 +1251,53 @@ OpenAIResponsesCreateRequest parse_openai_responses_create_request(const Json& b
     if (const std::optional<double> top_p = optional_number(body, "top_p")) {
         if (*top_p < 0.0 || *top_p > 1.0) { bad_request("top_p must be in [0,1]", "top_p"); }
         out.prompt.generation.sampling.top_p = *top_p;
+    }
+    if (body.contains("post_thinking") && !body.at("post_thinking").is_null()) {
+        require_object(body.at("post_thinking"), "post_thinking");
+        const Json& pt = body.at("post_thinking");
+        SamplingParams& out_pt = out.prompt.generation.post_thinking;
+        if (const std::optional<double> temperature = optional_number(pt, "temperature")) {
+            if (*temperature < 0.0 || *temperature > 2.0) {
+                bad_request("post_thinking temperature must be in [0,2]", "post_thinking");
+            }
+            out_pt.temperature = *temperature;
+        }
+        if (const std::optional<double> pt_top_p = optional_number(pt, "top_p")) {
+            if (*pt_top_p < 0.0 || *pt_top_p > 1.0) {
+                bad_request("post_thinking top_p must be in [0,1]", "post_thinking");
+            }
+            out_pt.top_p = *pt_top_p;
+        }
+        if (const std::optional<int> pt_top_k = optional_int(pt, "top_k")) {
+            if (*pt_top_k < 0 || *pt_top_k > 20) {
+                bad_request("post_thinking top_k must be in [0,20]", "post_thinking");
+            }
+            out_pt.top_k = *pt_top_k;
+        }
+        if (const std::optional<double> pt_min_p = optional_number(pt, "min_p")) {
+            if (*pt_min_p < 0.0 || *pt_min_p > 1.0) {
+                bad_request("post_thinking min_p must be in [0,1]", "post_thinking");
+            }
+            out_pt.min_p = *pt_min_p;
+        }
+        if (const std::optional<double> pt_presence = optional_number(pt, "presence_penalty")) {
+            if (*pt_presence < -2.0 || *pt_presence > 2.0) {
+                bad_request("post_thinking presence_penalty must be in [-2,2]", "post_thinking");
+            }
+            out_pt.presence_penalty = *pt_presence;
+        }
+        if (const std::optional<double> pt_frequency = optional_number(pt, "frequency_penalty")) {
+            if (*pt_frequency < -2.0 || *pt_frequency > 2.0) {
+                bad_request("post_thinking frequency_penalty must be in [-2,2]", "post_thinking");
+            }
+            out_pt.frequency_penalty = *pt_frequency;
+        }
+        if (pt.contains("seed") && !pt.at("seed").is_null()) {
+            if (!pt.at("seed").is_number_unsigned()) {
+                bad_request("post_thinking seed must be a non-negative integer", "post_thinking");
+            }
+            out_pt.seed = pt.at("seed").get<std::uint64_t>();
+        }
     }
     if (const std::optional<int> max_output = optional_int(body, "max_output_tokens")) {
         if (*max_output < 0) {

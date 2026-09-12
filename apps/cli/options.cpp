@@ -87,6 +87,8 @@ std::string usage_text(const char* argv0) {
            "       [--stop-token-id N]... [--stop <text>]... [--reasoning-stop <text>]...\n"
            "       [--raw-output] [--print-token-ids] [--no-thinking] [--thinking-budget N]\n"
            "       [--reasoning-effort low|medium|xhigh] [--vision]\n"
+           "       [--post-thinking-temperature F] [--post-thinking-top-p F]\n"
+           "       [--post-thinking-top-k N] [--post-thinking-sampler temp=F,top_p=F,top_k=N]\n"
            "       [--no-cuda-graph]\n"
            "\n"
            "Streams answer content to stdout and reasoning plus diagnostics to stderr.\n"
@@ -100,6 +102,46 @@ std::string usage_text(const char* argv0) {
            " MiB of sizing headroom.\n"
            "Sampling defaults come from the loaded model and thinking mode; flags override "
            "individual fields.\n";
+}
+
+void apply_post_thinking_sampler(std::string_view spec, SamplingOverrides& out) {
+    std::size_t begin = 0;
+    while (begin < spec.size()) {
+        const std::size_t comma = spec.find(',', begin);
+        const std::string_view field =
+            spec.substr(begin, comma == std::string_view::npos
+                              ? std::string_view::npos
+                              : comma - begin);
+        const std::size_t equals = field.find('=');
+        if (equals == std::string_view::npos) {
+            throw std::invalid_argument("--post-thinking-sampler field missing '=': " +
+                                        std::string(field));
+        }
+        const std::string_view key   = field.substr(0, equals);
+        const std::string_view value = field.substr(equals + 1);
+        if (key == "temp") {
+            out.temperature = parse_float(std::string(value).c_str(), "post-thinking temp", 0.0F,
+                                          2.0F);
+        } else if (key == "top_p") {
+            out.top_p = parse_float(std::string(value).c_str(), "post-thinking top_p", 0.0F, 1.0F);
+        } else if (key == "top_k") {
+            const std::uint32_t top_k =
+                parse_u32(std::string(value).c_str(), "post-thinking top_k", true);
+            if (top_k > 20) { throw std::invalid_argument("post-thinking top_k must be in [0,20]"); }
+            out.top_k = static_cast<std::int32_t>(top_k);
+        } else if (key == "min_p") {
+            out.min_p = parse_float(std::string(value).c_str(), "post-thinking min_p", 0.0F, 1.0F);
+        } else if (key == "presence") {
+            out.presence_penalty = parse_float(std::string(value).c_str(), "post-thinking presence",
+                                              -2.0F, 2.0F);
+        } else if (key == "frequency") {
+            out.frequency_penalty = parse_float(std::string(value).c_str(), "post-thinking frequency",
+                                               -2.0F, 2.0F);
+        } else {
+            throw std::invalid_argument("unknown --post-thinking-sampler key: " + std::string(key));
+        }
+        begin = comma == std::string_view::npos ? spec.size() : comma + 1;
+    }
 }
 
 Options parse_options(int argc, char** argv) {
@@ -195,6 +237,18 @@ Options parse_options(int argc, char** argv) {
                 parse_float(value(arg), "frequency-penalty", -2.0F, 2.0F);
         } else if (arg == "--seed") {
             options.sampling.seed = parse_u64(value(arg), "seed");
+        } else if (arg == "--post-thinking-temperature") {
+            options.post_thinking_sampling.temperature =
+                parse_float(value(arg), "post-thinking-temperature", 0.0F, 2.0F);
+        } else if (arg == "--post-thinking-top-p") {
+            options.post_thinking_sampling.top_p =
+                parse_float(value(arg), "post-thinking-top-p", 0.0F, 1.0F);
+        } else if (arg == "--post-thinking-top-k") {
+            const std::uint32_t top_k = parse_u32(value(arg), "post-thinking-top-k", true);
+            if (top_k > 20) { throw std::invalid_argument("--post-thinking-top-k must be in [0,20]"); }
+            options.post_thinking_sampling.top_k = static_cast<std::int32_t>(top_k);
+        } else if (arg == "--post-thinking-sampler") {
+            apply_post_thinking_sampler(value(arg), options.post_thinking_sampling);
         } else if (arg == "--greedy") {
             options.greedy = true;
         } else {
@@ -228,7 +282,10 @@ Options parse_options(int argc, char** argv) {
     if (!options.enable_thinking && options.thinking_budget) {
         throw std::invalid_argument("--thinking-budget cannot be combined with --no-thinking");
     }
-    if (options.greedy) { options.sampling.temperature = 0.0F; }
+    if (options.greedy) {
+        options.sampling.temperature = 0.0F;
+        options.post_thinking_sampling.temperature = 0.0F;
+    }
     return options;
 }
 

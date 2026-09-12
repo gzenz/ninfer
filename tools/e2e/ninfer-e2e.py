@@ -421,8 +421,8 @@ def parse_serve_log(path, skip_lines=0):
         "private_turn_closure", "tool_calls_done",
         "materialize_fallback", "materialize_safety_hit",
         "materialize_oom_first",
-        "checkpoint_demoted", "checkpoint_restored", "checkpoint_spill_merged",
-        "state_only_lru_evict", "finish_demote_fallback",
+        "checkpoint_demoted", "checkpoint_restored", "unit_not_retained",
+        "unit_partial_rejected", "unit_evicted_smallest_first",
         "hostonly_restore_fail",
         "kv_copy_skip",
         "host_copy_ok",
@@ -481,27 +481,27 @@ def parse_serve_log(path, skip_lines=0):
                     d["materialize_safety_hit"] += 1
                 if "[materialize] OOM (first)" in line:
                     d["materialize_oom_first"] += 1
-                if "[checkpoint-demoted]" in line:
-                    d["checkpoint_demoted"] += 1
                 if "[checkpoint] demoting old checkpoint to host" in line:
                     d["checkpoint_demoted"] += 1
                 # [rewrite-restore] restored demoted checkpoint from safety net
                 # -- pattern reserved for future Step 5-6 work (not emitted yet)
                 if "[rewrite-restore] restoring HostOnly checkpoint to device" in line:
                     d["checkpoint_restored"] += 1
-                if "[safety-spill] merged dropped checkpoint state" in line:
-                    d["checkpoint_spill_merged"] += 1
-                if "[safety-net] evicting oldest state-only entry" in line:
-                    d["state_only_lru_evict"] += 1
-                if "[checkpoint-demoted] finish-fallback" in line:
-                    d["finish_demote_fallback"] += 1
+                # A cache unit is {KV + state}. Non-retention is explicit, and a partial
+                # unit must never be stored; eviction reclaims whole units smallest-first.
+                if "[checkpoint] unit-not-retained" in line:
+                    d["unit_not_retained"] += 1
+                if "[safety-net] REJECT-PARTIAL" in line:
+                    d["unit_partial_rejected"] += 1
+                if "[host-state-pool] evict=" in line:
+                    d["unit_evicted_smallest_first"] += 1
                 if "[kv-not-resident]" in line and "STALE_HANDLE" in line:
                     d["kv_not_resident_stale"] += 1
                 if "[kv-not-resident]" in line and "VALID_BUT_NO_DEVICE" in line:
                     d["kv_not_resident_no_device"] += 1
                 if "[safety-spill] mixed_copy_ok" in line:
                     d["mixed_copy_ok"] += 1
-                if "insufficient capacity" in line and "state-only" in line:
+                if "[safety-spill] FAIL: insufficient capacity" in line:
                     d["spill_fail_capacity"] += 1
                 if "[safety-spill] host_copy_ok" in line:
                     d["host_copy_ok"] += 1
@@ -537,13 +537,13 @@ def evaluate(phase_name, sessions, stats0, stats1, log, expect_trash=False):
     if log.get("mixed_copy_ok", 0) > 0:
         v.append(f"PASS: {log['mixed_copy_ok']} mixed device+host copies (partial D2H worked)")
     if log.get("spill_fail", 0) > 0 and phase_name not in ("trash", "mixed", "concurrent"):
-        v.append(f"WARN: {log['spill_fail']} spill failures (check state-only fallback)")
+        v.append(f"WARN: {log['spill_fail']} spill failures (a unit could not be completed)")
     if log.get("spill_fail_capacity", 0) > 0:
-        v.append(f"WARN: {log['spill_fail_capacity']} spill capacity failures (fell back to state-only)")
+        v.append(f"WARN: {log['spill_fail_capacity']} spill capacity failures (no room for a complete unit)")
     if log.get("host_copy_ok", 0) > 0:
         v.append(f"PASS: {log['host_copy_ok']} host replica copies (demoted KV recovered from host)")
     if log.get("kv_copy_skip", 0) > 0:
-        v.append(f"WARN: {log['kv_copy_skip']} KV copy skips (device pages unavailable, state-only fallback)")
+        v.append(f"WARN: {log['kv_copy_skip']} KV copy skips (device pages unavailable, unit not retained)")
     if log["bad_alloc"] > 0 and phase_name in ("trash", "mixed", "concurrent", "tool-calling"):
         v.append(f"PASS: {log['bad_alloc']} std::bad_alloc caught and recovered (extreme pressure handled)")
 
@@ -791,19 +791,26 @@ def evaluate(phase_name, sessions, stats0, stats1, log, expect_trash=False):
     # of dropping rewrite checkpoints. Checkpoint state is preserved via
     # the safety net spill (ckpt_ok) or demotion capture.
     if phase_name == "demotion":
-        preserved = log["checkpoint_demoted"] + log["spill_ckpt_ok"]
-        if preserved > 0:
-            v.append(f"PASS: {preserved} checkpoint states preserved "
-                     f"(demoted={log['checkpoint_demoted']}, spill_ckpt={log['spill_ckpt_ok']})")
+        # A cache unit is {attention KV + GDN state} and is retained whole or not at
+        # all. Checkpoint state therefore survives only inside a retained unit, and
+        # an explicit non-retention is the correct outcome when the shared host
+        # budget cannot hold the whole unit - it is not a failure.
+        # spill_ckpt_ok is counted inside the spill_ok branch, so it is a subset; use
+        # spill_ok alone as the unit count and report the checkpoint-bearing share.
+        retained = log["spill_ok"]
+        if retained > 0:
+            v.append(f"PASS: {retained} complete units retained "
+                     f"(spill_ok={log['spill_ok']}, spill_ckpt={log['spill_ckpt_ok']})")
         else:
-            v.append("FAIL: no checkpoint state preserved in demotion phase")
+            v.append("FAIL: no complete {KV + state} unit retained in demotion phase")
         if log["checkpoint_restored"] > 0:
             v.append(f"PASS: {log['checkpoint_restored']} checkpoint restores from safety net")
-        if log["checkpoint_spill_merged"] > 0:
-            v.append(f"PASS: {log['checkpoint_spill_merged']} spill merges consolidated state")
-        if log["checkpoint_demoted"] > 0 and log["checkpoint_restored"] == 0:
-            v.append(f"PASS: {log['checkpoint_demoted']} checkpoint demotions (restored 0 — "
-                     "sessions did not return before phase ended, state preserved in safety net)")
+        if log["unit_partial_rejected"] > 0:
+            v.append(f"FAIL: {log['unit_partial_rejected']} partial units were offered for retention")
+        if log["unit_not_retained"] > 0:
+            v.append(f"INFO: {log['unit_not_retained']} captures not retained (no complete unit)")
+        if log["unit_evicted_smallest_first"] > 0:
+            v.append(f"INFO: {log['unit_evicted_smallest_first']} units reclaimed smallest-first")
         if log["rewrite_restore_fail"] > 0:
             v.append(f"FAIL: {log['rewrite_restore_fail']} rewrite restore failures")
 

@@ -93,8 +93,14 @@ runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefau
         throw std::invalid_argument("thinking budget must be positive");
     }
     runtime::ResolvedRequestOptions resolved;
+    const SamplingPhase initial_phase = initial_sampling_phase(mode);
     resolved.execution.sampling =
-        runtime::resolve_sampling(defaults, mode, options.execution.sampling);
+        runtime::resolve_sampling(defaults, initial_phase, options.execution.sampling);
+    if (mode == SamplingMode::Thinking && defaults.has_post_thinking) {
+        resolved.execution.post_thinking_sampling = runtime::resolve_sampling(
+            defaults, SamplingPhase::PostThinking, options.execution.post_thinking_sampling);
+        resolved.execution.post_thinking_configured = true;
+    }
     resolved.execution.requested_output_tokens = options.execution.requested_output_tokens;
     resolved.execution.allow_prefix_reuse      = options.execution.allow_prefix_reuse;
     resolved.execution.thinking                = options.execution.thinking;

@@ -1269,6 +1269,10 @@ std::uint32_t OutputSession::reasoning_tokens() const noexcept {
     return impl_ != nullptr ? impl_->state.reasoning_tokens : 0;
 }
 
+bool OutputSession::reasoning_closed() const noexcept {
+    return impl_ != nullptr && impl_->split_reasoning && !impl_->state.in_reasoning;
+}
+
 ThinkingBudgetStats OutputSession::thinking_stats() const noexcept {
     if (impl_ == nullptr) { return {}; }
     return ThinkingBudgetStats{

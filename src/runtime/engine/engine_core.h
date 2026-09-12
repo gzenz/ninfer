@@ -1166,6 +1166,14 @@ private:
                 auto published = request->output.commit_preview();
                 if (!request->first_token && accepted != 0) { request->first_token = Clock::now(); }
                 append_output(request, std::move(published));
+                if (decode_round && !cancelled[row] && !decisions[row].terminal &&
+                    request->options.execution.post_thinking_configured &&
+                    !request->post_thinking_applied && request->sequence &&
+                    request->output.reasoning_closed()) {
+                    instance_.program->update_sampling(*request->sequence,
+                                                       request->options.execution.post_thinking_sampling);
+                    request->post_thinking_applied = true;
+                }
                 if (decisions[row].terminal) {
                     if (cancelled[row]) {
                         terminal_requests[terminal_count] = request;

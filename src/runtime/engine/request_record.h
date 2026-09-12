@@ -172,6 +172,8 @@ struct RequestRecord {
     std::atomic<bool> cancelled{false};
     EngineRequestState model_state        = EngineRequestState::Waiting;
     bool capture_pending                  = false;
+    // Thinking -> post-thinking phase switch has been applied to this request's sampling.
+    bool post_thinking_applied            = false;
     EngineRequestState post_capture_state = EngineRequestState::Prefill;
     std::optional<FinishReason> terminal_reason;
 

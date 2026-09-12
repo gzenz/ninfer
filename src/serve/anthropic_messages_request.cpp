@@ -943,6 +943,26 @@ void parse_generation_fields(const Json& body, GenerationRequest& request) {
     if (request.sampling.top_k && (*request.sampling.top_k < 0 || *request.sampling.top_k > 20)) {
         bad_request("top_k must be in [0,20]", "top_k");
     }
+
+    if (body.contains("post_thinking") && !body.at("post_thinking").is_null()) {
+        if (!body.at("post_thinking").is_object()) {
+            bad_request("post_thinking must be an object", "post_thinking");
+        }
+        const Json& pt = body.at("post_thinking");
+        SamplingParams& out = request.post_thinking;
+        out.temperature     = optional_number(pt, "temperature");
+        out.top_p           = optional_number(pt, "top_p");
+        out.top_k           = optional_int(pt, "top_k");
+        if (out.temperature && (*out.temperature < 0.0 || *out.temperature > 2.0)) {
+            bad_request("post_thinking temperature must be in [0,2]", "post_thinking");
+        }
+        if (out.top_p && (*out.top_p < 0.0 || *out.top_p > 1.0)) {
+            bad_request("post_thinking top_p must be in [0,1]", "post_thinking");
+        }
+        if (out.top_k && (*out.top_k < 0 || *out.top_k > 20)) {
+            bad_request("post_thinking top_k must be in [0,20]", "post_thinking");
+        }
+    }
 }
 
 std::string parse_model(const Json& body) {

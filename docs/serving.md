@@ -99,6 +99,9 @@ The endpoint supports:
   processing without generation;
 - `temperature`, `top_p`, presence/frequency penalties, and signed integer `seed`;
 - the compatible `top_k` (`0..20`) and `min_p` (`0..1`) sampler extensions;
+- an optional `post_thinking` object (`temperature`, `top_p`, `top_k`, `min_p`, penalties, `seed`)
+  whose fields apply from the token after the model closes its reasoning block; omitted fields fall
+  back to the model's post-thinking preset, and it has no effect unless thinking is enabled;
 - up to four non-empty stop strings, applied to both reasoning and answer output;
 - `n:1`, text-only `modalities`, and `response_format: {"type":"text"}`;
 - non-streaming responses and server-sent event streams;
@@ -324,6 +327,7 @@ wire response contains typed `output` Items.
 | `store` | boolean, default `true`; controls local retrieval and continuation state |
 | `temperature` | finite number in `[0,2]` |
 | `top_p` | finite number in `[0,1]` |
+| `post_thinking` | optional object (`temperature`, `top_p`, `top_k`, `min_p`, penalties, `seed`); fields apply from the token after the model closes its reasoning block, with omitted fields falling back to the model's post-thinking preset; no effect unless thinking is enabled |
 | `metadata` | at most 16 string pairs; keys at most 64 characters and values at most 512 |
 | `client_metadata` | Codex client extension; an object or `null`, accepted as opaque tracing metadata with no generation effect |
 | `reasoning.effort` | `none` disables thinking; `low`, `medium`, or `xhigh` selects an effort exposed by the loaded chat template; `minimal`, `high`, and `max` return `reasoning_effort_not_supported` for the registered templates |
@@ -579,7 +583,14 @@ enabled.
 `max_tokens` is optional for local clients and otherwise uses `--default-max-tokens`; a positive
 value is the complete output budget. `max_tokens:0` is rejected because NInfer does not expose a
 completed zero-output cache-prewarm lifecycle. `temperature`, `top_p`, `top_k`, and
-`stop_sequences` enter Engine execution. A matched custom stop is returned as
+`stop_sequences` enter Engine execution. The `post_thinking` NInfer extension object
+(`temperature`, `top_p`, `top_k`) applies its fields from the token after the model closes its
+reasoning block; omitted fields fall back to the model's post-thinking preset, and it has no
+effect unless thinking is enabled. The preset default lowers only the emission phase. A 1240-sample
+BFCL v4 campaign found that quality-neutral for tool calling, and AIME and IFBench agree; the
+measurable contribution is reproducibility of long-form answers under load. See
+[the post-thinking A/B](performance.md#post-thinking-sampler-bfcl-v4-tool-calling-ab-qwen3_8_27b-quasar)
+and [the post-thinking temperature study](maintainer/post-thinking-temperature.md). A matched custom stop is returned as
 `stop_reason:"stop_sequence"` together with the actual `stop_sequence`; context exhaustion returns
 `model_context_window_exceeded`.
 

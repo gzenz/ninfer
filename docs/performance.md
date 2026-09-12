@@ -22,7 +22,9 @@ Tested Git revisions:
   `b3d4d0f50b868711c62432bbd68e746217a2f49a`;
 - Qwen3.6-27B groupwise-int MTP3: `5ea3242a206cdb0c4c1beaeb9d8a3048e6248423`;
 - Qwen3.6-35B-A3B MTP0 and Qwen3.6-27B groupwise-int MTP0:
-  `0795169393cab0f2c16246d4bac20dee735dc2a4`.
+  `0795169393cab0f2c16246d4bac20dee735dc2a4`;
+- Qwen3.8-27B QUASAR post-thinking sampler BFCL v4 tool-calling A/B:
+  `b802c515a3aa60121435adf169f686bdd4a045a6`.
 
 The Qwen3.6 measurements characterize its three registered artifact profiles independently on one
 NVIDIA GeForce RTX 5090. They cover long-context prefill and baseline decode with speculative
@@ -633,3 +635,73 @@ Each category contains three fixtures and five seeds per fixture, for 15 samples
 
 The baseline and speculative-decode suites intentionally measure different supported workloads.
 No per-scenario baseline/speculative speedup is reported.
+
+## Post-thinking sampler: BFCL v4 tool-calling A/B (`qwen3_8_27b` QUASAR)
+
+The post-thinking sampler changes the sampling parameters once the model closes its reasoning block,
+so the phase it governs is the emitted answer rather than the reasoning. This campaign asks whether
+that switch changes tool-calling quality, and in which direction.
+
+Both arms used `seed 42` and identical thinking parameters. The sampler is a pure positional hash of
+`(seed, position, purpose, sub)` with no mutable RNG state, so identical seeds and parameters reproduce
+the same tokens **only when the execution route is identical**, and this engine is not batch-invariant:
+eight sequential identical requests reproduce exactly, while eight with two in flight produce three
+distinct reasoning blocks, and cold-prefill versus cache-warm routes differ on three of six prompts.
+The arms therefore ran with reasoning blocks that were not bit-identical, so this compares two
+configurations rather than pairing tokens, and part of the observed discordance is route noise. The
+[post-thinking temperature study](maintainer/post-thinking-temperature.md) documents the control and
+re-states its paired results conditioned on identical reasoning.
+
+- `emit @ 1.0` sets `post_thinking` to mirror the thinking sampler (temperature 1.0, top-p 0.95,
+  top-k 20), so a single preset governs the whole generation. This reproduces the behaviour that
+  existed before the feature.
+- `emit @ 0.2` sends no `post_thinking` override, so the registered preset (temperature 0.2,
+  top-p 0.95, top-k 20) governs the phase after the reasoning block closes.
+
+Both arms ran at Git revision `b802c515` on the QUASAR NVFP4 artifact through NInfer's
+OpenAI-compatible serving route with thinking enabled, MTP=5, NVFP4 KV, a 262,144-token context
+limit, the froggeric v22.5 template and `--weights-profile qwen36-nvfp4`. Server defaults were
+temperature 1.0, top-p 0.95, top-k 20, seed 42. Each arm ran on a fresh server, so neither could
+inherit the other's cached prefixes. Every subset ran at full population and all 1240 samples
+completed and were scored in both arms. BFCL's reference protocol runs greedy; this campaign samples
+deliberately, because a post-thinking switch only exists while sampling is active.
+
+Because the arms are paired sample-by-sample, the discriminating quantity is the discordant pair
+count - how many samples `emit @ 0.2` fixes versus breaks - with an exact two-sided McNemar p-value.
+
+| Subset | Samples | `emit @ 1.0` | `emit @ 0.2` | Delta | fixed | broken | p |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `simple_python` | 400 | 92.5% (370/400) | 92.3% (369/400) | -0.3 pp | 3 | 4 | 1.00 |
+| `multiple` | 200 | 93.5% (187/200) | 92.5% (185/200) | -1.0 pp | 1 | 3 | 0.63 |
+| `parallel` | 200 | 90.0% (180/200) | 89.5% (179/200) | -0.5 pp | 0 | 1 | 1.00 |
+| `irrelevance` | 240 | 82.5% (198/240) | 82.5% (198/240) | 0.0 pp | 2 | 2 | 1.00 |
+| `multi_turn_base` | 200 | 66.0% (132/200) | 66.5% (133/200) | +0.5 pp | 20 | 19 | 1.00 |
+| **All subsets** | **1240** | **86.0% (1067/1240)** | **85.8% (1064/1240)** | **-0.2 pp** | **26** | **29** | **0.79** |
+
+The difference is not significant. Of 1240 paired samples, 55 were discordant: `emit @ 0.2` fixed 26
+and broke 29, a net of -3 samples (-0.2 pp), p = 0.79. The interval implied by the discordant pairs
+bounds any true difference to roughly ±1.2 pp. At this sample size the post-thinking switch neither
+improves nor degrades BFCL v4 tool-calling quality.
+
+The mechanism is visible in the failure modes, which are unchanged. Emission validity was 173 invalid
+samples of 1240 under `emit @ 1.0` and 176 under `emit @ 0.2`, and the error-type histograms match
+category for category: `irrelevance_error:decoder_success` 42 / 42, `ast_decoder:decoder_failed`
+23 / 24, `value_error:string` 12 / 12, `parallel_function_checker_no_order:cannot_find_match` 7 / 8,
+`value_error:others` 6 / 7, `parallel_function_checker_no_order:wrong_count` 5 / 5, and
+`type_error:nested` 4 / 4. The residual failures are semantic - a missing or wrong function, or an
+argument error - rather than temperature-sensitive syntactic breakage. The structured call is already
+reliable at temperature 1.0, so a colder emission phase has nothing to repair.
+
+The practical consequence for serving configuration: lowering the sampling temperature only for the
+phase after the reasoning block is quality-neutral on tool calling. That is what makes it safe to run
+the thinking phase at the official temperature instead of compromising it downward with a single
+global value.
+
+This campaign is part of a wider study of the post-thinking temperature, spanning an AIME
+emission ladder (60 problems per arm), an IFBench emission ladder (300 samples per arm), a
+temperature-response sweep, a reproducibility measurement under route variation, and a controlled
+QUASAR-versus-Ostfralla artifact comparison. All three accuracy benchmarks are null; the only
+measurable effect is reproducibility of long-form output under route variation. See
+[the post-thinking temperature study](maintainer/post-thinking-temperature.md) for the full results
+and the recommendation, including why
+[ReSET](https://arxiv.org/abs/2606.13233)-style entropy-gated temperature is deferred.

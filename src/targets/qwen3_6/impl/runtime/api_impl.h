@@ -434,6 +434,12 @@ runtime::ExecutionTiming Program<Variant>::append_forced_tokens(
 }
 
 template <>
+void Program<Variant>::update_sampling(SequenceHandle<Variant> sequence,
+                                       const runtime::ResolvedSamplingParameters& sampling) {
+    impl_->update_sampling(sequence, sampling);
+}
+
+template <>
 CommitResult<Variant> Program<Variant>::commit(PendingBatch<Variant>&& pending,
                                                std::span<const runtime::CommitDecision> decisions,
                                                runtime::CommitObservation observation,

@@ -742,6 +742,13 @@ struct MemorySummary {
     std::uint32_t host_state_occupied_slots       = 0;
     std::size_t host_kv_capacity_bytes            = 0;
     std::size_t host_kv_occupied_bytes            = 0;
+    // Host-KV arena fragmentation (instantaneous): free space is a set of
+    // non-adjacent extents; the ratio is largest extent / total free
+    // (1.0 = one contiguous extent, lower = more shredded).
+    std::size_t host_kv_free_bytes                  = 0;
+    std::size_t host_kv_largest_free_extent_bytes   = 0;
+    std::size_t host_kv_free_extent_count           = 0;
+    double host_kv_fragmentation_ratio              = 0.0;
 };
 
 // Worker-owned monotonic nanosecond counters. Top-level Host phases are mutually exclusive;
@@ -853,6 +860,13 @@ struct RuntimeStats {
     // and restores served from the host-KV safety net.
     std::uint64_t admission_catalog_hits        = 0;
     std::uint64_t admission_safety_net_restores = 0;
+    // Host-KV arena cumulative counters (monotonic): single-extent allocation
+    // failures despite sufficient total free (the fragmentation signature),
+    // arena compactions that repaired it, and whole units evicted from the
+    // safety net to make room.
+    std::uint64_t host_kv_single_alloc_failures = 0;
+    std::uint64_t host_kv_compactions           = 0;
+    std::uint64_t host_kv_evictions             = 0;
     std::uint32_t shared_active_references             = 0;
     std::uint64_t historical_fork_hits                 = 0;
     double actual_context_transfer_seconds             = 0.0;

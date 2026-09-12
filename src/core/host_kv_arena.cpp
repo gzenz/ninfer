@@ -3,6 +3,7 @@
 #include "core/dtype.h"
 
 #include <algorithm>
+#include <cstring>
 #include <exception>
 #include <limits>
 #include <stdexcept>
@@ -268,6 +269,14 @@ std::optional<std::size_t> HostKVArena::find_free_extent(std::size_t bytes) cons
     return std::nullopt;
 }
 
+std::size_t HostKVArena::largest_free_extent_bytes() const noexcept {
+    std::size_t largest = 0;
+    for (const FreeExtent& extent : free_extents_) {
+        largest = std::max(largest, extent.bytes);
+    }
+    return largest;
+}
+
 bool HostKVArena::can_allocate(const HostKVPageLayout& layout, std::uint32_t pages) const noexcept {
     if (pages == 0 || free_descriptors_.empty() || !find_layout(layout) ||
         layout.page_stride > std::numeric_limits<std::size_t>::max() / pages) {
@@ -285,7 +294,14 @@ std::optional<HostKVAllocation> HostKVArena::allocate(const HostKVPageLayout& la
     }
     const std::size_t bytes = layout.page_stride * static_cast<std::size_t>(pages);
     const std::optional<std::size_t> free_index = find_free_extent(bytes);
-    if (!free_index) { return std::nullopt; }
+    if (!free_index) {
+        // Count the fragmentation signature: total free was sufficient, but no single
+        // extent fit. (Insufficient total free is a capacity problem, not fragmentation.)
+        if (free_bytes() >= bytes) {
+            single_alloc_failures_.fetch_add(1, std::memory_order_relaxed);
+        }
+        return std::nullopt;
+    }
 
     const std::uint32_t descriptor_index = take_descriptor();
     if (descriptor_index == std::numeric_limits<std::uint32_t>::max()) { return std::nullopt; }
@@ -308,57 +324,55 @@ std::optional<HostKVAllocation> HostKVArena::allocate(const HostKVPageLayout& la
     return HostKVAllocation(*this, descriptor_index, descriptor.generation);
 }
 
-std::vector<HostKVAllocation>
-HostKVArena::allocate_multi(const HostKVPageLayout& layout, std::uint32_t pages) noexcept {
+bool HostKVArena::compact() noexcept {
     try {
-        std::vector<HostKVAllocation> result;
-        if (pages == 0) { return result; }
-        const std::optional<std::uint32_t> layout_index = find_layout(layout);
-        if (!layout_index) { return result; }
-        const std::size_t page_stride = layout.page_stride;
+        // At most one free extent means the free space is already contiguous.
+        if (free_extents_.size() <= 1) { return false; }
 
-        // Check total free space first.
-        if (free_bytes() < page_stride * static_cast<std::size_t>(pages)) { return result; }
-
-        // No artificial fragment limit — the number of fragments is
-        // naturally bounded by the number of free extents, which is
-        // bounded by the arena capacity / page size. Each fragment is
-        // a separate HostKVAllocation tracked in the descriptors vector.
-        std::uint32_t remaining = pages;
-        while (remaining > 0) {
-            // Find the largest free extent.
-            std::size_t best_index = std::numeric_limits<std::size_t>::max();
-            std::size_t best_bytes = 0;
-            for (std::size_t i = 0; i < free_extents_.size(); ++i) {
-                if (free_extents_[i].bytes > best_bytes) {
-                    best_bytes = free_extents_[i].bytes;
-                    best_index = i;
-                }
-            }
-            if (best_index == std::numeric_limits<std::size_t>::max()) { break; }
-
-            // How many pages fit in this extent?
-            const std::uint32_t fit_pages = static_cast<std::uint32_t>(
-                std::min(free_extents_[best_index].bytes / page_stride,
-                         static_cast<std::size_t>(remaining)));
-            if (fit_pages == 0) { break; }
-
-            // Allocate from this extent.
-            std::optional<HostKVAllocation> block = allocate(layout, fit_pages);
-            if (!block) { break; }
-            result.push_back(std::move(*block));
-            remaining -= fit_pages;
+        // Live descriptors in current offset order. Relocating in this order is
+        // overlap-safe: a block's packed destination ends at or before the next
+        // live block's CURRENT offset (packing only moves blocks forward), so a
+        // destination can never clobber a not-yet-moved block's source.
+        std::vector<std::size_t> live;
+        live.reserve(descriptors_.size());
+        for (std::size_t i = 0; i < descriptors_.size(); ++i) {
+            if (descriptors_[i].active) { live.push_back(i); }
         }
+        std::sort(live.begin(), live.end(), [this](std::size_t a, std::size_t b) {
+            return descriptors_[a].offset < descriptors_[b].offset;
+        });
 
-        if (remaining > 0) {
-            // Couldn't allocate everything — roll back.
-            result.clear();
+        // Pack from offset 0. Every allocation size is a multiple of its page
+        // stride (itself a multiple of the pinned buffer's alignment), so packed
+        // offsets stay aligned. memmove handles the self-overlap case where a
+        // block moves forward into its own tail.
+        std::byte* base = static_cast<std::byte*>(backing_->data());
+        std::size_t cursor = 0;
+        bool moved_any = false;
+        for (std::size_t index : live) {
+            Descriptor& d = descriptors_[index];
+            const std::size_t new_offset = cursor;
+            cursor += d.bytes;
+            if (new_offset == d.offset) { continue; }
+            std::memmove(base + new_offset, base + d.offset, d.bytes);
+            d.offset = new_offset;
+            moved_any = true;
         }
-        return result;
+        if (!moved_any) { return false; }
+
+        // All live bytes now occupy [0, cursor): the free space is one trailing
+        // extent. (occupied_bytes_ is unchanged — compaction moves, not frees.)
+        free_extents_.clear();
+        if (cursor < capacity_bytes_) {
+            free_extents_.push_back(FreeExtent{cursor, capacity_bytes_ - cursor});
+        }
+        compactions_.fetch_add(1, std::memory_order_relaxed);
+        bump_revision();
+        return true;
     } catch (...) {
-        // noexcept: swallow std::bad_alloc from vector operations.
-        // Partial allocations are freed by HostKVAllocation destructors.
-        return {};
+        // noexcept: a failed index-vector allocation leaves the arena as found;
+        // the caller falls back to its capacity-failure path.
+        return false;
     }
 }
 

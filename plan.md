@@ -1,17 +1,12 @@
-# Frontend Template Execution — jinja engine integration + froggeric v22.5 (2026-09-10)
+# Host-KV context-cache — open optimization work
 
-> Replaces the "Upstream Sync 2026-09-09" plan (dual-recipe NVFP4 KV),
-> which is **not executed** as of today: verified absent from master and
-> both local checkouts (no `kv-recipe` in src, no `local/up-sync-2026-09`
-> branch, master still at d6ae7d2f = PR #3 checkpoint-host-demotion merge).
-> That sync remains a separate pending effort and is deferred by this plan.
->
-> What did land from the leak-incident line:
-> - the tool-call leak fix shipped (3c0b4dc5, `--tolerant-tool-calls` last-close
->   recovery + empty-tools contract) and is deployed on the production server
-> - the pi-plan client fix (never wipe the active tool set) landed
-> - the A/B leak battery now has a permanent no-tools condition (D_notools)
->   verified RECOVERED end-to-end
+This plan tracks the open host-KV / context-cache optimization work for the
+Qwen3.6/3.8 27B hybrid (SSM + attention) targets. Two earlier efforts that lived
+in this file are now merged and are no longer tracked here (see "Shipped" below);
+what remains is the atomic-unit invariant plus the still-open arena, topology and
+cache-shedding work.
+
+The governing invariant for all of it is the standing plan below.
 
 ## Standing plan — a cache unit is {KV + state}, atomically (invariant for every phase)
 
@@ -53,207 +48,46 @@ Consequences for the host-KV safety net: entries are atomic; never create a part
 entry; reclaim any pre-existing partial entry first; then reclaim by re-prefill cost
 (smallest unit first, recent large units kept), with recency as the tie-breaker.
 
-## Context: the template file is a digest label, not executable behavior
+## Shipped (merged — see git history and maintainer docs)
 
-Verified state (2026-09-10):
+The jinja and post-thinking efforts that previously occupied this file are done:
 
-- `frontend/chat_template.jinja` in the artifact is consumed only as (1) a
-  SHA-256 digest that selects the C++ renderer semantics, or is bypassed
-  entirely by `--chat-template-semantics`; (2) a byte-consistency check
-  against `tokenizer_config.json.chat_template`; (3) a raw resource in the
-  artifact.
-- No jinja interpreter exists anywhere in the repo (code, tests, history).
-  All rendering is the hand-written C++ port in
-  `src/targets/qwen3_6/impl/frontend/chat_template.cpp` (~40 KB, the
-  "port froggeric v22 chat template semantics" lineage plus local adoptions:
-  multi-variant think-close handling, no-dangling-intent rule, tool-example
-  fixes).
-- The README "Chat template loading" section promises that `--chat-template`
-  loads any jinja template and changes behavior. It does not: pointing the
-  flag at a different file changes the rendered output by zero bytes. The
-  documented feature is a fake.
+- **Jinja chat-template engine + froggeric v22.5** (PR #4, `cb535944`): the
+  vendored `wangzhaode/jinja.cpp` engine now genuinely executes `--chat-template`;
+  the ~800-line hand-written renderer is gone; every parity gate is byte-exact
+  against the Python jinja2 oracle (engine + frontend suites, 16/16 froggeric
+  contract); deployed on strix with the A/B tool-leak battery green.
+- **Post-thinking sampler + atomic {KV + state} cache unit** (PR #6, `ae8eb23e`):
+  the `post_thinking` sampling phase (CLI + HTTP) and the atomic-unit invariant
+  below, enforced in `host_kv_safety_net.h` (half units refused, cost-aware
+  smallest-unit-first eviction, one shared host budget). Measured: quality-neutral
+  on BFCL v4 tool calling (1240 paired samples, p = 0.79) — a reproducibility /
+  reliability knob, not a quality one; full study in
+  `docs/maintainer/post-thinking-temperature.md`.
 
-Decision (user, 2026-09-10): make the promise real — add a real jinja engine
-so `--chat-template` genuinely loads and executes the specified file. The
-froggeric v22.5 merge (Phase 3) then becomes a template content change
-instead of a C++ porting project.
-
-## Phase 1 — Engine selection (done, 2026-09-10)
-
-Selected: `wangzhaode/jinja.cpp` — Apache-2.0, single 80 KB header + 25 KB
-JSON bridge (`ujson.hpp`), nlohmann backend (already vendored in
-`third_party/nlohmann`). Purpose-built for LLM chat templates; validated by
-its authors against Python transformers on Qwen 2.5/3, DeepSeek, Llama.
-
-Rejected: `jinja2cpp/Jinja2Cpp` (599 stars, broader conformance) — requires
-Boost >= 1.65 + fmt + four nonstd-lite libraries; contradicts the repo's
-three-small-libs `third_party` discipline. `hughperkins/Jinja2CppLight` —
-dead since 2020.
-
-Proof (byte-exact parity, oracle = Python jinja2 3.1.6, keep_trailing_
-newline, rendering the actual v22.5 template): 25/25 contexts identical,
-including tool definitions (xml + json formats), tool-history replay,
-reasoning replay, all effort aliases, error-tiering (text + JSON payload),
-truncation (text path + v22.5 JSON-payload-skip), inline effort tags,
-image/video/vision-id media, auto-disable, multi-call turns, the literal
-think-close-tag incident case, and both raise_exception error paths
-(error-message parity).
-
-Five contained patches to the vendored header (each verified in the parity
-harness):
-1. `make_unique` polyfill collides with `std::make_unique` under modern
-   standards -> guard with `__cpp_lib_make_unique`.
-2. `join` filter missing (20 uses in the template) -> added.
-3. `tojson` used a custom tool-canonical key order -> aligned to jinja2
-   semantics (sort_keys, `", "`/`": "` separators, UTF-8 preserved).
-4. String slicing missing (`content[:n]`, `[:1]`) — the truncation and
-   error-tiering branches were silent no-ops -> added string-slice branch.
-5. Tuple literals (`x in ('a', 'low')`) parsed as function calls — the
-   effort-alias branches misrouted -> parenthesized comma lists parse as
-   arrays.
-Plus one registration: `raise_exception` via the engine's `add_function`
-API as a throwing function (render() propagates exceptions — verified).
-
-Harness lives at `/tmp/jinja_parity` (25-context suite, render drivers for
-both engines, patched header). Promote into the repo in Phase 2.
-
-## Phase 2a — Perf gate (measured 2026-09-10, Mac, -O2, C++20) — PASS
-
-~200.7k-token context (802,896 chars, 311 messages, 154 tool rounds with
-code arguments/results, xhigh thinking), tool arguments in the production
-shape (JSON mappings, not wire strings), 5 timed renders each:
-
-| renderer | best | mean | output |
-|---|---|---|---|
-| hand-written port (v22 + adoptions) | 5.19 ms | 5.23 ms | 807,676 B |
-| jinja engine, v22 template | 5.90 ms | 6.03 ms | 804,563 B |
-| jinja engine, v22.5 template | 7.80 ms | 8.27 ms | 807,489 B |
-
-One-time (startup, not per request): template compile ~6-15 ms; context JSON
-parse ~8 ms (the integration builds the context in-memory, so only the
-compile applies).
-
-- Gate: no regression. The engine renders 13% slower than the hand-written
-  port (5.90 vs 5.19 ms best); v22.5 complexity adds +1.9 ms. Both are <0.2%
-  of a 2-4 s 200k-token prefill.
-- Scale parity: the engine is byte-identical to the Python jinja2 oracle at
-  200k tokens for BOTH v22 (804,563 B) and v22.5 (807,489 B), so the
-  25-context suite's guarantee holds at scale.
-- The port is 3,113 B larger than the template's own v22 render. Those
-  adoption differences (D1/D2/D3) are port-only and disappear at cutover,
-  because the template becomes the renderer.
-- Engine defects this gate exposed (all fixed in the vendored header; see
-  third_party/jinja/NOTES.md): jinja2 iterates mappings in insertion order
-  while nlohmann::json sorts keys, which silently reordered every multi-key
-  parameter block; `set` stored variables inside the context document, and
-  with vector-backed ordered objects that insertion relocated the document
-  being iterated (dropped/truncated tool arguments); `tojson` sorted
-  reference-like JSON wrappers in place, writing through them and corrupting
-  values.
-- Final confirmation on strix with a real 200k request stays in Phase 2
-  validation (absolute numbers differ on the 5090 box; the relative
-  comparison is the gate).
-
-## Phase 2 — Integration (done, 2026-09-10)
-
-1. Vendored `third_party/jinja/` (header + ujson bridge, pinned, patches, LICENSE).
-2. CMake: `ninfer_jinja` interface target (top level), added to `ninfer_engine`;
-   CUDA-free test targets for the engine and the frontend renderer.
-3. Frontend rewiring (done): `CompiledChatTemplate` now owns a compiled template and
-   delegates every render to it; the ~800-line hand-written renderer is gone.
-   `--chat-template-semantics` selects advertised capabilities and the
-   registered-template diagnostic only, because the file is the renderer.
-   - Context construction maps `ChatMessage`/`ChatRenderOptions` onto the template
-     variables (messages, tools, enable_thinking, reasoning_effort, preserve_thinking,
-     add_vision_id, add_generation_prompt). Tool arguments are parsed from the wire
-     string into a mapping, which is what routes the template into its
-     `<parameter=...>` branch (the D2 adoption).
-   - Structured output is reconstructed from the engine's render trace, not by
-     scanning the text: message frontiers come from the message loop's iteration
-     spans, literal spans from printed-leaf provenance (minus media and vision-id
-     markers), media placeholders from the content layout, cache markers from the
-     corresponding frontiers, and rewrite checkpoints from the assistant-block and
-     generation-suffix structure.
-4. Adoptions moved into the template file (done): the thinking-disabled replay rule
-   (an empty reasoning block must match the generation prologue for prefix reuse) and
-   the no-dangling-intent rule now live in the fixture, not in C++.
-5. Hand-written render path retired (done): `chat_template.cpp` is 120 lines of
-   registration and delegation.
-6. Docs updated: README "Chat template loading" and `docs/serving.md` describe
-   execution of the file.
-
-Verification (Mac, no CUDA):
-- `tests/test_jinja_template.cpp`: 26 contexts byte-exact against the Python oracle.
-- `tests/targets/qwen3_6/test_jinja_frontend_render.cpp`: all three registered
-  templates x 22 contexts = 66 renders byte-exact against the Python oracle for the
-  same file, plus structured-output invariants (boundaries monotone and in range,
-  literal spans sorted and disjoint, media spans covering the pad token in render
-  order, cache/rewrite frontiers in range).
-- `tests/targets/qwen3_6/test_froggeric_render.cpp`: all 16 prompt-contract checks
-  pass against the executed template.
-- The oracle environment is the HuggingFace one (`trim_blocks=True`,
-  `lstrip_blocks=True`, `keep_trailing_newline=True`), which is what the registered
-  templates are written for; the engine implements both flags.
-
-Open items carried out of Phase 2:
-- Artifact regeneration: the qwen3.8 artifact embeds the template, so the fixture's
-  local additions (and its digest, now registered as `kFroggericV22TemplateDigest`)
-  need a conversion run. `kFroggericV22DeployedTemplateDigest` keeps the currently
-  deployed digest accepted until that rebuild happens, then goes away.
-- GPU-box verification: the CUDA build plus the e2e suite, the tool-leak A/B battery,
-  and a live-server run under the new path (the engine-level `test_frontend` links the
-  full engine and cannot be built on the Mac).
-- The engine executes tool-argument/response truncation and `tool_call_format` from
-  the template, but the frontend does not expose those knobs yet; contexts that use
-  them are skipped in the frontend suite.
-
-## Phase 3 — Froggeric v22.5 (done, 2026-09-10)
-
-The merge was a template content change, as planned; no C++ work was needed.
-
-1. Fixture replaced: `tests/fixtures/frontend/froggeric_v225_chat_template.jinja`
-   (upstream v22.5 plus our local no-dangling-intent tool rule, applied to both the
-   XML and JSON instruction branches). The superseded v22 fixture is deleted.
-2. Registered as the same identity: a digest update, plus
-   `kFroggericV22DeployedTemplateDigest` so the artifact that is deployed today keeps
-   loading until it is rebuilt from the v22.5 fixture.
-3. All v22.1 -> v22.5 semantics come from the template: effort aliases and the
-   default-medium resolution, merging of all leading system messages, the explicit
-   reasoning-field variants (reasoning_content / thinking / reasoning) with lead-strip,
-   the reworked tool-error tiering, single-newline multi-tool separation, non-thinking
-   tool-prompt alignment, video_url, and JSON-payload truncation protection.
-4. Our previous thinking-disabled replay adoption is now upstream behaviour: v22.5
-   keeps the reasoning block on replay for every message whenever the reasoning is
-   preserved or belongs to the current turn, so the block is no longer a local patch.
-
-Verification:
-- Raw engine parity at v22.5: 32 contexts byte-exact against the Python oracle,
-  including six new contexts for the v22.5 features (multi-system merge, effort
-  alias, reasoning-field variants, video_url, inline effort tags, non-thinking tool
-  prompt).
-- Frontend: 84 renders (3 registered templates x 28 contexts) byte-exact, plus the
-  structured-output invariants.
-- Froggeric prompt contract: 16/16 after updating two checks that pinned v22
-  behaviour (replay now keeps the reasoning block; consecutive tool calls are
-  separated by one newline).
-- Scale: byte-identical to Python at ~200k tokens (807,647 bytes).
-- Render time at ~200k tokens: 7.83 ms best (v22 was 5.90 ms, the retired
-  hand-written renderer 5.18 ms) - about 0.2-0.4% of a 2-4 s prefill.
-
-Standing caveat unchanged: upstream v22.5 extracts in-content thinking at the first
-think-close occurrence; the deployed server-side tolerant parser remains the backstop
-for already-emitted text-form calls.
-
-Still open from Phase 2: the GPU-box build and e2e/A-B verification, the artifact
-rebuild, and exposing the max_tool_*_chars / tool_call_format knobs.
-
-## Effort
-
-- Phase 2: ~2-3 days (structured-output reconstruction is the bulk).
-- Phase 3: ~0.5-1 day (template edit + validation) once Phase 2 lands.
-
+Still open from the jinja line (carried, not on the serving path):
+- the qwen3.8 artifact still embeds the pre-v22.5 template; rebuilding it needs the
+  BF16 source checkpoint (not on the Mac). `kFroggericV22DeployedTemplateDigest`
+  keeps the currently deployed digest accepted until the rebuild; live serving
+  overrides the embedded template via `--chat-template`, so it is not on the path.
+- the frontend does not yet expose `tool_call_format`, `auto_disable_thinking_with_
+  tools`, `max_tool_arg_chars`, `max_tool_response_chars`; contexts using them are
+  covered by the raw engine suite only.
 
 ## Post-Merge Findings — Arena Fragmentation & Eviction Strategy (2026-09-10)
+
+> **Status (2026-09-12):** the state-only FALLBACK failure mode is gone — PR #6 made
+> the cache unit atomic (no state-only entries), and eviction is now cost-aware,
+> smallest-unit-first, looping until the incoming unit fits the shared host budget
+> (`host_kv_safety_net.h::retain_state_capture`). That resolves Finding B and removes
+> the "state-only fallback loses KV" tail of the incident.
+>
+> **Status (2026-09-13):** Finding A is fixed by **arena compaction**: the
+> scatter-gather path is removed, and a single-extent allocation that fails despite
+> sufficient total free now triggers `HostKVArena::compact()` (live extents relocate
+> to the front, free space becomes one contiguous extent) before the allocation
+> retries. The `/stats` fragmentation metrics below are implemented. **Still open:**
+> the real-scenario evaluation on the GPU box.
 
 Production testing under extreme pressure (single 371k-token session, 1016
 messages, arena exhausted to 14MB free) revealed two issues in the host KV
@@ -293,19 +127,20 @@ allocations are freed they add more live regions, so under churn the loop is
 self-reinforcing (Finding A's feedback chain holds, driven by live-entry
 interleaving rather than a missing coalesce).
 
-**Fix needed:** Coalescing is not the fix — it already exists and is not the
-gap. The real options, in order of directness:
-1. **Compaction:** when the fragmentation ratio (largest free extent / total
-   free) drops below a threshold, relocate live extents to the back of the
-   arena (copy + repoint) so free space re-merges into one contiguous
-   region. This is the only option that can fix external fragmentation
-   caused by live entries.
-2. **Uniform entry sizes:** make spill entries smaller and uniform so free
-   holes fit each other — the Level 1 "drop backend_kv" change below does
-   exactly this (12.5GB -> 6.2GB entries, half the size and more uniform).
-3. **Buddy/slab allocator:** naturally avoids fragmentation for
-   power-of-two sizes, but is a larger rewrite for a problem 1+2 already
-   address.
+**Fix (implemented, 2026-09-13): compaction.** `HostKVArena::compact()`
+relocates every live allocation into a contiguous block at the front of the
+arena so all free space merges into one trailing extent. The spill path
+triggers it reactively: a single-extent allocation that fails despite
+sufficient total free syncs the transfer stream (no in-flight copies may
+reference arena memory), compacts, and retries — after which the retry
+always succeeds, because the free space is one extent of the total free.
+The scatter-gather path (`allocate_multi`) is removed: with compaction it is
+unreachable (total free < need is a capacity failure, not fragmentation).
+Options 2 (uniform entries via dropping backend KV) and 3 (buddy/slab) are
+not pursued: option 2's premise was wrong (see the corrected Architecture
+Optimization section — the "backend KV" is the MTP module's KV, not droppable
+replay records), and option 3 is a larger rewrite for a problem compaction
+already solves.
 
 ### Finding B — evict-smallest evicts only ONE entry
 
@@ -352,29 +187,34 @@ Instantaneous (into `MemorySummary`):
   contiguous extent; lower = more shredded). The arena already tracks
   `free_extents_`; this is a small read-only accessor.
 
-Cumulative counters (plumbed into `RuntimeStats`, incremented at the spill
-path in `program_impl.h`, which today only `fprintf(stderr)`s):
-- `host_kv_single_alloc_failures`
-- `host_kv_scatter_gather_allocations` and `host_kv_scatter_gather_extents`
-  (total extents across all scatter-gather allocations)
-- `host_kv_state_only_fallbacks`
-- `host_kv_evictions` (evict-smallest invocations)
+Cumulative counters (plumbed into `RuntimeStats`, exposed under the
+`host_kv` group of `/stats`):
+- `host_kv_single_alloc_failures` — single-extent allocations that failed
+  despite sufficient total free (the fragmentation signature; in the spill
+  path each is immediately repaired by a compaction)
+- `host_kv_compactions` — arena compactions that merged the free space
+- `host_kv_evictions` — whole units evicted from the safety net
+
+(The section's original `host_kv_state_only_fallbacks` counter is obsolete:
+PR #6 removed the state-only fallback path. The original
+`host_kv_scatter_gather_*` counters are obsolete too: the scatter-gather
+path was removed when compaction landed.)
 
 Land the metrics first, before the allocator fix: they are additive and
 give us the "before" baseline immediately.
 
 ### Verification after fix (quantified against the metrics above)
 
-- `host_kv_single_alloc_failures` with `host_kv_free_bytes >= need` = 0
-  (incident baseline: 144)
-- `host_kv_scatter_gather_allocations` only fire for genuine large
-  allocations (need > 50% of arena capacity); otherwise 0
-- `host_kv_state_only_fallbacks` only when total used >= 90% of capacity
-  (incident baseline: 278 at ~50% occupancy)
+- every `host_kv_single_alloc_failures` increment in the spill path is
+  immediately followed by a compaction and a successful allocation — no
+  fragmentation-caused spill failures (incident baseline: 144 failures,
+  278 fallbacks)
+- no multi-extent allocations at all — the scatter-gather path is removed
 - evict-smallest frees enough space for the new allocation in one pass
   (`host_kv_evictions` does not climb to drain the safety net)
 - `host_kv_fragmentation_ratio` stays at or above 0.9 during the evaluation
-  run
+  run (it is 1.0 right after a compaction; it only drops when interleaved
+  frees split the free space again)
 
 ### Evaluation — demonstrate the defrag fix in a real scenario
 
@@ -397,16 +237,17 @@ Method:
 3. Compare. Pass = all four verification criteria hold in the post-fix run
    and fail (as in the incident) in the pre-fix run.
 
-Configurations: pre-fix, fix-only, fix + Level 1 (drop `backend_kv`) — the
-third isolates how much of the improvement comes from uniform entry sizes
-versus the allocator change itself.
+Configurations: pre-fix (incident build) vs post-fix. The pre-fix baseline
+is the incident journal data (144 single-alloc failures, 278 fallbacks); a
+fresh pre-fix run is optional.
 
-Fast regression: a `HostKVArena` unit test that replays the mixed-size
-allocate/free sequence (interleaved 6GB / 2MB shapes) and asserts 0
-single-alloc failures with sufficient total free and a fragmentation ratio at
-the threshold. CI-runnable without a GPU; the real-scenario run is the
-end-to-end evidence, the unit test keeps it in the suite.
-
+Fast regression (implemented): `tests/test_kv_cache.cpp::exercise_compaction`
+replays the interleaved allocate/free pattern (eight 8-page blocks, two
+interleaved frees), asserts the 12-page allocation fails despite sufficient
+total free, compacts, asserts the free space is one extent with the data
+intact, and asserts the allocation then succeeds. Runs with the other
+`ninfer_kv_cache_test` checks (needs the CUDA driver for the pinned buffer,
+like the rest of that target).
 
 ## Architecture Optimization — Exploit Hybrid SSM+Attention Topology (2026-09-10)
 
@@ -433,48 +274,45 @@ does NOT scale with context length.
 ### What we currently store vs what we actually need
 
 **Current spill (per checkpoint):**
-- `text_kv` — attention K/V for 7 layers, scales with context (~6GB at 370k tokens)
-- `backend_kv` — GDN replay records for 21 layers, scales with context (~6GB at 370k tokens)
+- `text_kv` — attention K/V for the attention layers, scales with context
+- `backend_kv` — speculative-backend KV (the MTP module's causal-attention KV when
+  `--spec mtp`, or the DFlash context KV), scales with context
 - State image — GDN recurrent state, fixed ~150MB
-- Total: ~12.5GB per checkpoint (text + backend), both scaling linearly
 
-**What we actually need for turn_closure (forward generation from checkpoint):**
-- `text_kv` — attention K/V for 7 layers (needed — attention layers must attend to past tokens)
-- State image — GDN recurrent state (needed — SSM layers need their running state)
-- `backend_kv` — **NOT NEEDED** — GDN replay records are only for mid-sequence branching,
-  not for forward generation. The recurrent state already summarizes all history.
-
-The backend KV (`GdnReplayRecordLayer`: conv, key, value, gate per token per layer)
-stores per-token transition records that allow "replaying" GDN computation from an
-arbitrary position. This is useful for branching from a mid-sequence checkpoint but
-is pure overhead for the common case: appending tokens to the end (turn_closure).
-
-> **Atomicity note:** this section decomposes a unit into `text_kv`, `backend_kv` and the
-> state image in order to reason about *what each part is for*. It does NOT license
-> storing, evicting or restoring them separately. Per the standing plan above, the
-> attention KV and the GDN state image are retained and restored as one unit.
-> `backend_kv` is a question about the unit's *internal composition* (whether GDN replay
-> records belong in it for the common forward-generation case) — not a proposal to split
-> state from KV.
+> **Correction (2026-09-13, verified in code):** the original text of this section
+> described `backend_kv` as "GDN replay records" that are "only for mid-sequence
+> branching" and therefore droppable. That premise is **wrong**. In this codebase the
+> "backend KV" is the speculative backend's KV: `backend_kv_cache()` returns
+> `decoder->mtp_cache()` for `--spec mtp` (the production configuration), and the MTP
+> ops run **causal attention over the entire MTP KV prefix**
+> (`mtp_forward_batch` / `mtp_forward_ar_step`, `CausalAttentionExecutionEnvelope{visible,
+> visible}`). The GDN replay records the original text meant to drop are not in the
+> host spill at all — they live in the fixed `replay_records` arena plus the state
+> image, and are only consumed by the Fold of the current speculative round's candidate
+> window. Dropping the MTP KV from the host spill would therefore permanently degrade
+> MTP drafting after any safety-net restore (the restored prefix's MTP KV would be zero
+> and never recovered short of a full re-prefill). Level 1 below is rejected on this
+> basis. The size estimates in this section (backend_kv ≈ text_kv ≈ 6GB) are also
+> suspect: the MTP module is a small extra layer, so its KV is much smaller than the
+> main attention KV.
 
 ### Three optimization levels
 
-**Level 1 — Drop backend_kv from host spill (keep text_kv + state image):**
+**Level 1 — Drop backend_kv from host spill (keep text_kv + state image): REJECTED (2026-09-13).**
 
-> **Compatible with the standing plan — not superseded.** This level keeps `text_kv`
-> (the attention KV) together with the state image, so the retained unit stays atomic. It
-> drops only `backend_kv`, the optional GDN replay records, which the atomicity note above
-> treats as the unit's internal composition rather than as a half of the unit. If this is
-> implemented, the added flag must be named for the dropped replay data (not for a partial
-> unit), and `is_complete_unit()` must continue to accept units without `backend_kv`.
+> **Rejected — wrong premise.** This level assumed `backend_kv` holds droppable GDN
+> replay records. It does not: it is the MTP module's causal-attention KV (see the
+> correction above). Dropping it from the host spill permanently degrades MTP drafting
+> after any safety-net restore — the restored prefix's MTP KV would be zero and never
+> recovered short of a full re-prefill, which is exactly what the safety net exists to
+> avoid. Production runs `--spec mtp --draft-tokens 5`, so the cost is real. The
+> "2x more checkpoints" goal is also not achieved: the MTP KV is a small extra layer,
+> far smaller than the main attention KV that dominates the unit's size. The
+> fragmentation goal this level was meant to serve is instead met by arena compaction
+> (Post-Merge Findings, Finding A).
 
-- Arena storage per checkpoint: ~6GB (text only) + ~150MB (state) = ~6.2GB
-- vs current ~12.5GB → **2x more checkpoints fit in the same arena**
-- Turn_closure: restore text_kv from host + restore state image → same speed as today
-- Mid-sequence branching: not supported from these entries (would need re-prefill of GDN layers)
-- Arena at 30GB: fits ~4-5 checkpoints instead of ~2-3
-- Implementation: spill function skips backend_kv for entries beyond a threshold;
-  add `text_only` flag to `HostKVSafetyNetEntry`
+- (Original proposal, retained for the record:) spill function skips backend_kv for
+  entries beyond a threshold; add `text_only` flag to `HostKVSafetyNetEntry`.
 
 **Level 2 — Drop both text_kv and backend_kv (state image only):**
 
@@ -561,7 +399,6 @@ if (entry.text_only) {
 - Mid-sequence branching: document as unsupported from text-only entries
   (would need full re-prefill of GDN layers, which is correct but slow)
 
-
 ### Refined Analysis — Reasoning Block Shedding (from user feedback)
 
 > **Attribution:** The reasoning-block shedding concept was proposed by
@@ -603,13 +440,15 @@ The hybrid SSM+attention topology makes shedding **almost free**:
 | Strategy | Tokens spilled | Arena per checkpoint | Reduction |
 |---|---|---|---|
 | Current (text+backend) | 370k | ~12.5GB | 1x |
-| Drop backend_kv (Level 1) | 370k | ~6.2GB | 2x |
 | Shed old reasoning | ~50k (responses only) | ~1.7GB | 7x |
-| **Both combined** | **~50k** | **~0.85GB** | **14x** |
 
-With 14x reduction, the 30GB arena could hold ~35 checkpoints instead
-of ~2.5. Arena exhaustion, fragmentation, and bad_alloc would all
-disappear for typical workloads.
+(The original table's "Drop backend_kv (Level 1)" and "Both combined / 14x"
+rows depended on the rejected Level 1 — see the correction above — and are
+removed. Shedding alone is the remaining lever.)
+
+With 7x reduction, the 30GB arena could hold ~18 checkpoints instead of
+~2.5. Arena exhaustion and bad_alloc would disappear for typical workloads;
+fragmentation is handled separately by arena compaction.
 
 #### Implementation
 
@@ -640,142 +479,6 @@ disappear for typical workloads.
   the model can still reference conclusions from old turns
 - This is strictly better than the current behavior (full eviction of
   entire continuations, which loses EVERYTHING including responses)
-
-
-## Post-Thinking Sampler — Dynamic Sampling Parameter Switching
-
-> **Status: shipped** (`dd5534a5`). The preset, the CLI flags, the HTTP `post_thinking` object, the
-> per-phase fallback and the `--greedy` interaction below all landed as designed.
->
-> **Measured outcome (2026-09-12)**, Qwen3.8-27B QUASAR NVFP4 with the thinking phase frozen at 1.0;
-> see [the post-thinking temperature study](docs/maintainer/post-thinking-temperature.md):
->
-> - the premise below - that a lower answer-phase temperature substantially reduces errors in answers
->   and tool calls - **did not reproduce on this stack**: no measurable accuracy or format effect on
->   BFCL v4 tool calling (1240 paired samples, exact McNemar p = 0.79), AIME (60 problems per arm) or
->   IFBench (300 samples per arm);
-> - the measurable effect is **reproducibility**: at identical numerical-route variation, long
->   free-form answers became markedly more repeatable at the cold emission (100% to 62.5% distinct),
->   while short structured output is insensitive at any temperature;
-> - the registered value is therefore a **reliability** setting rather than a quality one, and the
->   study recommends reviewing the default - mirroring the thinking sampler, with 0.2 as an explicit
->   opt-in;
-> - ReSET-style entropy-gated temperature is **deferred** for this setup: the symbolic damage pool it
->   targets is not observable here, and this artifact is already quantization-aware trained.
->
-> The design below is retained as written; only its premise is qualified by measurement.
-
-> **Attribution:** Based on [vLLM PR #52876](https://github.com/vllm-project/vllm/pull/52876),
-> which proposes separate post-thinking sampling parameters for reasoning models.
-
-### Problem
-
-With `--thinking` enabled, a single set of sampling parameters is used for the
-entire generation: both the reasoning block AND the final answer.
-
-For Qwen3-27B, the optimal parameters differ substantially between phases:
-
-| Phase | Optimal temp | Why |
-|---|---|---|
-| Reasoning (`...`) | 0.9–1.0 | High temp avoids reasoning loops and repetition |
-| Final answer (after ``) | 0.2 | Low temp gives precise, reliable output and tool calls |
-
-Using temp=0.9 throughout: reasoning is healthy but final answers are error-prone.
-Using temp=0.2 throughout: final answers are clean but reasoning can loop/stall.
-
-### ninfer's Existing Infrastructure
-
-ninfer already has the building blocks:
-- `SamplingMode::Thinking` vs `SamplingMode::NonThinking` presets (in `package.cpp`)
-- `OutputChannel::Content` vs `OutputChannel::Reasoning` — the engine tracks
-  which channel it's currently generating to
-- `ModelSamplingDefaults` with separate `thinking` and `non_thinking` presets
-- Thinking state tracking (`model_thinking_tokens`, thinking budget, `</think>` detection)
-
-What's missing: the sampler is resolved **once** at request submission
-(`resolve_sampling`) and used for the entire generation. There's no
-dynamic switch when the model transitions from reasoning to content.
-
-### Proposed Implementation
-
-1. Add `SamplingPreset post_thinking` to `ModelSamplingDefaults`:
-   ```
-   constexpr ModelSamplingDefaults kQwen3_8Defaults{
-       .thinking       = {.temperature = 1.0F, .top_k = 20, .top_p = 0.95F, ...},
-       .post_thinking  = {.temperature = 0.2F, .top_k = 20, .top_p = 0.95F, ...},
-       .non_thinking   = {.temperature = 0.7F, .top_k = 20, .top_p = 0.80F, ...},
-   };
-   ```
-
-2. In the decode loop, when `` is detected (the engine already
-   detects this for `OutputChannel` transitions), switch the active
-   sampler from `thinking` to `post_thinking`.
-
-3. CLI flags:
-   - `--post-thinking-temperature 0.2`
-   - `--post-thinking-top-p 0.95`
-   - `--post-thinking-top-k 20`
-   - Or a combined `--post-thinking-sampler temp=0.2,top_p=0.95,top_k=20`
-
-4. API: `post_thinking` field in request options (same as vLLM PR).
-
-5. Backward compatible: if no `post_thinking` preset is configured,
-   behavior is unchanged (thinking sampler used throughout).
-
-### Why This Matters for Our Setup
-
-Our production server runs with `--temperature 0.9 --top-p 0.95 --top-k 20`
-for the entire generation. The vLLM PR author tested specifically with
-Qwen 3.8 27B and found:
-- temp=0.9 during reasoning: correct, avoids loops
-- temp=0.2 after reasoning: significantly fewer errors in answers and tool calls
-
-This is a small, clean change that fits naturally into ninfer's existing
-thinking/non_thinking architecture. The engine already knows when it
-transitions from `OutputChannel::Reasoning` to `OutputChannel::Content`.
-
-## Deployment verification (strix, 2026-09-11)
-
-Both changes are deployed together as `4bab2c35` (`b432a107` jinja cutover +
-`3c0b4dc5` tolerant parser cherry-picked onto it). The prod tree
-`/home/zenz/ninfer` is reset to that commit and rebuilt there.
-
-- Build: `ninfer-serve` plus `ninfer_tool_call_parser_test`,
-  `ninfer_jinja_template_test`, `ninfer_qwen3_6_froggeric_render_test` and
-  `ninfer_qwen3_6_jinja_frontend_render_test` all build and run clean on the box:
-  parser `ok`, engine parity `ok (33 contexts)`, froggeric contract all checks,
-  frontend `ok (84 renders, 15 skipped)`.
-- Live service: the previous instance had been wedged for about six hours
-  (`materializing=1` with every other counter at zero, `/health` and inference
-  both returning an empty reply). That predates this work and is independent of it
-  (the process was the old binary, 13 h uptime). A restart cleared it and put the
-  new build live: `/health` 200 after 18 s, model alias `qwen3.8-27b` serving.
-- `~/.config/ninfer.conf` now points `--chat-template` at
-  `froggeric_v225_chat_template.jinja` (backup kept beside it), because the v22
-  fixture is deleted by this change.
-- Tool-leak A/B battery, run against the new build: 20/20 requests HTTP 200, all
-  four conditions returned structured tool calls, zero marker text in content, and
-  `D_notools` (the pi-plan incident shape) is RECOVERED 5/5. No transient
-  materialization 500s in this run.
-
-Regression this deploy surfaced: the first attempt reset the prod tree to the jinja
-branch, which does not contain the deployed tolerant parser, so `D_notools` leaked
-5/5. The parser fix is now cherry-picked onto the jinja branch; anyone deploying
-from a feature branch must check `git merge-base --is-ancestor <deployed> <target>`
-first instead of assuming the tree already carries it.
-
-Still open:
-- The qwen3.8 artifact embeds the old template; rebuilding it needs the BF16 source
-  checkpoint, which is not on this Mac. Until then `kFroggericV22DeployedTemplateDigest`
-  stays in the registry. The live deployment overrides the embedded template with
-  `--chat-template`, so it is not on the serving path today.
-- `ninfer_qwen3_6_frontend_test` cannot run on strix: it wants a checkpoint under
-  `/home/neroued/models/...` that does not exist on that box. Environmental, and it
-  fails before rendering.
-- The template knobs the frontend does not expose (`tool_call_format`,
-  `auto_disable_thinking_with_tools`, `max_tool_arg_chars`, `max_tool_response_chars`)
-  remain covered by the raw engine suite only.
-
 
 > **Reconciled with the standing plan:** the strip-invariance result below concerns the
 > GDN recurrent state, which is position-independent — that part stands. It does NOT
@@ -850,8 +553,11 @@ When enabled, on request completion with reasoning tokens detected:
 
 1. **Spill to host KV:** Only spill text_kv for the prompt prefix (before any
    thinking block). Don't spill thinking + answer text_kv (RoPE-invalid).
-   Don't spill backend_kv (GDN replay records — not needed for forward gen,
-   and GDN state is in the state image).
+   Don't spill the thinking + answer range of backend_kv either — it is the
+   MTP module's KV (see the correction in the Architecture Optimization
+   section), and MTP causally attends over that range, so it has the same
+   position-binding problem; the cost is degraded MTP drafting until the
+   range is re-prefilled, which is acceptable for stripped/cancelled turns.
 
 2. **State image:** Always preserve (GDN recurrent state is position-independent
    and fully reusable).

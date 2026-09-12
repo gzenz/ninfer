@@ -4,6 +4,7 @@
 #include "core/paged_kv_cache.h"
 #include "core/transfer_work.h"
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -209,6 +210,24 @@ public:
         return capacity_bytes_ - occupied_bytes_;
     }
 
+    // Fragmentation observability: the free space is a set of non-adjacent extents
+    // (coalesced on every free, but live allocations partition what coalescing can
+    // merge). These accessors let /stats report how shredded the free space is
+    // instead of relying on log-grepped allocation failures.
+    [[nodiscard]] std::size_t largest_free_extent_bytes() const noexcept;
+    [[nodiscard]] std::size_t free_extent_count() const noexcept { return free_extents_.size(); }
+
+    // Cumulative allocator counters (monotonic, read by /stats from the serve thread):
+    // single_alloc_failures counts single-extent allocations that failed despite
+    // sufficient TOTAL free space (the fragmentation signature); compactions count
+    // arena compactions that repaired it.
+    [[nodiscard]] std::uint64_t single_alloc_failures() const noexcept {
+        return single_alloc_failures_.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] std::uint64_t compaction_count() const noexcept {
+        return compactions_.load(std::memory_order_relaxed);
+    }
+
     [[nodiscard]] const HostKVPageLayout* layout_for(const KVPageGeometry& geometry) const noexcept;
 
     [[nodiscard]] bool can_allocate(const HostKVPageLayout& layout,
@@ -216,13 +235,16 @@ public:
     [[nodiscard]] std::optional<HostKVAllocation> allocate(const HostKVPageLayout& layout,
                                                            std::uint32_t pages) noexcept;
 
-    // Allocate across multiple free extents when no single extent is large enough.
-    // Returns a vector of allocations whose total page count equals `pages`, or
-    // an empty vector if the total free space is insufficient. Each allocation
-    // covers a contiguous range of pages; the caller must map page offsets to
-    // the correct allocation when copying.
-    [[nodiscard]] std::vector<HostKVAllocation>
-    allocate_multi(const HostKVPageLayout& layout, std::uint32_t pages) noexcept;
+    // Compact the arena: relocate every live allocation into a contiguous block
+    // starting at offset 0 so all free space merges into one trailing extent.
+    // Returns true if any allocation was relocated (false when the free space is
+    // already a single extent or nothing needed to move).
+    //
+    // The caller must guarantee that no in-flight copy references arena memory
+    // (synchronize the transfer stream first): compaction moves live host bytes
+    // and any data pointer taken before the call is invalidated. Views in this
+    // codebase are computed on demand, so none survive across a compaction.
+    [[nodiscard]] bool compact() noexcept;
 
     [[nodiscard]] std::optional<HostKVAllocationRecipe>
     plan_after_releases(std::span<const HostKVAllocationHandle> proposed_releases,
@@ -281,6 +303,8 @@ private:
     std::vector<std::uint32_t> free_descriptors_;
     std::vector<FreeExtent> free_extents_;
     std::uint64_t revision_ = 1;
+    std::atomic<std::uint64_t> single_alloc_failures_{0};
+    std::atomic<std::uint64_t> compactions_{0};
 };
 
 } // namespace ninfer

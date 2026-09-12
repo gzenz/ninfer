@@ -417,6 +417,87 @@ int exercise_layout_and_transfer(ninfer::DeviceContext& context, ninfer::KVPageG
     return failures;
 }
 
+// Arena compaction: interleaved live blocks shard the free space into extents
+// that coalescing cannot merge. A single-extent allocation then fails despite
+// sufficient total free (the incident signature); compact() relocates the live
+// blocks so the free space becomes one contiguous extent.
+int exercise_compaction() {
+    int failures = 0;
+    const std::string label = "[compaction]";
+
+    const ninfer::KVPageGeometry geometry{
+        .device_plane_order = ninfer::PagedKVPlaneOrder::PageMajor,
+        .planes             = {{ninfer::DType::BF16, 1, 16, 256}},
+    };
+    const ninfer::HostKVPageLayout layout = ninfer::plan_host_kv_page_layout(geometry);
+    const std::size_t stride              = layout.page_stride;
+    constexpr std::uint32_t kPages        = 64;
+    const ninfer::HostKVPageLayout layouts[] = {layout};
+    ninfer::HostKVArena arena(stride * kPages,
+                              std::span<const ninfer::HostKVPageLayout>(layouts));
+
+    // Eight 8-page blocks fill the arena; freeing two interleaved blocks leaves
+    // two 8-page holes with live blocks on both sides.
+    std::vector<ninfer::HostKVAllocation> blocks;
+    for (std::uint32_t i = 0; i < 8; ++i) {
+        auto block = arena.allocate(layout, 8);
+        if (!block) {
+            failures += expect(false, label + " fixture allocation failed");
+            return failures;
+        }
+        blocks.push_back(std::move(*block));
+    }
+    const auto stamp = [&](std::size_t i, std::uint8_t tag) {
+        auto view = arena.writable_view(blocks[i]);
+        std::memset(view.data(), tag, stride * blocks[i].page_count());
+    };
+    for (std::size_t i = 0; i < blocks.size(); ++i) { stamp(i, static_cast<std::uint8_t>(0x10 + i)); }
+
+    blocks[1].release();
+    blocks[5].release();
+    failures += expect_size(arena.free_extent_count(), 2, label + " interleaved free extents");
+    failures += expect_size(arena.largest_free_extent_bytes(), stride * 8,
+                            label + " largest free extent");
+
+    // 12 pages fit the total free (16) but no single extent (8): the
+    // fragmentation signature.
+    const std::uint64_t failures_before = arena.single_alloc_failures();
+    auto probe                          = arena.allocate(layout, 12);
+    failures += expect(!probe.has_value(), label + " fragmented single allocation succeeded");
+    failures += expect_size(arena.single_alloc_failures(), failures_before + 1,
+                            label + " fragmentation counter");
+
+    // Compact: live blocks pack to the front, free space becomes one extent.
+    failures += expect(arena.compact(), label + " compact reported no work");
+    failures += expect_size(arena.free_extent_count(), 1, label + " post-compact extents");
+    failures += expect_size(arena.largest_free_extent_bytes(), arena.free_bytes(),
+                            label + " post-compact free space");
+    failures += expect_size(arena.compaction_count(), 1, label + " compaction counter");
+
+    // The data moved with the descriptors.
+    for (std::size_t i = 0; i < blocks.size(); ++i) {
+        if (i == 1 || i == 5) { continue; }  // released
+        auto view = arena.view(blocks[i]);
+        const auto* bytes = static_cast<const std::uint8_t*>(view.data());
+        bool ok = true;
+        for (std::size_t j = 0; j < stride * blocks[i].page_count() && ok; ++j) {
+            ok = bytes[j] == static_cast<std::uint8_t>(0x10 + i);
+        }
+        failures += expect(ok, label + " relocated block data");
+    }
+
+    // The allocation that failed now succeeds from the contiguous free space.
+    auto repaired = arena.allocate(layout, 12);
+    failures += expect(repaired.has_value(), label + " allocation failed after compaction");
+
+    // Full release returns the whole arena; a contiguous arena needs no work.
+    for (auto& block : blocks) { if (block.valid()) { block.release(); } }
+    if (repaired) { repaired->release(); }
+    failures += expect_size(arena.free_bytes(), stride * kPages, label + " full release");
+    failures += expect(!arena.compact(), label + " compact on contiguous arena did work");
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -456,6 +537,7 @@ int main() {
                     },
             },
             "HeadMajor");
+        failures += exercise_compaction();
         if (failures != 0) {
             std::cerr << failures << " Paged KV physical-container checks failed\n";
             return 1;

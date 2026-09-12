@@ -5902,28 +5902,33 @@ void ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index) no
         std::vector<HostKVAllocation> backend_allocations;
         if (kv_copy_ok) {
         // Allocate host memory and copy D2H for text KV.
-        // Try single contiguous allocation first; fall back to scatter-gather
-        // (multi-extent) when the arena is fragmented.
+        // A single contiguous extent is required; when the arena is fragmented
+        // (total free fits but no single extent does), compact it and retry.
         {
             std::optional<HostKVAllocation> single =
                 host_kv_arena->allocate(*text_layout, text_pages);
-            if (single) {
-                text_allocations.push_back(std::move(*single));
-            } else {
-                std::fprintf(stderr, "[safety-spill] multi-extent: single failed, trying scatter-gather "
-                             "need=%zu free=%zu\n",
-                             text_bytes, host_kv_arena->free_bytes());
-                text_allocations = host_kv_arena->allocate_multi(*text_layout, text_pages);
-                if (text_allocations.empty()) {
-                    std::fprintf(stderr, "[safety-spill] FAIL: text allocate (fragmentation) need=%zu free=%zu\n",
-                                 text_bytes, host_kv_arena->free_bytes());
-                    return;
+            if (!single && host_kv_arena->free_bytes() >= text_bytes) {
+                // Fragmentation: repair it by relocating live extents so the free
+                // space becomes one contiguous region, then retry. The
+                // transfer-stream sync guarantees no in-flight copy references
+                // arena memory while it is moved.
+                std::fprintf(stderr,
+                             "[safety-spill] compact: text single failed need=%zu free=%zu extents=%zu\n",
+                             text_bytes, host_kv_arena->free_bytes(),
+                             host_kv_arena->free_extent_count());
+                try { cudaStreamSynchronize(device.transfer_stream); } catch (...) {}
+                if (host_kv_arena->compact()) {
+                    single = host_kv_arena->allocate(*text_layout, text_pages);
                 }
-                std::fprintf(stderr, "[safety-spill] multi-extent OK: %zu allocations for %u pages\n",
-                             text_allocations.size(), text_pages);
             }
+            if (!single) {
+                std::fprintf(stderr, "[safety-spill] FAIL: text allocate need=%zu free=%zu\n",
+                             text_bytes, host_kv_arena->free_bytes());
+                return;
+            }
+            text_allocations.push_back(std::move(*single));
         }
-        // Copy D2H for text KV, iterating over allocations (scatter-gather).
+        // Copy D2H for text KV.
         // If device pages are unavailable (device_replica cleared by a prior
         // release_reference), the unit cannot be completed and nothing is retained.
         kv_copy_ok = kv_copy_ok && !text_allocations.empty();
@@ -6003,20 +6008,26 @@ void ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index) no
                          index, backend_pages);
             std::optional<HostKVAllocation> single =
                 host_kv_arena->allocate(*backend_layout, backend_pages);
-            if (single) {
-                backend_allocations.push_back(std::move(*single));
-            } else {
-                backend_allocations = host_kv_arena->allocate_multi(*backend_layout, backend_pages);
-                if (backend_allocations.empty()) {
-                    std::fprintf(stderr, "[safety-spill] FAIL: backend allocate (fragmentation) need=%zu free=%zu\n",
-                                 backend_bytes, host_kv_arena->free_bytes());
-                    cudaStreamSynchronize(device.transfer_stream);
-                    return;
+            if (!single && host_kv_arena->free_bytes() >= backend_bytes) {
+                // Same fragmentation repair as the text path. The sync also
+                // covers the in-flight text D2H copies above.
+                std::fprintf(stderr,
+                             "[safety-spill] compact: backend single failed need=%zu free=%zu extents=%zu\n",
+                             backend_bytes, host_kv_arena->free_bytes(),
+                             host_kv_arena->free_extent_count());
+                try { cudaStreamSynchronize(device.transfer_stream); } catch (...) {}
+                if (host_kv_arena->compact()) {
+                    single = host_kv_arena->allocate(*backend_layout, backend_pages);
                 }
-                std::fprintf(stderr, "[safety-spill] backend multi-extent OK: %zu allocations for %u pages\n",
-                             backend_allocations.size(), backend_pages);
             }
-            // Copy D2H for each backend allocation (scatter-gather).
+            if (!single) {
+                std::fprintf(stderr, "[safety-spill] FAIL: backend allocate need=%zu free=%zu\n",
+                             backend_bytes, host_kv_arena->free_bytes());
+                cudaStreamSynchronize(device.transfer_stream);
+                return;
+            }
+            backend_allocations.push_back(std::move(*single));
+            // Copy D2H for the backend allocation.
             // Use physical_page_if_resident to handle demoted backend pages.
             std::uint32_t backend_page_offset = 0;
             for (auto& alloc : backend_allocations) {
@@ -6279,6 +6290,18 @@ void ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index) no
     }
 }
 
+
+std::uint64_t ProgramImplCore::host_kv_single_alloc_failures() const noexcept {
+    return host_kv_arena ? host_kv_arena->single_alloc_failures() : 0;
+}
+
+std::uint64_t ProgramImplCore::host_kv_compaction_count() const noexcept {
+    return host_kv_arena ? host_kv_arena->compaction_count() : 0;
+}
+
+std::uint64_t ProgramImplCore::host_kv_eviction_count() const noexcept {
+    return host_kv_safety_net.eviction_count();
+}
 
 ProgramImplCore::PhysicalReleaseResult
 ProgramImplCore::release_materialization_victim(MaterializationTransaction& transaction,
@@ -10559,13 +10582,14 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
             HostKVSafetyNetEntry entry = host_kv_safety_net.take_pinned(*transaction.host_kv_restore_entry_index);
             transaction.host_kv_restore_entry_index.reset();
             // Text KV restore: materialize pages for the cached prefix and copy H2D.
-            // Handles both single-allocation and scatter-gather (multi-extent) entries.
+            // Entries hold one contiguous allocation per component (the spill
+            // path compacts the arena instead of splitting across extents).
             if (!entry.text_allocations.empty() && restore_frontier > 0) {
                 const std::uint32_t text_pages = kv_pages_for_frontier(restore_frontier);
                 if (text_pages > 0 && text_pages <= entry.text_page_count) {
                     text_kv_addresses->materialize_to_tokens(
                         sequence.kv->text, restore_frontier, device.transfer_stream);
-                    // Copy H2D for each allocation (scatter-gather).
+                    // Copy H2D for the (single) text allocation.
                     std::uint32_t page_offset = 0;
                     for (const auto& alloc : entry.text_allocations) {
                         const std::uint32_t alloc_pages = std::min(alloc.page_count(), text_pages - page_offset);
@@ -10584,7 +10608,7 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
                 }
             }
 
-            // Backend KV restore (handles both single and scatter-gather).
+            // Backend KV restore.
             if (!entry.backend_allocations.empty() && sequence.kv->backend && backend_kv_addresses) {
                 const std::uint32_t backend_frontier =
                     speculative_backend == SpeculativeBackend::Mtp && restore_frontier > 0
@@ -10594,7 +10618,7 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
                 if (backend_pages > 0 && backend_pages <= entry.backend_page_count) {
                     backend_kv_addresses->materialize_to_tokens(
                         *sequence.kv->backend, backend_frontier, device.transfer_stream);
-                    // Copy H2D for each allocation (scatter-gather).
+                    // Copy H2D for the (single) backend allocation.
                     std::uint32_t backend_page_offset = 0;
                     for (const auto& alloc : entry.backend_allocations) {
                         const std::uint32_t alloc_pages = std::min(alloc.page_count(),
@@ -12928,6 +12952,14 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
         // instead of hiding them from the occupancy the budget governs.
         out.host_kv_occupied_bytes =
             host_kv_arena->occupied_bytes() + host_kv_safety_net.retained_state_bytes();
+        out.host_kv_free_bytes                  = host_kv_arena->free_bytes();
+        out.host_kv_largest_free_extent_bytes   = host_kv_arena->largest_free_extent_bytes();
+        out.host_kv_free_extent_count           = host_kv_arena->free_extent_count();
+        out.host_kv_fragmentation_ratio =
+            out.host_kv_free_bytes > 0
+                ? static_cast<double>(out.host_kv_largest_free_extent_bytes) /
+                      static_cast<double>(out.host_kv_free_bytes)
+                : 0.0;
     }
     return out;
 }

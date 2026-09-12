@@ -1118,6 +1118,9 @@ public:
             context_stats_.pressure_maximal_fallback_selections;
         out.admission_catalog_hits        = context_stats_.admission_catalog_hits;
         out.admission_safety_net_restores = program.safety_net_restore_count();
+        out.host_kv_single_alloc_failures = program.host_kv_single_alloc_failures();
+        out.host_kv_compactions           = program.host_kv_compaction_count();
+        out.host_kv_evictions             = program.host_kv_eviction_count();
         out.historical_fork_hits            = context_stats_.historical_fork_hits;
         out.actual_context_transfer_seconds = context_stats_.actual_context_transfer_seconds;
 

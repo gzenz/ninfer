@@ -416,7 +416,7 @@ def parse_serve_log(path, skip_lines=0):
         "restore_started", "restore_completed", "restore_failed",
         "safety_find_hit", "safety_find_miss", "max_net_entries",
         "worker_crash", "bad_alloc", "capture_skip", "restore_skip",
-        "refind_hit", "evict_smallest", "multi_extent_ok", "admit_session",
+        "refind_hit", "evict_smallest", "compact", "admit_session",
         "rewrite_prefix_hit", "rewrite_restore_fail", "worker_recover",
         "private_turn_closure", "tool_calls_done",
         "materialize_fallback", "materialize_safety_hit",
@@ -451,7 +451,7 @@ def parse_serve_log(path, skip_lines=0):
                     if "ckpt_valid=1" in line: d["spill_ckpt_ok"] += 1
                     elif "ckpt_valid=0" in line: d["spill_ckpt_missing"] += 1
                 if "[safety-spill] FAIL" in line: d["spill_fail"] += 1
-                if "[safety-spill] multi-extent OK" in line or "[safety-spill] backend multi-extent OK" in line: d["multi_extent_ok"] += 1
+                if "[safety-spill] compact:" in line: d["compact"] += 1
                 if "WORKER CRASH" in line: d["worker_crash"] += 1
                 if "std::bad_alloc" in line: d["bad_alloc"] += 1
                 if "[capture] skip zero-prefill" in line: d["capture_skip"] += 1
@@ -574,8 +574,8 @@ def evaluate(phase_name, sessions, stats0, stats1, log, expect_trash=False):
         v.append(f"FAIL: {incomplete} restores started but not completed (excluding {log['restore_failed']} failures)")
     if log["max_net_entries"] >= 3 and log["restore_completed"] > 2:
         v.append(f"PASS: net accumulated (max={log['max_net_entries']})")
-    if log["multi_extent_ok"] > 0:
-        v.append(f"PASS: {log['multi_extent_ok']} scatter-gather allocations")
+    if log["compact"] > 0:
+        v.append(f"PASS: {log['compact']} arena compactions (fragmentation repaired)")
     if log["capture_skip"] > 0 or log["restore_skip"] > 0:
         v.append(f"PASS: {log['capture_skip'] + log['restore_skip']} capture skips (no crash)")
     if log["refind_hit"] > 0:

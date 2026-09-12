@@ -18,6 +18,8 @@
 
 #include <algorithm>
 
+#include <atomic>
+
 #include <chrono>
 
 #include <cstddef>
@@ -56,16 +58,15 @@ struct HostKVSafetyNetEntry {
 
 
 
-    // Raw host KV allocations from HostKVArena. Text may span multiple
+    // Raw host KV allocations from HostKVArena. Each is a single contiguous
 
-    // allocations (scatter-gather) when the arena is fragmented and no
-
-    // single contiguous block is large enough.
+    // extent: the spill path requires one extent per component and repairs
+    // arena fragmentation by compacting (relocating live extents) instead of
+    // splitting the allocation across extents. The vector keeps the entry
+    // format stable; it holds exactly one allocation per component.
 
     std::vector<HostKVAllocation> text_allocations;
 
-    // Scatter-gather backend KV allocations. Uses allocate_multi when
-    // the arena is fragmented and no single contiguous block is available.
     std::vector<HostKVAllocation> backend_allocations;
 
 
@@ -479,6 +480,12 @@ public:
     [[nodiscard]] std::size_t state_budget_bytes() const noexcept { return state_budget_bytes_; }
     [[nodiscard]] std::size_t retained_state_bytes() const noexcept { return state_retained_bytes_; }
 
+    // Cumulative whole units evicted (spill-path eviction + budget-driven
+    // reclaim). Monotonic; read by /stats from the serve thread.
+    [[nodiscard]] std::uint64_t eviction_count() const noexcept {
+        return evictions_.load(std::memory_order_relaxed);
+    }
+
     // Host KV pages and retained state images share ONE host memory budget. The
     // arena is the other tenant, so it is queried live instead of duplicating the
     // limit: neither pool may consume the other's headroom.
@@ -541,6 +548,7 @@ public:
                          "shared=%zu budget=%zu (smallest-unit-first)\n",
                          victim, victim_cost, entry_state_bytes(entries_[victim]),
                          state_retained_bytes_, shared_occupied_bytes(), state_budget_bytes_);
+            evictions_.fetch_add(1, std::memory_order_relaxed);
             state_retained_bytes_ -= entry_state_bytes(entries_[victim]);
             entries_.erase(entries_.begin() + static_cast<std::ptrdiff_t>(victim));
         }
@@ -624,6 +632,7 @@ public:
 
         if (index >= entries_.size()) { return; }
 
+        evictions_.fetch_add(1, std::memory_order_relaxed);
         state_retained_bytes_ -= (entries_[index].state_bytes +
                                          entries_[index].checkpoint_state_bytes);
         entries_.erase(entries_.begin() + static_cast<std::ptrdiff_t>(index));
@@ -714,6 +723,7 @@ private:
     std::size_t state_retained_bytes_  = 0;
     // Live view of the other tenant of the shared host budget (KV pages).
     const HostKVArena* shared_arena_ = nullptr;
+    std::atomic<std::uint64_t> evictions_{0};
 
 };
 

@@ -258,6 +258,21 @@ std::uint64_t Program<Variant>::safety_net_restore_count() const noexcept {
     return impl_ ? impl_->safety_net_restore_count_ : 0;
 }
 
+template <>
+std::uint64_t Program<Variant>::host_kv_single_alloc_failures() const noexcept {
+    return impl_ ? impl_->host_kv_single_alloc_failures() : 0;
+}
+
+template <>
+std::uint64_t Program<Variant>::host_kv_compaction_count() const noexcept {
+    return impl_ ? impl_->host_kv_compaction_count() : 0;
+}
+
+template <>
+std::uint64_t Program<Variant>::host_kv_eviction_count() const noexcept {
+    return impl_ ? impl_->host_kv_eviction_count() : 0;
+}
+
 
 template <>
 std::optional<ResourcePlan<Variant>>

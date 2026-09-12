@@ -563,6 +563,10 @@ public:
     // Copy a victim continuation's device KV to host RAM before eviction.
     void spill_victim_to_host_kv_safety_net(std::uint32_t index) noexcept;
     [[nodiscard]] std::uint64_t safety_net_restore_count() const noexcept;
+    // Host-KV arena fragmentation counters and safety-net evictions (for /stats).
+    [[nodiscard]] std::uint64_t host_kv_single_alloc_failures() const noexcept;
+    [[nodiscard]] std::uint64_t host_kv_compaction_count() const noexcept;
+    [[nodiscard]] std::uint64_t host_kv_eviction_count() const noexcept;
 
     [[nodiscard]] std::optional<AdmissionCandidate> seal_materialization(
         const AdmissionCandidate& admission, const PreparedPromptData& prompt,

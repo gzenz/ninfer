@@ -63,6 +63,10 @@ struct RenderTrace {
     struct LoopIteration {
         std::string loop;              // iterable expression, e.g. "_msgs"
         std::vector<std::string> vars; // loop variable names
+        // Identifies the one execution of the for statement this iteration belongs to.
+        // A nested loop inside an iteration records its own iterations first, so record
+        // order alone does not group a loop's iterations together.
+        std::size_t invocation = 0;
         std::size_t index = 0;         // position within the iterated sequence
         std::size_t begin = 0;         // output offset at iteration start
         std::size_t end = 0;           // output offset at iteration end
@@ -85,11 +89,15 @@ struct RenderTrace {
     std::vector<PrintSpan> prints;
     // One frame per expression currently being printed by a PrintNode.
     std::vector<std::vector<ValuePart>> value_stack;
+    // Source of loop invocation ids; never reused within one render.
+    std::size_t loop_invocations = 0;
     void clear() {
         loop_iterations.clear();
         prints.clear();
         value_stack.clear();
+        loop_invocations = 0;
     }
+    [[nodiscard]] std::size_t begin_loop() { return ++loop_invocations; }
     void begin_value() { value_stack.emplace_back(); }
     [[nodiscard]] std::vector<ValuePart> end_value() {
         if (value_stack.empty()) { return {}; }
@@ -1547,9 +1555,15 @@ inline json CallExpr::evaluate(Context& context) {
             }
             context.push_scope(scope);
             std::string out;
+            // A macro body renders into its own buffer, so its print and loop offsets
+            // belong to that buffer rather than to the output being traced. Recording
+            // them would publish spans that address the wrong text.
+            RenderTrace* const trace = context.trace();
+            context.set_trace(nullptr);
             for (const auto& node : macro->body) {
                 node->render(context, out);
             }
+            context.set_trace(trace);
             context.pop_scope();
             return out;
     }
@@ -1702,6 +1716,7 @@ struct ForStmt : Node {
         len = filtered_items.size();
         index = 0;
         JINJA_LOG("Render For: Iterating " << len << " items.");
+        const std::size_t invocation = context.trace() ? context.trace()->begin_loop() : 0;
 
         for (const auto& item : filtered_items) {
              json loop_scope;
@@ -1736,6 +1751,7 @@ struct ForStmt : Node {
                  RenderTrace::LoopIteration record;
                  record.loop            = iterable->dump();
                  record.vars            = loop_vars;
+                 record.invocation      = invocation;
                  record.index           = index;
                  record.begin           = iteration_begin;
                  record.end             = out.size();

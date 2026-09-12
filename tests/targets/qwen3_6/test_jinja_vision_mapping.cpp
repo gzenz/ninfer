@@ -7,8 +7,9 @@
 // (an image after a tool result, or after any earlier exchange).
 //
 // The digest-registered template the deployed qwen3.8 artifact embeds is one of the
-// files exercised here: the render oracle suite runs a stand-in for it, and the
-// mapping depends on template shape.
+// files exercised here. The render oracle suite covers the same template shape, but none
+// of its scenarios places an image after the first message, which is why this mapping bug
+// escaped it.
 
 #include "targets/qwen3_6/impl/frontend/chat_template.h"
 #include "targets/qwen3_6/impl/frontend/jinja_chat_render.h"
@@ -140,6 +141,24 @@ int main() {
                       {image_message(ninfer::ChatRole::User, "first: "),
                        text_message(ninfer::ChatRole::Assistant, "seen"),
                        image_message(ninfer::ChatRole::User, "second: ")}});
+    // Two images in one LATE message: the content macro's loop over that message's parts
+    // runs twice inside that iteration, which splits the message loop's records. Both
+    // details are load-bearing - a first-message image is mapped through the preamble path
+    // and a single-image message runs the parts loop once, so neither shape reaches this.
+    {
+        fi::ChatMessage both;
+        both.role = ninfer::ChatRole::User;
+        both.parts.push_back(fi::ChatPart::text_part("both: "));
+        for (int index = 0; index < 2; ++index) {
+            fi::ChatPart image;
+            image.kind = fi::ChatPartKind::Image;
+            both.parts.push_back(std::move(image));
+        }
+        shapes.push_back({"two-images-one-late-message",
+                          {text_message(ninfer::ChatRole::User, "hi"),
+                           text_message(ninfer::ChatRole::Assistant, "hello"),
+                           std::move(both)}});
+    }
 
     int failures = 0;
     int checked  = 0;

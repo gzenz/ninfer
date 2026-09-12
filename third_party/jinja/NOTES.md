@@ -64,6 +64,16 @@ tests/test_jinja_template.cpp (byte-exact against Python jinja2 as oracle).
    an undefined variable was passing straight through it.
 13. `loop.previtem` / `loop.nextitem` added to the loop object; the thinking-toggle
    and reasoning-effort templates group consecutive tool results with them.
+14. `RenderTrace::LoopIteration` carries an `invocation` id, one per executed `for`
+   statement, so the frontend groups a loop's iterations by identity. A loop nested inside
+   an iteration records its own iterations first, so record order alone does not group them
+   and adjacency-based grouping splits the enclosing loop. Verified by
+   `tests/targets/qwen3_6/test_jinja_vision_mapping.cpp`.
+15. Macro bodies render with tracing suspended (`context.set_trace(nullptr)` around the
+   body). A macro renders into its own buffer, so its print and loop offsets address that
+   buffer rather than the traced output, and recording them published spans over the wrong
+   text. Verified by `tests/targets/qwen3_6/test_jinja_vision_mapping.cpp` and
+   `tests/targets/qwen3_6/test_jinja_frontend_render.cpp`.
 
 ## Render environment
 

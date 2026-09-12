@@ -478,7 +478,7 @@ int exercise_compaction() {
     for (std::size_t i = 0; i < blocks.size(); ++i) {
         if (i == 1 || i == 5) { continue; }  // released
         auto view = arena.view(blocks[i]);
-        const auto* bytes = static_cast<const std::uint8_t*>(view.data());
+        const auto* bytes = reinterpret_cast<const std::uint8_t*>(view.data());
         bool ok = true;
         for (std::size_t j = 0; j < stride * blocks[i].page_count() && ok; ++j) {
             ok = bytes[j] == static_cast<std::uint8_t>(0x10 + i);

@@ -112,6 +112,8 @@ public:
     [[nodiscard]] PublishedOutput commit_preview();
     [[nodiscard]] std::vector<GeneratedToolCall> take_tool_calls() noexcept;
     [[nodiscard]] std::uint32_t reasoning_tokens() const noexcept;
+    // True once the reasoning block has closed for a session that started in reasoning.
+    [[nodiscard]] bool reasoning_closed() const noexcept;
     [[nodiscard]] ThinkingBudgetStats thinking_stats() const noexcept;
     [[nodiscard]] std::optional<std::string> matched_stop_string() const;
 

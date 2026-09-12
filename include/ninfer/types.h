@@ -146,6 +146,20 @@ enum class SamplingMode : std::uint8_t {
     NonThinking,
 };
 
+// Generation phase for sampling-preset selection. PostThinking is only reachable from Thinking:
+// it applies from the token after the model closes its reasoning block.
+enum class SamplingPhase : std::uint8_t {
+    Thinking,
+    PostThinking,
+    NonThinking,
+};
+
+// Phase a request starts in, derived from whether thinking is enabled.
+[[nodiscard]] constexpr SamplingPhase initial_sampling_phase(SamplingMode mode) noexcept {
+    return mode == SamplingMode::Thinking ? SamplingPhase::Thinking
+                                          : SamplingPhase::NonThinking;
+}
+
 // Immutable model-owned values used when a request does not override a sampling field. Seed is
 // deliberately excluded: it is an execution choice rather than a model recommendation.
 struct SamplingPreset {
@@ -159,10 +173,22 @@ struct SamplingPreset {
 
 struct ModelSamplingDefaults {
     SamplingPreset thinking;
+    SamplingPreset post_thinking;
     SamplingPreset non_thinking;
+    // Set by a model that registers a real post-thinking preset. The Engine switches to
+    // post_thinking sampling only when this is true and thinking is enabled.
+    bool has_post_thinking = false;
 
-    [[nodiscard]] constexpr const SamplingPreset& for_mode(SamplingMode mode) const noexcept {
-        return mode == SamplingMode::Thinking ? thinking : non_thinking;
+    [[nodiscard]] constexpr const SamplingPreset& for_phase(SamplingPhase phase) const noexcept {
+        switch (phase) {
+            case SamplingPhase::Thinking:
+                return thinking;
+            case SamplingPhase::PostThinking:
+                return post_thinking;
+            case SamplingPhase::NonThinking:
+                return non_thinking;
+        }
+        return non_thinking;
     }
 };
 
@@ -216,6 +242,9 @@ struct ThinkingControlOptions {
 
 struct ExecutionOptions {
     SamplingOverrides sampling;
+    // Overrides that apply from the token after the model closes its reasoning block. Omitted
+    // fields fall back to the model's post_thinking preset.
+    SamplingOverrides post_thinking_sampling;
     std::uint32_t requested_output_tokens = 0;
     bool allow_prefix_reuse               = true;
     ThinkingControlOptions thinking;

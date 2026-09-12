@@ -186,6 +186,9 @@ struct GenerationRequest {
     ninfer::PromptContinuationMode continuation = ninfer::PromptContinuationMode::NewAssistantTurn;
     bool allow_engine_automatic_shared_prefixes = true;
     SamplingParams sampling;
+    // Overrides applied from the token after the model closes its reasoning block. Omitted
+    // fields fall back to the model's post-thinking preset.
+    SamplingParams post_thinking;
 
     [[nodiscard]] bool uses_tools() const noexcept {
         return !tools.empty() && tool_choice.mode != ToolChoiceMode::None;

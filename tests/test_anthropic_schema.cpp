@@ -88,7 +88,8 @@ ResolvedPromptSemantics semantics(const GenerationRequest& request, bool default
 }
 
 ninfer::PromptInput prompt(const GenerationRequest& request) {
-    return to_prompt_input(request, semantics(request), [](const ContentPart& part) {
+    ServeOptions server;
+    return to_prompt_input(request, server, semantics(request), [](const ContentPart& part) {
         ninfer::OwnedMedia media;
         media.kind =
             part.kind == ContentKind::Image ? ninfer::MediaKind::Image : ninfer::MediaKind::Video;
@@ -414,6 +415,37 @@ int test_thinking_and_count_tokens() {
     return failures;
 }
 
+int test_post_thinking_sampling() {
+    Json body = base_request();
+    body["post_thinking"] = Json{{"temperature", 0.2}, {"top_p", 0.9}, {"top_k", 7}};
+    const GenerationRequest request = parse(body).generation;
+    int failures = check(request.post_thinking.temperature &&
+                             *request.post_thinking.temperature == 0.2 &&
+                             request.post_thinking.top_k &&
+                             *request.post_thinking.top_k == 7,
+                         "post_thinking object parsed");
+    const ninfer::RequestOptions options =
+        to_request_options(request, ServeOptions{}, semantics(request), true);
+    failures += check(options.execution.post_thinking_sampling.temperature &&
+                           *options.execution.post_thinking_sampling.temperature == 0.2F &&
+                           *options.execution.post_thinking_sampling.top_p == 0.9F &&
+                           *options.execution.post_thinking_sampling.top_k == 7,
+                       "post_thinking reaches Engine request options");
+
+    body["post_thinking"] = nullptr;
+    failures += check(!parse(body).generation.post_thinking.temperature,
+                      "post_thinking null treated as unset");
+
+    body["post_thinking"] = "text";
+    failures += check(api_param([&] { (void)parse(body); }) == "post_thinking",
+                      "non-object post_thinking rejected");
+
+    body["post_thinking"] = Json{{"temperature", 3.0}};
+    failures += check(api_param([&] { (void)parse(body); }) == "post_thinking",
+                      "out-of-range post_thinking temperature rejected");
+    return failures;
+}
+
 int test_thinking_history_integrity() {
     constexpr std::string_view thought = "thought";
     const std::string signature        = thinking_signer().sign(thought, 0);
@@ -670,6 +702,7 @@ int main() {
     failures += test_tool_history();
     failures += test_tools();
     failures += test_thinking_and_count_tokens();
+    failures += test_post_thinking_sampling();
     failures += test_thinking_history_integrity();
     failures += test_content_and_cache_hints();
     failures += test_aggregate_and_errors();

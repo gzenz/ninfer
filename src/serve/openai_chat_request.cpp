@@ -785,6 +785,19 @@ void parse_sampling(const Json& body, GenerationRequest& output) {
     sampling.top_k = optional_int(body, "top_k");
     sampling.min_p = get_number(body, "min_p");
 
+    if (body.contains("post_thinking") && !body.at("post_thinking").is_null()) {
+        require_object(body.at("post_thinking"), "post_thinking must be an object", "post_thinking");
+        const Json& pt = body.at("post_thinking");
+        SamplingParams& out = output.post_thinking;
+        out.temperature       = get_number(pt, "temperature");
+        out.top_p             = get_number(pt, "top_p");
+        out.presence_penalty  = get_number(pt, "presence_penalty");
+        out.frequency_penalty = get_number(pt, "frequency_penalty");
+        out.seed              = get_seed(pt);
+        out.top_k             = optional_int(pt, "top_k");
+        out.min_p             = get_number(pt, "min_p");
+    }
+
     if (const std::optional<int> count = optional_int(body, "n")) {
         if (*count != 1) {
             bad_request("n requests multiple completions, while NInfer produces one completion per "

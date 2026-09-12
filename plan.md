@@ -13,6 +13,46 @@
 > - the A/B leak battery now has a permanent no-tools condition (D_notools)
 >   verified RECOVERED end-to-end
 
+## Standing plan — a cache unit is {KV + state}, atomically (invariant for every phase)
+
+A context-cache unit is **the attention KV and the GDN recurrent state together**.
+It is captured, retained, evicted and restored as ONE indivisible unit. Never store,
+evict, retain, budget or restore either half on its own. This overrides any earlier
+text in this plan that describes them as separately storable items.
+
+Why (hybrid topology): the KV covers only the attention (softmax) layers — 7 of 28 in
+the Qwen3.6-27B configuration this plan targets, with the other 21 being GDN/SSM —
+while the ~150 MB state image carries the GDN recurrent state. The split is
+model-specific (the Qwen3.8-27B production configuration is 16 attention of 64); the
+invariant is not. Resuming at position N requires BOTH halves, and neither half is
+independently useful:
+
+- **KV without state cannot resume**, and is not "cheaper than losing both": the
+  attention K/V at position p depends on the GDN layers' output at p, so attention
+  KV is not independently recomputable. Any recompute is a full prefix pass, which
+  rebuilds the GDN state as a by-product and regenerates the KV being kept.
+- **State without KV can only resume while that KV is still device-resident**, so it
+  is not a durable unit and must not be a stored/retained form.
+
+Therefore:
+
+- a partially-retained unit is a **bug, not a degraded cache**: it wastes host memory
+  and it is a correctness hazard, because prefix matching can select it and then
+  restore with a missing half, silently producing a wrong continuation;
+- eviction removes a **whole unit** — there is no "state-only" or "KV-only" victim class;
+- the host budget accounts a unit's **full size** (KV pages + state image) as one number;
+- "which half is expensive" is never an eviction criterion, because the halves have no
+  independent value.
+
+- eviction is **cost-aware, not strict LRU**: re-prefill cost scales with the unit's
+  context length, so reclaim the SMALLEST complete units first and hold on to recent
+  large caches — re-prefilling a big context is far more expensive. Recency is only a
+  tie-breaker between units of comparable size.
+
+Consequences for the host-KV safety net: entries are atomic; never create a partial
+entry; reclaim any pre-existing partial entry first; then reclaim by re-prefill cost
+(smallest unit first, recent large units kept), with recency as the tie-breaker.
+
 ## Context: the template file is a digest label, not executable behavior
 
 Verified state (2026-09-10):
@@ -239,15 +279,33 @@ allocation failures) is **causing the fragmentation it was meant to solve**:
 - 278 FALLBACK (state-only) events as a direct consequence
 - 1 bad_alloc (caught by WORKER OOM handler, server survived)
 
-**Root cause:** The arena allocator does not coalesce adjacent free regions.
-It appears to use a simple free-list or bump allocator that fragments under
-multi-size allocation patterns. The scatter-gather workaround creates the
-multi-size pattern that triggers fragmentation.
+**Root cause (corrected, verified against the deployed tree):** This is NOT a
+missing-coalescing bug. `HostKVArena::insert_free_extent` has coalesced
+adjacent free extents on every free since the safety net landed (2026-08-24),
+and the journal evidence above was collected from a build that includes it.
+The real mechanism is external fragmentation: large live spill entries
+(6-12.5GB each) interleaved with small live entries partition the free space
+into non-adjacent extents, and coalescing can only merge adjacent free
+regions — it cannot merge across a live block. When no single extent is large
+enough, the single-allocation path fails despite sufficient total free. The
+scatter-gather workaround then allocates across multiple extents; when those
+allocations are freed they add more live regions, so under churn the loop is
+self-reinforcing (Finding A's feedback chain holds, driven by live-entry
+interleaving rather than a missing coalesce).
 
-**Fix needed:** Arena allocator must coalesce adjacent free blocks (like a
-proper malloc) or implement compaction when free space is fragmented below
-a threshold. Alternatively, use a slab/buddy allocator that naturally
-avoids fragmentation for power-of-two allocation sizes.
+**Fix needed:** Coalescing is not the fix — it already exists and is not the
+gap. The real options, in order of directness:
+1. **Compaction:** when the fragmentation ratio (largest free extent / total
+   free) drops below a threshold, relocate live extents to the back of the
+   arena (copy + repoint) so free space re-merges into one contiguous
+   region. This is the only option that can fix external fragmentation
+   caused by live entries.
+2. **Uniform entry sizes:** make spill entries smaller and uniform so free
+   holes fit each other — the Level 1 "drop backend_kv" change below does
+   exactly this (12.5GB -> 6.2GB entries, half the size and more uniform).
+3. **Buddy/slab allocator:** naturally avoids fragmentation for
+   power-of-two sizes, but is a larger rewrite for a problem 1+2 already
+   address.
 
 ### Finding B — evict-smallest evicts only ONE entry
 
@@ -280,13 +338,74 @@ loses KV and causes re-prefills. The bad_alloc at the end of this chain
 was caught by the OOM handler (server survived), but the re-prefills
 (278 FALLBACK events) are the real cost.
 
-### Verification after fix
+### Fragmentation measurement — extend the existing `/stats` endpoint
 
-- Arena should reach 0 single-allocation failures when free >= need
-- Scatter-gather should only fire for genuine large allocations (>50% arena)
-- State-only FALLBACK should only fire when arena is genuinely full
-  (total used >= 90% of capacity), not when fragmented
-- evict-smallest should free enough space for the new allocation in one pass
+No new endpoint: `/stats` (`src/serve/stats_json.cpp`) already exposes
+`host_kv_capacity_bytes` / `host_kv_occupied_bytes`. Add fragmentation
+fields so the fix is measured instead of log-grepped.
+
+Instantaneous (into `MemorySummary`):
+- `host_kv_free_bytes`
+- `host_kv_largest_free_extent_bytes`
+- `host_kv_free_extent_count`
+- `host_kv_fragmentation_ratio` = largest extent / total free (1.0 = one
+  contiguous extent; lower = more shredded). The arena already tracks
+  `free_extents_`; this is a small read-only accessor.
+
+Cumulative counters (plumbed into `RuntimeStats`, incremented at the spill
+path in `program_impl.h`, which today only `fprintf(stderr)`s):
+- `host_kv_single_alloc_failures`
+- `host_kv_scatter_gather_allocations` and `host_kv_scatter_gather_extents`
+  (total extents across all scatter-gather allocations)
+- `host_kv_state_only_fallbacks`
+- `host_kv_evictions` (evict-smallest invocations)
+
+Land the metrics first, before the allocator fix: they are additive and
+give us the "before" baseline immediately.
+
+### Verification after fix (quantified against the metrics above)
+
+- `host_kv_single_alloc_failures` with `host_kv_free_bytes >= need` = 0
+  (incident baseline: 144)
+- `host_kv_scatter_gather_allocations` only fire for genuine large
+  allocations (need > 50% of arena capacity); otherwise 0
+- `host_kv_state_only_fallbacks` only when total used >= 90% of capacity
+  (incident baseline: 278 at ~50% occupancy)
+- evict-smallest frees enough space for the new allocation in one pass
+  (`host_kv_evictions` does not climb to drain the safety net)
+- `host_kv_fragmentation_ratio` stays at or above 0.9 during the evaluation
+  run
+
+### Evaluation — demonstrate the defrag fix in a real scenario
+
+Run the same pressure workload against pre-fix and post-fix builds and
+compare the counters above.
+
+Workload (reproduces the production shape that triggered the incident):
+- one long multi-turn thinking session, 371k tokens / ~1000 messages
+  (drives repeated 6-12.5GB checkpoint spills), plus several small
+  interleaved sessions (~5k tokens each) so the arena holds mixed-size
+  live entries — the exact allocation pattern that produced the 144
+  single-alloc failures and 278 FALLBACKs.
+- 30GB arena, same seed, thinking with `--preserve-reasoning` on.
+
+Method:
+1. Pre-fix build (metrics only): run the workload, poll `/stats` through
+   the run; record worst-case `host_kv_fragmentation_ratio` and the four
+   cumulative counters.
+2. Post-fix build: identical run.
+3. Compare. Pass = all four verification criteria hold in the post-fix run
+   and fail (as in the incident) in the pre-fix run.
+
+Configurations: pre-fix, fix-only, fix + Level 1 (drop `backend_kv`) — the
+third isolates how much of the improvement comes from uniform entry sizes
+versus the allocator change itself.
+
+Fast regression: a `HostKVArena` unit test that replays the mixed-size
+allocate/free sequence (interleaved 6GB / 2MB shapes) and asserts 0
+single-alloc failures with sufficient total free and a fragmentation ratio at
+the threshold. CI-runnable without a GPU; the real-scenario run is the
+end-to-end evidence, the unit test keeps it in the suite.
 
 
 ## Architecture Optimization — Exploit Hybrid SSM+Attention Topology (2026-09-10)
@@ -330,9 +449,24 @@ stores per-token transition records that allow "replaying" GDN computation from 
 arbitrary position. This is useful for branching from a mid-sequence checkpoint but
 is pure overhead for the common case: appending tokens to the end (turn_closure).
 
+> **Atomicity note:** this section decomposes a unit into `text_kv`, `backend_kv` and the
+> state image in order to reason about *what each part is for*. It does NOT license
+> storing, evicting or restoring them separately. Per the standing plan above, the
+> attention KV and the GDN state image are retained and restored as one unit.
+> `backend_kv` is a question about the unit's *internal composition* (whether GDN replay
+> records belong in it for the common forward-generation case) — not a proposal to split
+> state from KV.
+
 ### Three optimization levels
 
 **Level 1 — Drop backend_kv from host spill (keep text_kv + state image):**
+
+> **Compatible with the standing plan — not superseded.** This level keeps `text_kv`
+> (the attention KV) together with the state image, so the retained unit stays atomic. It
+> drops only `backend_kv`, the optional GDN replay records, which the atomicity note above
+> treats as the unit's internal composition rather than as a half of the unit. If this is
+> implemented, the added flag must be named for the dropped replay data (not for a partial
+> unit), and `is_complete_unit()` must continue to accept units without `backend_kv`.
 
 - Arena storage per checkpoint: ~6GB (text only) + ~150MB (state) = ~6.2GB
 - vs current ~12.5GB → **2x more checkpoints fit in the same arena**
@@ -344,6 +478,13 @@ is pure overhead for the common case: appending tokens to the end (turn_closure)
 
 **Level 2 — Drop both text_kv and backend_kv (state image only):**
 
+> **SUPERSEDED by the standing plan (atomic {KV + state} unit).** This level proposes
+> storing the state image WITHOUT its attention KV. Per the invariant that is not a
+> valid cache unit: the attention K/V for a position depends on the hidden state produced
+> by the preceding GDN layers, so it is not recomputable in isolation — the premise here
+> that only the attention layers need re-prefilling must be re-derived before this level
+> can be considered. Do not implement this level as written.
+
 - This is what state-only fallback already does!
 - ~150MB per checkpoint → effectively unlimited checkpoints in arena
 - Turn_closure: restore state image + re-prefill 7 attention layers only
@@ -353,6 +494,13 @@ is pure overhead for the common case: appending tokens to the end (turn_closure)
   a failure mode rather than a deliberate storage strategy
 
 **Level 3 — Don't store text_kv on device either (radical):**
+
+> **SUPERSEDED by the standing plan (atomic {KV + state} unit).** This level proposes
+> storing the state image WITHOUT its attention KV. Per the invariant that is not a
+> valid cache unit: the attention K/V for a position depends on the hidden state produced
+> by the preceding GDN layers, so it is not recomputable in isolation — the premise here
+> that only the attention layers need re-prefilling must be re-derived before this level
+> can be considered. Do not implement this level as written.
 
 - Device KV only holds 7 attention layers' worth of K/V (not 28 layers' text+backend)
 - Same 12.8GB device KV budget → **4x larger context** (555k → ~2.2M tokens)
@@ -496,6 +644,27 @@ disappear for typical workloads.
 
 ## Post-Thinking Sampler — Dynamic Sampling Parameter Switching
 
+> **Status: shipped** (`dd5534a5`). The preset, the CLI flags, the HTTP `post_thinking` object, the
+> per-phase fallback and the `--greedy` interaction below all landed as designed.
+>
+> **Measured outcome (2026-09-12)**, Qwen3.8-27B QUASAR NVFP4 with the thinking phase frozen at 1.0;
+> see [the post-thinking temperature study](docs/maintainer/post-thinking-temperature.md):
+>
+> - the premise below - that a lower answer-phase temperature substantially reduces errors in answers
+>   and tool calls - **did not reproduce on this stack**: no measurable accuracy or format effect on
+>   BFCL v4 tool calling (1240 paired samples, exact McNemar p = 0.79), AIME (60 problems per arm) or
+>   IFBench (300 samples per arm);
+> - the measurable effect is **reproducibility**: at identical numerical-route variation, long
+>   free-form answers became markedly more repeatable at the cold emission (100% to 62.5% distinct),
+>   while short structured output is insensitive at any temperature;
+> - the registered value is therefore a **reliability** setting rather than a quality one, and the
+>   study recommends reviewing the default - mirroring the thinking sampler, with 0.2 as an explicit
+>   opt-in;
+> - ReSET-style entropy-gated temperature is **deferred** for this setup: the symbolic damage pool it
+>   targets is not observable here, and this artifact is already quantization-aware trained.
+>
+> The design below is retained as written; only its premise is qualified by measurement.
+
 > **Attribution:** Based on [vLLM PR #52876](https://github.com/vllm-project/vllm/pull/52876),
 > which proposes separate post-thinking sampling parameters for reasoning models.
 
@@ -606,3 +775,122 @@ Still open:
 - The template knobs the frontend does not expose (`tool_call_format`,
   `auto_disable_thinking_with_tools`, `max_tool_arg_chars`, `max_tool_response_chars`)
   remain covered by the raw engine suite only.
+
+
+> **Reconciled with the standing plan:** the strip-invariance result below concerns the
+> GDN recurrent state, which is position-independent — that part stands. It does NOT
+> license storing the state WITHOUT its attention KV: "arena stores state image only" is
+> not a valid cache unit. A strip-thinking design must retain the attention KV and the
+> GDN state together; what may legitimately change is which *positions* the retained KV
+> covers, not whether the KV is kept.
+
+## Strip-Thinking-Cache — Don't Cache Reasoning KV (from vLLM/SGLang)
+
+> **Attribution:** Based on [vLLM PR #39806](https://github.com/vllm-project/vllm/pull/39806)
+> and [SGLang PR #23315](https://github.com/sgl-project/sglang/pull/23315).
+> Both identified the same problem and implemented the same solution independently.
+
+### The RoPE Position Problem
+
+When a client strips reasoning blocks from subsequent turns (the standard
+convention per DeepSeek/OpenAI API docs), the prefix cache breaks for a
+fundamental reason: **RoPE position shift**.
+
+Answer tokens after thinking have RoPE positional encodings computed at:
+```
+positions [input_len + thinking_len, input_len + thinking_len + answer_len]
+```
+
+In the next turn (without thinking), those same answer tokens appear at:
+```
+positions [input_len, input_len + answer_len]
+```
+
+The positions don't match. RoPE encodings are baked into the attention KV
+cache. The answer KV is **permanently invalid** after stripping thinking —
+not just a prefix-match failure, but a numerical correctness issue.
+
+This applies to YaRN-scaled positions too: YaRN is a scaling factor on
+RoPE positions. The shift is proportional. The problem exists with or
+without YaRN; YaRN doesn't make it better or worse.
+
+### What vLLM and SGLang Do
+
+Both engines added an opt-in flag (vLLM: `cache_reasoning_tokens=False`,
+SGLang: `--strip-thinking-cache`). On request completion with reasoning
+tokens detected:
+
+1. **Prompt prefix blocks** → normal cache path (retain hash for prefix matching)
+2. **Thinking + answer blocks** → immediately evicted (hash removed, blocks freed)
+
+Answer tokens are also stripped because their RoPE positions are mismatched.
+Both engines measured significant improvements:
+- SGLang: +6% cache hit rate, -1s TTFT (QwQ-32B, 2×B300)
+- vLLM: eliminates 1.3–1.6 GB dead branches per turn
+
+### ninfer's Advantage: Hybrid Architecture
+
+The RoPE position problem only affects the **7 attention layers** (25% of
+the model). The **21 GDN/SSM layers** (75%) don't use RoPE at all —
+confirmed in `gdn_mix()` which has no position/RoPE parameters. GDN uses
+`conv1d` + `gated_delta_net` (SSM recurrence), both position-independent.
+
+This means:
+- **Attention KV (text_kv, 7 layers):** NOT reusable after stripping thinking
+  (RoPE position shift). Must re-prefill.
+- **GDN recurrent state (state image, 21 layers):** Fully reusable regardless
+  of thinking token stripping or YaRN. The recurrent state captures all
+  history in a fixed-size tensor.
+
+### Proposed Implementation
+
+Add `--strip-thinking-cache` CLI flag (opt-in, default off).
+
+When enabled, on request completion with reasoning tokens detected:
+
+1. **Spill to host KV:** Only spill text_kv for the prompt prefix (before any
+   thinking block). Don't spill thinking + answer text_kv (RoPE-invalid).
+   Don't spill backend_kv (GDN replay records — not needed for forward gen,
+   and GDN state is in the state image).
+
+2. **State image:** Always preserve (GDN recurrent state is position-independent
+   and fully reusable).
+
+3. **Device KV:** Free thinking + answer KV pages immediately for reuse
+   (same as vLLM/SGLang immediate eviction).
+
+4. **Next turn restore:** Restore GDN state from state image (instant) +
+   re-prefill 7 attention layers for the prompt prefix + answer + new message.
+   Re-prefill cost: 25% of full model (7/28 layers).
+
+### Impact
+
+| Scenario | Without strip | With strip |
+|---|---|---|
+| Normal turn (no cancellation) | turn_closure (0.3s) | Re-prefill 7 layers (~25% compute) |
+| Cancellation turn (reasoning stripped) | Root prefill ALL 28 layers (124s) | Re-prefill 7 layers only (~31s) |
+| Arena storage per checkpoint | ~12.5GB (text+backend) | ~0.15GB (state image only) |
+| Arena capacity (30GB) | ~2.4 entries | ~200 entries |
+
+The trade-off: normal turns become slightly slower (re-prefill 7 layers
+instead of instant turn_closure), but cancellation turns become 4x faster
+(31s instead of 124s), and arena pressure drops by 80x.
+
+For interactive coding sessions where cancellation is common, this is a
+net win. For batch/streaming sessions without cancellation, the default
+(off) preserves the current fast turn_closure behavior.
+
+### Combined with Reasoning Block Shedding
+
+The `--strip-thinking-cache` flag and the reasoning block shedding plan
+are complementary:
+
+- **strip-thinking-cache:** Don't cache thinking+answer KV at all. Handle
+  the client-stripping case (cancellation). Arena stores state image only.
+- **Reasoning block shedding:** Keep thinking in the prompt (preserve_thinking=on),
+  tag and shed old reasoning KV in the engine. Handle the accumulation case.
+  Arena stores text_kv for responses only.
+
+Both reduce arena pressure. Both exploit the GDN/SSM advantage (75% of
+layers unaffected by RoPE position shift). They can be used together or
+independently depending on the workload.

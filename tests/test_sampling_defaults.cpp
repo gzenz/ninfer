@@ -74,6 +74,24 @@ int main() {
     failures += check(same_preset(qwen3_8.thinking, dense_thinking) &&
                           same_preset(qwen3_8.non_thinking, dense_non_thinking),
                       "Qwen3.8-27B defaults mismatch");
+    const ninfer::SamplingPreset dense_post_thinking{
+        .temperature = 0.2F, .top_k = 20, .top_p = 0.95F, .min_p = 0.0F};
+    const ninfer::SamplingPreset moe_post_thinking{
+        .temperature      = 0.2F,
+        .top_k            = 20,
+        .top_p            = 0.95F,
+        .min_p            = 0.0F,
+        .presence_penalty = 1.5F,
+    };
+    failures += check(same_preset(qwen3_6.post_thinking, dense_post_thinking) &&
+                          qwen3_6.has_post_thinking,
+                      "Qwen3.6-27B post-thinking defaults mismatch");
+    failures += check(same_preset(qwen3_8.post_thinking, dense_post_thinking) &&
+                          qwen3_8.has_post_thinking,
+                      "Qwen3.8-27B post-thinking defaults mismatch");
+    failures += check(same_preset(qwen3_6_35.post_thinking, moe_post_thinking) &&
+                          qwen3_6_35.has_post_thinking,
+                      "Qwen3.6-35B-A3B post-thinking defaults mismatch");
     failures += check(same_preset(qwen3_6_35.thinking, moe_thinking) &&
                           same_preset(qwen3_6_35.non_thinking, dense_non_thinking),
                       "Qwen3.6-35B-A3B defaults mismatch");
@@ -81,15 +99,36 @@ int main() {
                       "unknown model received dense-27B sampling defaults");
 
     const ninfer::ResolvedSamplingParameters thinking = ninfer::runtime::resolve_sampling(
-        qwen3_8, ninfer::SamplingMode::Thinking, ninfer::SamplingOverrides{});
+        qwen3_8, ninfer::SamplingPhase::Thinking, ninfer::SamplingOverrides{});
     const ninfer::ResolvedSamplingParameters non_thinking = ninfer::runtime::resolve_sampling(
-        qwen3_8, ninfer::SamplingMode::NonThinking, ninfer::SamplingOverrides{});
+        qwen3_8, ninfer::SamplingPhase::NonThinking, ninfer::SamplingOverrides{});
     failures += check(thinking.temperature == 1.0F && thinking.top_p == 0.95F &&
                           thinking.presence_penalty == 0.0F && thinking.seed == 0,
                       "omitted overrides did not select Qwen3.8 thinking defaults");
     failures += check(non_thinking.temperature == 0.7F && non_thinking.top_p == 0.8F &&
                           non_thinking.presence_penalty == 1.5F,
                       "omitted overrides did not select Qwen3.8 non-thinking defaults");
+
+    const ninfer::ResolvedSamplingParameters post_thinking = ninfer::runtime::resolve_sampling(
+        qwen3_8, ninfer::SamplingPhase::PostThinking, ninfer::SamplingOverrides{});
+    failures += check(post_thinking.temperature == 0.2F && post_thinking.top_p == 0.95F &&
+                          post_thinking.presence_penalty == 0.0F && post_thinking.seed == 0,
+                      "omitted overrides did not select Qwen3.8 post-thinking defaults");
+    failures += check(
+        ninfer::initial_sampling_phase(ninfer::SamplingMode::Thinking) ==
+                ninfer::SamplingPhase::Thinking &&
+            ninfer::initial_sampling_phase(ninfer::SamplingMode::NonThinking) ==
+                ninfer::SamplingPhase::NonThinking,
+        "initial sampling phase did not follow the thinking mode");
+    const ninfer::SamplingOverrides post_overrides{.temperature = 0.5F};
+    const ninfer::ResolvedSamplingParameters post_overridden =
+        ninfer::runtime::resolve_sampling(qwen3_8, ninfer::SamplingPhase::PostThinking,
+                                         post_overrides);
+    failures += check(post_overridden.temperature == 0.5F && post_overridden.top_p == 0.95F,
+                      "post-thinking override did not mix with the phase preset");
+    const ninfer::ModelSamplingDefaults unregistered{};
+    failures += check(!unregistered.has_post_thinking,
+                      "unregistered model advertised a post-thinking preset");
 
     ninfer::SamplingOverrides overrides;
     overrides.temperature       = 0.0F;
@@ -100,7 +139,7 @@ int main() {
     overrides.frequency_penalty = -1.0F;
     overrides.seed              = 123;
     const ninfer::ResolvedSamplingParameters overridden =
-        ninfer::runtime::resolve_sampling(qwen3_8, ninfer::SamplingMode::NonThinking, overrides);
+        ninfer::runtime::resolve_sampling(qwen3_8, ninfer::SamplingPhase::NonThinking, overrides);
     failures += check(overridden.temperature == 0.0F && overridden.top_k == 20 &&
                           overridden.top_p == 0.0F && overridden.presence_penalty == 0.0F &&
                           overridden.frequency_penalty == -1.0F && overridden.seed == 123,
@@ -109,7 +148,7 @@ int main() {
     overrides.top_k = 21;
     failures += check(throws_invalid([&] {
                           (void)ninfer::runtime::resolve_sampling(
-                              qwen3_8, ninfer::SamplingMode::Thinking, overrides);
+                              qwen3_8, ninfer::SamplingPhase::Thinking, overrides);
                       }),
                       "top_k beyond the executable candidate domain was accepted");
     overrides.top_k = 0;
@@ -117,7 +156,7 @@ int main() {
     overrides.temperature = std::numeric_limits<float>::quiet_NaN();
     failures += check(throws_invalid([&] {
                           (void)ninfer::runtime::resolve_sampling(
-                              qwen3_8, ninfer::SamplingMode::Thinking, overrides);
+                              qwen3_8, ninfer::SamplingPhase::Thinking, overrides);
                       }),
                       "non-finite sampling override was accepted");
 

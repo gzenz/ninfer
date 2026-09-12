@@ -157,6 +157,10 @@ private:
 // and validated these values before constructing the runtime request.
 struct ResolvedExecutionOptions {
     ResolvedSamplingParameters sampling;
+    // Resolved at submit time; applied when the model closes its reasoning block.
+    ResolvedSamplingParameters post_thinking_sampling;
+    // Thinking is enabled and the model registered a real post-thinking preset.
+    bool post_thinking_configured = false;
     std::uint32_t requested_output_tokens = 0;
     bool allow_prefix_reuse               = true;
     ThinkingControlOptions thinking;

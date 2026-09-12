@@ -631,6 +631,10 @@ public:
     append_forced_tokens(std::span<const SequenceHandle> sequences,
                          std::span<const TokenId> row_major_tokens, std::uint32_t row_stride,
                          runtime::ExecutionTiming* failed_timing);
+    // Replace the device-lane sampling config mid-generation (thinking -> post-thinking
+    // phase switch). Takes effect from the next decode round.
+    void update_sampling(SequenceHandle sequence,
+                         const runtime::ResolvedSamplingParameters& sampling);
     [[nodiscard]] CommitResult commit(PendingBatch&& pending,
                                       std::span<const runtime::CommitDecision> decisions,
                                       runtime::CommitObservation observation,
@@ -690,9 +694,9 @@ public:
     HostKVSafetyNet host_kv_safety_net;
     std::uint64_t safety_net_restore_count_ = 0;
 
-    // Checkpoint state captures go to the safety net as state-only entries
-    // (unified architecture). The old DroppedCheckpointCapture side store
-    // has been removed.
+    // Checkpoint state is retained only inside a complete {attention KV + GDN state}
+    // unit held by the safety net; there is no state-only capture. The old
+    // DroppedCheckpointCapture side store has been removed.
     std::size_t text_host_kv_page_stride    = 0;
     std::size_t backend_host_kv_page_stride = 0;
     std::unique_ptr<qwen3_6::StateImageDevicePool> state_images;

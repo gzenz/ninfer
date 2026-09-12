@@ -17,9 +17,12 @@
 #include <bit>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <fstream>
+#include <optional>
 #include <future>
 #include <iostream>
 #include <iterator>
@@ -111,16 +114,55 @@ const fi::CompiledChatTemplate& reasoning_effort_template() {
     return value;
 }
 
+FrontendResources resources(const std::string& chat_template = thinking_toggle_template_source());
+
+// Directory holding the official Qwen3.6-27B base checkpoint resources (tokenizer.json,
+// tokenizer_config.json, generation_config.json). NINFER_QWEN3_6_27B_BASE overrides the
+// legacy maintainer-checkout location.
+std::optional<std::filesystem::path> official_base_dir() {
+    static const std::optional<std::filesystem::path> dir =
+        []() -> std::optional<std::filesystem::path> {
+        const auto complete = [](const std::filesystem::path& dir) {
+            return std::filesystem::is_regular_file(dir / "tokenizer.json") &&
+                   std::filesystem::is_regular_file(dir / "tokenizer_config.json") &&
+                   std::filesystem::is_regular_file(dir / "generation_config.json");
+        };
+        if (const char* base = std::getenv("NINFER_QWEN3_6_27B_BASE"); base != nullptr && *base != '\0') {
+            const std::filesystem::path candidate(base);
+            if (complete(candidate)) { return candidate; }
+        }
+        const std::filesystem::path legacy("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16");
+        if (complete(legacy)) { return legacy; }
+        return std::nullopt;
+    }();
+    return dir;
+}
+
+std::string official_tokenizer_file(const char* name) {
+    const auto dir = official_base_dir();
+    if (!dir) {
+        throw std::runtime_error("official Qwen3.6-27B tokenizer resources are unavailable");
+    }
+    return read_file((dir->string() + "/" + name).c_str());
+}
+
+FrontendResources official_resources() {
+    FrontendResources res = resources();
+    res.tokenizer_json         = official_tokenizer_file("tokenizer.json");
+    res.tokenizer_config_json  = official_tokenizer_file("tokenizer_config.json");
+    res.generation_config_json = official_tokenizer_file("generation_config.json");
+    return res;
+}
+
 const fi::Tokenizer& official_tokenizer() {
-    static const std::string tokenizer_json =
-        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/tokenizer.json");
-    static const std::string tokenizer_config_json =
-        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/tokenizer_config.json");
-    static const std::string generation_config_json =
-        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/generation_config.json");
-    static const fi::Tokenizer tokenizer({.tokenizer_json         = tokenizer_json,
-                                          .tokenizer_config_json  = tokenizer_config_json,
-                                          .generation_config_json = generation_config_json});
+    static const fi::Tokenizer tokenizer = [] {
+        const FrontendResources res = official_resources();
+        const fi::TokenizerResources resources{
+            .tokenizer_json         = res.tokenizer_json,
+            .tokenizer_config_json  = res.tokenizer_config_json,
+            .generation_config_json = res.generation_config_json};
+        return fi::Tokenizer(resources);
+    }();
     return tokenizer;
 }
 
@@ -154,7 +196,7 @@ std::string byte_level_symbol(std::uint8_t target) {
     throw std::logic_error("byte-level test symbol is outside one byte");
 }
 
-FrontendResources resources(const std::string& chat_template = thinking_toggle_template_source()) {
+FrontendResources resources(const std::string& chat_template) {
     FrontendResources result;
     result.chat_template_jinja  = chat_template;
     const nlohmann::json tokens = nlohmann::json::array(
@@ -1221,13 +1263,7 @@ int test_literal_control_tokens_with_media() {
             "<|im_start|>user\n<tool_response>\nimported result\n</tool_response><|im_end|>\n",
         "leading tool result was rendered without its user-role envelope");
 
-    FrontendResources official = resources();
-    official.tokenizer_json =
-        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/tokenizer.json");
-    official.tokenizer_config_json =
-        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/tokenizer_config.json");
-    official.generation_config_json =
-        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/generation_config.json");
+    FrontendResources official = official_resources();
     const Frontend frontend = FrontendFactory::create_component(official);
 
     auto text_part = [](std::string text) {
@@ -1372,13 +1408,7 @@ int test_image_resize_rejection_policy() {
 }
 
 int test_explicit_leading_instruction_cache_boundary() {
-    FrontendResources official = resources();
-    official.tokenizer_json =
-        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/tokenizer.json");
-    official.tokenizer_config_json =
-        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/tokenizer_config.json");
-    official.generation_config_json =
-        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/generation_config.json");
+    FrontendResources official = official_resources();
     const Frontend frontend           = FrontendFactory::create_component(official, false);
     constexpr std::string_view stable = "stable cache section.";
     ninfer::ChatMessage system;
@@ -1621,13 +1651,7 @@ int test_terminal_flush(const Frontend& frontend) {
 }
 
 int test_structured_tool_output() {
-    FrontendResources owned = resources();
-    owned.tokenizer_json =
-        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/tokenizer.json");
-    owned.tokenizer_config_json =
-        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/tokenizer_config.json");
-    owned.generation_config_json =
-        read_file("/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16/generation_config.json");
+    FrontendResources owned = official_resources();
     const Frontend frontend = FrontendFactory::create_component(owned);
 
     ninfer::ChatMessage message;
@@ -1688,6 +1712,38 @@ int test_reasoning_split(const Frontend& frontend) {
                       "content channel did not strip the post-thinking separator");
     failures += check(session.reasoning_tokens() == 2,
                       "reasoning token usage did not count accepted reasoning tokens exactly");
+    return failures;
+}
+
+// The post-thinking sampler switch keys off this transition: the output session reports the
+// reasoning block closed only after the round carrying the close marker is committed.
+int test_post_thinking_phase_switch(const Frontend& frontend) {
+    ninfer::ChatMessage message;
+    message.role = ninfer::ChatRole::User;
+    message.parts.push_back(
+        ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x", .media = {}});
+    ninfer::PromptInput input;
+    input.messages.push_back(std::move(message));
+    input.options.continuation    = ninfer::PromptContinuationMode::NewAssistantTurn;
+    input.options.enable_thinking = true;
+    const auto prompt = frontend.prepare(std::move(input));
+    auto session      = frontend.make_output_session(prompt, {});
+
+    int failures = check(!session.reasoning_closed(),
+                         "thinking session reports the reasoning block closed before any output");
+    // Fixture tokens 3+4 decode to the reasoning text, the close marker, and the answer.
+    const std::array<ninfer::TokenId, 2> tokens{3, 4};
+    const auto decision = session.preview_model(tokens, 8, ninfer::FinishReason::OutputLimit);
+    failures += check(decision.accepted_tokens == 2 && !decision.finished(),
+                      "reasoning-close round did not accept both tokens");
+    failures += check(!session.reasoning_closed(),
+                         "reasoning close reported before the preview was committed");
+    const auto output = session.commit_preview();
+    failures += check(session.reasoning_closed(),
+                      "committed close marker did not open the post-thinking phase");
+    failures += check(channel_text(output, ninfer::OutputChannel::Reasoning) == "thought" &&
+                          channel_text(output, ninfer::OutputChannel::Content) == "answer",
+                      "post-thinking round did not route the channels around the close marker");
     return failures;
 }
 
@@ -2169,6 +2225,11 @@ int test_media_preparation_cancellation() {
 } // namespace
 
 int main() {
+    if (!official_base_dir()) {
+        std::cerr << "SKIP: Qwen3.6-27B base tokenizer resources not found; "
+                     "set NINFER_QWEN3_6_27B_BASE to a base-hf-bf16 directory\n";
+        return 77;
+    }
     const FrontendResources owned = resources();
     const Frontend frontend       = FrontendFactory::create_component(owned);
     int failures                  = 0;
@@ -2200,6 +2261,7 @@ int main() {
     failures += test_terminal_flush(frontend);
     failures += test_structured_tool_output();
     failures += test_reasoning_split(frontend);
+    failures += test_post_thinking_phase_switch(frontend);
     failures += test_thinking_budget_control(frontend);
     failures += test_utf8_and_hidden_eos(frontend);
     failures += test_media_cache_reuses_immutable_payload();

@@ -57,7 +57,8 @@ ResolvedPromptSemantics semantics(const GenerationRequest& request) {
 }
 
 ninfer::PromptInput prompt(const GenerationRequest& request) {
-    return to_prompt_input(request, semantics(request), {});
+    ServeOptions server;
+    return to_prompt_input(request, server, semantics(request), {});
 }
 
 ninfer::RequestOptions options(const GenerationRequest& request) {
@@ -118,6 +119,68 @@ int test_request_envelope_and_sampling() {
     malformed["stream_options"] = true;
     failures += check(api_error([&] { (void)parse(malformed); }).param == "stream_options",
                       "malformed stream_options rejected");
+    return failures;
+}
+
+int test_post_thinking_sampling() {
+    int failures = 0;
+    Json body = base_request();
+    body["post_thinking"] = Json{{"temperature", 0.2},
+                                 {"top_p", 0.9},
+                                 {"top_k", 7},
+                                 {"min_p", 0.1},
+                                 {"presence_penalty", 0.5},
+                                 {"frequency_penalty", -0.25},
+                                 {"seed", 42}};
+    const OpenAIChatRequest request = parse(body);
+    failures += check(request.generation.post_thinking.temperature &&
+                          *request.generation.post_thinking.temperature == 0.2 &&
+                          request.generation.post_thinking.top_k &&
+                          *request.generation.post_thinking.top_k == 7 &&
+                          request.generation.post_thinking.min_p &&
+                          *request.generation.post_thinking.min_p == 0.1,
+                      "post_thinking object parsed");
+    const ninfer::RequestOptions translated = options(request.generation);
+    failures += check(translated.execution.post_thinking_sampling.temperature &&
+                          *translated.execution.post_thinking_sampling.temperature == 0.2F &&
+                          *translated.execution.post_thinking_sampling.top_p == 0.9F &&
+                          *translated.execution.post_thinking_sampling.top_k == 7 &&
+                          *translated.execution.post_thinking_sampling.min_p == 0.1F &&
+                          *translated.execution.post_thinking_sampling.presence_penalty ==
+                              0.5F &&
+                          *translated.execution.post_thinking_sampling.frequency_penalty ==
+                              -0.25F &&
+                          *translated.execution.post_thinking_sampling.seed == 42,
+                      "post_thinking reaches Engine request options");
+
+    Json null_body = base_request();
+    null_body["post_thinking"] = nullptr;
+    const OpenAIChatRequest null_request = parse(null_body);
+    failures += check(!null_request.generation.post_thinking.temperature,
+                      "post_thinking null treated as unset");
+
+    Json bad = base_request();
+    bad["post_thinking"] = "text";
+    failures += check(api_error([&] { (void)parse(bad); }).param == "post_thinking",
+                      "non-object post_thinking rejected");
+
+    Json range = base_request();
+    range["post_thinking"] = Json{{"temperature", 3.0}};
+    const OpenAIChatRequest range_request = parse(range);
+    failures += check(
+        api_error([&] { (void)options(range_request.generation); }).param == "post_thinking",
+        "out-of-range post_thinking temperature rejected");
+
+    Json seed_body            = base_request();
+    seed_body["seed"]         = 99;
+    seed_body["post_thinking"] = Json{{"temperature", 0.2}};
+    const OpenAIChatRequest seed_request = parse(seed_body);
+    const ninfer::RequestOptions seed_options = options(seed_request.generation);
+    failures += check(seed_options.execution.sampling.seed &&
+                          *seed_options.execution.sampling.seed == 99 &&
+                          seed_options.execution.post_thinking_sampling.seed &&
+                          *seed_options.execution.post_thinking_sampling.seed == 99,
+                      "omitted post_thinking seed did not inherit the request seed");
     return failures;
 }
 
@@ -686,6 +749,7 @@ int test_common_objects() {
 int main() {
     int failures = 0;
     failures += test_request_envelope_and_sampling();
+    failures += test_post_thinking_sampling();
     failures += test_standard_field_policy();
     failures += test_constrained_decoding_extensions();
     failures += test_tools();

@@ -266,6 +266,12 @@ int main(int argc, char** argv) {
 
         ninfer::RequestOptions request;
         request.execution.sampling                = cli.sampling;
+        request.execution.post_thinking_sampling  = cli.post_thinking_sampling;
+        // An explicit post-thinking seed wins; otherwise the request's seed carries over so both
+        // phases share one random stream.
+        if (!request.execution.post_thinking_sampling.seed) {
+            request.execution.post_thinking_sampling.seed = request.execution.sampling.seed;
+        }
         request.execution.requested_output_tokens = cli.max_new;
         request.execution.thinking.budget         = cli.thinking_budget;
         request.stop.token_ids                    = cli.stop_token_ids;

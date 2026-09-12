@@ -779,6 +779,10 @@ public:
     append_forced_tokens(std::span<const SequenceHandle<Variant>> sequences,
                          std::span<const TokenId> row_major_tokens, std::uint32_t row_stride,
                          runtime::ExecutionTiming* failed_timing = nullptr);
+    // Replace the device-lane sampling config mid-generation (thinking -> post-thinking phase
+    // switch). Takes effect from the next decode round.
+    void update_sampling(SequenceHandle<Variant> sequence,
+                         const runtime::ResolvedSamplingParameters& sampling);
     [[nodiscard]] CommitResult<Variant>
     commit(PendingBatch<Variant>&& pending, std::span<const runtime::CommitDecision> decisions,
            runtime::CommitObservation observation  = runtime::CommitObservation::AllRows,

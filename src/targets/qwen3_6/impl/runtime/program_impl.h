@@ -907,6 +907,13 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
         host_kv_arena = std::make_unique<HostKVArena>(
             plan.context_cache.host_kv_capacity_bytes,
             std::span<const HostKVPageLayout>(layouts.data(), layouts.size()));
+        // Retained state images are host memory exactly like host KV pages, so they
+        // are governed by an explicit byte budget instead of growing as heap. The
+        // budget matches the host KV capacity and the retained bytes are folded into
+        // the reported host occupancy below, so one number reflects the true host
+        // footprint of the context cache.
+        host_kv_safety_net.set_shared_arena(host_kv_arena.get());
+        host_kv_safety_net.set_state_budget_bytes(plan.context_cache.host_kv_capacity_bytes);
         std::size_t minimum_stride = layouts.front().page_stride;
         for (const HostKVPageLayout& layout : layouts) {
             minimum_stride = std::min(minimum_stride, layout.page_stride);
@@ -1806,12 +1813,10 @@ std::vector<qwen3_6::detail::PressureDecision> ProgramImplCore::inspect_pressure
     if (summary.endpoint) { append_checkpoint_successor(summary.endpoint->ref); }
     // Do NOT generate drop successors for rewrite checkpoints.
     // Principle: KV and checkpoint state move together to host, or not at all.
-    // Dropping a rewrite checkpoint (state only, keep KV on device) loses
-    // the checkpoint for the inspect — the follow-up must re-prefill.
-    // Instead, the pressure planner evicts the entire continuation
+    // Dropping a rewrite checkpoint while keeping its KV on device is refused by
+    // design: it would strand the state without its KV, which is not a restorable
+    // unit. Instead, the pressure planner evicts the entire continuation
     // (KV + state together to the safety net) when it needs the slot.
-    // The state-only safety net entry created at drop time (if any) is
-    // merged into the full entry by the spill function.
     // if (summary.rewrite) { append_checkpoint_successor(summary.rewrite->ref); }
     for (const qwen3_6::CheckpointSummary& anchor : summary.long_anchors) {
         append_checkpoint_successor(anchor.ref);
@@ -5422,86 +5427,15 @@ void ProgramImplCore::publish_pressure_host_releases(
         if (sequence == nullptr) {
             throw std::logic_error("checkpoint drop targets a shared pressure owner");
         }
-        bool capture_added_this_work = false;
         for (const runtime::CheckpointRef checkpoint : work.option.dropped_checkpoints) {
-            // Drop-time checkpoint capture: publish_checkpoint_drop releases the
-            // rewrite state image below; copy it to host first so a later
-            // session return can restore the checkpoint via H2D from the safety
-            // net. Device-resident images copy D2H; demoted (HostOnly) images
-            // copy host-to-host from the pool view.
-            //
-            // The captured state goes directly into a state-only
-            // HostKVSafetyNetEntry (not the old
-            // dropped_checkpoint_captures_ side store). The state-only
-            // entry is NOT findable by find() (it has no KV). It is
-            // merged into a full entry by the spill function when the
-            // continuation is later evicted. The continuation stays
-            // catalogued (KV on device) until eviction.
-            // Note: rewrite checkpoints (TurnClosure/ResponseReplay) are no
-            // longer dropped by the pressure planner (Step 3). This branch
-            // is currently unreachable but kept as defensive code in case
-            // rewrite drops are re-enabled in the future.
-            if ((checkpoint.kind == runtime::CheckpointKind::TurnClosure ||
-                 checkpoint.kind == runtime::CheckpointKind::ResponseReplay) &&
-                sequence->rewrite_state && state_store &&
-                state_store->valid(*sequence->rewrite_state) && state_images) {
-                const std::size_t capture_bytes = state_images->host_layout().image_bytes;
-                if (capture_bytes > 0) {
-                    std::vector<std::byte> state_host(capture_bytes);
-                    const StateReplicaResidency residency =
-                        state_store->residency(*sequence->rewrite_state);
-                    bool captured = false;
-                    if (residency == StateReplicaResidency::DeviceOnly ||
-                        residency == StateReplicaResidency::Both) {
-                        const std::int32_t slot =
-                            state_store->physical_slot(*sequence->rewrite_state);
-                        const HostStateImageView capture_view{
-                            .data = state_host.data(),
-                            .layout = &state_images->host_layout()};
-                        state_images->copy_to_host(slot, capture_view, device.transfer_stream);
-                        captured = true;
-                    } else if (const std::optional<qwen3_6::HostStateImageConstView> host_view =
-                                   state_store->host_replica_view(*sequence->rewrite_state);
-                               host_view && host_view->data != nullptr) {
-                        std::memcpy(state_host.data(), host_view->data, capture_bytes);
-                        captured = true;
-                    }
-                    if (captured) {
-                        // Create a state-only safety net entry. The continuation
-                        // stays catalogued (KV on device), so we COPY (not move)
-                        // the matching metadata. The safety-find will match by
-                        // checkpoint_frontier / session_key / compact_prefix.
-                        HostKVSafetyNetEntry entry;
-                        entry.state_only = true;
-                        entry.source_continuation_index = work.continuation_index;
-                        entry.checkpoint_valid = true;
-                        entry.checkpoint_frontier = checkpoint.frontier;
-                        entry.checkpoint_state_host = std::move(state_host);
-                        entry.checkpoint_state_bytes = capture_bytes;
-                        // Copy matching metadata — continuation still needs these.
-                        entry.session_key = sequence->session_key;
-                        entry.execution_frontier = 0;  // no KV spilled
-                        // Remove stale state-only entries before adding.
-                        host_kv_safety_net.remove_state_only_by_index(work.continuation_index);
-                        if (sequence->session_key) {
-                            host_kv_safety_net.remove_state_only(*sequence->session_key);
-                        }
-                        std::fprintf(stderr,
-                                     "[checkpoint-demoted] index=%u frontier=%u ckpt_frontier=%u "
-                                     "state_bytes=%zu\n",
-                                     work.continuation_index,
-                                     sequence->execution_frontier,
-                                     checkpoint.frontier, capture_bytes);
-                        host_kv_safety_net.add(std::move(entry));
-                        capture_added_this_work = true;
-                    }
-                }
-            }
+            // Checkpoint capture is no longer performed here. A cache unit is
+            // {attention KV + GDN state} and is retained whole by the spill path, which
+            // stores the continuation's attention KV together with its state image, or
+            // stores nothing at all. Capturing the state image alone - while the KV
+            // stayed on device - is what grew host memory without bound and is no longer
+            // permitted. If rewrite drops are ever re-enabled, the retention to add here
+            // is a complete-unit spill, not a state-only capture.
             publish_checkpoint_drop(*sequence, checkpoint);
-        }
-        if (capture_added_this_work) {
-            // Complete this work's capture D2H copies before the vectors are held.
-            CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
         }
         delta.removed =
             checked_resource_sum(delta.removed, work.option.checkpoint_drop_effect.removed);
@@ -5863,9 +5797,10 @@ void ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index) no
             return;
         }
 
-        // Check if the arena has enough free capacity for text; if not, evict
-        // LRU safety-net entries until it fits (the old HostKvCache acquire_slab
-        // behavior — a new victim is worth more than the oldest parked one).
+        // Check if the arena has enough free capacity for text; if not, reclaim whole
+        // units until it fits. Reclaim is cost-aware, not LRU: the smallest unit goes
+        // first, because re-prefilling a large context is the most expensive, and a
+        // recently parked large cache is worth keeping. Recency breaks ties only.
         const std::size_t text_bytes = text_layout->page_stride * text_pages;
         const std::size_t needed_total = [&] {
             const HostKVPageLayout* bl =
@@ -5882,8 +5817,6 @@ void ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index) no
             std::size_t reclaimable = 0;
             const std::size_t per_page = text_bytes / std::max(1U, text_pages);
             for (std::size_t i = 0; i < host_kv_safety_net.size(); ++i) {
-                // State-only entries use heap, not arena — no reclaimable bytes.
-                if (host_kv_safety_net.at(i).state_only) { continue; }
                 reclaimable += per_page *
                     (host_kv_safety_net.at(i).text_page_count +
                      host_kv_safety_net.at(i).backend_page_count);
@@ -5891,7 +5824,8 @@ void ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index) no
             if (host_kv_arena->free_bytes() + reclaimable < needed_total) {
                 std::fprintf(stderr,
                              "[safety-spill] FAIL: insufficient capacity even after evicting all "
-                             "(free=%zu reclaimable=%zu need=%zu) — falling back to state-only\n",
+                             "(free=%zu reclaimable=%zu need=%zu) - no room for a complete unit, "
+                             "retaining nothing\n",
                              host_kv_arena->free_bytes(), reclaimable, needed_total);
                 kv_copy_ok = false;
             }
@@ -5914,9 +5848,6 @@ void ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index) no
             for (std::size_t i = 0; i < host_kv_safety_net.size(); ++i) {
                 // Phase 1: only evict unpinned. Phase 2: also evict pinned.
                 if (!pinned_eviction_started && host_kv_safety_net.at(i).pinned) { continue; }
-                // Skip state-only entries: they use heap memory, not arena
-                // memory. Evicting them frees no arena bytes.
-                if (host_kv_safety_net.at(i).state_only) { continue; }
                 const std::uint64_t pages = static_cast<std::uint64_t>(host_kv_safety_net.at(i).text_page_count)
                                           + host_kv_safety_net.at(i).backend_page_count;
                 if (!victim || pages < victim_pages ||
@@ -5958,7 +5889,9 @@ void ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index) no
             else {
                 backend_bytes = backend_layout->page_stride * backend_pages;
                 if (host_kv_arena->free_bytes() < text_bytes + backend_bytes) {
-                    std::fprintf(stderr, "[safety-spill] FAIL: backend capacity free=%zu need=%zu — state-only\n",
+                    std::fprintf(stderr,
+                                 "[safety-spill] FAIL: backend capacity free=%zu need=%zu - no room "
+                                 "for a complete unit, retaining nothing\n",
                                  host_kv_arena->free_bytes(), text_bytes + backend_bytes);
                     kv_copy_ok = false;
                 }
@@ -5992,7 +5925,7 @@ void ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index) no
         }
         // Copy D2H for text KV, iterating over allocations (scatter-gather).
         // If device pages are unavailable (device_replica cleared by a prior
-        // release_reference), skip the KV copy and fall back to state-only entry.
+        // release_reference), the unit cannot be completed and nothing is retained.
         kv_copy_ok = kv_copy_ok && !text_allocations.empty();
         std::fprintf(stderr,
                      "[safety-spill] D2H text: index=%u pages=%u allocations=%zu active=%d\n",
@@ -6033,8 +5966,8 @@ void ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index) no
                     // Some pages have neither device nor host replica.
                     try { cudaStreamSynchronize(device.transfer_stream); } catch (...) {}
                     std::fprintf(stderr,
-                                 "[safety-spill] KV_COPY_SKIP: index=%u — %u device + %u host / %u pages, "
-                                 "falling back to state-only entry\n",
+                                 "[safety-spill] KV_COPY_SKIP: index=%u - %u device + %u host / %u pages, "
+                                 "unit incomplete, retaining nothing\n",
                                  index, resident_pages, host_copy_pages, alloc_pages);
                     text_allocations.clear();
                     kv_copy_ok = false;
@@ -6063,7 +5996,7 @@ void ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index) no
             }
         }
         // Allocate host memory and copy D2H for backend KV if present.
-        // Skip when KV copy failed (state-only fallback).
+        // Skip when the KV copy failed: the unit is incomplete and is not retained.
         if (kv_copy_ok && backend_pages != 0) {
             std::fprintf(stderr,
                          "[safety-spill] D2H backend: index=%u pages=%u\n",
@@ -6126,7 +6059,8 @@ void ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index) no
                         alloc_device_pages, host_kv_arena->writable_view(alloc),
                         device.transfer_stream);
                 } else {
-                    // Pages missing — can't recover. Fall back to state-only.
+                    // Pages missing - not recoverable. The unit is incomplete, so nothing is
+                    // retained rather than storing a half unit.
                     try { cudaStreamSynchronize(device.transfer_stream); } catch (...) {}
                     text_allocations.clear();
                     backend_allocations.clear();
@@ -6213,29 +6147,10 @@ void ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index) no
             }
         }
 
-        // When the checkpoint was dropped (rewrite_checkpoint cleared),
-        // a state-only safety net entry was created at capture time with the
-        // checkpoint state. Merge it into this full entry so the safety
-        // net can serve checkpoint-level restores after eviction.
-        // Match by continuation index first (always available), then by
-        // session_key (for Responses API sessions).
-        if (!checkpoint_valid) {
-            auto sn_entry = host_kv_safety_net.take_state_only_by_index(index);
-            if (!sn_entry && sequence.session_key) {
-                sn_entry = host_kv_safety_net.take_state_only_by_session(
-                    *sequence.session_key);
-            }
-            if (sn_entry) {
-                checkpoint_valid = true;
-                checkpoint_frontier = sn_entry->checkpoint_frontier;
-                checkpoint_state_bytes = sn_entry->checkpoint_state_bytes;
-                checkpoint_state_host = std::move(sn_entry->checkpoint_state_host);
-                std::fprintf(stderr,
-                    "[safety-spill] merged dropped checkpoint state from state-only entry "
-                    "(frontier=%u bytes=%zu)\n",
-                    checkpoint_frontier, checkpoint_state_bytes);
-            }
-        }
+        // The checkpoint state is captured from the sequence's own rewrite state below.
+        // There is no state-only entry class to merge from: a unit is retained as
+        // {attention KV + GDN state} or not at all, so a checkpoint that was dropped
+        // without its KV is not a restorable unit.
 
         // Diagnostic: log WHY checkpoint capture failed, but only after all
         // capture hooks have been attempted.
@@ -6284,14 +6199,16 @@ void ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index) no
                          static_cast<unsigned long long>(cp_hash),
                          entry.execution_frontier, entry.checkpoint_frontier);
         }
-        // If KV copy was skipped (device pages unavailable), mark as state-only.
-        // The entry has checkpoint state but no KV — find() will skip it for
-        // full KV restore, but take_state_only_by_session/index can still
-        // merge it during a later spill that succeeds.
+        // Atomicity: a cache unit is {attention KV + GDN state}. If the KV could not be
+        // copied, this is not a cache unit. KV without its state cannot resume (the
+        // attention K/V is not independently recomputable), and state without its KV is
+        // only usable while that KV is device-resident. Retain nothing rather than half.
         if (text_allocations.empty()) {
-            entry.state_only = true;
-            entry.source_continuation_index = index;
-            entry.execution_frontier = 0;  // no KV spilled
+            std::fprintf(stderr,
+                         "[safety-spill] ABORT: index=%u frontier=%u — KV copy unavailable; "
+                         "KV and state are one atomic unit, nothing retained\n",
+                         index, sequence.execution_frontier);
+            return;
         }
         entry.text_page_count = text_allocations.empty() ? 0 : text_pages;
         entry.backend_page_count = backend_allocations.empty() ? 0 : backend_pages;
@@ -6307,20 +6224,15 @@ void ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index) no
         // endpoint state; if missing (state store evicted the endpoint),
         // fall back to the checkpoint state as the restore state.
         if (entry.state_bytes == 0 || entry.state_host.empty()) {
-            // Endpoint state missing — fall back to checkpoint state.
-            // For state-only entries (KV copy failed), keep checkpoint state
-            // as-is so take_state_only_by_index can still find it.
-            // For full entries, move checkpoint to endpoint (existing behavior).
-            if (!entry.state_only &&
-                entry.checkpoint_valid && entry.checkpoint_state_bytes > 0 &&
+            // Endpoint state missing — fall back to the checkpoint state so the unit
+            // still carries a state image (an entry without one is never retained).
+            if (entry.checkpoint_valid && entry.checkpoint_state_bytes > 0 &&
                 !entry.checkpoint_state_host.empty()) {
                 entry.state_bytes = entry.checkpoint_state_bytes;
                 entry.state_host = std::move(entry.checkpoint_state_host);
                 entry.checkpoint_valid = false;
                 entry.checkpoint_state_bytes = 0;
-                if (!entry.state_only) {
-                    entry.execution_frontier = checkpoint_frontier;
-                }
+                entry.execution_frontier = checkpoint_frontier;
                 std::fprintf(stderr,
                              "[safety-spill] FALLBACK: using checkpoint state as endpoint "
                              "(index=%u frontier=%u ckpt_frontier=%u)\n",
@@ -6333,7 +6245,12 @@ void ProgramImplCore::spill_victim_to_host_kv_safety_net(std::uint32_t index) no
             }
         }
         if (entry.state_bytes == 0 || entry.state_host.empty()) {
-            // Still no state after fallback — skip this entry.
+            // No state image after the fallback. {@code KV + state} is the unit, so an
+            // entry without its state is not a cache unit: retain nothing.
+            std::fprintf(stderr,
+                         "[safety-spill] ABORT: index=%u frontier=%u — no state image; "
+                         "KV and state are one atomic unit, nothing retained\n",
+                         index, sequence.execution_frontier);
         } else {
             std::fprintf(stderr,
                          "[safety-spill] OK: index=%u frontier=%u ckpt_valid=%d ckpt_frontier=%u "
@@ -7232,12 +7149,6 @@ void ProgramImplCore::release_continuation_slot(std::uint32_t index) noexcept {
     ContinuationSlot& slot = continuation_slots[index];
     slot.role              = ContinuationSlotRole::Free;
     if (++slot.generation == 0) { ++slot.generation; }
-    // Clean up any state-only safety net entries for this slot to
-    // prevent stale entries from matching a recycled slot.
-    host_kv_safety_net.remove_state_only_by_index(index);
-    if (continuation_states[index].session_key) {
-        host_kv_safety_net.remove_state_only(*continuation_states[index].session_key);
-    }
 }
 
 detail::PhysicalResources
@@ -9778,36 +9689,14 @@ FinishResult ProgramImplCore::finish(SequenceHandle sequence) noexcept {
                 if (capture_bytes > 0 &&
                     state_store->residency(state.state.read) != StateReplicaResidency::None &&
                     state_store->residency(state.state.read) != StateReplicaResidency::HostOnly) {
-                    // Unified architecture: create a state-only safety net entry
-                    // instead of using the dropped_checkpoint_captures_ side store.
-                    std::vector<std::byte> capture_host(capture_bytes);
-                    const std::int32_t slot_num = state_store->physical_slot(state.state.read);
-                    const HostStateImageView capture_view{
-                        .data = capture_host.data(),
-                        .layout = &state_images->host_layout()};
-                    state_images->copy_to_host(slot_num, capture_view, device.transfer_stream);
-                    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
-                    HostKVSafetyNetEntry sn_entry;
-                    sn_entry.state_only = true;
-                    sn_entry.source_continuation_index = continuation_index;
-                    sn_entry.checkpoint_valid = true;
-                    sn_entry.checkpoint_frontier = state.rewrite_checkpoint.frontier;
-                    sn_entry.checkpoint_state_host = std::move(capture_host);
-                    sn_entry.checkpoint_state_bytes = capture_bytes;
-                    sn_entry.session_key = state.session_key;
-                    sn_entry.execution_frontier = 0;
-                    // Remove stale state-only entries for this slot/session
-                    // before adding -- ensures at most one entry per session.
-                    host_kv_safety_net.remove_state_only_by_index(continuation_index);
-                    if (state.session_key) {
-                        host_kv_safety_net.remove_state_only(*state.session_key);
-                    }
+                    // A cache unit is {attention KV + GDN state}, retained whole or not at
+                    // all. Retaining this state image while its KV stays on device is not a
+                    // restorable unit, and it was the unbounded host-memory growth this fix
+                    // removes. Retention happens in the spill path, which stores a complete
+                    // unit or nothing.
                     std::fprintf(stderr,
-                        "[checkpoint-demoted] finish: index=%u frontier=%u ckpt_frontier=%u "
-                        "state_bytes=%zu\n",
-                        continuation_index, state.execution_frontier,
-                        state.rewrite_checkpoint.frontier, capture_bytes);
-                    host_kv_safety_net.add(std::move(sn_entry));
+                                 "[checkpoint] unit-not-retained: a cache unit is {KV + state}; "
+                                 "retention happens only through the spill path\n");
                 }
             }
             // Materialize a real rewrite checkpoint image. In the
@@ -9821,10 +9710,10 @@ FinishResult ProgramImplCore::finish(SequenceHandle sequence) noexcept {
             std::optional<StateImageHandle> new_rewrite = state_store->reserve_destination();
             if (!new_rewrite && state.rewrite_state && state_store && state_images &&
                 state_store->residency(*state.rewrite_state) == StateReplicaResidency::DeviceOnly) {
-                // No device slot for the new checkpoint. Capture the OLD
-                // checkpoint state to a host buffer (D2H), then release
-                // its device slot for the new checkpoint. The captured
-                // state goes into a state-only safety net entry.
+                // No device slot for the new checkpoint. Move the OLD checkpoint state to a
+                // host buffer (D2H) so its device slot can be reused for the new checkpoint.
+                // The buffered state is never retained on its own: it only exists inside a
+                // complete {KV + state} unit, which the spill path builds.
                 // Unified architecture — no host_state_images dependency.
                 std::fprintf(stderr,
                     "[checkpoint] demoting old checkpoint to host (frontier=%u)\n",
@@ -9868,107 +9757,24 @@ FinishResult ProgramImplCore::finish(SequenceHandle sequence) noexcept {
                     state_store->release_checkpoint_reference(*state.rewrite_state);
                 }
                 state.rewrite_state = *new_rewrite;
-                // Move the captured state to the safety net AFTER the
-                // H2D copy is complete (the buffer was needed for copy).
+                // No state-only capture happens here. A cache unit is {KV + state}: this
+                // path holds a state image while the continuation's attention KV is not
+                // part of the entry, so retaining the state alone is not a restorable unit,
+                // and it was the unbounded host-memory growth this change removes.
+                // Retention is the spill path's job, which stores a complete unit or
+                // nothing and performs its own D2H copy - so nothing is copied here.
                 if (demoted_from_host && !demoted_host_buffer.empty()) {
-                    host_kv_safety_net.remove_state_only_by_index(continuation_index);
-                    if (state.session_key) {
-                        host_kv_safety_net.remove_state_only(*state.session_key);
-                    }
-                    HostKVSafetyNetEntry sn_entry;
-                    sn_entry.state_only = true;
-                    sn_entry.source_continuation_index = continuation_index;
-                    sn_entry.checkpoint_valid = true;
-                    sn_entry.checkpoint_frontier = state.rewrite_checkpoint.frontier;
-                    sn_entry.checkpoint_state_host = std::move(demoted_host_buffer);
-                    sn_entry.checkpoint_state_bytes = state_images->host_layout().image_bytes;
-                    sn_entry.session_key = state.session_key;
-                    sn_entry.execution_frontier = 0;
                     std::fprintf(stderr,
-                        "[checkpoint-demoted] finish: index=%u frontier=%u ckpt_frontier=%u "
-                        "state_bytes=%zu\n",
-                        continuation_index, state.execution_frontier,
-                        state.rewrite_checkpoint.frontier,
-                        static_cast<std::size_t>(state_images->host_layout().image_bytes));
-                    host_kv_safety_net.add(std::move(sn_entry));
-                } else if (!fork_collapsed_to_source) {
-                    // Normal path: capture old checkpoint state to safety net
-                    // before cleaning up. Skip if fork_collapsed_to_source
-                    // already captured (avoids redundant D2H copy).
-                    // This ensures the spill can merge checkpoint state
-                    // even after DropOptional clears the new rewrite_state.
-                    if (state_images && continuation_index < continuation_capacity &&
-                        state.rewrite_checkpoint.valid &&
-                        state.rewrite_checkpoint.frontier != 0) {
-                        // rewrite_checkpoint is valid — capture the old state.
-                        const std::size_t cap_bytes = state_images->host_layout().image_bytes;
-                        // rewrite_state was already released at L9657, but
-                        // state.state.read still has the turn-boundary state.
-                        // Use it as the checkpoint state source.
-                        const StateReplicaResidency cap_residency =
-                            state_store->residency(state.state.read);
-                        if (cap_bytes > 0 && state_store->valid(state.state.read) &&
-                            (cap_residency == StateReplicaResidency::DeviceOnly ||
-                             cap_residency == StateReplicaResidency::Both)) {
-                            std::vector<std::byte> cap_host(cap_bytes);
-                            const std::int32_t cap_slot =
-                                state_store->physical_slot(state.state.read);
-                            const HostStateImageView cap_view{
-                                .data = cap_host.data(),
-                                .layout = &state_images->host_layout()};
-                            state_images->copy_to_host(cap_slot, cap_view, device.transfer_stream);
-                            CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
-                            host_kv_safety_net.remove_state_only_by_index(continuation_index);
-                            if (state.session_key) {
-                                host_kv_safety_net.remove_state_only(*state.session_key);
-                            }
-                            HostKVSafetyNetEntry sn_entry;
-                            sn_entry.state_only = true;
-                            sn_entry.source_continuation_index = continuation_index;
-                            sn_entry.checkpoint_valid = true;
-                            sn_entry.checkpoint_frontier = state.rewrite_checkpoint.frontier;
-                            sn_entry.checkpoint_state_host = std::move(cap_host);
-                            sn_entry.checkpoint_state_bytes = cap_bytes;
-                            sn_entry.session_key = state.session_key;
-                            sn_entry.execution_frontier = 0;
-                            std::fprintf(stderr,
-                                "[checkpoint-demoted] finish-normal: index=%u frontier=%u ckpt_frontier=%u "
-                                "state_bytes=%zu\n",
-                                continuation_index, state.execution_frontier,
-                                state.rewrite_checkpoint.frontier, cap_bytes);
-                            host_kv_safety_net.add(std::move(sn_entry));
-                        }
-                    } else {
-                        // rewrite_checkpoint not valid (DropOptional cleared it).
-                        // DON'T clean up state-only entries — the advance_prefill
-                        // capture may have created one that the spill needs.
-                        // Cleanup happens via spill merge or slot recycling.
-                    }
+                                 "[checkpoint] unit-not-retained: demoted checkpoint state has "
+                                 "no complete {KV + state} unit\n");
                 }
             } else {
-                // Cannot reserve a new CheckpointImmutable image for the
-                // rewrite state. If demotion happened, save the captured
-                // state to the safety net so it is not lost.
+                // Cannot reserve a new CheckpointImmutable image for the rewrite state. The
+                // demoted state is not retained on its own for the same reason as above.
                 if (demoted_from_host && !demoted_host_buffer.empty()) {
-                    host_kv_safety_net.remove_state_only_by_index(continuation_index);
-                    if (state.session_key) {
-                        host_kv_safety_net.remove_state_only(*state.session_key);
-                    }
-                    HostKVSafetyNetEntry sn_entry;
-                    sn_entry.state_only = true;
-                    sn_entry.source_continuation_index = continuation_index;
-                    sn_entry.checkpoint_valid = true;
-                    sn_entry.checkpoint_frontier = state.rewrite_checkpoint.frontier;
-                    sn_entry.checkpoint_state_host = std::move(demoted_host_buffer);
-                    sn_entry.checkpoint_state_bytes = state_images->host_layout().image_bytes;
-                    sn_entry.session_key = state.session_key;
-                    sn_entry.execution_frontier = 0;
                     std::fprintf(stderr,
-                        "[checkpoint-demoted] finish-fallback: index=%u ckpt_frontier=%u "
-                        "state_bytes=%zu (reserve_destination failed after demotion)\n",
-                        continuation_index, state.rewrite_checkpoint.frontier,
-                        static_cast<std::size_t>(state_images->host_layout().image_bytes));
-                    host_kv_safety_net.add(std::move(sn_entry));
+                                 "[checkpoint] unit-not-retained: demoted checkpoint state has "
+                                 "no complete {KV + state} unit (reserve_destination failed)\n");
                 }
                 // state.read image is still valid and retains the
                 // turn-boundary state for in-place continuation.
@@ -10684,12 +10490,6 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
                     state_store->freeze(*new_rewrite);
                     state_store->retain_checkpoint_reference(*new_rewrite);
                     sequence.rewrite_state = *new_rewrite;
-                    // Clean up stale state-only safety net entries — the
-                    // new rewrite checkpoint supersedes them.
-                    host_kv_safety_net.remove_state_only_by_index(active_continuations[sequence.lane]);
-                    if (sequence.session_key) {
-                        host_kv_safety_net.remove_state_only(*sequence.session_key);
-                    }
                 } else {
                     // No device slot for the new checkpoint. The pressure
                     // planner should have made room (via request_plan_impl.h
@@ -10880,7 +10680,8 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
             // Re-add the entry to the safety net so the same session's next
             // root-path request can still match. The H2D copy did not modify
             // the host KV buffers; the entry is still valid for future restores.
-            // Refresh the timestamp so LRU eviction treats it as recently used.
+            // Refresh the timestamp: eviction is cost-aware (smallest unit first), so
+            // recency only matters when comparing units of similar size.
             entry.pinned = false;
             entry.created = std::chrono::steady_clock::now();
             host_kv_safety_net.add(std::move(entry));
@@ -11982,6 +11783,39 @@ void ProgramImplCore::prepare_graphs() {
     release_capture_rows(*text_kv_addresses, text_capture_allocations);
 }
 
+void ProgramImplCore::update_sampling(SequenceHandle sequence_handle,
+                                      const runtime::ResolvedSamplingParameters& sampling) {
+    if (!valid_sequence(sequence_handle)) {
+        throw std::logic_error("update_sampling sequence capability is invalid");
+    }
+    const std::uint32_t lane = ContractAccess::lane(sequence_handle).value;
+    if (lane >= max_concurrency || requests[lane].lifecycle != Lifecycle::Active) {
+        throw std::logic_error("update_sampling target is not active");
+    }
+    ops::SamplingConfig config;
+    config.temperature       = sampling.temperature;
+    config.top_k             = sampling.top_k;
+    config.top_p             = sampling.top_p;
+    config.min_p             = sampling.min_p;
+    config.presence_penalty  = sampling.presence_penalty;
+    config.frequency_penalty = sampling.frequency_penalty;
+    config.seed              = sampling.seed;
+    config.token_counts      = nullptr;
+    RequestControl& request = requests[lane];
+    request.sampling_host   = config;
+    const bool penalties = config.presence_penalty != 0.0F || config.frequency_penalty != 0.0F;
+    if (penalties) {
+        Tensor counts = token_counts.slice(1, static_cast<std::int32_t>(lane), 1)
+                            .view({TextConfig::token_domain});
+        CUDA_CHECK(cudaMemsetAsync(counts.data, 0, counts.bytes(), device.stream));
+        request.sampling_host.token_counts = static_cast<std::int32_t*>(counts.data);
+    }
+    Tensor config_lane = sampling_config.slice(1, static_cast<std::int32_t>(lane), 1);
+    CUDA_CHECK(cudaMemcpyAsync(config_lane.data, &request.sampling_host,
+                               sizeof(request.sampling_host), cudaMemcpyHostToDevice,
+                               device.stream));
+}
+
 void ProgramImplCore::install_sampling(SequenceState& sequence, RequestControl& request,
                                        const ops::SamplingConfig& config) {
     Tensor counts = token_counts.slice(1, static_cast<std::int32_t>(sequence.lane), 1)
@@ -12331,49 +12165,16 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
             // NOTE: staged.cursor == staged.prompt_tokens is already verified
             // above; sequence.execution_frontier is NOT yet updated at this point
             // (it's committed with the prefill result), so don't check it here.
-            // NOTE: staged.cursor == staged.prompt_tokens is already verified
-            // above; sequence.execution_frontier is NOT yet updated at this point
-            // (it's committed with the prefill result), so don't check it here.
+            // Prefill-completion state capture is NOT performed here. A cache unit is
+            // {KV + state}: this path holds a state image while the continuation's
+            // attention KV is not part of the entry, so retaining the state alone is not
+            // a restorable unit - it was the unbounded host-memory growth this change
+            // removes. Retention belongs to the spill path, which stores a complete unit
+            // or nothing and performs its own D2H copy, so nothing is copied here.
             if (!sequence.rewrite_checkpoint.valid && state_store && state_images) {
-                const std::uint32_t capture_index = active_continuations[sequence.lane];
-                if (capture_index < continuation_capacity) {
-                    const std::size_t capture_bytes = state_images->host_layout().image_bytes;
-                    const StateReplicaResidency residency =
-                        state_store->residency(sequence.state.write);
-                    if (capture_bytes > 0 &&
-                        (residency == StateReplicaResidency::DeviceOnly ||
-                         residency == StateReplicaResidency::Both)) {
-                        // Unified architecture: create a state-only safety net entry
-                        // instead of using the dropped_checkpoint_captures_ side store.
-                        std::vector<std::byte> capture_host(capture_bytes);
-                        const std::int32_t capture_slot = state_store->physical_slot(sequence.state.write);
-                        const HostStateImageView capture_view{
-                            .data = capture_host.data(),
-                            .layout = &state_images->host_layout()};
-                        state_images->copy_to_host(capture_slot, capture_view, device.transfer_stream);
-                        CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
-                        HostKVSafetyNetEntry sn_entry;
-                        sn_entry.state_only = true;
-                        sn_entry.source_continuation_index = capture_index;
-                        sn_entry.checkpoint_valid = true;
-                        sn_entry.checkpoint_frontier = staged.prompt_tokens;
-                        sn_entry.checkpoint_state_host = std::move(capture_host);
-                        sn_entry.checkpoint_state_bytes = capture_bytes;
-                        sn_entry.session_key = sequence.session_key;
-                        sn_entry.execution_frontier = 0;
-                        // Remove stale state-only entries before adding.
-                        host_kv_safety_net.remove_state_only_by_index(capture_index);
-                        if (sequence.session_key) {
-                            host_kv_safety_net.remove_state_only(*sequence.session_key);
-                        }
-                        std::fprintf(stderr,
-                            "[checkpoint-demoted] prefill: index=%u frontier=%u ckpt_frontier=%u "
-                            "state_bytes=%zu\n",
-                            capture_index, sequence.execution_frontier,
-                            static_cast<unsigned>(staged.prompt_tokens), capture_bytes);
-                        host_kv_safety_net.add(std::move(sn_entry));
-                    }
-                }
+                std::fprintf(stderr,
+                             "[checkpoint] unit-not-retained: prefill-completion state has no "
+                             "complete {KV + state} unit\n");
             }
             timing.resume_submit();
             copy_tail(sequence, prefill_hidden.slice(
@@ -13122,7 +12923,11 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
     }
     if (host_kv_arena) {
         out.host_kv_capacity_bytes = host_kv_arena->capacity_bytes();
-        out.host_kv_occupied_bytes = host_kv_arena->occupied_bytes();
+        // Host KV pages and retained state images share one host-memory budget:
+        // state images are heap-backed today, so report them alongside arena bytes
+        // instead of hiding them from the occupancy the budget governs.
+        out.host_kv_occupied_bytes =
+            host_kv_arena->occupied_bytes() + host_kv_safety_net.retained_state_bytes();
     }
     return out;
 }

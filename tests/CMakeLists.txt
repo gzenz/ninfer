@@ -135,6 +135,15 @@ ninfer_add_test(ninfer_qwen3_6_jinja_frontend_render_test
 target_include_directories(ninfer_qwen3_6_jinja_frontend_render_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/impl)
+# Holds the media placeholder mapping for an image in any message position, across the
+# registered templates including the one the deployed qwen3.8 artifact embeds.
+ninfer_add_test(ninfer_qwen3_6_jinja_vision_mapping_test
+  SOURCES targets/qwen3_6/test_jinja_vision_mapping.cpp
+  NEEDS_SOURCE_DIR
+  LIBRARIES ninfer_engine ninfer_core)
+target_include_directories(ninfer_qwen3_6_jinja_vision_mapping_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/impl)
 ninfer_add_test(ninfer_qwen3_6_runtime_mechanisms_test
   SOURCES targets/qwen3_6/test_runtime_mechanisms.cpp
   LIBRARIES ninfer_engine ninfer_core)

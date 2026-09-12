@@ -8,6 +8,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -125,23 +126,27 @@ json build_context(const std::vector<ChatMessage>& messages, const ChatRenderOpt
     return context;
 }
 
-// A run of consecutive trace iterations belonging to one loop statement.
+// The trace iterations of one execution of a for statement, in record order. A loop
+// nested inside an iteration — the content macro's loop over the parts of one message —
+// records its own iterations before the enclosing iteration closes, so the enclosing
+// loop's records are not consecutive and are grouped by invocation instead.
 struct LoopRun {
     std::string loop;
-    std::size_t begin = 0;
-    std::size_t count = 0;
+    std::vector<std::size_t> iterations;
 };
 
 std::vector<LoopRun> loop_runs(const jinja::RenderTrace& trace) {
     std::vector<LoopRun> runs;
+    std::unordered_map<std::size_t, std::size_t> run_of_invocation;
     for (std::size_t index = 0; index < trace.loop_iterations.size(); ++index) {
-        const std::string& loop = trace.loop_iterations[index].loop;
-        if (!runs.empty() && runs.back().loop == loop &&
-            runs.back().begin + runs.back().count == index) {
-            ++runs.back().count;
+        const jinja::RenderTrace::LoopIteration& iteration = trace.loop_iterations[index];
+        const auto [entry, inserted] = run_of_invocation.try_emplace(iteration.invocation,
+                                                                     runs.size());
+        if (inserted) {
+            runs.push_back(LoopRun{iteration.loop, {index}});
             continue;
         }
-        runs.push_back(LoopRun{loop, index, 1U});
+        runs[entry->second].iterations.push_back(index);
     }
     return runs;
 }
@@ -150,36 +155,36 @@ std::vector<LoopRun> loop_runs(const jinja::RenderTrace& trace) {
 // role order rather than by variable spelling, so a renamed loop variable does not break
 // the mapping.
 struct MessageLoop {
-    std::size_t begin = 0;
-    std::size_t count = 0;
-    std::size_t offset = 0; // input messages folded into the preamble
+    std::vector<std::size_t> iterations; // indices into trace.loop_iterations
+    std::size_t offset = 0;              // input messages folded into the preamble
 };
 
 std::optional<MessageLoop> select_message_loop(const jinja::RenderTrace& trace,
                                                const std::vector<ChatMessage>& messages) {
     for (const LoopRun& run : loop_runs(trace)) {
+        const std::size_t count = run.iterations.size();
         std::size_t emitted = 0;
         bool contiguous = true;
-        for (std::size_t index = 0; index < run.count; ++index) {
-            const auto& iteration = trace.loop_iterations[run.begin + index];
+        for (std::size_t index = 0; index < count; ++index) {
+            const auto& iteration = trace.loop_iterations[run.iterations[index]];
             emitted += iteration.end - iteration.begin;
             if (index != 0 &&
-                trace.loop_iterations[run.begin + index - 1U].end != iteration.begin) {
+                trace.loop_iterations[run.iterations[index - 1U]].end != iteration.begin) {
                 contiguous = false;
             }
         }
         if (emitted == 0 || !contiguous) { continue; }
         for (const std::size_t offset : {std::size_t{0}, std::size_t{1}}) {
-            if (run.count + offset != messages.size()) { continue; }
+            if (count + offset != messages.size()) { continue; }
             bool matches = true;
-            for (std::size_t index = 0; index < run.count; ++index) {
-                if (trace.loop_iterations[run.begin + index].item_role !=
+            for (std::size_t index = 0; index < count; ++index) {
+                if (trace.loop_iterations[run.iterations[index]].item_role !=
                     role_name(messages[index + offset].role)) {
                     matches = false;
                     break;
                 }
             }
-            if (matches) { return MessageLoop{run.begin, run.count, offset}; }
+            if (matches) { return MessageLoop{run.iterations, offset}; }
         }
     }
     return std::nullopt;
@@ -190,11 +195,16 @@ struct Leaf {
     std::size_t end = 0;
 };
 
-// Finds the printed leaf named `expr` inside [begin, end) and returns its byte span.
+// Finds the printed leaf named `expr` inside [begin, end) and returns its byte span. A
+// print of the bare value carries no operand parts, so its own expression is the leaf.
 std::optional<Leaf> find_leaf(const jinja::RenderTrace& trace, std::size_t begin, std::size_t end,
                               std::string_view expr) {
     for (const auto& print : trace.prints) {
         if (print.begin < begin || print.end > end) { continue; }
+        if (print.parts.empty()) {
+            if (print.expr == expr) { return Leaf{print.begin, print.end}; }
+            continue;
+        }
         std::size_t offset = print.begin;
         for (const auto& part : print.parts) {
             if (part.expr == expr) { return Leaf{offset, offset + part.length}; }
@@ -377,16 +387,19 @@ RenderedChat JinjaChatTemplate::render(const std::vector<ChatMessage>& messages,
     if (!loop) { return rendered; }
 
     const auto& iterations = trace.loop_iterations;
-    const std::size_t loop_begin = iterations[loop->begin].begin;
-    const std::size_t loop_end   = iterations[loop->begin + loop->count - 1U].end;
+    const std::size_t loop_count = loop->iterations.size();
+    const auto& loop_first       = iterations[loop->iterations.front()];
+    const std::size_t loop_begin = loop_first.begin;
+    const std::size_t loop_end   = iterations[loop->iterations.back()].end;
     // A leading instruction message is folded into the preamble by the template, and the
     // loop then has no emitted block for it. Such a message has no independent frontier, so
     // only the frontier that follows it is recorded.
-    const bool first_iteration_emits = iterations[loop->begin].end > iterations[loop->begin].begin;
+    const bool first_iteration_emits = loop_first.end > loop_first.begin;
     rendered.message_boundaries[loop->offset] =
         first_iteration_emits ? std::optional<std::size_t>(loop_begin) : std::nullopt;
-    for (std::size_t index = first_iteration_emits ? 0U : 1U; index < loop->count; ++index) {
-        rendered.message_boundaries[loop->offset + index + 1U] = iterations[loop->begin + index].end;
+    for (std::size_t index = first_iteration_emits ? 0U : 1U; index < loop_count; ++index) {
+        rendered.message_boundaries[loop->offset + index + 1U] =
+            iterations[loop->iterations[index]].end;
     }
     if (!first_iteration_emits) {
         // The folded message's frontier is the preamble end, which is where the loop starts.
@@ -414,8 +427,8 @@ RenderedChat JinjaChatTemplate::render(const std::vector<ChatMessage>& messages,
 
     std::size_t media_index = 0;
     std::vector<std::vector<std::size_t>> part_offsets(messages.size());
-    for (std::size_t index = 0; index < loop->count; ++index) {
-        const auto& iteration = iterations[loop->begin + index];
+    for (std::size_t index = 0; index < loop_count; ++index) {
+        const auto& iteration = iterations[loop->iterations[index]];
         const std::size_t message_index = loop->offset + index;
         const ChatMessage& message = messages[message_index];
         if (const auto leaf = find_leaf(trace, iteration.begin, iteration.end, "reasoning_content")) {
@@ -461,10 +474,10 @@ RenderedChat JinjaChatTemplate::render(const std::vector<ChatMessage>& messages,
     // from the trace as well.
     std::vector<std::size_t> tool_boundaries;
     for (const LoopRun& run : loop_runs(trace)) {
-        if (run.loop != "tools" || run.count == 0) { continue; }
-        if (iterations[run.begin].begin < loop_end) { continue; }
-        for (std::size_t index = 0; index < run.count; ++index) {
-            tool_boundaries.push_back(iterations[run.begin + index].end);
+        if (run.loop != "tools" || run.iterations.empty()) { continue; }
+        if (iterations[run.iterations.front()].begin < loop_end) { continue; }
+        for (const std::size_t index : run.iterations) {
+            tool_boundaries.push_back(iterations[index].end);
         }
     }
 
@@ -512,9 +525,9 @@ RenderedChat JinjaChatTemplate::render(const std::vector<ChatMessage>& messages,
         last_query = messages.size() > 50U ? static_cast<long>(messages.size()) - 1 : 0;
     }
 
-    if (options.continuation == PromptContinuationMode::ContinueFinalAssistant && loop->count != 0) {
+    if (options.continuation == PromptContinuationMode::ContinueFinalAssistant && loop_count != 0) {
         // The final assistant turn is replayed and may be rewritten as the response continues.
-        const auto& iteration = iterations[loop->begin + loop->count - 1U];
+        const auto& iteration = iterations[loop->iterations.back()];
         rendered.rewrite_checkpoint =
             RewriteCheckpointByteSpec{RewriteCheckpointKind::ResponseReplay, iteration.begin};
     } else if (options.add_generation_prompt) {
@@ -535,11 +548,11 @@ RenderedChat JinjaChatTemplate::render(const std::vector<ChatMessage>& messages,
                 *suffix_begin};
         }
     } else if (!preserve_thinking) {
-        for (std::size_t index = 0; index < loop->count; ++index) {
+        for (std::size_t index = 0; index < loop_count; ++index) {
             const std::size_t message_index = loop->offset + index;
             if (messages[message_index].role != ChatRole::Assistant) { continue; }
             if (static_cast<long>(message_index) <= last_query) { continue; }
-            const auto& iteration = iterations[loop->begin + index];
+            const auto& iteration = iterations[loop->iterations[index]];
             rendered.rewrite_checkpoint =
                 RewriteCheckpointByteSpec{RewriteCheckpointKind::TurnClosure, iteration.begin};
         }

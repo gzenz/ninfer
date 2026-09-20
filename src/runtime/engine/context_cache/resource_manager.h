@@ -11,8 +11,10 @@
 #include <array>
 #include <bit>
 #include <chrono>
+#include <cstdarg>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <limits>
 #include <optional>
 #include <span>
@@ -293,6 +295,15 @@ public:
         if (!destination) { return {.readiness = Readiness::TemporarilyBlocked}; }
 
         const typename Planner::Clock::time_point planning_started = Planner::Clock::now();
+        const bool cdbg = std::getenv("NINFER_MAT_DEBUG") != nullptr;
+        const auto cdbg_log = [cdbg](const char* fmt, ...) {
+            if (!cdbg) { return; }
+            std::va_list ap;
+            va_start(ap, fmt);
+            std::vfprintf(stderr, fmt, ap);
+            va_end(ap);
+            std::fflush(stderr);
+        };
         rebuild_prefix_index();
         PrefixDemandRecord provisional_demand;
         provisional_demand.domain =
@@ -320,16 +331,60 @@ public:
         candidates.push_back(Candidate{.plan = std::move(*root)});
 
         if (cache_enabled_) {
+            {
+                const auto probe1 = base.prefix_shortlist_key(1);
+                std::uint64_t sfp = 0;
+                if (base.context_cache().session_key) {
+                    const auto sv = base.context_cache().session_key->view();
+                    for (const char c : sv) { sfp = (sfp ^ static_cast<unsigned char>(c)) * 1099511628211ULL; }
+                }
+                cdbg_log("[candgen] === episode prefix_index=%zu session=%016lx digests=%d base_tag=%u ===\n",
+                         prefix_index_.size(), sfp, probe1 ? 1 : 0, probe1 ? probe1->identity_tag : 0U);
+            }
             for (const PrefixIndexEntry& index : prefix_index_) {
                 if (!valid_prefix_index_entry(index)) { continue; }
                 const std::optional<PrefixShortlistKey> incoming =
                     base.prefix_shortlist_key(index.key.frontier);
-                if (!incoming || *incoming != index.key) { continue; }
+                if (!incoming) {
+                    cdbg_log("[candgen] priv SKIP slot=%u NULLOPT idx_frontier=%u shared=%d\n",
+                             index.slot, index.key.frontier, index.shared ? 1 : 0);
+                    continue;
+                }
+                if (incoming->identity_tag != index.key.identity_tag) {
+                    cdbg_log("[candgen] priv SKIP slot=%u TAG-MISMATCH base=%u idx=%u f=%u\n",
+                             index.slot, incoming->identity_tag, index.key.identity_tag,
+                             index.key.frontier);
+                    continue;
+                }
+                if (*incoming != index.key) {
+                    // Own-session guard: a re-touch probes every stored slot, so a
+                    // *different* session's response naturally mismatches a slot it does
+                    // not own. Label those XSESSION-MISMATCH so they are not mistaken for a
+                    // real key-match failure of the re-touch's own checkpoint.
+                    const CatalogEntry& probe_entry = catalog_[index.slot];
+                    const bool own_session = probe_entry.session &&
+                                             base.context_cache().session_key &&
+                                             *probe_entry.session ==
+                                                 *base.context_cache().session_key;
+                    cdbg_log("[candgen] priv SKIP slot=%u %s frontier=%u "
+                             "in=(%lx,%lx) st=(%lx,%lx)\n",
+                             index.slot,
+                             own_session ? "DIGEST-MISMATCH" : "XSESSION-MISMATCH",
+                             index.key.frontier,
+                             incoming->digests[0], incoming->digests[1],
+                             index.key.digests[0], index.key.digests[1]);
+                    continue;
+                }
 
                 if (!index.shared) {
                     const CatalogEntry& entry = catalog_[index.slot];
                     if (entry.state != CatalogState::Catalogued || !entry.handle ||
                         private_has_active_edge(index.slot)) {
+                        cdbg_log("[candgen] priv SKIP slot=%u state=%d handle=%d active_edge=%d "
+                                 "(key matched)\n",
+                                 index.slot, static_cast<int>(entry.state),
+                                 entry.handle ? 1 : 0,
+                                 private_has_active_edge(index.slot) ? 1 : 0);
                         continue;
                     }
                     const bool retain =
@@ -339,7 +394,14 @@ public:
                     std::optional<AdmissionCandidate> plan =
                         program.inspect_admission(prompt, base, *destination, &*entry.handle,
                                                   nullptr, index.checkpoint, retain);
-                    if (!plan) { continue; }
+                    if (!plan) {
+                        cdbg_log("[candgen] priv SKIP slot=%u inspect_admission=nullopt\n",
+                                 index.slot);
+                        continue;
+                    }
+                    cdbg_log("[candgen] priv BUILD slot=%u reuse_tok=%u retain=%d\n", index.slot,
+                             static_cast<unsigned>(plan->summary().reusable_prompt_tokens),
+                             retain ? 1 : 0);
                     if (plan->summary().reusable_prompt_tokens == 0 ||
                         (retain &&
                          plan->identity_assessment().source_mode != PrivateSourceMode::Retain)) {

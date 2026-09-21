@@ -4,6 +4,7 @@
 #include "serve/http_transport.h"
 #include "serve/openai_common.h"
 #include "serve/request_log.h"
+#include "serve/stats_json.h"
 
 #include <nlohmann/json.hpp>
 
@@ -224,6 +225,12 @@ HttpServer::HttpServer(ServeOptions options, std::shared_ptr<spdlog::logger> log
     server_.new_task_queue         = [queued_requests, worker_count] {
         return new httplib::ThreadPool(worker_count, worker_count, queued_requests);
     };
+    if (options_.stats_port != 0) {
+        // One worker is ample: /stats + /health are cheap reads polled at most
+        // every few seconds, and the point of the dedicated server is that they
+        // never queue behind the streaming handlers on the main pool.
+        stats_server_.new_task_queue = [] { return new httplib::ThreadPool(1, 1, 64); };
+    }
     server_.set_socket_options(configure_http_server_socket);
     server_.set_payload_max_length(options_.max_request_bytes);
     register_routes();
@@ -352,7 +359,8 @@ void HttpServer::register_routes() {
 
     server_.set_pre_routing_handler([this](const httplib::Request& req, httplib::Response& res) {
         ensure_openai_request_id(req, res);
-        if (options_.api_key.empty() || req.path == "/health" || req.method == "OPTIONS") {
+        if (options_.api_key.empty() || req.path == "/health" || req.path == "/stats" ||
+            req.method == "OPTIONS") {
             return httplib::Server::HandlerResponse::Unhandled;
         }
         // Accept both the OpenAI-style bearer token and the Anthropic-style
@@ -431,6 +439,23 @@ void HttpServer::register_routes() {
         res.set_content(nlohmann::json{{"status", available ? "ok" : "unavailable"}}.dump(),
                         "application/json");
     });
+    server_.Get("/stats", [this](const httplib::Request& req, httplib::Response& res) {
+        handle_stats(req, res);
+    });
+    if (options_.stats_port != 0) {
+        // The main server keeps /stats + /health for backward compatibility;
+        // the dedicated server mirrors them so pollers (sentinel, dashboard)
+        // can use a port that is never saturated by streaming handlers.
+        stats_server_.Get("/health", [this](const httplib::Request&, httplib::Response& res) {
+            const bool available = service_ != nullptr && service_->is_available();
+            res.status           = available ? 200 : 503;
+            res.set_content(nlohmann::json{{"status", available ? "ok" : "unavailable"}}.dump(),
+                            "application/json");
+        });
+        stats_server_.Get("/stats", [this](const httplib::Request& req, httplib::Response& res) {
+            handle_stats(req, res);
+        });
+    }
     server_.Get("/v1/models", [this](const httplib::Request& req, httplib::Response& res) {
         handle_models(req, res);
     });
@@ -482,6 +507,19 @@ void HttpServer::handle_models(const httplib::Request&, httplib::Response& res) 
                     "application/json");
 }
 
+void HttpServer::handle_stats(const httplib::Request&, httplib::Response& res) const {
+    if (service_ == nullptr) {
+        res.status = 503;
+        res.set_content(nlohmann::json{{"status", "unavailable"}}.dump(), "application/json");
+        return;
+    }
+    res.set_content(
+        format_stats_json(service_->runtime_stats(), service_->memory_summary(),
+                          service_->load_summary(), options_.context_cache,
+                          service_->in_flight(), service_->max_in_flight()),
+        "application/json");
+}
+
 void HttpServer::handle_model(const httplib::Request& req, httplib::Response& res) const {
     const std::string id = req.matches.size() > 1 ? req.matches[1].str() : std::string();
     if (id != public_model_id_) {
@@ -497,7 +535,13 @@ void HttpServer::handle_model(const httplib::Request& req, httplib::Response& re
                     "application/json");
 }
 
-bool HttpServer::bind() { return server_.bind_to_port(options_.host, options_.port); }
+bool HttpServer::bind() {
+    if (!server_.bind_to_port(options_.host, options_.port)) { return false; }
+    if (options_.stats_port != 0 && !stats_server_.bind_to_port(options_.host, options_.stats_port)) {
+        return false;
+    }
+    return true;
+}
 
 void HttpServer::attach(GenerationService& service) {
     if (service_ != nullptr) {
@@ -520,16 +564,33 @@ bool HttpServer::listen() {
         stats_stopping_ = false;
         stats_thread_   = std::thread([this] { run_stats_reporter(); });
     }
+    // Start the dedicated listener BEFORE the main accept loop: listen_after_bind
+    // blocks, so anything that must outlive it has to be running already.
+    if (options_.stats_port != 0) {
+        stats_listener_ = std::thread([this] { stats_server_.listen_after_bind(); });
+    }
     try {
         const bool result = server_.listen_after_bind();
+        stop_stats_listener();
         stop_stats_reporter();
         return result;
     } catch (...) {
+        stop_stats_listener();
         stop_stats_reporter();
         throw;
     }
 }
 
-void HttpServer::stop() { server_.stop(); }
+void HttpServer::stop_stats_listener() {
+    if (stats_listener_.joinable()) {
+        stats_server_.stop();
+        stats_listener_.join();
+    }
+}
+
+void HttpServer::stop() {
+    stop_stats_listener();
+    server_.stop();
+}
 
 } // namespace ninfer::serve

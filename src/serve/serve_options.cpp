@@ -155,6 +155,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.host = require_value("--host");
         } else if (arg == "--port") {
             options.port = parse_nonnegative_int(require_value("--port"), "port");
+        } else if (arg == "--stats-port") {
+            options.stats_port = parse_nonnegative_int(require_value("--stats-port"), "stats-port");
         } else if (arg == "--api-key") {
             options.api_key = require_value("--api-key");
         } else if (arg == "--model-id") {

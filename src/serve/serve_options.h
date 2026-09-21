@@ -25,6 +25,10 @@ struct ServeOptions {
     std::filesystem::path chat_template_path;
     std::string host = "127.0.0.1";
     int port         = 8080;
+    // Optional second port for a dedicated single-thread /stats + /health
+    // server. 0 (default) disables it; the main server keeps serving both
+    // routes on `port` either way.
+    int stats_port   = 0;
     std::string api_key;                          // empty => no auth
     std::optional<std::string> model_id_override; // unset => artifact metadata.name
     std::string request_log_jsonl;                // empty => structured request logging disabled

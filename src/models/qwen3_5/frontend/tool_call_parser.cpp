@@ -20,8 +20,6 @@ using TypeSet             = Contract::TypeSet;
 constexpr std::string_view kToolOpen      = "<tool_call>";
 constexpr std::string_view kToolClose     = "</tool_call>";
 constexpr std::string_view kFunctionOpen  = "<function=";
-// Tolerant-only: the same tag with its opening '<' dropped. See parse_function.
-constexpr std::string_view kFunctionOpenBare = "function=";
 constexpr std::string_view kFunctionClose = "</function>";
 constexpr std::string_view kParamOpen     = "<parameter=";
 constexpr std::string_view kParamClose    = "</parameter>";
@@ -483,12 +481,20 @@ private:
     }
 
     FallbackReason parse_function(std::size_t& pos, RawToolCall& call) const {
-        // Tolerant mode: the model sometimes drops the '<' before the function tag
-        // (e.g. "function=Bash>"), which turns the whole call into prose. Accept the
-        // bare opener here; the name is still validated below either way.
-        if (!consume(pos, kFunctionOpen) &&
-            !(tolerant_ && consume(pos, kFunctionOpenBare))) {
-            return FallbackReason::MalformedStructure;
+        // Tolerant mode: models corrupt the opener in several ways, each of which turns the
+        // whole call into prose. Accept a dropped '<' ("function=Bash>"), a leaked ChatML turn
+        // marker ("<|im_start|>function=Bash>"), a dropped "function" keyword
+        // ("<|im_start|>=Bash>", "<=Bash>"), or a doubled '<'. A form that yields no name is
+        // still rejected below by valid_function_name, so prose after a marker cannot pass.
+        if (!consume(pos, kFunctionOpen)) {
+            if (!tolerant_) { return FallbackReason::MalformedStructure; }
+            std::size_t scan = pos;
+            while (scan < text_.size() && text_[scan] == '<') { ++scan; }
+            if (starts_with_at(text_, scan, "|im_start|>")) { scan += 11; }
+            if (starts_with_at(text_, scan, "function")) { scan += 8; }
+            if (scan < text_.size() && text_[scan] == '=') { ++scan; }
+            if (scan == pos) { return FallbackReason::MalformedStructure; }
+            pos = scan;
         }
         const std::size_t name_begin = pos;
         std::size_t name_end         = text_.find('>', name_begin);

@@ -87,6 +87,7 @@ private:
     void handle_response_compact(const httplib::Request& req, httplib::Response& res);
     void handle_models(const httplib::Request& req, httplib::Response& res) const;
     void handle_model(const httplib::Request& req, httplib::Response& res) const;
+    void handle_stats(const httplib::Request& req, httplib::Response& res) const;
 
     void record_request_start(const RequestLogContext& context);
     void record_request_rejected(const RequestRejectionLogContext& context);
@@ -96,6 +97,9 @@ private:
     void record_throughput(const ThroughputReport& report);
     void run_stats_reporter();
     void stop_stats_reporter();
+    // Stops the dedicated /stats + /health listener (no-op when --stats-port
+    // is unset or the listener never started).
+    void stop_stats_listener();
 
     GenerationService* service_ = nullptr;
     ServeOptions options_;
@@ -104,6 +108,11 @@ private:
     OperationalLog operational_log_;
     JsonlRequestLog request_jsonl_;
     httplib::Server server_;
+    // Dedicated single-thread server for /stats + /health (only when
+    // --stats-port is set): liveness and stats must stay reachable while the
+    // main pool is saturated by streaming handlers spanning long prefills.
+    httplib::Server stats_server_;
+    std::thread stats_listener_;
     std::atomic<std::uint64_t> request_seq_{0};
     std::mutex stats_mutex_;
     std::condition_variable stats_cv_;

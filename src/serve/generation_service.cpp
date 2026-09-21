@@ -18,7 +18,8 @@ struct RequestCapacity {
     explicit RequestCapacity(std::size_t limit) : maximum(limit) {}
 
     std::mutex mutex;
-    std::size_t active = 0;
+    std::size_t active   = 0;
+    std::size_t max_seen = 0;  // high-water mark of active since startup
     const std::size_t maximum;
 };
 
@@ -270,6 +271,9 @@ GenerationService::acquire_request_lifetime(DeadlinePolicy deadline_policy) cons
                                                      "inference request queue is full"));
         }
         ++request_capacity_->active;
+        if (request_capacity_->active > request_capacity_->max_seen) {
+            request_capacity_->max_seen = request_capacity_->active;
+        }
     }
     try {
         const Clock::time_point deadline =
@@ -282,6 +286,16 @@ GenerationService::acquire_request_lifetime(DeadlinePolicy deadline_policy) cons
         --request_capacity_->active;
         throw;
     }
+}
+
+std::size_t GenerationService::in_flight() const {
+    std::lock_guard lock(request_capacity_->mutex);
+    return request_capacity_->active;
+}
+
+std::size_t GenerationService::max_in_flight() const {
+    std::lock_guard lock(request_capacity_->mutex);
+    return request_capacity_->max_seen;
 }
 
 PreparedRequest GenerationService::prepare(const GenerationRequest& request,

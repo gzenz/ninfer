@@ -49,6 +49,18 @@ int main() {
         require(restore_after_setup.allow(3 * ms + ms / 2, 2 * ms, 2 * ms, 70'000 * ms, true, 1),
                 "mandatory setup starved the first complete reuse assessment in a busy boundary");
 
+        // The value threshold is a per-request fact: the same gain must clear the same
+        // completion solo and under 10-way load (only the time allowance shrinks with it).
+        auto ten_way = PlanningAllowance::boundary(9, 0);
+        require(ten_way.limit_ns == 10 * ms && ten_way.affected_requests == 10,
+                "10-way boundary did not apply the load limits");
+        MaterializationSearchBudget solo(idle, 0, 80'000 * ms);
+        MaterializationSearchBudget loaded(ten_way, 0, 80'000 * ms);
+        require(solo.allow(5 * ms, 2 * ms, 5 * ms, 200 * ms, true, 1),
+                "solo boundary denied a completion within its economic allowance");
+        require(loaded.allow(5 * ms, 2 * ms, 5 * ms, 200 * ms, true, 1),
+                "the value threshold shrank with concurrency for an identical gain");
+
         MaterializationSearchBudget cheap(idle, 0, ms);
         require(cheap.granted_ns() == ms / 20, "cheap request received a minimum 5 ms grant");
         require(!cheap.allow(ms / 20, ms, ms, ms, false, 1),

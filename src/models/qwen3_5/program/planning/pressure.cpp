@@ -2330,6 +2330,16 @@ bool ProgramImpl::compose_pressure_candidate(
     return true;
 }
 
+bool ProgramImpl::try_claim_seal_window() noexcept {
+    bool expected = false;
+    return seal_window_claimed_.compare_exchange_strong(expected, true,
+                                                         std::memory_order_acquire);
+}
+
+void ProgramImpl::release_seal_window() noexcept {
+    seal_window_claimed_.store(false, std::memory_order_release);
+}
+
 runtime::PreflightStatus
 ProgramImpl::revalidate_materialization(const AdmissionCandidate& plan,
                                         const PreparedPromptData& prompt) const {

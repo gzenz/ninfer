@@ -197,6 +197,7 @@ public:
     [[nodiscard]] const PreparedContextCache& context_cache() const noexcept;
     [[nodiscard]] std::optional<PrefixShortlistKey>
     prefix_shortlist_key(std::uint32_t frontier) const noexcept;
+    [[nodiscard]] std::size_t prefix_shortlist_size() const noexcept;
     [[nodiscard]] std::optional<runtime::PrefillWork>
     shared_candidate_rebuild_work(std::uint32_t frontier) const noexcept;
 
@@ -592,6 +593,11 @@ public:
                                                    runtime::FinalScheduleIntent intent);
     [[nodiscard]] std::optional<CapturePressurePlan>
     seal_capture(AssessedPressureTarget&& assessed);
+    // Claim the seal window so a concurrent demote cannot bump a victim's slot generation
+    // between this session's final assess and seal. Returns false if another session already
+    // claims it; the caller must back off. release_seal_window is idempotent.
+    [[nodiscard]] bool try_claim_seal_window() noexcept;
+    void release_seal_window() noexcept;
 
 private:
     explicit PressurePlanningSession(

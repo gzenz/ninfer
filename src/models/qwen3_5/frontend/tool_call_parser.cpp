@@ -20,6 +20,8 @@ using TypeSet             = Contract::TypeSet;
 constexpr std::string_view kToolOpen      = "<tool_call>";
 constexpr std::string_view kToolClose     = "</tool_call>";
 constexpr std::string_view kFunctionOpen  = "<function=";
+// Tolerant-only: the same tag with its opening '<' dropped. See parse_function.
+constexpr std::string_view kFunctionOpenBare = "function=";
 constexpr std::string_view kFunctionClose = "</function>";
 constexpr std::string_view kParamOpen     = "<parameter=";
 constexpr std::string_view kParamClose    = "</parameter>";
@@ -481,7 +483,13 @@ private:
     }
 
     FallbackReason parse_function(std::size_t& pos, RawToolCall& call) const {
-        if (!consume(pos, kFunctionOpen)) { return FallbackReason::MalformedStructure; }
+        // Tolerant mode: the model sometimes drops the '<' before the function tag
+        // (e.g. "function=Bash>"), which turns the whole call into prose. Accept the
+        // bare opener here; the name is still validated below either way.
+        if (!consume(pos, kFunctionOpen) &&
+            !(tolerant_ && consume(pos, kFunctionOpenBare))) {
+            return FallbackReason::MalformedStructure;
+        }
         const std::size_t name_begin = pos;
         std::size_t name_end         = text_.find('>', name_begin);
         bool ws_boundary             = false;

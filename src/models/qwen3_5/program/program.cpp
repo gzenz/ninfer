@@ -87,6 +87,10 @@ RequestBasePlan::prefix_shortlist_key(std::uint32_t frontier) const noexcept {
     };
 }
 
+std::size_t RequestBasePlan::prefix_shortlist_size() const noexcept {
+    return impl_ == nullptr ? std::size_t{0} : impl_->prefix_digests.size();
+}
+
 std::optional<runtime::PrefillWork>
 RequestBasePlan::shared_candidate_rebuild_work(std::uint32_t frontier) const noexcept {
     if (impl_ == nullptr) { return std::nullopt; }
@@ -198,6 +202,14 @@ std::optional<ResourcePlan> PressurePlanningSession::seal(AssessedPressureTarget
     if (!sealed) { return std::nullopt; }
     const bool needs_transfer = sealed->impl_->needs_transfer;
     return ResourcePlan(std::move(*sealed), impl_->resource_revision, needs_transfer);
+}
+
+bool PressurePlanningSession::try_claim_seal_window() noexcept {
+    return impl_ != nullptr && impl_->program->try_claim_seal_window();
+}
+
+void PressurePlanningSession::release_seal_window() noexcept {
+    if (impl_ != nullptr) { impl_->program->release_seal_window(); }
 }
 
 std::optional<CapturePressurePlan>

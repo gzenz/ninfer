@@ -72,8 +72,11 @@ public:
             reason_ = MaterializationStopReason::InsufficientExpectedGain;
             return false;
         }
-        // Unknown forecasts get one bounded discovery episode, not a fresh grant for every node.
-        if (!complete_prediction && (!discovery_eligible || discovery_used_)) {
+        // An incomplete (uncertain) forecast is only admitted for a discovery-eligible node. The
+        // eligibility is per-candidate (the caller passes it); cheap confirmation steps such as
+        // the assessment of an already-generated preserving alternative are admitted so a demote
+        // is not generated and then left unassessed.
+        if (!complete_prediction && !discovery_eligible) {
             reason_ = MaterializationStopReason::InsufficientExpectedGain;
             return false;
         }
@@ -112,9 +115,13 @@ public:
     }
 
 private:
+    // The gain is a per-request fact (the re-prefill a restore avoids). Dividing it by the
+    // concurrency inverts the economics: under load re-prefills queue and cost more, so the
+    // value threshold must not shrink as affected requests rise. The time allowance above is
+    // the legitimate concurrency fairness bound.
     [[nodiscard]] std::uint64_t economic(std::uint64_t gain) const noexcept {
         if (gain == std::numeric_limits<std::uint64_t>::max()) { return 0; }
-        return gain / 20U / std::max(1U, allowance_.affected_requests);
+        return gain / 20U;
     }
 
     bool boundary_limited_ = false;

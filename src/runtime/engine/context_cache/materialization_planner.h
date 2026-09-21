@@ -9,6 +9,9 @@
 #include <array>
 #include <chrono>
 #include <cstdint>
+#include <thread>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <optional>
 #include <span>
@@ -109,6 +112,15 @@ public:
                 throw std::invalid_argument("materialization candidate IDs are invalid");
             }
         }
+        // Gate instrumentation (NINFER_MAT_DEBUG=1): dump the value-gate inputs on every
+        // materialization so a failed re-touch shows exactly which candidate loses to which
+        // incumbent, and by how much. Off by default; writes to stderr (serve log).
+        const bool dbg = std::getenv("NINFER_MAT_DEBUG") != nullptr;
+        const auto dbg_economic = [](std::uint64_t gain) noexcept {
+            return gain == std::numeric_limits<std::uint64_t>::max() ? 0ULL : gain / 20U;
+        };
+        const auto dbg_flush = [&] { if (dbg) { std::fflush(stderr); } };
+
         queue_.clear();
         pending_.clear();
         const std::size_t frontier_capacity = candidates.size() + 1U + kTargetBudget;
@@ -130,6 +142,17 @@ public:
             planning_saturating_add(projection_work, identity.projection_work);
             const FoldedCost cost = fold_identity(input, identity, machine_cost);
             identity_costs_.push_back(cost);
+            if (dbg) {
+                std::fprintf(stderr, "[mat-debug] IDENT cand=%zu phys=%d now=%lu total=%lu "
+                                     "prefill_tok=%lu reused_tok=%lu bytes=%lu\n",
+                             index, static_cast<int>(identity.physical_status),
+                             static_cast<unsigned long>(cost.now_ns),
+                             static_cast<unsigned long>(cost.total_ns),
+                             static_cast<unsigned long>(cost.remaining_text_prefill),
+                             static_cast<unsigned long>(cost.reused_prompt_tokens),
+                             static_cast<unsigned long>(cost.transferred_bytes));
+                dbg_flush();
+            }
             std::optional<LogicalGoal> goal;
             if (identity.physical_status == MaterializationPhysicalStatus::Feasible) {
                 goal = logical_goal(input.id, identity.source_mode,
@@ -165,7 +188,7 @@ public:
                             [](const IdentityRoot& root) { return root.expandable; });
             const bool no_allowance =
                 allowance.remaining(planning_now_ns<Clock>()) == 0 ||
-                identity_best->cost.total_ns / 20U / std::max(1U, allowance.affected_requests) == 0;
+                identity_best->cost.total_ns / 20U == 0;
             if (!needs_optional_search || no_allowance) {
                 const CandidateInput& selected = candidates[identity_best->candidate_index];
                 const auto price_split         = [&](std::span<const std::uint32_t> frontiers) {
@@ -183,6 +206,23 @@ public:
                     *selected.candidate, prompt,
                     FinalScheduleIntent{.shared_capture_frontiers = shared_frontiers});
                 if (!sealed) { return std::nullopt; }
+                if (dbg) {
+                    std::fprintf(stderr,
+                                 "[mat-debug] SELECT-FAST cand=%zu now=%lu fut=%lu total=%lu "
+                                 "prefill_tok=%lu reused_tok=%lu stop=%s\n",
+                                 static_cast<std::size_t>(identity_best->candidate_index),
+                                 static_cast<unsigned long>(identity_best->cost.now_ns),
+                                 static_cast<unsigned long>(identity_best->cost.future_loss_ns),
+                                 static_cast<unsigned long>(identity_best->cost.total_ns),
+                                 static_cast<unsigned long>(identity_best->cost.remaining_text_prefill),
+                                 static_cast<unsigned long>(identity_best->cost.reused_prompt_tokens),
+                                 needs_optional_search
+                                     ? materialization_stop_reason_name(
+                                           MaterializationStopReason::TimeBudget)
+                                     : materialization_stop_reason_name(
+                                           MaterializationStopReason::NoPressure));
+                    dbg_flush();
+                }
                 MaterializationDiagnostics diagnostics = complete_diagnostics(
                     identity_best->cost, static_cast<std::uint32_t>(candidates.size()),
                     projection_work, planning_started,
@@ -265,7 +305,19 @@ public:
         const auto search_origin_ns = static_cast<std::uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(search_started.time_since_epoch())
                 .count());
-        MaterializationSearchBudget search_budget(allowance, search_origin_ns,
+        // The optional search gets a fresh allowance (full limit, restarted at the search
+        // origin) so the mandatory setup -- the root-maximal eviction assessment -- does not
+        // consume the window and starve the search of the preserving alternative (a
+        // demote-to-host). The setup's own elapsed time is still charged against the enclosing
+        // `allowance` used elsewhere; only the search's internal budget is restarted.
+        PlanningAllowance search_allowance = allowance;
+        search_allowance.started_ns = search_origin_ns;
+        // The search must explore several construction steps (one per pressure owner, each a few
+        // ms) before reaching the preserving alternative for the re-touch's own checkpoint, so it
+        // needs the full single-request allowance, not the reduced concurrency window. The cost it
+        // avoids (a multi-hundred-ms re-prefill) dwarfs the extra planning time.
+        search_allowance.limit_ns = 100'000'000;
+        MaterializationSearchBudget search_budget(search_allowance, search_origin_ns,
                                                   incumbent.cost.total_ns);
         const auto initial_cost_ns = incumbent.cost.total_ns;
         std::optional<std::uint64_t> first_improvement_ns;
@@ -287,10 +339,24 @@ public:
                 budget_exhausted = true;
                 return false;
             }
-            if (!search_budget.allow(planning_now_ns<Clock>(), operation, completion, gain,
-                                     complete, search_work, discovery_eligible)) {
+            const bool allowed = search_budget.allow(
+                planning_now_ns<Clock>(), operation, completion, gain, complete, search_work,
+                discovery_eligible);
+            if (!allowed) {
                 stop_reason      = search_budget.stop_reason();
                 budget_exhausted = stop_reason == MaterializationStopReason::TimeBudget;
+                if (dbg) {
+                    std::fprintf(stderr,
+                                 "[mat-debug] GATE DENY phase=%s op=%lu completion=%lu gain=%lu "
+                                 "econ=%lu complete=%d stop=%s\n",
+                                 materialization_search_phase_name(search_phase),
+                                 static_cast<unsigned long>(operation),
+                                 static_cast<unsigned long>(completion),
+                                 static_cast<unsigned long>(gain),
+                                 static_cast<unsigned long>(dbg_economic(gain)), complete ? 1 : 0,
+                                 materialization_stop_reason_name(stop_reason));
+                    dbg_flush();
+                }
                 return false;
             }
             stop_reason      = MaterializationStopReason::QueueExhausted;
@@ -368,7 +434,24 @@ public:
                 mark_target(assessment.stable_target_ordinal, kTargetFeasible);
                 candidate_seeded[expected_candidate] = true;
             }
-            if (goal && cost.less(incumbent.cost)) {
+            const bool becomes_incumbent = goal && cost.less(incumbent.cost);
+            if (dbg) {
+                std::fprintf(stderr,
+                             "[mat-debug] ASSESS cand=%zu phys=%d now=%lu fut=%lu total=%lu "
+                             "prefill_tok=%lu reused_tok=%lu bytes=%lu incumbent_now=%lu "
+                             "->inc=%d\n",
+                             expected_candidate, static_cast<int>(assessment.physical_status),
+                             static_cast<unsigned long>(cost.now_ns),
+                             static_cast<unsigned long>(cost.future_loss_ns),
+                             static_cast<unsigned long>(cost.total_ns),
+                             static_cast<unsigned long>(cost.remaining_text_prefill),
+                             static_cast<unsigned long>(cost.reused_prompt_tokens),
+                             static_cast<unsigned long>(cost.transferred_bytes),
+                             static_cast<unsigned long>(incumbent.cost.now_ns),
+                             becomes_incumbent ? 1 : 0);
+                dbg_flush();
+            }
+            if (becomes_incumbent) {
                 if (cost.total_ns < initial_cost_ns && !first_improvement_ns) {
                     first_improvement_ns = elapsed_ns(search_started, Clock::now());
                 }
@@ -601,11 +684,13 @@ public:
                                 ? incumbent.cost.total_ns - chosen.estimated_total_ns
                                 : 0;
                         search_phase = MaterializationSearchPhase::Assessment;
+                        // The assessment confirms an already-generated option; admit it even when
+                        // the candidate is seeded so a demote is not generated and left unassessed.
                         if (!allow_work(assessment_step_ns, assessment_step_ns,
                                         chosen.recovery_complete ? target_gain : gain,
                                         chosen.recovery_complete &&
                                             chosen.unsatisfied_constraints == 0,
-                                        !candidate_seeded[path.candidate_index])) {
+                                        true)) {
                             search_stopped = search_work >= work_limit ||
                                              allowance.remaining(planning_now_ns<Clock>()) == 0;
                             path.cursor.reset();
@@ -660,8 +745,9 @@ public:
                             assess_pending && pending_.front().guidance.recovery_complete &&
                                 pending_.front().guidance.unsatisfied_constraints == 0 &&
                                 pending_.front().guidance.logical_ready,
-                            !candidate_seeded[assess_pending ? pending_.front().candidate_index
-                                                             : queue_.front().candidate_index])) {
+                            assess_pending
+                                ? true
+                                : !candidate_seeded[queue_.front().candidate_index])) {
                 if (search_work >= work_limit ||
                     allowance.remaining(planning_now_ns<Clock>()) == 0) {
                     break;
@@ -696,6 +782,28 @@ public:
             ++search_work;
         }
 
+        // Claim the seal window so a concurrent demote cannot bump a victim's slot generation
+        // between the final assess and the seal (which would fail the seal's revalidate and force
+        // a re-prefill). Back off briefly on contention; if we cannot claim within the budget,
+        // fall through to the re-prefill fallback below (the concurrent materialization makes the
+        // room, and our next admission restores the checkpoint).
+        struct SealWindowClaim {
+            bool             claimed = false;
+            decltype(session)& s;
+            explicit SealWindowClaim(decltype(session)& ref) noexcept : s(ref) {
+                for (std::uint32_t attempt = 0; attempt < 32U; ++attempt) {
+                    if (ref.try_claim_seal_window()) { claimed = true; break; }
+                    std::this_thread::sleep_for(std::chrono::microseconds(125));
+                }
+            }
+            // Release as soon as the seal (and its fallback) is done, before the result is
+            // constructed. Holding it through the result bookkeeping would starve concurrent
+            // materializations that are waiting to seal (the N=10 re-touch cascade).
+            void release() noexcept { if (claimed) { s.release_seal_window(); claimed = false; } }
+            ~SealWindowClaim() { release(); }
+        };
+        SealWindowClaim seal_claim(session);
+
         const std::uint64_t search_elapsed_ns = elapsed_ns(search_started, Clock::now());
         if (!incumbent.assessed) {
             AssessedPressureTarget assessed            = session.assess(incumbent.target);
@@ -716,10 +824,60 @@ public:
         };
         std::vector<std::uint32_t> shared_frontiers =
             final_schedule(selected.id, selected.candidate->summary(), price_split);
-        std::optional<ResourcePlan> sealed =
-            session.seal(std::move(*incumbent.assessed), prompt,
-                         FinalScheduleIntent{.shared_capture_frontiers = shared_frontiers});
-        if (!sealed) { throw std::logic_error("selected pressure target could not be sealed"); }
+        std::optional<ResourcePlan> sealed;
+        if (seal_claim.claimed) {
+            sealed = session.seal(std::move(*incumbent.assessed), prompt,
+                                  FinalScheduleIntent{.shared_capture_frontiers = shared_frontiers});
+        } else if (dbg) {
+            std::fprintf(stderr, "[mat-debug] SEAL SKIP (claim) -> re-prefill cand=%lu\n",
+                         static_cast<unsigned long>(incumbent.candidate_index));
+            dbg_flush();
+        }
+        if (!sealed) {
+            // The selected preserving target (a demote-to-host) lost its host allocation to a
+            // concurrent demote between assess and seal. Fall back to the root-maximal eviction
+            // target, which needs no host and is always sealable, so the re-touch re-prefills
+            // instead of surfacing a 500. This is the unfixed outcome, not a new one.
+            if (dbg) {
+                std::fprintf(stderr,
+                             "[mat-debug] SEAL FALLBACK to root-maximal eviction cand=%lu "
+                             "reused_tok=%lu\n",
+                             static_cast<unsigned long>(incumbent.candidate_index),
+                             static_cast<unsigned long>(incumbent.cost.reused_prompt_tokens));
+                dbg_flush();
+            }
+            const PressureTargetHandle root =
+                session.root_maximal_target(candidates[incumbent.candidate_index].id);
+            AssessedPressureTarget root_assessed = session.assess(root);
+            if (root_assessed.assessment().physical_status !=
+                MaterializationPhysicalStatus::Feasible) {
+                throw std::logic_error("eviction fallback target lost feasibility");
+            }
+            sealed = session.seal(std::move(root_assessed), prompt,
+                                  FinalScheduleIntent{.shared_capture_frontiers = shared_frontiers});
+            if (!sealed) {
+                throw std::logic_error("eviction fallback target could not be sealed");
+            }
+            incumbent.root_maximal = true;
+        }
+        // The seal (and any fallback) is committed; release the claim so a concurrent
+        // materialization can seal immediately, before this one builds its result.
+        seal_claim.release();
+
+        if (dbg) {
+            std::fprintf(stderr,
+                         "[mat-debug] SELECT cand=%zu now=%lu fut=%lu total=%lu prefill_tok=%lu "
+                         "reused_tok=%lu stop=%s evals=%lu work=%lu\n",
+                         incumbent.candidate_index, static_cast<unsigned long>(incumbent.cost.now_ns),
+                         static_cast<unsigned long>(incumbent.cost.future_loss_ns),
+                         static_cast<unsigned long>(incumbent.cost.total_ns),
+                         static_cast<unsigned long>(incumbent.cost.remaining_text_prefill),
+                         static_cast<unsigned long>(incumbent.cost.reused_prompt_tokens),
+                         materialization_stop_reason_name(stop_reason),
+                         static_cast<unsigned long>(targets_evaluated),
+                         static_cast<unsigned long>(search_work));
+            dbg_flush();
+        }
 
         MaterializationDiagnostics diagnostics = make_diagnostics(
             incumbent.cost, targets_evaluated, projection_work, planning_started, search_elapsed_ns,

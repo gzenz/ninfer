@@ -106,8 +106,11 @@ struct FakeCacheSessionKey {
 };
 
 struct FakeShortlistKey {
-    std::uint32_t digest   = 0;
-    std::uint32_t frontier = 0;
+    std::uint32_t digest    = 0;
+    std::uint32_t frontier  = 0;
+    // Match the real PrefixShortlistKey surface used by [candgen] instrumentation.
+    std::array<std::uint64_t, 2> digests{};
+    std::uint32_t identity_tag               = 0;
 
     friend bool operator==(FakeShortlistKey, FakeShortlistKey) = default;
 };
@@ -223,6 +226,10 @@ struct FakeRequestBasePlan {
     prefix_shortlist_key(std::uint32_t frontier) const noexcept {
         if (!allow_shortlist || frontier == 0) { return std::nullopt; }
         return FakeShortlistKey{.digest = shortlist_digest, .frontier = frontier};
+    }
+
+    [[nodiscard]] std::size_t prefix_shortlist_size() const noexcept {
+        return allow_shortlist ? 1 : 0;
     }
 
     [[nodiscard]] std::optional<PrefillWork>
@@ -581,6 +588,8 @@ public:
     [[nodiscard]] std::optional<FakeResourcePlan> seal(FakeAssessedPressureTarget&& assessed);
     [[nodiscard]] std::optional<FakeResourcePlan>
     seal_capture(FakeAssessedPressureTarget&& assessed);
+    [[nodiscard]] bool try_claim_seal_window() noexcept;
+    void release_seal_window() noexcept;
 
 private:
     struct Owner {
@@ -1759,6 +1768,10 @@ FakePressurePlanningSession::seal(FakeAssessedPressureTarget&& assessed, const F
     program_->seal_attempts.push_back(std::move(action_ids));
     return plan;
 }
+
+bool FakePressurePlanningSession::try_claim_seal_window() noexcept { return true; }
+
+void FakePressurePlanningSession::release_seal_window() noexcept {}
 
 std::optional<FakeResourcePlan>
 FakePressurePlanningSession::seal_capture(FakeAssessedPressureTarget&& assessed) {

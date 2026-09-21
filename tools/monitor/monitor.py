@@ -222,7 +222,7 @@ class Monitor:
         # Per-tick host-KV event counts (park/evict/restore/miss), parsed from
         # the serve log; captured into each sample and charted.
         self._kv_totals = {"d2h_pages": 0, "h2d_pages": 0, "spill_pages": 0,
-                           "owners_evicted": 0, "owners_degraded": 0,
+                           "owners_evicted": 0, "owners_demoted": 0, "owners_degraded": 0,
                            "checkpoints_dropped": 0, "maximal_fallbacks": 0,
                            "d2h_bytes": 0, "h2d_bytes": 0,
                            "d2h_seconds": 0, "h2d_seconds": 0,
@@ -643,6 +643,7 @@ class Monitor:
                 "h2d_seconds": kt.get("main_kv_h2d_seconds", 0) + kt.get("backend_kv_h2d_seconds", 0),
                 "spill_pages": pr.get("spill_pages", 0),
                 "owners_evicted": pr.get("private_owners_evicted", 0) + pr.get("shared_owners_evicted", 0),
+                "owners_demoted": pr.get("private_owners_demoted", 0),
                 "owners_degraded": pr.get("private_owners_degraded", 0) + pr.get("shared_owners_degraded", 0),
                 "checkpoints_dropped": pr.get("checkpoints_dropped", 0),
                 "maximal_fallbacks": pr.get("maximal_fallback_selections", 0),
@@ -892,7 +893,7 @@ const C={sched:['#58a6ff','#3fb950','#d29922','#bc8cff','#f778ba','#f85149','#3f
          concurrent:['#58a6ff'],
          decode:['#58a6ff','#d29922'],prefill:['#3fb950','#d29922'],
          kv:['#58a6ff','#3fb950','#d29922'],
-         kvev:['#f85149','#d29922','#58a6ff','#3fb950'],
+         kvev:['#f85149','#d29922','#58a6ff','#3fb950','#bc8cff'],
          mtp:['#3fb950','#bc8cff'],ttft:['#58a6ff','#d29922'],proc:['#bc8cff','#f778ba'],
          gpu:['#58a6ff','#3fb950'],cpura:['#58a6ff','#d29922'],
          hpwr:['#f0883e']};
@@ -1099,6 +1100,7 @@ function render(d){
   draw('c-press','l-press',[
     seriesFrom(S,s=>s.kv_events?.spill_pages||0,C.kvev[0],'spill'),
     seriesFrom(S,s=>s.kv_events?.owners_evicted||0,C.kvev[1],'evict'),
+    seriesFrom(S,s=>s.kv_events?.owners_demoted||0,C.kvev[4],'demote'),
     seriesFrom(S,s=>s.kv_events?.owners_degraded||0,C.kvev[2],'degrade'),
     seriesFrom(S,s=>s.kv_events?.maximal_fallbacks||0,C.kvev[3],'fallback'),
   ],{integers:true});
@@ -1185,6 +1187,7 @@ function renderKvBars(latest){
   const slots=mem.host_state_occupied_slots||0,maxSlots=mem.host_state_capacity_slots||0;
   const devSlots=pstats.device_state_occupied_slots||0;
   const evict=(pstats.private_owners_evicted||0)+(pstats.shared_owners_evicted||0);
+  const demoted=pstats.private_owners_demoted||0;
   const spill=pstats.spill_pages||0,ckptDrop=pstats.checkpoints_dropped||0;
   let h='<div style="font-size:12px;color:var(--muted);margin-bottom:4px">device KV: '+pg+' / '+mpg+' pages ('+pgPct.toFixed(0)+'%) · payload: '+gb(mem.kv_payload_bytes||0)+'</div>';
   h+=bar([{pct:pgPct,color:C.kv[0],label:'used'},{pct:100-pgPct,color:'#30363d',label:'free'}]);
@@ -1194,7 +1197,7 @@ function renderKvBars(latest){
   } else {
     h+='<div class="empty">host KV cache disabled</div>';
   }
-  h+='<div style="font-size:12px;color:var(--muted);margin:6px 0 2px">pressure (cum): evict '+evict+' · spill '+spill+' · ckpt_drop '+ckptDrop+'</div>';
+  h+='<div style="font-size:12px;color:var(--muted);margin:6px 0 2px">pressure (cum): evict '+evict+' · demote '+demoted+' · spill '+spill+' · ckpt_drop '+ckptDrop+'</div>';
   $('kvbars').innerHTML=h;
 }
 function renderXferStats(latest){

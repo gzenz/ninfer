@@ -98,6 +98,7 @@ std::string format_stats_json(const ninfer::RuntimeStats& s, const ninfer::Memor
         {"spill_pages", s.pressure_spill_pages},
         {"partial_tail_cow_pages", s.partial_tail_cow_pages},
         {"private_owners_degraded", s.pressure_private_owners_degraded},
+        {"private_owners_demoted", s.pressure_private_owners_demoted},
         {"private_owners_evicted", s.pressure_private_owners_evicted},
         {"shared_owners_degraded", s.pressure_shared_owners_degraded},
         {"shared_owners_evicted", s.pressure_shared_owners_evicted},

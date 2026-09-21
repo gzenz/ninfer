@@ -1,3 +1,4 @@
+#include "models/qwen3_5/program/planning/pressure_value_ranking.h"
 #include "runtime/engine/context_cache/resource_manager.h"
 
 #include <algorithm>
@@ -3464,6 +3465,245 @@ void test_publication_only_pressure_constructs_adoptable_target() {
             "publication-only closure did not release exactly one private slot");
 }
 
+// Value-aware demote-vs-evict selection: when two private victims have DIFFERENT re-prefill
+// cost (endpoint rebuild_work) and device pressure forces one to demote-to-host and one to
+// evict-and-drop, the planner must demote the HIGHER-value victim (keep its restorable
+// checkpoint) and evict the cheaper one. The value weight is a property of the shared
+// materialization objective (the portfolio-value fold priced from checkpoint rebuild_ns), so
+// this drives the real MaterializationPlanner directly with two owners of distinct rebuild_ns
+// and gates feasibility through logical_goal to model the host-arena constraint.
+void test_value_aware_pressure_demotes_high_value_victim_over_eviction() {
+    using Planner = ninfer::runtime::MaterializationPlanner<FakeModelContract>;
+    constexpr std::uint64_t ms           = 1'000'000;
+    constexpr std::uint32_t weight       = 4;
+    constexpr std::uint64_t rebuild_high = 400 * ms;
+    constexpr std::uint64_t rebuild_low  = 40 * ms;
+    // Above both rebuild costs, so an evicted victim loses its full rebuild value in the
+    // portfolio fold while a retained/demoted victim (zero restore cost) loses nothing.
+    constexpr std::uint64_t recovery_cost = 1000 * ms;
+
+    // Owner 1 carries the high re-prefill value; owner 2 the low value.
+    const std::array<FakeContinuationHandle, 2> handles{
+        FakeContinuationHandle{1, 0},
+        FakeContinuationHandle{2, 0},
+    };
+    const std::array<const FakeContinuationHandle*, 2> owners{&handles[0], &handles[1]};
+    const std::array<PlanningOwnerId, 2> ids{
+        PlanningOwnerId{.value = 0},
+        PlanningOwnerId{.value = 1},
+    };
+    const std::array<ninfer::runtime::MaterializationOwnerPolicy, 2> policies{
+        ninfer::runtime::MaterializationOwnerPolicy{.owner                    = ids[0],
+                                                    .private_retention_weight = weight},
+        ninfer::runtime::MaterializationOwnerPolicy{.owner                    = ids[1],
+                                                    .private_retention_weight = weight},
+    };
+    const std::array<ninfer::runtime::MaterializationCheckpointPolicy, 2> checkpoints{
+        ninfer::runtime::MaterializationCheckpointPolicy{
+            .owner       = ids[0],
+            .checkpoint  = CheckpointRef{.kind     = CheckpointKind::SessionEndpoint,
+                                         .frontier = 16,
+                                         .ordinal  = 0},
+            .demand_mask = 1,
+            .rebuild_ns  = rebuild_high},
+        ninfer::runtime::MaterializationCheckpointPolicy{
+            .owner       = ids[1],
+            .checkpoint  = CheckpointRef{.kind     = CheckpointKind::SessionEndpoint,
+                                         .frontier = 16,
+                                         .ordinal  = 0},
+            .demand_mask = 1,
+            .rebuild_ns  = rebuild_low},
+    };
+    // Each owner can demote-to-host (preserve, one relief unit) or evict-and-drop (one relief
+    // unit). Both owners are touched under primary pressure; the host constraint decides the mix.
+    const std::vector<std::pair<std::uint32_t, std::vector<FakeTargetDecision>>> owner_decisions{
+        {1,
+         {{.id                  = 1000U + 1, .immediate_ns = 0, .degradation_units = 1},
+          {.id                  = 2000U + 1,
+           .immediate_ns        = 0,
+           .degradation_units   = 4,
+           .dropped_checkpoints = 1,
+           .evicts_continuation = true}}},
+        {2,
+         {{.id                  = 1000U + 2, .immediate_ns = 0, .degradation_units = 1},
+          {.id                  = 2000U + 2,
+           .immediate_ns        = 0,
+           .degradation_units   = 4,
+           .dropped_checkpoints = 1,
+           .evicts_continuation = true}}},
+    };
+    const auto inputs = [&]() -> Planner::PressureInputs {
+        return Planner::PressureInputs{
+            .private_owners    = owners,
+            .private_owner_ids = ids,
+            .shared_owners     = {},
+            .shared_owner_ids  = {},
+            .owner_policy      = policies,
+            .checkpoint_policy = checkpoints,
+        };
+    };
+
+    // Primary: host room holds exactly one demote, so one victim must evict. The value-aware
+    // objective must demote the high-value owner and evict the low-value owner.
+    {
+        FakeProgram program;
+        program.required_pressure_actions        = 2;
+        program.eviction_pressure_action_units   = 1;
+        program.pressure_action_immediate_ns     = 0;
+        program.pressure_checkpoint_recovery_ns  = recovery_cost;
+        program.owner_decisions                  = owner_decisions;
+
+        FakeAdmissionCandidate root;
+        set_fake_machine_costs(root.identity.machine_work, 100 * ms, 100 * ms);
+        root.identity.physical_status            =
+            ninfer::runtime::MaterializationPhysicalStatus::Infeasible;
+        root.identity.expandable                 = true;
+        root.identity.assessment_digest          = 7;
+        const std::array<Planner::CandidateInput, 1> candidates{
+            Planner::CandidateInput{.candidate        = &root,
+                                    .id               = PlanningCandidateId{.value = 0},
+                                    .stable_ordinal   = 0,
+                                    .current_session_binding = false},
+        };
+        const auto goal = [](PlanningCandidateId, PrivateSourceMode,
+                             std::span<const ninfer::runtime::PressureOwnerOutcome> outcomes)
+            -> std::optional<Planner::LogicalGoal> {
+            std::uint32_t evicted = 0;
+            for (const auto& outcome : outcomes) {
+                if (outcome.disposition == VictimDisposition::Evicted) { ++evicted; }
+            }
+            if (evicted == 0) { return std::nullopt; }  // host can't hold every demote
+            return Planner::LogicalGoal{.publication_slot = 0};
+        };
+        Planner planner;
+        auto allowance                      = ninfer::runtime::PlanningAllowance::boundary(0);
+        allowance.limit_ns                  = 100 * ms;
+        const auto result                   =
+            planner.plan(program, FakePreparedPrompt{}, test_cost_model(), candidates, 0, inputs,
+                         goal, Planner::Clock::now(), allowance);
+        require(result && result->plan,
+                "value-aware pressure search found no demote/evict closure");
+        const auto& plan = *result->plan;
+        require(plan.private_owner_ids.size() == 2 && plan.private_actions.size() == 2,
+                "value-aware pressure closure did not act on both victims");
+        std::uint64_t action_for_high = 0, action_for_low = 0;
+        for (std::size_t index = 0; index < plan.private_owner_ids.size(); ++index) {
+            if (plan.private_owner_ids[index] == 1) { action_for_high = plan.private_actions[index].id; }
+            if (plan.private_owner_ids[index] == 2) { action_for_low = plan.private_actions[index].id; }
+        }
+        require(action_for_high == 1000U + 1,
+                "planner evicted (or failed to demote) the HIGH-value victim instead of demoting it");
+        require(action_for_low == 2000U + 2,
+                "planner demoted the LOW-value victim and evicted a higher-value one");
+        // The evicted victim is the low-value owner, so the value-aware cost is the candidate
+        // immediate plus rebuild_low * retention_weight; the retained high-value owner keeps the
+        // public portfolio value, so it adds no future loss.
+        const std::uint64_t expected = 100 * ms + static_cast<std::uint64_t>(weight) * rebuild_low;
+        require(result->diagnostics.predicted_total_ns == expected,
+                "value-aware cost model mis-priced the demote-high/evict-low closure");
+    }
+
+    // Fallback: host is full (no demote successor), so the victim that must be sacrificed evicts.
+    // With relief = 1 the cheaper (low-value) victim evicts, preserving the value-aware outcome.
+    {
+        FakeProgram program;
+        program.required_pressure_actions        = 1;
+        program.eviction_pressure_action_units   = 1;
+        program.pressure_action_immediate_ns     = 0;
+        program.pressure_checkpoint_recovery_ns  = recovery_cost;
+        program.owner_decisions                  = owner_decisions;
+
+        FakeAdmissionCandidate root;
+        set_fake_machine_costs(root.identity.machine_work, 100 * ms, 100 * ms);
+        root.identity.physical_status            =
+            ninfer::runtime::MaterializationPhysicalStatus::Infeasible;
+        root.identity.expandable                 = true;
+        root.identity.assessment_digest          = 7;
+        const std::array<Planner::CandidateInput, 1> candidates{
+            Planner::CandidateInput{.candidate        = &root,
+                                    .id               = PlanningCandidateId{.value = 0},
+                                    .stable_ordinal   = 0,
+                                    .current_session_binding = false},
+        };
+        const auto goal = [](PlanningCandidateId, PrivateSourceMode,
+                             std::span<const ninfer::runtime::PressureOwnerOutcome> outcomes)
+            -> std::optional<Planner::LogicalGoal> {
+            std::uint32_t evicted = 0;
+            for (const auto& outcome : outcomes) {
+                if (outcome.disposition == VictimDisposition::Evicted) { ++evicted; }
+            }
+            if (evicted == 0) { return std::nullopt; }  // host full: a demote is impossible
+            return Planner::LogicalGoal{.publication_slot = 0};
+        };
+        Planner planner;
+        auto allowance                      = ninfer::runtime::PlanningAllowance::boundary(0);
+        allowance.limit_ns                  = 100 * ms;
+        const auto result                   =
+            planner.plan(program, FakePreparedPrompt{}, test_cost_model(), candidates, 0, inputs,
+                         goal, Planner::Clock::now(), allowance);
+        require(result && result->plan, "full-host pressure search found no evicting closure");
+        const auto& plan = *result->plan;
+        require(plan.private_owner_ids.size() == 1,
+                "full-host closure evicted more than the one required victim");
+        require(plan.private_owner_ids[0] == 2 && plan.private_actions[0].id == 2000U + 2,
+                "full-host closure did not evict the cheaper (low-value) victim");
+        // Same value-aware pricing as the primary closure: the sacrificed victim is the
+        // low-value owner, so the cost is the candidate immediate plus rebuild_low * weight.
+        const std::uint64_t expected = 100 * ms + static_cast<std::uint64_t>(weight) * rebuild_low;
+        require(result->diagnostics.predicted_total_ns == expected,
+                "full-host closure was not priced as a low-value eviction");
+    }
+}
+
+// Deterministic check of the REAL value-aware victim ranking that populate_options charges
+// to the evict cost: the highest re-prefill-cost private victim gets the highest
+// value_weight (so the planner demotes it to host), the cheapest gets 0 (so it is evicted),
+// and shared victims are always weight 0. This drives pressure_value_ranking.h directly —
+// the exact function the production planner calls — with no GPU/program, so the
+// demote-high/evict-low choice is reproducible on demand (unlike the e2e pressure search,
+// a rare timing race).
+void test_value_weights_rank_private_victims_by_rebuild_cost() {
+    using ninfer::models::qwen3_5::detail::value_weights_for_victims;
+
+    // Costs: A=high, B=low, C=mid, D=shared. Expected weights: A=3, B=0, C=1, D=0.
+    {
+        const std::array<std::uint8_t, 4> is_shared  = {0, 0, 0, 1};
+        const std::array<std::uint64_t, 4> cost      = {9000, 100, 5000, 0};
+        const auto weights                           = value_weights_for_victims(is_shared, cost);
+        require(weights.size() == 4, "weight vector size mismatch");
+        // 3 non-shared victims -> ranks are 0..2; the highest cost takes the top rank (2).
+        require(weights[0] == 2, "high-cost private victim did not get the top rank");
+        require(weights[1] == 0, "lowest-cost private victim did not get rank 0");
+        require(weights[2] == 1, "mid-cost private victim did not get rank 1");
+        require(weights[3] == 0, "shared victim must stay weight 0");
+    }
+
+    // All shared -> all weights 0 (nothing to rank).
+    {
+        const std::array<std::uint8_t, 2> is_shared  = {1, 1};
+        const std::array<std::uint64_t, 2> cost      = {123, 456};
+        const auto weights                           = value_weights_for_victims(is_shared, cost);
+        require(weights[0] == 0 && weights[1] == 0, "all-shared victims must all be weight 0");
+    }
+
+    // Ties are deterministic (the victim index breaks them): equal costs keep ascending order.
+    {
+        const std::array<std::uint8_t, 3> is_shared  = {0, 0, 0};
+        const std::array<std::uint64_t, 3> cost      = {7, 7, 7};
+        const auto weights                           = value_weights_for_victims(is_shared, cost);
+        require(weights[0] == 0 && weights[1] == 1 && weights[2] == 2,
+                "equal-cost victims must keep deterministic ascending order");
+    }
+
+    // Empty: no victims, no weights.
+    {
+        const std::array<std::uint8_t, 0> is_shared  = {};
+        const std::array<std::uint64_t, 0> cost      = {};
+        const auto weights                           = value_weights_for_victims(is_shared, cost);
+        require(weights.empty(), "no victims -> no weights");
+    }
+}
+
 
 } // namespace
 
@@ -3472,6 +3712,10 @@ int main() {
              test_complete_search_against_small_exhaustive_oracle);
     run_test("publication-only construction",
              test_publication_only_pressure_constructs_adoptable_target);
+    run_test("value-aware demotes high-value victim over eviction",
+             test_value_aware_pressure_demotes_high_value_victim_over_eviction);
+    run_test("value-aware ranking of private victims by rebuild cost",
+             test_value_weights_rank_private_victims_by_rebuild_cost);
     run_test("private checkpoint identity loss",
              test_private_portfolio_loss_keeps_checkpoint_identity_fixed);
     run_test("portfolio demand and owner aggregation", test_portfolio_demand_and_owner_aggregation);

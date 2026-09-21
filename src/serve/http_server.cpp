@@ -90,6 +90,8 @@ bool report_has_activity(const ThroughputReport& report) {
            report.current.partial_tail_cow_pages != report.previous.partial_tail_cow_pages ||
            report.current.pressure_private_owners_degraded !=
                report.previous.pressure_private_owners_degraded ||
+           report.current.pressure_private_owners_demoted !=
+               report.previous.pressure_private_owners_demoted ||
            report.current.pressure_private_owners_evicted !=
                report.previous.pressure_private_owners_evicted ||
            report.current.pressure_shared_owners_degraded !=

@@ -1237,6 +1237,10 @@ struct PressurePlanningSessionImpl {
         std::uint32_t owner_index = 0;
         std::vector<PressureDecision> decisions;
         std::uint16_t eviction_choice = 0;
+        // Bounded rank (0..N-1) of this private victim's re-prefill cost, used to make the
+        // planner's cost objective prefer demoting the highest-value victims to host over
+        // evict-and-drop. Zero for shared victims. See populate_options.
+        std::uint64_t value_weight = 0;
     };
 
     struct CandidateOptions {

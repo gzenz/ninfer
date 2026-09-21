@@ -331,23 +331,52 @@ public:
         candidates.push_back(Candidate{.plan = std::move(*root)});
 
         if (cache_enabled_) {
+            const auto seshash = [](const std::string_view sv) noexcept {
+                std::uint64_t h = 0;
+                for (const char c : sv) { h = (h ^ static_cast<unsigned char>(c)) * 1099511628211ULL; }
+                return h;
+            };
             {
                 const auto probe1 = base.prefix_shortlist_key(1);
                 std::uint64_t sfp = 0;
                 if (base.context_cache().session_key) {
-                    const auto sv = base.context_cache().session_key->view();
-                    for (const char c : sv) { sfp = (sfp ^ static_cast<unsigned char>(c)) * 1099511628211ULL; }
+                    sfp = seshash(base.context_cache().session_key->view());
                 }
-                cdbg_log("[candgen] === episode prefix_index=%zu session=%016lx digests=%d base_tag=%u ===\n",
-                         prefix_index_.size(), sfp, probe1 ? 1 : 0, probe1 ? probe1->identity_tag : 0U);
+                cdbg_log("[candgen] === episode prefix_index=%zu session=%016lx digests=%d base_tag=%u sl_size=%zu ===\n",
+                         prefix_index_.size(), sfp, probe1 ? 1 : 0, probe1 ? probe1->identity_tag : 0U,
+                         base.prefix_shortlist_size());
+                if (current_session_cell) {
+                    const auto& scell = session_index_[*current_session_cell];
+                    if (scell.slot < catalog_count_) {
+                        const CatalogEntry& oe = catalog_[scell.slot];
+                        cdbg_log("[candgen] OWN slot=%u state=%d handle=%d id=%lu rev=%lu sl_size=%zu\n",
+                                 scell.slot, static_cast<int>(oe.state), oe.handle ? 1 : 0,
+                                 oe.id, oe.revision, base.prefix_shortlist_size());
+                    } else {
+                        cdbg_log("[candgen] OWN slot=ABSENT sl_size=%zu\n",
+                                 base.prefix_shortlist_size());
+                    }
+                } else {
+                    cdbg_log("[candgen] OWN cell=NONE update_index=%d session=%d sl_size=%zu\n",
+                             base.context_cache().update_session_index ? 1 : 0,
+                             base.context_cache().session_key ? 1 : 0,
+                             base.prefix_shortlist_size());
+                }
             }
             for (const PrefixIndexEntry& index : prefix_index_) {
                 if (!valid_prefix_index_entry(index)) { continue; }
                 const std::optional<PrefixShortlistKey> incoming =
                     base.prefix_shortlist_key(index.key.frontier);
                 if (!incoming) {
-                    cdbg_log("[candgen] priv SKIP slot=%u NULLOPT idx_frontier=%u shared=%d\n",
-                             index.slot, index.key.frontier, index.shared ? 1 : 0);
+                    const CatalogEntry& nslot = catalog_[index.slot];
+                    const std::uint64_t nh =
+                        nslot.session ? seshash(nslot.session->view()) : 0ULL;
+                    const bool nown = nslot.session && base.context_cache().session_key &&
+                                      *nslot.session == *base.context_cache().session_key;
+                    cdbg_log("[candgen] priv SKIP slot=%u NULLOPT idx_frontier=%u shared=%d "
+                             "sl_size=%zu sess=%016lx %s\n",
+                             index.slot, index.key.frontier, index.shared ? 1 : 0,
+                             base.prefix_shortlist_size(), nh, nown ? "OWN" : "XSESSION");
                     continue;
                 }
                 if (incoming->identity_tag != index.key.identity_tag) {
@@ -1149,6 +1178,7 @@ public:
         out.pressure_spill_pages               = context_stats_.pressure_spill_pages;
         out.partial_tail_cow_pages             = context_stats_.partial_tail_cow_pages;
         out.pressure_private_owners_degraded   = context_stats_.pressure_private_owners_degraded;
+        out.pressure_private_owners_demoted    = context_stats_.pressure_private_owners_demoted;
         out.pressure_private_owners_evicted    = context_stats_.pressure_private_owners_evicted;
         out.pressure_shared_owners_degraded    = context_stats_.pressure_shared_owners_degraded;
         out.pressure_shared_owners_evicted     = context_stats_.pressure_shared_owners_evicted;
@@ -2675,6 +2705,15 @@ private:
         advance_revision(entry.revision);
         refresh_session_owner_revision(claim.capability.owner.id, slot, entry.revision);
         saturating_increment(context_stats_.pressure_private_owners_degraded);
+        // A committed non-evicted action that leaves the endpoint resident on host (HostOnly /
+        // Both) is a demote-to-host: the checkpoint stays Catalogued + session-cell (restorable)
+        // rather than dropped. Track it separately from a plain in-device degrade.
+        const auto& final_summary = *result.final_summary;
+        if (final_summary.endpoint &&
+            (final_summary.endpoint->state_residency == runtime::ReplicaResidency::HostOnly ||
+             final_summary.endpoint->state_residency == runtime::ReplicaResidency::Both)) {
+            saturating_increment(context_stats_.pressure_private_owners_demoted);
+        }
         record_checkpoint_drops(context_stats_, dropped);
         entry.state = CatalogState::Catalogued;
     }

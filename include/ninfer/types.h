@@ -967,6 +967,7 @@ struct RuntimeStats {
     std::uint32_t device_backend_kv_occupied_pages     = 0;
     std::size_t host_kv_occupied_bytes                 = 0;
     std::uint64_t pressure_private_owners_degraded     = 0;
+    std::uint64_t pressure_private_owners_demoted      = 0;
     std::uint64_t pressure_private_owners_evicted      = 0;
     std::uint64_t pressure_shared_owners_degraded      = 0;
     std::uint64_t pressure_shared_owners_evicted       = 0;

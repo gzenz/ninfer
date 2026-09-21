@@ -1,4 +1,5 @@
 #include "models/qwen3_5/program/planning/pressure_planner.h"
+#include "models/qwen3_5/program/planning/pressure_value_ranking.h"
 
 namespace ninfer::models::qwen3_5::detail {
 
@@ -413,6 +414,43 @@ void PressurePlanningSessionImpl::populate_options(std::uint32_t selected_candid
         }
         victim.eviction_choice = static_cast<std::uint16_t>(decisions.size());
     }
+
+    // Value-aware demote-vs-evict priority: rank the private victims by re-prefill cost so the
+    // planner's cost objective prefers demoting the highest-value (most expensive to rebuild)
+    // victims to host and evict-and-dropping the cheapest. The weight is a bounded rank
+    // (0..N-1) rather than the raw cost, keeping it comparable to degradation_units so it
+    // steers the search without overwhelming feasibility. Shared victims stay weight 0.
+    //
+    // The ranking itself is the dependency-free value_weights_for_victims (unit-tested in
+    // isolation); here we only gather each victim's shared flag and re-prefill cost.
+    {
+        using PlanningContractAccess = qwen3_5::detail::RuntimeContractAccess;
+        std::vector<std::uint8_t> is_shared;
+        std::vector<std::uint64_t> rebuild_cost;
+        is_shared.reserve(options.victims.size());
+        rebuild_cost.reserve(options.victims.size());
+        for (std::size_t victim_index = 0; victim_index < options.victims.size(); ++victim_index) {
+            const Owner& owner = owners[options.victims[victim_index].owner_index];
+            is_shared.push_back(owner.shared ? 1U : 0U);
+            std::uint64_t cost = 0;
+            if (!owner.shared) {
+                const auto& sequence =
+                    program->continuation_states[PlanningContractAccess::index(*owner.private_handle)];
+                const qwen3_5::ContinuationSummary summary = program->continuation_summary(sequence);
+                if (summary.endpoint) {
+                    const auto& work = summary.endpoint->rebuild_work;
+                    planning_saturating_add(cost, work.tokens);
+                    planning_saturating_add(cost, work.attention_pairs);
+                }
+            }
+            rebuild_cost.push_back(cost);
+        }
+        const std::vector<std::uint32_t> weights =
+            detail::value_weights_for_victims(is_shared, rebuild_cost);
+        for (std::size_t victim_index = 0; victim_index < options.victims.size(); ++victim_index) {
+            options.victims[victim_index].value_weight = weights[victim_index];
+        }
+    }
     options.populated = true;
 }
 
@@ -719,7 +757,14 @@ runtime::PressureTargetGuidance PressurePlanningSessionImpl::guidance_choices(
         approximate_pressure.removed =
             planning_resource_sum(approximate_pressure.removed, decision.effect.removed);
         estimated_pressure.append(decision.transfer_requirements);
-        const std::uint32_t units = degradation_units(decision);
+        std::uint32_t units = degradation_units(decision);
+        // Evicting-and-dropping a private victim is not just one degradation unit: it loses a
+        // restorable checkpoint, so charge its value rank. This makes the search prefer to
+        // demote the highest-value victims to host and evict the cheapest when host is short.
+        if (decision.evicts_continuation) {
+            units = planning_saturating_u32(static_cast<std::uint64_t>(units) +
+                                            victim_options.value_weight);
+        }
         total_degradation =
             planning_saturating_u32(static_cast<std::uint64_t>(total_degradation) + units);
         total_dropped = planning_saturating_u32(static_cast<std::uint64_t>(total_dropped) +

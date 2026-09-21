@@ -753,6 +753,8 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
               monotonic_delta(previous.partial_tail_cow_pages, current.partial_tail_cow_pages)},
              {"private_owners_degraded", monotonic_delta(previous.pressure_private_owners_degraded,
                                                          current.pressure_private_owners_degraded)},
+             {"private_owners_demoted", monotonic_delta(previous.pressure_private_owners_demoted,
+                                                        current.pressure_private_owners_demoted)},
              {"private_owners_evicted", monotonic_delta(previous.pressure_private_owners_evicted,
                                                         current.pressure_private_owners_evicted)},
              {"shared_owners_degraded", monotonic_delta(previous.pressure_shared_owners_degraded,

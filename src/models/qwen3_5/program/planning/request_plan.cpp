@@ -4,6 +4,8 @@
 #include "models/qwen3_5/program/context.h"
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <iterator>
 #include <limits>
 #include <stdexcept>
@@ -330,6 +332,102 @@ RequestBasePlan ProgramImpl::plan_request(const PreparedPromptData& prompt,
         base->prefix_digests.assign(prompt);
         base->prefix_identity_tag =
             capture_identity_tag(speculative_backend, proposal_head, kv_storage);
+        if (std::getenv("NINFER_MAT_DEBUG")) {
+            const std::uint32_t n = static_cast<std::uint32_t>(prompt.token_ids.size());
+            std::fprintf(stderr,
+                         "[digest] pub tok=%u rewrite_n=%zu",
+                         n, prompt.identity.rewrite_execution_frontiers.size());
+            for (const std::uint32_t rf : prompt.identity.rewrite_execution_frontiers) {
+                std::fprintf(stderr, " rf=%u", rf);
+            }
+            if (n > 0) {
+                std::fprintf(stderr, " pos00=%d pos01=%d pos02=%d ", prompt.positions[0],
+                             prompt.positions[1], prompt.positions[2]);
+                if (n >= 3) {
+                    std::fprintf(stderr, "posFm3=%d posFm2=%d posFm1=%d ",
+                                 prompt.positions[n - 3U], prompt.positions[n - 2U],
+                                 prompt.positions[n - 1U]);
+                }
+                std::fprintf(stderr, "tt0=%u tt1=%u tt2=%u ",
+                             prompt.token_types.size() > 0 ? prompt.token_types[0] : 0U,
+                             prompt.token_types.size() > 1 ? prompt.token_types[1] : 0U,
+                             prompt.token_types.size() > 2 ? prompt.token_types[2] : 0U);
+                std::fprintf(stderr, "led_n=%zu", prompt.token_ids.size());
+                if (prompt.token_ids.size() > 2) {
+                    std::fprintf(stderr, " tok0=%u tok1=%u tok2=%u", prompt.token_ids[0],
+                                 prompt.token_ids[1], prompt.token_ids[2]);
+                }
+                if (n >= 3) {
+                    std::fprintf(stderr, " tokFm3=%u tokFm2=%u tokFm1=%u",
+                                 prompt.token_ids[n - 3U], prompt.token_ids[n - 2U],
+                                 prompt.token_ids[n - 1U]);
+                }
+                for (const std::uint32_t rf : prompt.identity.rewrite_execution_frontiers) {
+                    if (rf < base->prefix_digests.size()) {
+                        const auto d = base->prefix_digests.at(rf);
+                        std::fprintf(stderr, " d@%u=%lx,%lx", rf, d[0], d[1]);
+                    }
+                }
+                const auto dend = base->prefix_digests.at(base->prefix_digests.size());
+                std::fprintf(stderr, " dend=%lx,%lx", dend[0], dend[1]);
+                // Grid digest+token trace: localizes where an incoming re-render diverges
+                // from a stored checkpoint's running digest (NINFER_MAT_DEBUG only).
+                if (std::getenv("NINFER_MAT_GRID")) {
+                    std::fprintf(stderr, " GRID");
+                    for (std::uint32_t f = 0; f < n; f += 64) {
+                        const auto d = base->prefix_digests.at(f);
+                        std::fprintf(stderr, " g%u=%u:%lx", f, prompt.token_ids[f], d[0]);
+                    }
+                    std::fprintf(stderr, "\n");
+                    std::fflush(stderr);
+                }
+                // Per-token dump of the response region: start at the establishment end
+                // (2nd rewrite frontier, if present) so it aligns with [tail] F= (NINFER_MAT_TAIL).
+                if (std::getenv("NINFER_MAT_FINE")) {
+                    const auto& frs = prompt.identity.rewrite_execution_frontiers;
+                    std::uint32_t base_pos = (frs.size() >= 2) ? frs[1] : 0;
+                    std::uint32_t lo = base_pos > 256 ? base_pos - 256 : 0;
+                    std::uint32_t hi = base_pos + 256;
+                    std::fprintf(stderr, "[fine] in base=%u ", base_pos);
+                    for (std::uint32_t f = lo; f < hi && f < base->prefix_digests.size(); ++f) {
+                        const auto d = base->prefix_digests.at(f);
+                        std::fprintf(stderr, " %u=%lx:%lx", f, d[0], d[1]);
+                    }
+                    std::fprintf(stderr, "\n");
+                    std::fflush(stderr);
+                }
+                if (std::getenv("NINFER_MAT_TAIL")) {
+                    const auto& rfs = prompt.identity.rewrite_execution_frontiers;
+                    std::uint32_t base0 = (rfs.size() >= 2) ? rfs[1] : 0;
+                    const std::uint32_t nt = static_cast<std::uint32_t>(prompt.token_ids.size());
+                    std::fprintf(stderr, "[tail] in est_end=%u n=%u nt=%zu ", base0, n,
+                                 prompt.token_ids.size());
+                    // Log the response-region tokens from base0; if base0 exceeds the prompt
+                    // (suffix-indexed plan) log from 0 instead so we never come up empty.
+                    const std::size_t nt64 = prompt.token_ids.size();
+                    std::uint32_t lo = (base0 < nt) ? base0 : 0;
+                    for (std::uint32_t f = lo; f < lo + 60 && f < nt; ++f) {
+                        // positions is 3*n flat: track a at index a*n+f.
+                        const int32_t p0 = f < nt64 ? prompt.positions[f] : -1;
+                        const int32_t p1 = f + nt64 < prompt.positions.size()
+                                               ? prompt.positions[f + nt64]
+                                               : -1;
+                        const int32_t p2 = f + 2 * nt64 < prompt.positions.size()
+                                               ? prompt.positions[f + 2 * nt64]
+                                               : -1;
+                        std::fprintf(stderr, "%u:p0=%d,p1=%d,p2=%d,tt=%u,t=%u ", f, p0, p1, p2,
+                                     f < prompt.token_types.size()
+                                         ? static_cast<unsigned>(prompt.token_types[f])
+                                         : -1,
+                                     prompt.token_ids[f]);
+                    }
+                    std::fprintf(stderr, "\n");
+                    std::fflush(stderr);
+                }
+            }
+            std::fprintf(stderr, "\n");
+            std::fflush(stderr);
+        }
     }
     if (options.allow_prefix_reuse && prompt.identity.reusable && context_cache.enabled) {
         const auto add_capture = [&](std::uint32_t frontier, std::uint32_t input_order,

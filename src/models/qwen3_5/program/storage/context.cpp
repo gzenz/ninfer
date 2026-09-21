@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdio>
+#include <cstdlib>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -748,6 +750,87 @@ ProgramImpl::checkpoint_summary(const SequenceState& sequence, runtime::Checkpoi
     const std::uint32_t identity_tag = static_cast<std::uint32_t>(speculative_backend) |
                                        (static_cast<std::uint32_t>(proposal_head) << 8U) |
                                        (static_cast<std::uint32_t>(kv_storage) << 16U);
+    if (std::getenv("NINFER_MAT_DEBUG") && checkpoint.kind == runtime::CheckpointKind::SessionEndpoint) {
+        const std::size_t F = checkpoint.frontier;
+        const auto& pid     = sequence.prefix_identity;
+        const auto& tt      = pid.token_types();
+        const auto& pos     = pid.positions(0);
+        std::fprintf(stderr, "[csum] frontier=%u rope=%d tt0=%u tt1=%u tt2=%u ",
+                     checkpoint.frontier, sequence.rope_delta,
+                     tt.empty() ? 0U : tt[0], tt.size() > 2 ? tt[1] : 0U,
+                     tt.size() > 2 ? tt[2] : 0U);
+        std::fprintf(stderr, "pos00=%d pos01=%d pos02=%d ", pos.size() > 0 ? pos[0] : 0,
+                     pos.size() > 1 ? pos[1] : 0, pos.size() > 2 ? pos[2] : 0);
+        if (F >= 3 && pos.size() >= F) {
+            std::fprintf(stderr, "posFm3=%d posFm2=%d posFm1=%d ", pos[F - 3], pos[F - 2],
+                         pos[F - 1]);
+        }
+        std::fprintf(stderr, "rw_n=%zu led_n=%zu", pid.rewrite_frontiers().size(),
+                     sequence.ledger.size());
+        if (sequence.ledger.size() > 2) {
+            std::fprintf(stderr, " tok0=%u tok1=%u tok2=%u", sequence.ledger[0],
+                         sequence.ledger[1], sequence.ledger[2]);
+        }
+        if (F >= 3 && sequence.ledger.size() >= F) {
+            std::fprintf(stderr, " tokFm3=%u tokFm2=%u tokFm1=%u", sequence.ledger[F - 3],
+                         sequence.ledger[F - 2], sequence.ledger[F - 1]);
+        }
+        if (F < sequence.prefix_digests.size()) {
+            const auto d = sequence.prefix_digests.at(F);
+            std::fprintf(stderr, " d=%lx,%lx", d[0], d[1]);
+        }
+        // Full rewrite-execution-frontier list dump (NINFER_MAT_FRONT): the digest's only
+        // remaining input after token/pos/type are byte-stable. Dumps the stored list so it
+        // can be diffed element-for-element against the incoming [frontiers] (request_plan).
+        if (std::getenv("NINFER_MAT_FRONT")) {
+            std::fprintf(stderr, " FRONT n=%zu [", pid.rewrite_frontiers().size());
+            for (const auto rf : pid.rewrite_frontiers()) { std::fprintf(stderr, "%u ", rf); }
+            std::fprintf(stderr, "]");
+        }
+        // Grid digest+token trace: mirrors the [digest] GRID so a stored endpoint can be
+        // compared position-by-position against the incoming re-render (NINFER_MAT_GRID).
+        if (std::getenv("NINFER_MAT_GRID")) {
+            std::fprintf(stderr, " GRID");
+            for (std::uint32_t f = 0; f < F; f += 64) {
+                if (f >= sequence.prefix_digests.size()) { break; }
+                const auto d = sequence.prefix_digests.at(f);
+                std::fprintf(stderr, " g%u=%u:%lx", f, sequence.ledger[f], d[0]);
+            }
+            std::fprintf(stderr, "\n");
+            std::fflush(stderr);
+        }
+        // Per-token dump of the response tail (last 50 ledger tokens) so the exact
+        // divergent token vs the incoming re-render can be diffed (NINFER_MAT_TAIL).
+        if (std::getenv("NINFER_MAT_FINE")) {
+            const std::uint32_t lo = F > 256 ? static_cast<std::uint32_t>(F - 256) : 0;
+            std::fprintf(stderr, "[fine] F=%u ", F);
+            for (std::uint32_t f = lo; f < F && f < sequence.prefix_digests.size(); ++f) {
+                const auto d = sequence.prefix_digests.at(f);
+                std::fprintf(stderr, " %u=%lx:%lx", f, d[0], d[1]);
+            }
+            std::fprintf(stderr, "\n");
+            std::fflush(stderr);
+        }
+        if (std::getenv("NINFER_MAT_TAIL")) {
+            const std::uint32_t lo = F > 50 ? static_cast<std::uint32_t>(F - 50) : 0;
+            const auto& p0 = pid.positions(0);
+            const auto& p1 = pid.positions(1);
+            const auto& p2 = pid.positions(2);
+            const auto& ttv = pid.token_types();
+            std::fprintf(stderr, "[tail] F=%u ", F);
+            for (std::uint32_t f = lo; f < F && f < sequence.ledger.size(); ++f) {
+                std::fprintf(stderr, "%u:p0=%d,p1=%d,p2=%d,tt=%u,t=%u ",
+                             f, f < p0.size() ? p0[f] : -1, f < p1.size() ? p1[f] : -1,
+                             f < p2.size() ? p2[f] : -1,
+                             f < ttv.size() ? static_cast<unsigned>(ttv[f]) : -1,
+                             sequence.ledger[f]);
+            }
+            std::fprintf(stderr, "\n");
+            std::fflush(stderr);
+        }
+        std::fprintf(stderr, "\n");
+        std::fflush(stderr);
+    }
     return qwen3_5::CheckpointSummary{
         .ref   = checkpoint,
         .scope = runtime::CheckpointScope::Private,

@@ -13,6 +13,11 @@ Doelfke's tree we have added:
   victim's slot generation between the final `assess` and `seal`, forcing a full
   re-prefill on a re-touch. The claim serializes that window so re-touches restore from
   the (device- or host-resident) KV instead of re-prefilling.
+- **Value-aware demote-to-host** — under device saturation the pressure planner ranks
+  private victims by re-prefill cost and charges a bounded rank to the evict cost, so it
+  demotes the highest-value (most expensive to rebuild) victims to host and
+  evicts-and-drops the cheapest, preserving restorable checkpoints on re-touch. Exposed as
+  `pressure.private_owners_demoted` in `/stats` and the request log.
 - **Tool-call hardening** — a generalized tolerant opener that recovers `<function=…>`
   when the model drops the `<`, leaks a ChatML `<|im_start|>` marker, drops the `function`
   keyword, or doubles the `<`.

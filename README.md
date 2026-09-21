@@ -13,6 +13,11 @@ Doelfke's tree we have added:
   victim's slot generation between the final `assess` and `seal`, forcing a full
   re-prefill on a re-touch. The claim serializes that window so re-touches restore from
   the (device- or host-resident) KV instead of re-prefilling.
+- **Value-aware demote-to-host** — under device saturation the pressure planner ranks
+  private victims by re-prefill cost and charges a bounded rank to the evict cost, so it
+  demotes the highest-value (most expensive to rebuild) victims to host and
+  evicts-and-drops the cheapest, preserving restorable checkpoints on re-touch. Exposed as
+  `pressure.private_owners_demoted` in `/stats` and the request log.
 - **Tool-call hardening** — a generalized tolerant opener that recovers `<function=…>`
   when the model drops the `<`, leaks a ChatML `<|im_start|>` marker, drops the `function`
   keyword, or doubles the `<`.
@@ -39,6 +44,23 @@ The symptom is task-state tracking over an extremely long agentic history — a 
 behavior, not an attention/cache/YaRN defect. We therefore currently recommend running the
 **Swift model at a 262k context** (see the deploy config below) rather than a
 YaRN-extended NVFP4 context.
+
+**Swift model artifact.** We run the single-file v3 NInfer artifact
+[`CaptainArni/Swift-Qwen3.8-27B-NInfer`](https://huggingface.co/CaptainArni/Swift-Qwen3.8-27B-NInfer)
+(21.2 GiB, DFlash2 draft included, sha256 `5412a0e7…`):
+
+```bash
+hf download CaptainArni/Swift-Qwen3.8-27B-NInfer \
+  qwen3_8_27b_nvfp4swift.ninfer --local-dir ~/ninfer-models
+```
+
+Provenance: built from
+[`ukisai/Swift-Qwen3.8-27B-NVFP4`](https://huggingface.co/ukisai/Swift-Qwen3.8-27B-NVFP4)
+(the pre-quantized partner of
+[`ukisai/Swift-Qwen3.8-27b`](https://huggingface.co/ukisai/Swift-Qwen3.8-27b), a
+reasoning-efficient fine-tune of Qwen3.8-27B). Swift uses its own MTP head;
+`--spec dflash2 --draft-tokens 7` uses the DFlash2 draft for lighter in-VRAM
+footprint (18.9 vs 20.5 GiB).
 
 The original YaRN enhancement list:
 

@@ -1209,6 +1209,10 @@ private:
                                         std::uint32_t backend_pages);
     void bind_sequence_kv(SequenceState& sequence);
     void unbind_sequence_kv(SequenceState& sequence) noexcept;
+    // Publish this lane's own DFlash prefill-sink controls (lane, source/destination slots, backend
+    // row) into the single device ingress the sink reads. Must be called at every prefill step, not
+    // only at materialization: other lanes' decode rounds overwrite that ingress.
+    void bind_dflash_prefill_sink(SequenceState& sequence);
     void ensure_sequence_kv_mapped(SequenceState& sequence, std::uint32_t main_tokens,
                                    std::uint32_t backend_tokens = 0);
     void trim_sequence_kv(SequenceState& sequence, std::uint32_t main_tokens,

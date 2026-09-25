@@ -205,6 +205,28 @@ std::array<std::int32_t, 3> prompt_rope_position(const PreparedPromptData& promp
 
 } // namespace
 
+void ProgramImpl::bind_dflash_prefill_sink(SequenceState& sequence) {
+    // One derivation, called from every prefill step and from materialization. Two call sites were
+    // how this drifted before: the materialization site re-derived the values, the multi-step path
+    // did not, and the comment claimed both did.
+    if (!is_masked_draft_backend(speculative_backend) || dflash_host_ingress == nullptr ||
+        !io.dflash_decode.has_value()) {
+        return;
+    }
+    const StateImageSelectors selectors = state_selectors(sequence);
+    *dflash_host_ingress                            = {};
+    dflash_host_ingress->active_lanes[0]            = static_cast<std::int32_t>(sequence.lane);
+    dflash_host_ingress->state_source_slots[0]      = selectors.source;
+    dflash_host_ingress->state_destination_slots[0] = selectors.destination;
+    dflash_host_ingress->dflash_kv_table_rows[0] =
+        (sequence.kv && sequence.kv->backend)
+            ? backend_kv_addresses->bound_row(*sequence.kv->backend)
+            : 0;
+    CUDA_CHECK(cudaMemcpyAsync(io.dflash_decode->ingress.data, dflash_host_ingress,
+                               sizeof(qwen3_5::DFlashDecodeIngress), cudaMemcpyHostToDevice,
+                               device.stream));
+}
+
 void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
                                  MaterializationTransaction& transaction) {
     if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
@@ -599,28 +621,19 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
             }
             refresh_state_views(sequence);
             bind_sequence_kv(sequence);
-
-    // The DFlash sink has the same defect as the KV row above, and it matters on prod's backend: the
-    // sink reads its destination slot and table row from `io.dflash_decode->ingress`, a single device
-    // buffer that is uploaded once at materialization and then overwritten by EVERY dflash decode round
-    // of ANY lane. A prefill interleaved with other lanes' decode rounds therefore appended drafter
-    // context into another lane's dflash KV and consumed another lane's state destination slot. Re-derive
-    // and re-upload this lane's own values at each step, exactly as the row scalars are re-bound.
-    if (is_masked_draft_backend(speculative_backend) && dflash_host_ingress != nullptr &&
-        io.dflash_decode.has_value()) {
-        const StateImageSelectors dflash_selectors = state_selectors(sequence);
-        *dflash_host_ingress                            = {};
-        dflash_host_ingress->active_lanes[0]            = static_cast<std::int32_t>(sequence.lane);
-        dflash_host_ingress->state_source_slots[0]      = dflash_selectors.source;
-        dflash_host_ingress->state_destination_slots[0] = dflash_selectors.destination;
-        dflash_host_ingress->dflash_kv_table_rows[0] =
-            (sequence.kv && sequence.kv->backend)
-                ? backend_kv_addresses->bound_row(*sequence.kv->backend)
-                : 0;
-        CUDA_CHECK(cudaMemcpyAsync(io.dflash_decode->ingress.data, dflash_host_ingress,
-                                   sizeof(qwen3_5::DFlashDecodeIngress), cudaMemcpyHostToDevice,
-                                   device.stream));
-    }
+            // The DFlash sink has the same defect as the KV row above, and it matters on prod's
+            // backend: the sink reads its destination slot and table row from
+            // `io.dflash_decode->ingress`, a single device buffer that is uploaded once at
+            // materialization and then overwritten by EVERY dflash decode round of ANY lane. A
+            // prefill interleaved with other lanes' decode rounds therefore appended drafter context
+            // into another lane's dflash KV and consumed another lane's state destination slot.
+            //
+            // 2026-09-25 correction: the 479c92c4 commit message claims this re-upload happens "at
+            // each step" and this comment said the same. It did not: the block below is inside
+            // `start_sequence`, so it ran once per materialization, and `advance_prefill` -- the
+            // multi-step path a long prompt actually takes -- re-bound only the KV row scalars. The
+            // shared helper is now called from both, which is what makes the claim true.
+            bind_dflash_prefill_sink(sequence);
         } else if (request_plan.reuse == ReusePath::PrivateEndpoint) {
             if (!state_store->valid(sequence.state.read) ||
                 sequence.state.read != sequence.state.write || sequence.state.fork_pending ||
@@ -1199,6 +1212,10 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
     // Idempotent for an active address (it skips `activate`), so calling it here costs two 4-byte
     // device writes per step.
     bind_sequence_kv(sequence);
+    // The DFlash sink's ingress is shared device state with the same exposure as the row scalars, and
+    // it must be re-published here for the same reason: this is the path a long prompt takes, and the
+    // fix that claimed to cover it only covered materialization (see the note in `start_sequence`).
+    bind_dflash_prefill_sink(sequence);
     // Admission-side prompt tail (NINFER_LEDGER_PROBE=1): the same 64-entry hash the decode-side
     // LEDGER-FP prints, over the same region (the tail of the admitted prompt), so the two can be
     // compared per lane without any cross-lane alignment. The canary sits at the prompt's END, so

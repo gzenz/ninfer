@@ -20,7 +20,8 @@ diagnosis rests on, on the test server, without needing to reproduce a recovery 
   context limit (262,144) and the page capacity (4096 x 64 = 262,144) are *the same number*, so the
   upper arm brackets the context limit, not the capacity line the wedge lives on. That line separates
   only once a leak has consumed capacity, which is why the discriminating experiment is the
-  rewind-replay arm (`L2` in `results/HANDOFF.md`), not this probe alone.
+  rewind-replay arm (`L2` in the Current state section of `plan.md` at the repo root), not this probe
+  alone. (`results/HANDOFF.md` was merged into `plan.md` and deleted on 2026-09-25.)
 
 Run it through the swap (it needs the test port; against prod it would consume real capacity and, if
 a leak were present, stall real traffic):

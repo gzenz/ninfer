@@ -275,8 +275,10 @@ runtime::ExecutionTiming ProgramImpl::append_forced_tokens(
         Tensor forced_ids =
             work.alloc(DType::I32, {checked_i32(static_cast<std::uint32_t>(row_major_tokens.size()),
                                                 "forced-token batch exceeds int32")});
+        // Async + settle: `row_major_tokens` is function-local and the copy must stay ordered.
         CUDA_CHECK(cudaMemcpyAsync(forced_ids.data, row_major_tokens.data(), forced_ids.bytes(),
                                    cudaMemcpyHostToDevice, device.stream));
+        CUDA_CHECK(cudaStreamSynchronize(device.stream));
         for (std::size_t row = 0; row < members.size(); ++row) {
             const std::uint32_t lane = lanes[row];
             if (requests[lane].sampling_host.token_counts == nullptr) { continue; }

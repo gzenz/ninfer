@@ -803,7 +803,7 @@ ProgramImpl::checkpoint_summary(const SequenceState& sequence, runtime::Checkpoi
         // divergent token vs the incoming re-render can be diffed (NINFER_MAT_TAIL).
         if (std::getenv("NINFER_MAT_FINE")) {
             const std::uint32_t lo = F > 256 ? static_cast<std::uint32_t>(F - 256) : 0;
-            std::fprintf(stderr, "[fine] F=%u ", F);
+            std::fprintf(stderr, "[fine] F=%zu ", F);
             for (std::uint32_t f = lo; f < F && f < sequence.prefix_digests.size(); ++f) {
                 const auto d = sequence.prefix_digests.at(f);
                 std::fprintf(stderr, " %u=%lx:%lx", f, d[0], d[1]);
@@ -817,7 +817,7 @@ ProgramImpl::checkpoint_summary(const SequenceState& sequence, runtime::Checkpoi
             const auto& p1 = pid.positions(1);
             const auto& p2 = pid.positions(2);
             const auto& ttv = pid.token_types();
-            std::fprintf(stderr, "[tail] F=%u ", F);
+            std::fprintf(stderr, "[tail] F=%zu ", F);
             for (std::uint32_t f = lo; f < F && f < sequence.ledger.size(); ++f) {
                 std::fprintf(stderr, "%u:p0=%d,p1=%d,p2=%d,tt=%u,t=%u ",
                              f, f < p0.size() ? p0[f] : -1, f < p1.size() ? p1[f] : -1,
@@ -1157,6 +1157,59 @@ bool ProgramImpl::state_exclusive_to_sequence(const SequenceState& sequence,
 }
 
 void ProgramImpl::refresh_state_views(SequenceState& sequence) {
+    // Cross-lane slot audit (NINFER_MAT_DEBUG=1): two concurrently non-terminal lanes
+    // naming the same physical StateImage slot is the cross-session bleed signature --
+    // agent-found hazard: cached views/state bindings keyed by physical slot are only
+    // refreshed by convention, and a shared-prefix fork hands slots between lanes.
+    if (std::getenv("NINFER_MAT_DEBUG") != nullptr) {
+        const auto device_slot = [&](const StateImageHandle& handle) -> std::int32_t {
+            if (!state_store->valid(handle) ||
+                state_store->residency(handle) == StateReplicaResidency::HostOnly) {
+                return -1;
+            }
+            return state_store->physical_slot(handle);
+        };
+        const std::int32_t read_slot    = device_slot(sequence.state.read);
+        const std::int32_t write_slot   = device_slot(sequence.state.write);
+        const std::int32_t rewrite_slot = sequence.rewrite_state ? device_slot(*sequence.rewrite_state) : -1;
+        std::fprintf(stderr,
+                     "[mat-debug] STATE-VIEW lane=%u read_slot=%d write_slot=%d rewrite_slot=%d "
+                     "fork_pending=%d exec_frontier=%u\n",
+                     sequence.lane, read_slot, write_slot, rewrite_slot,
+                     sequence.state.fork_pending ? 1 : 0, sequence.execution_frontier);
+        std::fflush(stderr);
+    }
+    // Deterministic cross-lane slot invariant (NINFER_MAT_DEBUG=1): a physical StateImage
+    // slot must never be named by two lanes at once. Interleaved printouts cannot prove
+    // simultaneity, so check it here, where the whole lane set is visible.
+    if (std::getenv("NINFER_MAT_DEBUG") != nullptr) {
+        // physical_slot() throws for a HostOnly image (no device replica); the audit must
+        // never change engine behaviour, so skip those.
+        const auto device_slot_of = [&](const StateImageHandle& handle) -> std::int32_t {
+            if (!state_store->valid(handle) ||
+                state_store->residency(handle) == StateReplicaResidency::HostOnly) {
+                return -1;
+            }
+            return state_store->physical_slot(handle);
+        };
+        const auto slot_of = [&](const SequenceState& other) -> std::int32_t {
+            const std::int32_t w = device_slot_of(other.state.write);
+            return w >= 0 ? w : device_slot_of(other.state.read);
+        };
+        const std::int32_t mine = slot_of(sequence);
+        if (mine >= 0) {
+            for (const SequenceState& other : continuation_states) {
+                if (&other == &sequence || other.lane == sequence.lane) { continue; }
+                if (slot_of(other) == mine) {
+                    std::fprintf(stderr,
+                                 "[mat-debug] SLOT-CLASH lane=%u other_lane=%u slot=%d "
+                                 "(both lanes name the same StateImage)\n",
+                                 sequence.lane, other.lane, mine);
+                    std::fflush(stderr);
+                }
+            }
+        }
+    }
     sequence.tail_hidden               = {};
     sequence.rewrite_checkpoint_hidden = {};
     if (state_store->valid(sequence.state.read) && state_store->valid(sequence.state.write) &&
@@ -1623,9 +1676,17 @@ qwen3_5::PagedKVCacheView ProgramImpl::mtp_kv_view(const SequenceState& sequence
         backend_kv_addresses->execution_row(*sequence.kv->backend));
 }
 
+// `value` is a by-value parameter, i.e. stack memory that dies with this frame, so the copy has to
+// be ordered and complete before the caller returns. A synchronous cudaMemcpy was tried and
+// reverted: it is ordered only on the legacy default stream while `device.stream` is
+// cudaStreamNonBlocking, and it is not recorded in a stream capture. Async-plus-settle keeps the
+// ordering the rest of the program uses and still guarantees the source is unread after return.
 void ProgramImpl::set_device_i32(Tensor& tensor, std::int32_t value) {
-    CUDA_CHECK(
-        cudaMemcpyAsync(tensor.data, &value, sizeof(value), cudaMemcpyHostToDevice, device.stream));
+    // Async on the compute stream, then settle: `value` is a by-value parameter, so the copy must
+    // complete before this frame dies -- and the copy must stay ordered on the non-blocking stream.
+    CUDA_CHECK(cudaMemcpyAsync(tensor.data, &value, sizeof(value), cudaMemcpyHostToDevice,
+                               device.stream));
+    CUDA_CHECK(cudaStreamSynchronize(device.stream));
 }
 
 void ProgramImpl::ordered_reset(SequenceState& sequence) {

@@ -391,8 +391,11 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
             Tensor logprobs   = work.alloc(DType::FP32, {columns});
             Tensor hidden     = score_hidden->slice(1, 0, columns);
             execution::project(hidden, parameters.text.output_head, logits, work, device.stream);
+            // Async + settle: `staged_targets` is a function-local buffer, and the copy must stay
+            // ordered on the non-blocking compute stream.
             CUDA_CHECK(cudaMemcpyAsync(target_ids.data, staged_targets.data(), target_ids.bytes(),
-                                                    cudaMemcpyHostToDevice, device.stream));
+                                       cudaMemcpyHostToDevice, device.stream));
+            CUDA_CHECK(cudaStreamSynchronize(device.stream));
             ops::target_logprobs(logits, target_ids,
                                               dimension(parameters.model.resources().public_token_count),
                                               logprobs, device.stream);

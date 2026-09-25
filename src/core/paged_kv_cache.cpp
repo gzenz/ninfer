@@ -828,6 +828,13 @@ void KVExecutionTablePool::publish_indices(KVExecutionRowHandle row_handle,
     if (indices.empty()) { return; }
     Tensor destination_row = row(row_handle);
     auto* destination      = static_cast<std::int32_t*>(destination_row.data) + logical_begin;
+    // Plain stream-ordered async, for two reasons that stand on their own: the source span is
+    // built from `host_shadow_`, a pool member, so source lifetime is not at issue here; and a
+    // synchronous pageable H2D copy is ordered only on the legacy default stream, while the stream
+    // this is submitted on is non-blocking. (An earlier comment claimed this path is reachable
+    // inside a captured decode body -- the sixth review traced every caller and it is not: they are
+    // all submit paths outside `definition.capture`. The site stays async because that is the
+    // pre-existing and sufficient form, not because of capture.)
     CUDA_CHECK(cudaMemcpyAsync(destination, indices.data(), indices.size_bytes(),
                                cudaMemcpyHostToDevice, stream));
 }

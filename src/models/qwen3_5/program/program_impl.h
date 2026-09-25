@@ -1236,6 +1236,11 @@ private:
                                         std::uint32_t backend_pages);
     void bind_sequence_kv(SequenceState& sequence);
     void unbind_sequence_kv(SequenceState& sequence) noexcept;
+    // W1-A: release a lane's ownership of the shared row scalars and emit the cumulative counter
+    // totals. Called from every lane-end path -- `unbind_sequence_kv` (a publishing finish) and both
+    // strict releases (a non-publishing finish) -- because emitting from only one of them was a seam
+    // a review found: `clear_lane_strict` freed the KV and never reported or released anything.
+    void release_kv_row_binding(std::uint32_t lane) noexcept;
     // Publish this lane's own DFlash prefill-sink controls (lane, source/destination slots, backend
     // row) into the single device ingress the sink reads. Must be called at every prefill step, not
     // only at materialization: other lanes' decode rounds overwrite that ingress.

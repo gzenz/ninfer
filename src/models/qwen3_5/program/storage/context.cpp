@@ -1563,6 +1563,35 @@ void ProgramImpl::bind_sequence_kv(SequenceState& sequence) {
     }
 }
 
+void ProgramImpl::release_kv_row_binding(std::uint32_t lane) noexcept {
+    // W1-A: release this lane's ownership -- attributed to the lane, because another lane's binding
+    // is what the record may legitimately hold while *this* one releases (lane-end paths run for one
+    // lane at a time), and clearing it wholesale made that other lane's next observation count as a
+    // foreign rebind it never had.
+    kv_row_binding_.clear(lane);
+    // The only emission that can report a run's cumulative totals: every per-step print is
+    // rate-limited by design, so without a line at a lane's end the last figure anyone can read is
+    // whatever the schedule happened to stop at -- which is how a capped value came to be quoted as
+    // a run total.
+    //
+    // How to read it, because the label alone is not enough: the counters are monotone and
+    // process-wide, each line reports the totals *at that release*, and the lines are emitted
+    // repeatedly during a run (once per request end, plus once per slot torn down at shutdown, where
+    // `lane` is the slot's stale last lane). **The run total is the last line before exit, and it is
+    // only a run total if it follows the run's last `req# ... done`.** An earlier version of this
+    // line was labelled FINAL, which invited reading the first one -- and a review caught exactly
+    // that.
+    std::fprintf(stderr,
+                 "[kv-binding] LANE-RELEASE lane=%u checks=%llu diverged=%llu unverifiable=%llu "
+                 "foreign=%llu/%llu\n",
+                 lane, static_cast<unsigned long long>(kv_row_binding_.verified_readings()),
+                 static_cast<unsigned long long>(kv_row_binding_.diverged_readings()),
+                 static_cast<unsigned long long>(kv_row_binding_.unverifiable_readings()),
+                 static_cast<unsigned long long>(kv_row_binding_.foreign_observations()),
+                 static_cast<unsigned long long>(kv_row_binding_.total_observations()));
+    std::fflush(stderr);
+}
+
 void ProgramImpl::unbind_sequence_kv(SequenceState& sequence) noexcept {
     if (!sequence.kv) { return; }
     try {
@@ -1575,11 +1604,7 @@ void ProgramImpl::unbind_sequence_kv(SequenceState& sequence) noexcept {
             text_kv_addresses->deactivate(sequence.kv->text);
         }
     } catch (...) {}
-    // W1-A: release this lane's ownership -- attributed to the lane, because another lane's binding
-    // is what the record may legitimately hold while *this* one unbinds (finish/release run for one
-    // lane at a time), and clearing it wholesale made that other lane's next observation count as a
-    // foreign rebind it never had.
-    kv_row_binding_.clear(sequence.lane);
+    release_kv_row_binding(sequence.lane);
 }
 
 void ProgramImpl::ensure_sequence_kv_mapped(SequenceState& sequence, std::uint32_t main_tokens,
@@ -1648,6 +1673,10 @@ void ProgramImpl::release_active_sequence_kv_strict(SequenceState& sequence) noe
     if (!text_kv_addresses->release_after_deactivate(sequence.kv->text)) { std::terminate(); }
     sequence.kv.reset();
     if (host_kv_extents) { (void)host_kv_extents->release_unreferenced(); }
+    // W1-A: a non-publishing finish frees this lane's KV through here and never unbinds, so without
+    // this call it released ownership silently -- a review found the seam by noticing that the
+    // teardown lines could not account for every lane end.
+    release_kv_row_binding(sequence.lane);
 }
 
 void ProgramImpl::release_sequence_kv_strict(SequenceState& sequence) noexcept {
@@ -1664,6 +1693,7 @@ void ProgramImpl::release_sequence_kv_strict(SequenceState& sequence) noexcept {
     if (!text_kv_addresses->release(sequence.kv->text)) { std::terminate(); }
     sequence.kv.reset();
     if (host_kv_extents) { (void)host_kv_extents->release_unreferenced(); }
+    release_kv_row_binding(sequence.lane);
 }
 
 void ProgramImpl::release_sequence_kv(SequenceState& sequence) noexcept {

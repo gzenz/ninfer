@@ -1210,26 +1210,42 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
     // files a lane's ordinary finish under the D2 defect -- a review caught that, and the release is
     // now attributed to its own lane so a finish cannot raise another lane's count at all.
     //
-    // On measurement: the only run that printed these counters is the prod4 run of 2026-09-25, and
-    // that run had `active=0` in every PREFILL-CENSUS line -- no lane was ever occupied when a
-    // request was admitted, so it cannot speak to behaviour under concurrency at all. An earlier
-    // version of this comment cited its 0 of 512 as refuting the expectation of foreign readings.
-    // It refutes nothing. What is true is weaker and stays true: 0 of N means the trigger did not
-    // occur in that workload, never that a guard passed.
+    // On measurement: the prod4 run of 2026-09-25 printed `0 of 512` and had `active=0` in every
+    // PREFILL-CENSUS line -- no lane was ever occupied when a request was admitted, so it cannot
+    // speak to behaviour under concurrency at all. An earlier version of this comment cited that 0
+    // as refuting the expectation of foreign readings; it refutes nothing, and 0 of N means only
+    // that the trigger did not occur in that workload. The canary runs of the same day do carry
+    // the trigger: `foreign=8/272` and `9/272` with 6 census lines showing a lane occupied.
     {
         const std::pair<std::int32_t, std::int32_t> step_rows = bound_kv_rows(sequence);
         const bool foreign = kv_row_binding_.observe(sequence.lane, step_rows.first, step_rows.second);
         // A foreign observation is an event this counter exists to surface; printing only device
         // divergences meant a run whose whole concurrent phase produced foreign readings emitted no
-        // line for them at all (a review read the resulting silence as "no trigger"). Bounded like
-        // the others so a persistent condition cannot flood the journal, and the totals are in every
-        // line so a bounded print still reports the denominator.
-        if (foreign && kv_row_binding_.foreign_observations() <= 8ULL) {
+        // line for them at all (a review read the resulting silence as "no trigger").
+        //
+        // Printed at powers of two, NOT capped at eight. A cap has to stop somewhere, and whatever
+        // number it stops at becomes the last figure anyone can read -- so a review caught me quoting
+        // a capped value as a run total, and every inference built on it (the two runs "agreeing",
+        // "one took two steps fewer", the count of pre-fix-contaminated steps) was invented.
+        //
+        // Powers of two keep the output logarithmic, but they *sample*: these lines are observations
+        // #1, #2, #4, #8, ... and must never be read as a contiguous sequence. A second review caught
+        // that error too, in the first version of this fix ("the first three observations ..."). The
+        // cumulative totals come from `release_kv_row_binding`, emitted at each lane release; the run
+        // total is the last of those lines before exit.
+        const std::uint64_t foreign_count = kv_row_binding_.foreign_observations();
+        const bool foreign_is_power_of_two =
+            foreign_count != 0ULL && (foreign_count & (foreign_count - 1ULL)) == 0ULL;
+        if (foreign && foreign_is_power_of_two) {
             std::fprintf(stderr,
                          "[kv-binding] FOREIGN-REBIND lane=%u expected=(%d,%d) record_lane=%u "
-                         "recorded=(%d,%d) foreign=%llu/%llu\n",
+                         "recorded=(%d,%d) checks=%llu diverged=%llu unverifiable=%llu "
+                         "foreign=%llu/%llu\n",
                          sequence.lane, step_rows.first, step_rows.second, kv_row_binding_.lane(),
                          kv_row_binding_.text_row(), kv_row_binding_.backend_row(),
+                         static_cast<unsigned long long>(kv_row_binding_.verified_readings()),
+                         static_cast<unsigned long long>(kv_row_binding_.diverged_readings()),
+                         static_cast<unsigned long long>(kv_row_binding_.unverifiable_readings()),
                          static_cast<unsigned long long>(kv_row_binding_.foreign_observations()),
                          static_cast<unsigned long long>(kv_row_binding_.total_observations()));
             std::fflush(stderr);

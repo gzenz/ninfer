@@ -131,7 +131,8 @@ public:
                                                    VisionPrefillSession& vision,
                                                    bool finalize_at_end, DFlashFeatureSink& sink);
     void ordinary_decode_batch(const Tensor& ids, const Tensor& cache_positions,
-                               const Tensor& rope_positions, const Tensor& kv_table_rows,
+                               const Tensor& rope_positions, const Tensor& valid_columns,
+                               const Tensor& kv_table_rows,
                                const Tensor& linear_state_source_slots,
                                const Tensor& linear_state_destination_slots,
                                ops::CausalAttentionExecutionEnvelope envelope, Tensor& hidden,

@@ -3,6 +3,7 @@
 #include "models/qwen3_5/program/context.h"
 #include "models/qwen3_5/execution/linear.h"
 #include "core/device.h"
+#include "core/diagnostics.h"
 #include "ninfer/ops/gdn_replay.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/scalar.h"
@@ -14,6 +15,8 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <string>
+#include <cstdio>
 #include <limits>
 #include <optional>
 #include <span>
@@ -113,8 +116,10 @@ void mtp_bridge_multimodal(PrefillContext& state, const PreparedPromptData& prom
 
     Tensor bridge_token = state.execution.io.mtp->target_input_ids.slice(0, 0, 1);
     const TokenId token = prompt.token_ids[state.text_kv_base];
+    // Async + settle: stack-local source, non-blocking compute stream -- keep ordering, then wait.
     CUDA_CHECK(cudaMemcpyAsync(bridge_token.data, &token, sizeof(token), cudaMemcpyHostToDevice,
                                state.execution.device.stream));
+    CUDA_CHECK(cudaStreamSynchronize(state.execution.device.stream));
 
     Tensor visual_embedding;
     const Tensor* composed_embedding = nullptr;
@@ -151,9 +156,12 @@ void sample_from_hidden(PrefillContext& state, const Tensor& hidden, std::int32_
     Tensor logits = state.execution.io.logits.slice(1, 0, 1);
     project(hidden, state.execution.parameters.text.output_head, logits, state.execution.work,
             state.execution.device.stream);
+    // Async + settle: `absolute_position` is a parameter and is the sampler's logical position
+    // (its RNG key); keep the copy ordered on the non-blocking stream, then wait for it.
     CUDA_CHECK(cudaMemcpyAsync(state.execution.io.pos.data, &absolute_position,
                                sizeof(absolute_position), cudaMemcpyHostToDevice,
                                state.execution.device.stream));
+    CUDA_CHECK(cudaStreamSynchronize(state.execution.device.stream));
     ops::sample(logits, state.execution.io.token,
                 dimension(state.execution.parameters.model.resources().public_token_count),
                 state.sampling, state.execution.io.pos, purpose, state.execution.work,
@@ -215,6 +223,25 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
     const std::uint32_t prompt_tokens      = staged.prompt_tokens;
     const std::uint32_t base               = staged.base;
     const std::uint32_t initial_mtp_extent = staged.initial_mtp_extent;
+    // Durable owner binding: the continuation keeps this value after the lane is released, so a
+    // later adoption can tell whose checkpoint it is taking (W1.2).
+    if (staged.prompt.context_cache.session_key) {
+        std::uint64_t owner = 1469598103934665603ULL;
+        for (const char byte : staged.prompt.context_cache.session_key->view()) {
+            owner ^= static_cast<std::uint8_t>(byte);
+            owner *= 1099511628211ULL;
+        }
+        sequence.session_key_hash = owner == 0 ? 1 : owner;
+    } else {
+        sequence.session_key_hash = 0;
+    }
+    sequence.admitted_prompt_tokens = prompt_tokens;
+    // (removed) NINFER_PROMPT_PROBE / PROMPT-FOREIGN-DOC: it scanned every stored session prompt
+    // against every new prompt (4 x 32k x 32k x 64 comparisons on the admission path) and retained
+    // every prompt for the life of the process. Its question is answered -- no lane's prompt carries
+    // another session's document -- and an instrument that can hang or leak on the served path does
+    // not belong in the tree. Re-implement offline over captured request payloads if it is ever
+    // needed again.
     request.lifecycle                      = Lifecycle::Empty;
     try {
         const std::uint32_t state_slots = request_plan.demand.active_entitlement.device.state_slots;
@@ -287,7 +314,25 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
                 state_store->split_device_replica_identity(selected, current);
                 sequence.state = ActiveStateBinding{.read = current, .write = current};
             } else {
+                // Fork-side determinism control (NINFER_FORK_ZERO=1): a fork destination is
+                // filled by the ops that consume the selector pair, so any region they do not
+                // cover keeps the previous occupant's bytes -- another sequence's state. Root
+                // admissions zero their slot (activate_reset); forks do not. Zeroing here is a
+                // behavioural control that either removes the cross-session bleed (stale fork
+                // destination bytes are the carrier) or leaves it untouched. Compiled out unless
+                // the build enables harmful controls (see diagnostic_control_enabled).
+                if (diagnostic_control_enabled("NINFER_FORK_ZERO")) {
+                    state_store->zero_reserved_device_replica(current, device.stream);
+                }
                 const StateImageSelectors selectors = state_store->begin_fork(selected, current);
+                // Fork completeness control (NINFER_FORK_COPY=1): initialize the whole
+                // destination image from the source before the ops run, so a region the ops
+                // read but never write cannot carry the previous occupant's state. The zeroing
+                // control above changed behaviour (a lane returned an empty reply), which says
+                // some region IS read before it is written.
+                if (diagnostic_control_enabled("NINFER_FORK_COPY")) {
+                    state_images->copy_slot(selectors.source, selectors.destination, device.stream);
+                }
                 if (is_masked_draft_backend(speculative_backend)) {
                     state_images->copy_dflash_local(selectors.source, selectors.destination,
                                                     device.stream);
@@ -481,8 +526,15 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
                 const StateReadOwnership read_ownership =
                     lineage_references == references ? StateReadOwnership::LineageCheckpoint
                                                      : StateReadOwnership::ExternalOwner;
+                if (diagnostic_control_enabled("NINFER_FORK_ZERO") &&
+                    state_store->role(destination) == StateImageRole::ReservedDestination) {
+                    state_store->zero_reserved_device_replica(destination, device.stream);
+                }
                 const StateImageSelectors selectors =
                     state_store->begin_fork(selected, destination);
+                if (diagnostic_control_enabled("NINFER_FORK_COPY")) {
+                    state_images->copy_slot(selectors.source, selectors.destination, device.stream);
+                }
                 if (is_masked_draft_backend(speculative_backend)) {
                     state_images->copy_dflash_local(selectors.source, selectors.destination,
                                                     device.stream);
@@ -653,6 +705,105 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
             : speculative_backend == SpeculativeBackend::DFlash ? prompt_tokens
                                                                 : 0U;
         ensure_sequence_kv_mapped(sequence, prompt_tokens, backend_materialized);
+        // Prefill-side write audit (NINFER_MAT_DEBUG=1): everything else is cleared, so print
+        // what each lane binds and writes at prefill activation -- the KV table rows (text and
+        // backend), the state slots and the token range. Two lanes naming the same row or slot
+        // in one window is the prefill-side aliasing signature.
+        if (std::getenv("NINFER_MAT_DEBUG") != nullptr) {
+            // Occupancy first: a one-line census otherwise reads as "no concurrency" while it is
+            // really "every other lane was empty". `lifecycles` uses one character per lane:
+            // E=Empty, P=Prefilling, A=Active, and . for any other state.
+            std::string lifecycles(max_concurrency, '.');
+            std::uint32_t occupied = 0;
+            for (std::uint32_t other = 0; other < max_concurrency; ++other) {
+                switch (requests[other].lifecycle) {
+                case Lifecycle::Empty: lifecycles[other] = 'E'; break;
+                case Lifecycle::Prefilling: lifecycles[other] = 'P'; ++occupied; break;
+                case Lifecycle::Active: lifecycles[other] = 'A'; ++occupied; break;
+                default: ++occupied; break;
+                }
+            }
+            std::fprintf(stderr, "[mat-debug] PREFILL-CENSUS active=%u lifecycles=%s\n", occupied,
+                         lifecycles.c_str());
+            // The *local* sequence, i.e. the object this step will actually use. `active_sequence`
+            // may still resolve a lane to its previous continuation at the first step after
+            // admission, so the per-lane census alone cannot show a reusing lane's binding.
+            try {
+                const StateImageSelectors local_selectors = state_selectors(sequence);
+                std::fprintf(stderr,
+                             "[mat-debug] PREFILL-LOCAL lane=%u base=%u cursor=%u prompt=%u "
+                             "frontier=%u src_slot=%d dst_slot=%d fork_pending=%d reuse=%d "
+                             "mapped=%u\n",
+                             sequence.lane, requests[sequence.lane].prefill
+                                                ? requests[sequence.lane].prefill->base
+                                                : 0U,
+                             requests[sequence.lane].prefill
+                                 ? requests[sequence.lane].prefill->cursor
+                                 : 0U,
+                             requests[sequence.lane].prefill
+                                 ? requests[sequence.lane].prefill->prompt_tokens
+                                 : 0U,
+                             sequence.execution_frontier, local_selectors.source,
+                             local_selectors.destination, sequence.state.fork_pending ? 1 : 0,
+                             requests[sequence.lane].prefill
+                                 ? static_cast<int>(requests[sequence.lane].prefill->reuse)
+                                 : -1,
+                             sequence.kv ? text_kv_addresses->mapped_pages(sequence.kv->text) : 0U);
+                std::fflush(stderr);
+            } catch (const std::exception& skip) {
+                std::fprintf(stderr, "[mat-debug] PREFILL-LOCAL-SKIP lane=%u reason=%s\n",
+                             sequence.lane, skip.what());
+                std::fflush(stderr);
+            }
+            // Simultaneous census of every active lane (one print, so the snapshot is atomic --
+            // an interleaved per-lane print cannot prove simultaneity). For each lane: the KV
+            // table row, the physical page id of its first and last mapped page, the state
+            // slots it reads/writes. Two lanes naming the same row, page or slot outside a
+            // legitimately shared prefix is the prefill-side aliasing signature.
+            for (std::uint32_t other = 0; other < max_concurrency; ++other) {
+                if (requests[other].lifecycle == Lifecycle::Empty) { continue; }
+                // Instrumentation must never disturb the served path: a lane in a transient
+                // state simply drops out of the census.
+                try {
+                const SequenceState& lane_state = active_sequence(other);
+                if (!lane_state.kv) {
+                    std::fprintf(stderr, "[mat-debug] PREFILL-CENSUS-SKIP lane=%u reason=no-kv\n",
+                                 other);
+                    continue;
+                }
+                if (!text_kv_addresses->valid(lane_state.kv->text)) {
+                    std::fprintf(stderr,
+                                 "[mat-debug] PREFILL-CENSUS-SKIP lane=%u reason=kv-not-occupied\n",
+                                 other);
+                    continue;
+                }
+                const std::uint32_t mapped_pages =
+                    text_kv_addresses->mapped_pages(lane_state.kv->text);
+                const std::uint64_t last_page_epoch =
+                    mapped_pages == 0
+                        ? 0
+                        : text_kv_addresses->content_epoch(lane_state.kv->text, mapped_pages - 1U);
+                const StateImageSelectors lane_selectors = state_selectors(lane_state);
+                std::fprintf(stderr,
+                             "[mat-debug] PREFILL-LANE lane=%u frontier=%u text_row=%d pages=%u "
+                             "last_page_epoch=%llu src_slot=%d dst_slot=%d fork_pending=%d "
+                             "rope_delta=%d\n",
+                             other, lane_state.execution_frontier,
+                             text_kv_addresses->bound_row(lane_state.kv->text), mapped_pages,
+                             static_cast<unsigned long long>(last_page_epoch),
+                             lane_selectors.source, lane_selectors.destination,
+                             lane_state.state.fork_pending ? 1 : 0, lane_state.rope_delta);
+                } catch (const std::exception& skip) {
+                    // Never silent: a lane missing from the census must say why, otherwise a
+                    // single-line census looks like "no concurrency" when it is really "skipped".
+                    std::fprintf(stderr, "[mat-debug] PREFILL-CENSUS-SKIP lane=%u reason=%s\n",
+                                 other, skip.what());
+                    std::fflush(stderr);
+                    continue;
+                }
+            }
+            std::fflush(stderr);
+        }
         install_sampling(sequence, request, request_plan.sampling);
         sequence.rope_delta = staged.prompt.rope_delta;
         set_device_i32(io.rope_delta, sequence.rope_delta);
@@ -698,7 +849,37 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
 runtime::PrefillStepResult
 ProgramImpl::advance_prefill_raw(std::uint32_t lane, runtime::ExecutionTiming* failed_timing) {
     if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
-    return advance_prefill(active_sequence(lane), requests[lane], failed_timing);
+    // Cross-step GPU dependency control (NINFER_SYNC_STEPS=1). Two concurrent canary runs with
+    // byte-identical prompts produce *different* recurrent states for the same session at the
+    // same step, while a non-overlapping session is bit-identical across the same runs -- i.e.
+    // the nondeterminism needs overlapping work. If draining the device before and after every
+    // prefill step makes the two concurrent runs identical (and removes the bleed), then a
+    // prefill's kernels are still running while a later step's kernels share scratch with them.
+    // N1: NOT fixed, and no drain is kept here. Five attempts failed to make the engine's steps
+    // reproducible -- ordering the compute stream behind the transfer stream, a ready()-guarded
+    // host sync, draining the transfer stream alone, draining before the step only, and draining
+    // both sides of it. The both-sided device drain had appeared to give bit-identical runs twice,
+    // but under the three-run standard the pairs differ (1, 171 and 170 of 234 step digests), i.e.
+    // the pairs agreed by luck -- the same error the "located" claim was retracted for.
+    //
+    // The determinism oracle itself is now suspected: `STATE-SLOT` hashed 256 bytes from the START
+    // of each layer's conv slot, and the conv window is written at column `pos % 3`, so offset 0 is
+    // stale-dependent by construction and any two runs can differ without the engine being
+    // nondeterministic. Fix the oracle (digest a fully-written region) before spending another run
+    // on this.
+    // Uninitialized-scratch control (NINFER_POISON_WORKSPACE=1). The engine produces a foreign
+    // reply for a lane whose prompt, KV pages, device block table and state slots are all its own,
+    // so the pollution is in memory no per-lane audit covers: the shared forward-pass workspace.
+    // Filling it with a constant before each prefill step replaces whatever the previous occupant
+    // -- possibly another lane -- left behind: if a kernel reads scratch it never wrote, the reply
+    // changes (to fixed garbage or to the correct one); if nothing reads it, the reply is
+    // unchanged and the arena is not the carrier.
+    if (diagnostic_control_enabled("NINFER_POISON_WORKSPACE")) {
+        CUDA_CHECK(cudaMemsetAsync(work.base(), 0xAB, work.capacity(), device.stream));
+    }
+    runtime::PrefillStepResult result =
+        advance_prefill(active_sequence(lane), requests[lane], failed_timing);
+    return result;
 }
 
 runtime::ExecutionTiming ProgramImpl::resolve_prefill_raw(std::uint32_t lane, bool terminal,
@@ -858,9 +1039,11 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
             } else {
                 throw std::logic_error("partial speculative commit has no target frame");
             }
+            // Async + settle: `hidden_selectors` is a block-local std::array.
             CUDA_CHECK(cudaMemcpyAsync(selector_tensor.data, hidden_selectors.data(),
                                        lanes.size() * sizeof(std::int32_t), cudaMemcpyHostToDevice,
                                        device.stream));
+            CUDA_CHECK(cudaStreamSynchronize(device.stream));
             ops::speculative_select_accepted_hidden(hidden, selector_tensor, selected,
                                                     device.stream);
             ops::scatter(selected, destinations, state_images->continuation_hidden_store(),
@@ -977,6 +1160,36 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
     if (staged.pending_capture_offer != 0) {
         throw std::logic_error("prefill cannot advance while a capture offer is pending");
     }
+    // Admission-side prompt tail (NINFER_LEDGER_PROBE=1): the same 64-entry hash the decode-side
+    // LEDGER-FP prints, over the same region (the tail of the admitted prompt), so the two can be
+    // compared per lane without any cross-lane alignment. The canary sits at the prompt's END, so
+    // this is the region a contaminated ledger would have to differ in.
+    if (std::getenv("NINFER_LEDGER_PROBE") != nullptr) {
+        try {
+            const auto& ids = staged.prompt.token_ids;
+            std::uint64_t tail_hash    = 1469598103934665603ULL;
+            std::uint32_t tail_checked = 0;
+            const std::uint32_t tail =
+                std::min<std::uint32_t>(64U, staged.prompt_tokens);
+            for (std::uint32_t i = 0; i < tail; ++i) {
+                const std::size_t index = static_cast<std::size_t>(staged.prompt_tokens - 1U - i);
+                if (index >= ids.size()) { break; }
+                tail_hash ^= static_cast<std::uint64_t>(ids[index]);
+                tail_hash *= 1099511628211ULL;
+                ++tail_checked;
+            }
+            std::fprintf(stderr,
+                         "[mat-debug] PROMPT-TAIL64 lane=%u admitted=%u ids=%zu tail64=%llx "
+                         "tail_checked=%u\n",
+                         sequence.lane, staged.prompt_tokens, ids.size(),
+                         static_cast<unsigned long long>(tail_hash), tail_checked);
+            std::fflush(stderr);
+        } catch (const std::exception& error) {
+            std::fprintf(stderr, "[mat-debug] PROMPT-TAIL64-SKIP lane=%u reason=%s\n", sequence.lane,
+                         error.what());
+            std::fflush(stderr);
+        }
+    }
     const runtime::BeginSummary summary{.prompt_tokens        = staged.prompt_tokens,
                                         .reused_prompt_tokens = staged.base,
                                         .prefix_reuse_path    = staged.reuse};
@@ -1048,8 +1261,10 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             } else {
                 Tensor bridge_token = io.mtp->target_input_ids.slice(0, 0, 1);
                 const TokenId token = staged.prompt.token_ids[staged.base];
+                // Async + settle: stack-local source, non-blocking stream.
                 CUDA_CHECK(cudaMemcpyAsync(bridge_token.data, &token, sizeof(token),
                                            cudaMemcpyHostToDevice, device.stream));
+                CUDA_CHECK(cudaStreamSynchronize(device.stream));
                 execution::mtp_bridge_and_propose(schedule_state, bridge_token, previous_hidden,
                                                   bridge.position, bridge.rope_position, false);
             }

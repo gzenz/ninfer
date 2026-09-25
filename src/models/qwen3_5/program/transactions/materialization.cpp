@@ -650,6 +650,57 @@ void ProgramImpl::prepare_materialization(MaterializationTransaction& transactio
             source_state != nullptr
                 ? selected_state(*source_state, details.reuse, details.selected_checkpoint)
                 : shared_state->state;
+        // Owner binding (W1.2): a *private* checkpoint may only be adopted by the session that
+        // produced it. A shared entry is cross-session by design, so only the private side is
+        // checked. Both sides are FNV-1a over the session key (0 = keyless request).
+        if (source_state != nullptr) {
+            const std::uint64_t source_owner = source_state->session_key_hash;
+            const std::uint64_t consumer_owner =
+                requests[lane].prefill ? requests[lane].prefill->prompt.context_cache.session_key
+                                             ? [&] {
+                                                   std::uint64_t owner = 1469598103934665603ULL;
+                                                   for (const char byte :
+                                                        requests[lane]
+                                                            .prefill->prompt.context_cache.session_key
+                                                            ->view()) {
+                                                       owner ^= static_cast<std::uint8_t>(byte);
+                                                       owner *= 1099511628211ULL;
+                                                   }
+                                                   return owner == 0 ? 1ULL : owner;
+                                               }()
+                                             : 0ULL
+                                       : 0ULL;
+            // Detector, not a fix: a private checkpoint adopted by a different session should be
+            // impossible by construction, so this is evidence only if a denominator accompanies it.
+            // Gated (it was the one new print without a NINFER_MAT_DEBUG guard) and reported as a
+            // finding: if it ever fires, the adoption must be rejected, not merely logged.
+            if (std::getenv("NINFER_MAT_DEBUG") != nullptr && source_owner != 0 &&
+                consumer_owner != 0 && source_owner != consumer_owner) {
+                std::fprintf(stderr,
+                             "[mat-debug] SESSION-ADOPT-CROSS lane=%u source_owner=%llx "
+                             "consumer_owner=%llx reuse=%d frontier=%u\n",
+                             lane, static_cast<unsigned long long>(source_owner),
+                             static_cast<unsigned long long>(consumer_owner),
+                             static_cast<int>(details.reuse), details.reuse_base);
+                std::fflush(stderr);
+            }
+        }
+        // Adoption audit (NINFER_MAT_DEBUG=1): what a lane adopts. Single-lane decode rules
+        // out intra-batch mixing, so cross-session content must enter through adoption.
+        if (std::getenv("NINFER_MAT_DEBUG") != nullptr) {
+            const std::int32_t slot =
+                state_store->residency(state) == StateReplicaResidency::HostOnly
+                    ? -1
+                    : state_store->physical_slot(state);
+            std::fprintf(stderr,
+                         "[mat-debug] ADOPT source=%s src_frontier=%u shared_frontier=%u "
+                         "state_slot=%d state_epoch=%llu\n",
+                         source_state != nullptr ? "private" : "shared",
+                         source_state != nullptr ? source_state->execution_frontier : 0U,
+                         shared_state != nullptr ? shared_state->frontier : 0U, slot,
+                         static_cast<unsigned long long>(state_store->content_epoch(state)));
+            std::fflush(stderr);
+        }
         const StateReplicaResidency residency = state_store->residency(state);
         // Source existence is a StateImageStore fact. Owner-exclusive resources may be zero for a
         // valid allocation aliased by private and shared checkpoints.

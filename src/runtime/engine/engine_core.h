@@ -3,6 +3,7 @@
 // Small fixed-capacity request execution for every backend.
 
 #include "core/device.h"
+#include "core/diagnostics.h"
 #include "core/nvtx.h"
 #include "ninfer/types.h"
 #include "runtime/contract/execution.h"
@@ -1113,6 +1114,24 @@ private:
             generated_staged = false;
         };
         try {
+            // Batch-composition audit (NINFER_MAT_DEBUG=1): cross-session bleed needs >=3
+            // lanes and only occurs when lanes reuse prefixes (i.e. when a batch mixes
+            // prefilling and decoding lanes). Print the composition so a bleeding turn can be
+            // matched to the batch shape that produced it.
+            if (std::getenv("NINFER_MAT_DEBUG") != nullptr) {
+                std::string shape;
+                std::uint32_t prefilling = 0;
+                for (std::size_t row = 0; row < row_count; ++row) {
+                    const std::uint32_t lane = lane_indices[row];
+                    const auto& probe        = slots_[lane];
+                    const bool pref          = probe != nullptr && probe->is_prefilling();
+                    if (pref) { ++prefilling; }
+                    shape += pref ? "P" : "d";
+                }
+                std::fprintf(stderr, "[mat-debug] BATCH rows=%zu shape=%s prefilling=%u decode_round=%d\n",
+                             row_count, shape.c_str(), prefilling, decode_round ? 1 : 0);
+                std::fflush(stderr);
+            }
             for (std::size_t row = 0; row < row_count; ++row) {
                 const std::uint32_t lane = lane_indices[row];
                 const auto& request      = slots_[lane];
@@ -1860,6 +1879,29 @@ private:
 
     void run_decode_round(const RoundMembership& membership,
                           const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start) {
+        // WITHDRAWN CONTROL -- kept only for reference, do not use for measurements: it slices the
+        // decode membership to one row while the scheduler still believes the whole membership
+        // decoded, so it perturbs the bookkeeping it was meant to hold fixed (a queued run with it
+        // armed bled where the queued run without it was clean).
+        //
+        // It is also compiled out by default. The rule for anything left in the tree is that a
+        // probe must not be *able* to harm; this one substitutes a different decode membership in
+        // the live scheduler, so an operator who exported the variable from an old shell would run
+        // a perturbed engine believing it was the shipped one. Rebuild with
+        // -DNINFER_ENABLE_HARMFUL_CONTROLS to get it back -- a deliberate act, which is the point.
+        const bool decode_batch_one = diagnostic_control_enabled("NINFER_DECODE_BATCH");
+        if (decode_batch_one && membership.size > 1) {
+            const auto sequences = membership.sequence_span().first(1);
+            const auto budgets   = membership.budget_span().first(1);
+            const auto lanes     = membership.lane_span().first(1);
+            nvtx::ScopedRange decode_range(nvtx::Name::Decode, nvtx::Category::Decode, 1);
+            ProgramCallScope program_call(*this);
+            auto pending = instance_.program->decode(sequences, budgets, &program_call.failed_timing());
+            program_call.finish(pending.execution_timing());
+            commit_pending(std::move(pending), lanes, true, cancelled_at_unit_start);
+            publish_runtime_stats();
+            return;
+        }
         nvtx::ScopedRange decode_range(nvtx::Name::Decode, nvtx::Category::Decode,
                                        static_cast<std::uint64_t>(membership.size));
         ProgramCallScope program_call(*this);

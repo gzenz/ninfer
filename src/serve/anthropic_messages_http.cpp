@@ -5,8 +5,12 @@
 
 #include <atomic>
 #include <cstddef>
+#include <cstdlib>
+#include <ctime>
 #include <cstdint>
+#include <cstdio>
 #include <exception>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <utility>
@@ -112,6 +116,30 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
             return;
         }
         lifecycle->done(outcome);
+        // Response provenance (NINFER_RESP_PROBE=1). Every engine-internal per-lane binding is
+        // verified clean, so the remaining question is whether a foreign reply is *produced* for
+        // this prompt or *delivered* to the wrong client. Printing the canary found in the
+        // request text next to the one found in the reply settles it: prompt=S1/reply=S0 is
+        // content corruption; prompt=S1/reply=S1 while the client received S0's text is routing.
+        if (std::getenv("NINFER_RESP_PROBE") != nullptr) {
+            const auto canary_of = [](const std::string& text) -> std::string {
+                const std::size_t at = text.find("CANARY-");
+                if (at == std::string::npos) { return {}; }
+                return text.substr(at, std::min<std::size_t>(text.size() - at, 20));
+            };
+            std::string prompt_text;
+            for (const ChatTurn& turn : request.generation.messages) {
+                for (const ContentPart& part : turn.content) { prompt_text += part.text; }
+            }
+            const std::string reply_text = outcome.text + outcome.reasoning;
+            std::fprintf(stderr,
+                         "[resp-probe] rid=%s prompt_tokens=%d completion=%d prompt_canary=%s "
+                         "reply_canary=%s reply_bytes=%zu\n",
+                         request_id.c_str(), input_tokens, outcome.completion_tokens,
+                         canary_of(prompt_text).c_str(), canary_of(reply_text).c_str(),
+                         reply_text.size());
+            std::fflush(stderr);
+        }
         try {
             set_owned_json_content(res, make_anthropic_messages_response(identity, outcome),
                                    prepared.lifetime);

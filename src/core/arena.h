@@ -28,6 +28,10 @@ public:
     DeviceBuffer& operator=(DeviceBuffer&& other) noexcept;
 
     void fill(int byte_value = 0);
+
+    // Raw device pointer for callers that must issue their own Device-to-Device copy (auditing
+    // probes that sample a buffer at the moment the kernels read it). Read-only.
+    [[nodiscard]] void* data() const noexcept { return p; }
     // Completes the upload before returning. Callers must first order any prior device
     // accesses to the destination range.
     void copy_from_host(const void* source, std::size_t count, std::size_t byte_offset = 0);

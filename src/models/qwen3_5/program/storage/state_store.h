@@ -174,6 +174,21 @@ public:
         object.role          = StateImageRole::ActiveMutable;
     }
 
+    // Zero a reserved Device replica without touching its role or content epoch. A fork
+    // destination is filled by the ops that consume the selector pair, and an op that covers
+    // only part of the image leaves the rest holding the previous occupant's bytes; a root
+    // admission zeroes its slot for that reason (activate_reset) while a fork does not. This
+    // is the fork-side equivalent, used to make a fork destination's untouched regions
+    // deterministic instead of inheriting another sequence's state.
+    void zero_reserved_device_replica(StateImageHandle handle, cudaStream_t stream = nullptr) {
+        Object& object = require(handle);
+        if (object.role != StateImageRole::ReservedDestination || !object.device_slot ||
+            object.source_pins != 0 || object.destination_pinned || has_pending_replica(object)) {
+            throw std::logic_error("StateImage reserved destination is not zeroable");
+        }
+        device_->zero_slot(*object.device_slot, stream);
+    }
+
     [[nodiscard]] bool valid(StateImageHandle handle) const noexcept {
         return handle.owner_ == this && handle.index_ < objects_.size() &&
                objects_[handle.index_].role != StateImageRole::Free &&

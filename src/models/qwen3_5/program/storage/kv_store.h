@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <cstdio>
 #include <cstdint>
 #include <exception>
 #include <limits>
@@ -1179,6 +1180,44 @@ public:
             membership(destination, fork.full_pages_) = *fork.tail_destination_;
             fork.tail_destination_.reset();
         }
+        // Cross-session bleed audit (NINFER_MAT_DEBUG=1). A shared prefix is forked at a
+        // mid-page frontier: the full pages are aliased (immutable) and only the tail page
+        // is copied. If the copied tail carries columns past the frontier -- written by the
+        // publisher's continuing prefill -- a consumer that reads the page's committed
+        // columns rather than its own frontier sees another session's tokens.
+        // Auditing only: `membership()` is noexcept and unchecked, the column accessors throw on a
+        // stale handle, and a throw here would land mid-commit (after the tail destination was
+        // reset, the table published and references retained). A page-aligned frontier leaves
+        // full_pages_ == page_count, so the index can be one past the live pages: guard and skip.
+        if (std::getenv("NINFER_MAT_DEBUG") != nullptr) try {
+            if (fork.tail_columns_ == 0 || fork.full_pages_ >= source.page_count) {
+                throw std::out_of_range("prefix fork has no tail page to audit");
+            }
+            const LogicalKVPageHandle src_tail = membership(source, fork.full_pages_);
+            if (!pages_->valid(src_tail)) {
+                throw std::out_of_range("prefix fork tail handle is not live");
+            }
+            std::uint32_t dst_cols = 0;
+            if (fork.tail_destination_ && pages_->valid(*fork.tail_destination_)) {
+                dst_cols = pages_->committed_columns(*fork.tail_destination_);
+            }
+            // The entry's tail page holds `src_tail_committed` columns; the fork only claims
+            // `tail_cols` of them. src_tail_committed > tail_cols means the page carries the
+            // publisher's tokens past the advertised frontier.
+            std::fprintf(stderr,
+                         "[mat-debug] PREFIX-FORK frontier=%u full_pages=%u tail_cols=%u "
+                         "src_tail_committed=%u src_tail_protected=%u src_tail_epoch=%llu "
+                         "dst_tail_committed=%u required_pages=%u\n",
+                         fork.frontier_, fork.full_pages_, fork.tail_columns_,
+                         pages_->committed_columns(src_tail), pages_->protected_columns(src_tail),
+                         static_cast<unsigned long long>(pages_->content_epoch(src_tail)),
+                         dst_cols, required_pages);
+            std::fflush(stderr);
+        } catch (const std::exception& skip) {
+            std::fprintf(stderr, "[mat-debug] PREFIX-FORK-SKIP frontier=%u reason=%s\n",
+                         fork.frontier_, skip.what());
+            std::fflush(stderr);
+        }
         destination.page_count         = required_pages;
         destination.committed_frontier = fork.frontier_;
         destination.reservation        = std::move(fork.page_reservation_);
@@ -1656,6 +1695,17 @@ public:
         return *address.row;
     }
 
+    // The Device block table the kernels actually read for this address. Auditing aid: the host
+    // side can be fully consistent while the published table row still names other sequences'
+    // pages, which is exactly the case a host-only audit cannot see.
+    [[nodiscard]] Tensor execution_table(KVAddressSpaceHandle handle) const {
+        const Address& address = require(handle);
+        if (!address.active || !address.row) {
+            throw std::logic_error("KV address space has no execution row");
+        }
+        return tables_->row(address.row->handle());
+    }
+
     [[nodiscard]] DeviceKVPageHandle physical_page(KVAddressSpaceHandle handle,
                                                    std::uint32_t logical_page) const {
         const Address& address = require(handle);
@@ -1663,6 +1713,18 @@ public:
             throw std::out_of_range("KV logical page is outside the address space");
         }
         return pages_->physical(membership(address, logical_page));
+    }
+
+    // Physical page ordinal for a mapped page, or -1 when the page has no Device replica.
+    // Auditing aid: two live address spaces must never name the same physical page.
+    [[nodiscard]] std::int32_t physical_page_index(KVAddressSpaceHandle handle,
+                                                   std::uint32_t logical_page) const noexcept {
+        if (!valid(handle)) { return -1; }
+        const Address& address = addresses_[handle.index_];
+        if (logical_page >= address.page_count) { return -1; }
+        const LogicalKVPageHandle logical = membership(address, logical_page);
+        if (!pages_->valid(logical) || !pages_->device_resident(logical)) { return -1; }
+        return pages_->physical(logical).index();
     }
 
     [[nodiscard]] std::uint64_t content_epoch(KVAddressSpaceHandle handle,

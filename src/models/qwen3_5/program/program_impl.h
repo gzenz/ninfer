@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <unordered_map>
 #include <array>
 #include <limits>
 #include <memory>
@@ -369,7 +370,23 @@ struct SequenceState {
     std::vector<std::uint32_t> shared_prefix_references;
     runtime::PrefillWork rebuild_work;
     std::uint32_t rebuild_tail_begin = 0;
+    // Owner binding (FNV-1a over the session key, 0 when the request carried none). A private
+    // checkpoint may only be adopted by the session that produced it; recording the owner here
+    // is what makes that checkable, because the continuation slot keeps the value from the
+    // owning session's admission and nothing else survives the lane's release.
+    std::uint64_t session_key_hash = 0;
+    // The prompt length this sequence was admitted with. The ledger is seeded from the prompt, so
+    // at a turn's first decode step `ledger.size()` must equal this; a lane whose ledger size
+    // matches a *different* prompt length was seeded from another request, which is the one
+    // content carrier the binding audits never looked at.
+    std::uint32_t admitted_prompt_tokens = 0;
 };
+
+// (removed 2026-09-24) GeneratedTokenTails and PromptRecords: leftovers of the deleted
+// NINFER_PROMPT_PROBE. GeneratedTokenTails was still written once per generated token in the
+// ordinary-decode commit loop and read by nothing, so it grew one deque per session-key hash for
+// the life of the process -- an unbounded allocation on the hottest path, which is exactly what the
+// same rule deleted the prompt probe for.
 
 struct SharedPrefixState {
     std::optional<SequenceKVBundle> kv;
@@ -598,6 +615,7 @@ public:
     std::unique_ptr<qwen3_5::HostStatePool> host_state_images;
     std::unique_ptr<StateImageStore> state_store;
     std::optional<GdnReplayRecords> replay_records;
+    std::optional<DeviceBuffer> ingress_shadow;
     std::optional<ops::GdnReplayFoldPlan> replay_fold;
     std::optional<DFlashPersistentState> dflash;
     qwen3_5::RoundState io;
@@ -608,6 +626,11 @@ public:
 
     std::vector<SequenceState> continuation_states;
     std::vector<ContinuationSlot> continuation_slots;
+    // Who last WROTE each linear-attention state slot, and at which step. The proven ordering
+    // result is that a victim emits the canary of the request admitted immediately before it, so
+    // the cheapest decisive audit is whether any lane ever READS a slot another lane wrote last.
+    std::unordered_map<std::int32_t, std::pair<std::uint32_t, std::uint64_t>> slot_last_writer;
+    std::uint64_t step_counter = 0;
     std::vector<SharedPrefixState> shared_prefix_states;
     std::vector<SharedPrefixSlot> shared_prefix_slots;
     std::array<std::uint32_t, kMaximumConcurrency> active_continuations{};

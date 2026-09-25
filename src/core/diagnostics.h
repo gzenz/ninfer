@@ -68,4 +68,42 @@ namespace ninfer {
 #endif
 }
 
+// Inject a throw at a named site, to provoke the failure paths that traffic has not reached. Three load
+// attempts and five constructed scenarios all came back negative, so "create the conditions and watch"
+// is exhausted for these defects; what is left is creating the *failure*.
+//
+//   NINFER_INJECT_THROW=mat-consume        -- throw the first time that site is reached
+//   NINFER_INJECT_THROW=mat-consume:3      -- ... the third time (for a site reached repeatedly)
+//
+// Gated like the other state-mutating controls: it changes control flow, so it must not be reachable in
+// a shipped build even if the variable is exported from an old shell. The caller throws what it likes;
+// this only decides *whether*. The per-site counter is keyed by pointer identity (callers pass literals)
+// and bounded, like the warning table above.
+[[nodiscard]] inline bool harmful_inject_throw(const char* site) noexcept {
+    if (!diagnostic_control_enabled("NINFER_INJECT_THROW")) { return false; }
+    const char* spec = std::getenv("NINFER_INJECT_THROW");
+    if (spec == nullptr || site == nullptr) { return false; }
+    const char* colon          = std::strchr(spec, ':');
+    const std::size_t name_len = colon != nullptr ? static_cast<std::size_t>(colon - spec)
+                                                 : std::strlen(spec);
+    if (std::strlen(site) != name_len || std::strncmp(spec, site, name_len) != 0) { return false; }
+    const unsigned nth = colon != nullptr ? static_cast<unsigned>(std::atoi(colon + 1)) : 1U;
+    if (nth == 0U) { return false; }
+
+    constexpr unsigned kSlots = 8;
+    static const char* names[kSlots]  = {};
+    static unsigned counts[kSlots]    = {};
+    static unsigned used              = 0;
+    for (unsigned i = 0; i < used; ++i) {
+        if (names[i] == site || std::strcmp(names[i], site) == 0) {
+            return ++counts[i] == nth;
+        }
+    }
+    if (used == kSlots) { return false; }
+    names[used]  = site;
+    counts[used] = 1;
+    ++used;
+    return counts[used - 1] == nth;
+}
+
 } // namespace ninfer

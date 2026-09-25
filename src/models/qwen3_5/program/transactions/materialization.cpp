@@ -1,4 +1,5 @@
 #include "models/qwen3_5/program/program_impl.h"
+#include "core/diagnostics.h"
 #include "models/qwen3_5/program/context_work.h"
 #include "models/qwen3_5/program/context.h"
 
@@ -608,6 +609,26 @@ void ProgramImpl::prepare_consumed_source(MaterializationTransaction& transactio
     }
     if (host_kv_extents) { (void)host_kv_extents->release_unreferenced(); }
     refresh_state_views(source);
+
+    // Fault injection (NINFER_INJECT_THROW=mat-consume, harmful-controls build). This point is chosen
+    // deliberately: the source has just been destructively truncated and released, the views refreshed,
+    // and the host extents dropped -- everything `checked_resource_difference` reads -- while the
+    // materialization staging still holds its reservations. Throwing here unwinds through the engine's
+    // failure path, which runs `recover_from_oom_locked` -> `fail_all_cleanup` with that state in
+    // flight: the exact situation the 2026-09-25 recovery was in when it left occupancy owned by
+    // nothing (#9). Nothing here is production behaviour; the guard makes it unreachable unless the
+    // build enables harmful controls.
+    //
+    // Injection is what is left because the conditions are not sufficient: three load attempts and five
+    // constructed real-engine scenarios produced no occurrence, so the failure has to be created.
+    // `std::bad_alloc` deliberately: the engine catches that as the *recoverable* error and routes it
+    // through `recover_from_oom_locked` -> `WORKER RECOVER`, which is the path the incident's underflow
+    // took. A `std::runtime_error` is not recoverable and takes the fatal `fail_all_locked` instead --
+    // which is worth knowing too, and is what the first run of this injection demonstrated: the fail-all
+    // path from this state is clean (0 skipped, 0 refused, all-zero residual, 3 continuations released).
+    if (ninfer::harmful_inject_throw("mat-consume")) {
+        throw std::bad_alloc();
+    }
 
     const detail::PhysicalResources after   = owner_exclusive_resources(source);
     const detail::PhysicalResources removed = checked_resource_difference(before, after);

@@ -23,7 +23,12 @@ set -uo pipefail
 
 TARGET="${1:?usage: ninfer-gpu-window.sh <test-binary-name> [timeout-seconds]}"
 TIMEOUT_S="${2:-900}"
-BIN="./build/tests/${TARGET}"
+# A bare name means the normal build; a path (it contains a /) means wherever it points -- which is how
+# the harmful-controls build in build-diag is run without prod's binary ever being touched.
+case "$TARGET" in
+  */*) BIN="$TARGET" ;;
+  *)   BIN="./build/tests/${TARGET}" ;;
+esac
 
 case "${ANTHROPIC_BASE_URL:-}" in
   *127.0.0.1:8080*|*localhost:8080*)

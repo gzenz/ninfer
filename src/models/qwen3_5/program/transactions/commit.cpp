@@ -234,6 +234,28 @@ runtime::ExecutionTiming ProgramImpl::append_forced_tokens(
         throw std::invalid_argument("forced-token membership is invalid");
     }
 
+    // Forced-token path probe (NINFER_FORCED_PROBE=1). Read-only, and it prints the denominator that
+    // matters: how many rows this call was given, and which lanes they are.
+    //
+    // The path had never been observable at all. A comment in this file even claimed the request log's
+    // `units.control` showed it had never run -- false, that field is a control-plane work counter that
+    // is non-zero in most records (see the correction beside `bind_sequence_kv`). The condition that
+    // reaches here IS reproducible (`thinking.budget_tokens` with a prompt that exceeds it gives
+    // `stop_reason: max_tokens` with thinking past the budget), but whether this function then runs --
+    // and, above all, whether it ever sees *more than one row*, which is the case the per-row bind
+    // exists for -- needs an observation from inside the function. This is that observation.
+    if (std::getenv("NINFER_FORCED_PROBE") != nullptr) {
+        // `multi_row` is what matters: 1 means this call carried more than one row, i.e. the case the
+        // per-row KV bind exists for. (The first version printed this same boolean under the name
+        // `distinct_lanes`, which reads as a count of lanes and reported 0 for a single-row call --
+        // a label that said something other than what it measured.)
+        std::fprintf(stderr,
+                     "[forced] append_forced_tokens rows=%zu stride=%u tokens=%zu multi_row=%d\n",
+                     members.size(), row_stride, row_major_tokens.size(),
+                     static_cast<int>(members.size() > 1));
+        std::fflush(stderr);
+    }
+
     std::array<std::uint32_t, kMaximumConcurrency> lanes{};
     for (std::size_t row = 0; row < members.size(); ++row) {
         if (!valid_sequence(members[row])) {

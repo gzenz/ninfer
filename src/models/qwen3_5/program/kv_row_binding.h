@@ -38,14 +38,19 @@ public:
         ever_written_    = true;
     }
 
-    // Releases *ownership* only. `unbind_sequence_kv` clears this while the device scalars keep the
-    // values they last received -- nothing writes them on unbind -- so the written pair survives it.
-    // An earlier version cleared the written pair too, and once `verify()` moved before the re-bind
-    // that made a lane's readback report DEVICE-DIVERGED every time any other lane finished between
-    // two of its steps (a 2026-09-25 review caught it): the record said "unbound", the check read
-    // that as a mismatch, and the device was untouched. Ownership and "what the device last got" are
-    // two different facts and this class now keeps them apart.
-    void clear() noexcept { lane_ = kUnboundLane; }
+    // Releases *ownership*, and only if `lane` is the owner. The device scalars keep the values they
+    // last received -- nothing writes them on unbind -- so the written pair survives it.
+    //
+    // Two defects came from getting this wrong, both caught by review on 2026-09-25. First the
+    // written pair was cleared too, so once `verify()` moved before the re-bind a lane's readback
+    // reported DEVICE-DIVERGED every time any other lane finished. Then the remaining unconditional
+    // clear still made `observe()` count a *foreign rebind* whenever a lane finished while another
+    // lane owned the scalars -- the label says "the scalars named somebody else", and they had not.
+    // Ownership and "what the device last got" are different facts; this class keeps them apart, and
+    // the release is attributed to the lane it belongs to.
+    void clear(std::uint32_t lane) noexcept {
+        if (lane_ == lane) { lane_ = kUnboundLane; }
+    }
 
     [[nodiscard]] std::uint32_t lane() const noexcept { return lane_; }
     [[nodiscard]] std::int32_t text_row() const noexcept { return written_text_; }

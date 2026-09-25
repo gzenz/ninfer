@@ -64,12 +64,24 @@ void test_observations_count_both_denominators() {
            "re-binding did not stop the foreign count");
 }
 
-void test_clear_reports_foreign() {
+void test_release_is_attributed_to_its_lane() {
+    // The second half of the ownership/written conflation a 2026-09-25 review found: `clear()` was
+    // unconditional, so a lane finishing made *another* lane's next observation count as a foreign
+    // rebind -- the label says the scalars named somebody else, and they had not.
     Binding binding;
-    binding.bind(0, 0, 0);
-    binding.clear();
-    expect(binding.lane() == Binding::kUnboundLane, "clear did not unbind");
-    expect(binding.observe(0, 0, 0), "an observation against a cleared binding was not foreign");
+    binding.bind(1, 1, 1);
+    binding.clear(0);  // lane 0 finishes; lane 1 still owns the scalars
+    expect(binding.lane() == 1, "another lane's release cleared this lane's ownership");
+    expect(!binding.observe(1, 1, 1), "a foreign rebind was reported although nothing re-bound");
+    expect(binding.foreign_observations() == 0 && binding.total_observations() == 1,
+           "the observation counts disagree with the single observation made");
+
+    // The lane's OWN release does transfer ownership away, so the next observation is foreign.
+    binding.clear(1);
+    expect(binding.lane() == Binding::kUnboundLane, "a lane's own release did not unbind it");
+    expect(binding.observe(1, 1, 1), "an observation after this lane's own release was not foreign");
+    expect(binding.foreign_observations() == 1 && binding.total_observations() == 2,
+           "the counters disagree after the attributed release");
 }
 
 void test_verify_compares_the_device_reading() {
@@ -94,7 +106,7 @@ void test_releasing_ownership_does_not_fabricate_divergence() {
     // made every readback after any other lane finished report a divergence that was not there.
     Binding binding;
     binding.bind(1, 1, 1);
-    binding.clear();
+    binding.clear(1);
     expect(binding.lane() == Binding::kUnboundLane, "clear did not release ownership");
     expect(binding.has_written_values(), "clear discarded what the device last received");
     expect(binding.verify(1, 1) == Verdict::Agrees,
@@ -118,7 +130,7 @@ int main() {
     test_unbound_is_not_held();
     test_each_axis_discriminates();
     test_observations_count_both_denominators();
-    test_clear_reports_foreign();
+    test_release_is_attributed_to_its_lane();
     test_verify_compares_the_device_reading();
     test_releasing_ownership_does_not_fabricate_divergence();
     test_unwritten_record_is_unverifiable_not_agreeing();

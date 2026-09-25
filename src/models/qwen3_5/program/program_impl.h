@@ -903,9 +903,10 @@ private:
         // offered) is running. The first version recorded `execution_frontier` and reported a 1/1
         // mismatch that was the instrument reading the wrong quantity.
         //
-        // What this can and cannot detect, per a 2026-09-25 review: on each of the four offer paths
-        // the offer is triggered by the same cursor that `text_kv_valid` holds, so the comparison is
-        // equal *by construction* -- it can fire only on drift between the offer and the freeze, and
+        // What this can and cannot detect, per a 2026-09-25 review: each of the three sites that
+        // create an offer (`prefill.cpp` zero-prefill and mid-prefill, `commit.cpp` for the finalized
+        // prompt) triggers on the same cursor `text_kv_valid` holds, so the comparison is equal *by
+        // construction* -- it can fire only on drift between the offer and the freeze, and
         // it never inspects the StateImage itself. The recorded corpus (62 `SHARED-PUBLISH` lines)
         // is one mid-prefill event in one workload repeated 62 times, all `group_frontier=12516`;
         // it settles that `execution_frontier` was the wrong quantity and is not evidence that

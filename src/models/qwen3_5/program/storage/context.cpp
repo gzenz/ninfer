@@ -1543,9 +1543,12 @@ void ProgramImpl::bind_sequence_kv(SequenceState& sequence) {
         const std::pair<std::int32_t, std::int32_t> rows = bound_kv_rows(sequence);
         set_device_i32(io.text_kv_table_row, rows.first);
         set_device_i32(io.backend_kv_table_row, rows.second);
-        // W1-A: remember what the two scalars now name. Recorded only here, after both writes have
-        // settled (`set_device_i32` syncs the stream), and only on the success path -- the rollback
-        // below must leave the record describing the device as it actually is.
+        // W1-A: remember what the two scalars now name. Recorded only on the success path, after
+        // both writes have settled (`set_device_i32` syncs the stream). Note the one gap a review
+        // found in the claim this comment used to make: if the text write succeeds and the backend
+        // write throws, the device holds a new text row while the record still holds the old pair --
+        // the rollback cannot undo a completed device write. That path is CUDA-fatal, so it is not
+        // reachable in practice, but the comment should not state an invariant the code lacks.
         kv_row_binding_.bind(sequence.lane, rows.first, rows.second);
     } catch (...) {
         if (!text_active) {
@@ -1572,10 +1575,11 @@ void ProgramImpl::unbind_sequence_kv(SequenceState& sequence) noexcept {
             text_kv_addresses->deactivate(sequence.kv->text);
         }
     } catch (...) {}
-    // W1-A: the device scalars still hold whatever they last held, but nothing is bound any more, so
-    // the record must not keep claiming a lane -- an observation after this point is foreign by
-    // definition, which is what the counters are for.
-    kv_row_binding_.clear();
+    // W1-A: release this lane's ownership -- attributed to the lane, because another lane's binding
+    // is what the record may legitimately hold while *this* one unbinds (finish/release run for one
+    // lane at a time), and clearing it wholesale made that other lane's next observation count as a
+    // foreign rebind it never had.
+    kv_row_binding_.clear(sequence.lane);
 }
 
 void ProgramImpl::ensure_sequence_kv_mapped(SequenceState& sequence, std::uint32_t main_tokens,

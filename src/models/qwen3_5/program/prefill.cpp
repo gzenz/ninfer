@@ -1196,17 +1196,19 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
     //
     // Every audit missed it because they all checked KV *bindings* -- page identity, block tables,
     // table contents -- and the decode ingress, never the row *selector* the prefill kernel reads.
-    // Idempotent for an active address (it skips `activate`), so calling it here costs two 4-byte
-    // device writes per step.
+    // Idempotent for an active address (it skips `activate`), so the cost per step is two 4-byte
+    // device writes -- and each `set_device_i32` is an async copy plus a `cudaStreamSynchronize`
+    // (storage/context.cpp), so it is two writes and two stream syncs, not two writes. An earlier
+    // version of this comment said "two 4-byte device writes" and left the syncs out.
     // W1-A: what the host record says the scalars named when this step began, judged against this
     // lane's own rows. One comparison and two increments, always on.
     //
-    // A foreign reading here is the pre-2026-09-25 condition -- the state the D2 fix exists to
-    // correct -- but the trigger is not "another lane is running". These scalars are re-bound by
-    // `bind_sequence_kv` only, and the host record is *also* released by `unbind_sequence_kv`, i.e.
-    // by `finish()` or `release_sequence_kv()` of any lane. So a foreign or unbound reading means
-    // some lane was admitted, published a shared prefix, finished or released between two of this
-    // lane's steps -- which is what a 2026-09-25 review pointed out this comment had got wrong.
+    // The trigger is not "another lane is running": these scalars are bound by `bind_sequence_kv`
+    // and the record is released by `unbind_sequence_kv`, i.e. by some lane's admission, shared-prefix
+    // publication, `finish()` or `release_sequence_kv()` landing between two of this lane's steps.
+    // An earlier version called a foreign reading "the pre-2026-09-25 condition" outright, which
+    // files a lane's ordinary finish under the D2 defect -- a review caught that, and the release is
+    // now attributed to its own lane so a finish cannot raise another lane's count at all.
     //
     // On measurement: the only run that printed these counters is the prod4 run of 2026-09-25, and
     // that run had `active=0` in every PREFILL-CENSUS line -- no lane was ever occupied when a
@@ -1216,7 +1218,22 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
     // occur in that workload, never that a guard passed.
     {
         const std::pair<std::int32_t, std::int32_t> step_rows = bound_kv_rows(sequence);
-        kv_row_binding_.observe(sequence.lane, step_rows.first, step_rows.second);
+        const bool foreign = kv_row_binding_.observe(sequence.lane, step_rows.first, step_rows.second);
+        // A foreign observation is an event this counter exists to surface; printing only device
+        // divergences meant a run whose whole concurrent phase produced foreign readings emitted no
+        // line for them at all (a review read the resulting silence as "no trigger"). Bounded like
+        // the others so a persistent condition cannot flood the journal, and the totals are in every
+        // line so a bounded print still reports the denominator.
+        if (foreign && kv_row_binding_.foreign_observations() <= 8ULL) {
+            std::fprintf(stderr,
+                         "[kv-binding] FOREIGN-REBIND lane=%u expected=(%d,%d) record_lane=%u "
+                         "recorded=(%d,%d) foreign=%llu/%llu\n",
+                         sequence.lane, step_rows.first, step_rows.second, kv_row_binding_.lane(),
+                         kv_row_binding_.text_row(), kv_row_binding_.backend_row(),
+                         static_cast<unsigned long long>(kv_row_binding_.foreign_observations()),
+                         static_cast<unsigned long long>(kv_row_binding_.total_observations()));
+            std::fflush(stderr);
+        }
     }
     // W1-A: the device's own answer, read BEFORE this step re-binds. Placed after the re-bind it
     // only confirmed that `set_device_i32` did what it had just done -- the same stream, the same
@@ -1251,20 +1268,22 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             std::fflush(stderr);
         }
         const std::uint64_t verified = kv_row_binding_.verified_readings();
-        // `verified % 512 == 0` alone was a rate limit that swallowed the denominator: the counter
-        // starts at 1 after the first check, so only a run that reached *exactly* a multiple of 512
-        // printed anything -- the prod4 run of 14:22 printed once at 512, the one at 14:31 printed
-        // nothing, and the silence read as "nothing to report". Print the first reading
-        // unconditionally, then every 512th, and every divergence.
+        // One line carrying every field, on a schedule that cannot swallow the answer. An earlier
+        // version printed only on `verified % 512 == 0` -- which fires only on exact multiples, so a
+        // run ending at 300 checks printed nothing and the silence read as clean -- and it omitted
+        // `unverifiable`, so a reading that could not be judged looked like no reading at all. Both
+        // were caught by review; the first is the reason the prod4 run at 14:31 was silent.
         if (verified == 1ULL || verified % 512ULL == 0ULL || !device_agrees) {
             std::fprintf(stderr,
-                         "[kv-binding] lane=%u checks=%llu diverged=%llu foreign_rebinds=%llu/%llu "
-                         "device=(%d,%d)\n",
+                         "[kv-binding] lane=%u checks=%llu diverged=%llu unverifiable=%llu "
+                         "foreign_rebinds=%llu/%llu device=(%d,%d) recorded=(%d,%d)\n",
                          sequence.lane, static_cast<unsigned long long>(verified),
                          static_cast<unsigned long long>(kv_row_binding_.diverged_readings()),
+                         static_cast<unsigned long long>(kv_row_binding_.unverifiable_readings()),
                          static_cast<unsigned long long>(kv_row_binding_.foreign_observations()),
                          static_cast<unsigned long long>(kv_row_binding_.total_observations()),
-                         device_text_row, device_backend_row);
+                         device_text_row, device_backend_row, kv_row_binding_.text_row(),
+                         kv_row_binding_.backend_row());
             std::fflush(stderr);
         }
     }

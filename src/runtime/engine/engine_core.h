@@ -1975,6 +1975,23 @@ private:
     }
 
     void run_control_batch(const ControlMembership& membership) {
+        // Membership probe (NINFER_FORCED_PROBE=1), read-only. It answers the question three load shapes
+        // could not: whether a one-row membership is the *scheduler's choice* or simply all there was.
+        // The membership is built by `build_control_membership(slots_, max_concurrency_)`, so if several
+        // lanes are control-ready here and the membership still holds one row, the multi-row case
+        // `append_forced_tokens` guards cannot be produced by concurrency at all in this configuration --
+        // which is an answer about the fix's reach, not a defect in it. If only one lane is ready, the
+        // separation is timing, and the answer is scheduling.
+        if (std::getenv("NINFER_FORCED_PROBE") != nullptr) {
+            std::uint32_t control_ready = 0;
+            for (const auto& request : slots_) {
+                if (request != nullptr && request->is_control_ready()) { ++control_ready; }
+            }
+            std::fprintf(stderr,
+                         "[forced] run_control_batch membership=%zu control_ready_lanes=%u\n",
+                         membership.size, control_ready);
+            std::fflush(stderr);
+        }
         nvtx::ScopedRange control_range(nvtx::Name::ControlBatch, nvtx::Category::Control,
                                         static_cast<std::uint64_t>(membership.size));
         EnginePhaseScope phase(*this, EngineHostPhase::CommitOutput);

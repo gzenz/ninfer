@@ -50,8 +50,48 @@ public:
     MaterializationSearchBudget(PlanningAllowance allowance, std::uint64_t started,
                                 std::uint64_t initial_cost) noexcept
         : allowance_(allowance), started_(started),
-          granted_(std::min(
-              {std::uint64_t{5'000'000}, economic(initial_cost), allowance.remaining(started)})) {}
+          // No flat millisecond cap on the initial window. What the artifacts support, with the
+          // denominators stated because this repo keeps paying for claims without them:
+          //
+          //  * the gate's own FORECAST for a construction step (`GATE DENY phase=construction
+          //    completion=…` -- the `completion` argument handed to `allow_work`, an estimate, not a
+          //    measured duration). The figure that motivated this change is from ONE log: `/tmp/why.log`
+          //    (n=8, all `complete=0`), 7.4-30.8 ms. Across every surviving log the same line reads
+          //    **0.024-30.8 ms (n=92, p50 4.7 ms, 71 of them `complete=1`)** -- so "several times the
+          //    flat 5 ms window" is true of that log's construction steps and NOT of the population.
+          //    The decision does not rest on it: the A/B below is the measurement;
+          //  * the collapse artifacts' stop reasons read `{'no_pressure': 1, 'time_budget': 15}` with
+          //    0% prefix reuse;
+          //  * the 5 ms arm below shows a work unit WAS admitted inside a 5 ms window, so the tempting
+          //    reading "the first step could not be admitted" is FALSE -- the window opened, one work
+          //    unit ran, and the search was cut off before finding the candidate. What remains (the
+          //    collapse) is labelled INFERENCE where it is stated.
+          //
+          // THE MEASURED A/B (2026-09-24, prod4 4x150k; arms by instance id in ~/ninfer-requests.jsonl -- neither arm recorded a binary identity). Counts are per COMPLETED turn: records the 420 s cap cancelled in flight carry `finish_reason=cancelled`, `prefill=0`, no reuse evidence, and are excluded -- an earlier version of this comment counted them as turns, which flattered the ratio and hid that a third of the "12 records" never ran.
+          //   * 5 ms arm 1 (serve-293952): cut by the 420 s cap after 9 of 16 turns completed (rc=124); 3 further turns cancelled in flight. Of the 9 completed: 9/9 root with 0 hits, 8 with `search_work>0` (`granted=5e6`, `time_budget`), 1 `no_pressure` (`granted=0`).
+          //   * 5 ms arm 2 (serve-307902, 3 rounds): cut after 9 of 12 completed, 3 cancelled. Of the 9: 8/9 root with 0 hits, 1 `private_endpoint` (152,227 hits); 7 with `search_work>0`.
+          //   * combined: 17 of 18 completed turns re-prefilled from root.
+          //   * 400 ms arm (serve-292073): completed 16/16. Rounds 2-3 (records 5-12): 8/8 `private_endpoint`, hits 152,333-154,799. Overall 12 of 16 `private_endpoint` (152,333-157,004) and 4 root (round 1, records 1-4); 15 of 16 with `search_work>0` -- the exception is record 1, `no_pressure`, `granted=0`.
+          // SCOPE: at a 5 ms allowance the old capped expression and the new one are numerically identical (both 5 ms) and `allow()` is byte-identical, so this pair measures THE WINDOW'S VALUE, not the cap removal as such. The cap's contribution is arithmetic: kept, with the allowance at 400 ms, `granted_` would still be 5 ms -- so it is what makes the measured window reachable, and its effect is not separately measured.
+          // STILL TUNED, not derived: 400 ms is the only value measured PASSING. 100 ms fails the gate (`/tmp/cmp-ms100.json`: root 12/16, 614,577 hits, `queue_wait_s.max` 153.03 s, 67% root in rounds 2+), and the no-reuse collapse is `/tmp/cmp-after.json` (`{no_pressure: 1, time_budget: 15}`, root 16/16, 0 hits -- its own `n_errors` is 0; the 22 turn errors belong to the narrowed-window arms, `cmp-ms800`/`cmp-w32`).
+          // KNOWN COST, deliberate: inside this window the per-step economic test does not run (the
+          // shortcut below precedes it), so discovery is bounded by the allowance rather than per
+          // step. In the prod4 4x150k profile that is the whole budget -- `search_granted_ns` is
+          // 4e8 on every record that searched (15 of 16; record 1 is `no_pressure`/`granted=0`), i.e.
+          // `granted_ == remaining`, because `economic(initial_cost)` is far above the allowance: the
+          // cost field (`initial_predicted_total_ns`) reads 1.239e11-8.798e12 ns across the prod4
+          // instances and `economic` is that divided by 20 -- **6.2e9-4.4e11 ns**. (An earlier version
+          // quoted the cost range as if it were the economic bound: 20x too large at the top end.)
+          // Ordinary traffic is not the prod4 profile, where `granted_ == remaining` still holds;
+          // across all records the smallest granted value on a record that actually searched
+          // (`search_work>0`) is 4,270,230 ns (`serve-820`); one record with `search_work=0` was
+          // granted 35,391 ns, and 901 records carry `granted=0` because no search was needed. No
+          // upper bound is claimed here. The test reaches the per-step guards with a 200 ms cost.
+          //
+          // The 32 ms arm did not complete (1200 s cap, 22 turn errors, 0 prefix hits) and its result
+          // file is byte-identical to an 800 ms arm's and tagged only `build`, so no arm's provenance
+          // is established and none of it is cited as evidence here.
+          granted_(std::min(economic(initial_cost), allowance.remaining(started))) {}
 
     [[nodiscard]] bool allow(std::uint64_t now, std::uint64_t next_operation_ns,
                              std::uint64_t completion_ns, std::uint64_t gain_ns,

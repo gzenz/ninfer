@@ -312,11 +312,43 @@ public:
         // `allowance` used elsewhere; only the search's internal budget is restarted.
         PlanningAllowance search_allowance = allowance;
         search_allowance.started_ns = search_origin_ns;
-        // The search must explore several construction steps (one per pressure owner, each a few
-        // ms) before reaching the preserving alternative for the re-touch's own checkpoint, so it
-        // needs the full single-request allowance, not the reduced concurrency window. The cost it
-        // avoids (a multi-hundred-ms re-prefill) dwarfs the extra planning time.
-        search_allowance.limit_ns = 100'000'000;
+        // This is a CUT-OFF, not a completeness bound. What the artifacts contain, with inference
+        // labelled and denominators stated:
+        //   - the gate's own FORECAST for a construction step (`GATE DENY phase=construction
+        //     completion=…`, the `completion` argument passed to `allow_work` -- an estimate, not a
+        //     measured duration). From ONE log (`/tmp/why.log`, n=8, all `complete=0`): 7.4-30.8 ms.
+        //     Across every surviving log the same line reads 0.024-30.8 ms (n=92, p50 4.7 ms), so
+        //     "several times the flat 5 ms window" holds for that log, not for the population;
+        //   - the collapse artifacts' stop reasons read `{'no_pressure': 1, 'time_budget': 15}` with
+        //     0% prefix reuse;
+        //   - in the 400 ms arm 14 of its 16 records report `search_elapsed` ~395 ms with
+        //     `budget_exhausted: true` (req 1 made no search; req 2 stopped `queue_exhausted` at
+        //     ~150 ms), i.e. the search is stopped by this bound, not finished;
+        //   - `first_improvement_ns` is carried by 15 of serve-292073's 16 records, spanning
+        //     8.534-163.925 ms; req 16's is 95.541 ms (an earlier version said "the record that
+        //     carries it", singular -- wrong by 14 records). The later acceptance arm spans
+        //     8.227-166.211 ms, and earlier runs 18.7-23.4 ms (serve-277147, serve-277417,
+        //     serve-278329 -- the range was written as "19-23 ms", which excludes 18.740).
+        // THE MEASURED A/B (2026-09-24, prod4 4x150k; arms by instance id -- neither recorded a binary). Counts per COMPLETED turn: records the 420 s cap cancelled in flight (`finish_reason=cancelled`, `prefill=0`) carry no reuse evidence and are excluded.
+        //   * 5 ms arm 1 (serve-293952): cut after 9 of 16 turns completed (rc=124), 3 cancelled in flight. Of the 9: 9/9 root with 0 hits, 8 with search_work>0 (granted 5e6, time_budget), 1 no_pressure (granted 0).
+        //   * 5 ms arm 2 (serve-307902, 3 rounds): cut after 9 of 12 completed, 3 cancelled. Of the 9: 8/9 root with 0 hits, 1 private_endpoint (152,227 hits), 7 with search_work>0.
+        //   * combined: 17 of 18 completed turns re-prefilled from root.
+        //   * 400 ms arm (serve-292073): completed 16/16; rounds 2-3 (records 5-12) 8/8 private_endpoint with hits 152,333-154,799; overall 12 of 16 private_endpoint (152,333-157,004), 4 root (round 1), 15 of 16 with search_work>0 (exception: record 1, no_pressure, granted 0).
+        // SCOPE: at 5 ms the old capped expression and the new one are numerically identical (both 5 ms) with `allow()` byte-identical, so this pair measures THE WINDOW'S VALUE; the cap's removal is what makes 400 ms reachable (arithmetic), not separately measured.
+        // STILL TUNED: 400 ms is the only value measured PASSING. 100 ms fails the gate (`/tmp/cmp-ms100.json`: root 12/16, 614,577 hits, queue_wait_s.max 153.03 s); a 32 ms arm failed too but its artifact is byte-identical to an 800 ms arm's and tagged only `build`, so it establishes nothing.
+        // NINFER_SEARCH_MS is an operator override, not a diagnostic: it sets this bound, is the
+        // supported way to A/B it, and is deliberately not behind the harmful-control guard (see
+        // src/core/diagnostics.h, which names this and the ingress probe as its two documented
+        // exceptions). A negative value is clamped rather than rejected (`strtoull` negation lands
+        // above the clamp, so it becomes the 2000 ms ceiling) -- read it as "no limit".
+        search_allowance.limit_ns = 400'000'000;
+        if (const char* override_ms = std::getenv("NINFER_SEARCH_MS")) {
+            const auto parsed = std::strtoull(override_ms, nullptr, 10);
+            // Clamped: an unbounded planning window would spend a request's whole deadline here.
+            if (parsed > 0) {
+                search_allowance.limit_ns = std::min<std::uint64_t>(parsed, 2'000ULL) * 1'000'000ULL;
+            }
+        }
         MaterializationSearchBudget search_budget(search_allowance, search_origin_ns,
                                                   incumbent.cost.total_ns);
         const auto initial_cost_ns = incumbent.cost.total_ns;
@@ -810,7 +842,17 @@ public:
             const PressureTargetAssessment& assessment = assessed.assessment();
             if (assessment.candidate != candidates[incumbent.candidate_index].id ||
                 assessment.physical_status != MaterializationPhysicalStatus::Feasible) {
-                throw std::logic_error("selected identity target lost exact feasibility");
+                // Stale before commit: a concurrent transition took the target's room. Reject
+                // without physical side effects (§12 invariant 10) and let the caller fall back
+                // to the root identity, so the request re-prefills instead of failing the batch
+                // with a 500.
+                if (dbg) {
+                    std::fprintf(stderr,
+                                 "[mat-debug] STALE identity target -> re-prefill cand=%lu\n",
+                                 static_cast<unsigned long>(incumbent.candidate_index));
+                    dbg_flush();
+                }
+                return std::nullopt;
             }
             incumbent.assessed.emplace(std::move(assessed));
         }
@@ -851,12 +893,26 @@ public:
             AssessedPressureTarget root_assessed = session.assess(root);
             if (root_assessed.assessment().physical_status !=
                 MaterializationPhysicalStatus::Feasible) {
-                throw std::logic_error("eviction fallback target lost feasibility");
+                // The fallback is not guaranteed feasible under concurrent transitions either.
+                // Re-prefill is the intended outcome (see the comment above): a retention loss
+                // must never become a request failure.
+                if (dbg) {
+                    std::fprintf(stderr, "[mat-debug] SEAL FALLBACK infeasible -> re-prefill\n");
+                    dbg_flush();
+                }
+                return std::nullopt;
             }
             sealed = session.seal(std::move(root_assessed), prompt,
                                   FinalScheduleIntent{.shared_capture_frontiers = shared_frontiers});
             if (!sealed) {
-                throw std::logic_error("eviction fallback target could not be sealed");
+                // Reproduced under 4 concurrent sessions sharing a large prefix: the losing lane
+                // cannot claim the seal window, so neither the preserving target nor the
+                // root-maximal fallback seals. Degrade to re-prefill instead of HTTP 500.
+                if (dbg) {
+                    std::fprintf(stderr, "[mat-debug] SEAL FALLBACK claims blocked -> re-prefill\n");
+                    dbg_flush();
+                }
+                return std::nullopt;
             }
             incumbent.root_maximal = true;
         }
@@ -895,6 +951,14 @@ public:
         diagnostics.search_overshoot_ns        = search_elapsed_ns > search_budget.granted_ns()
                                                      ? search_elapsed_ns - search_budget.granted_ns()
                                                      : 0;
+        if (!sealed) {
+            if (dbg) {
+                std::fprintf(stderr, "[mat-debug] NO SEAL -> re-prefill cand=%lu\n",
+                             static_cast<unsigned long>(incumbent.candidate_index));
+                dbg_flush();
+            }
+            return std::nullopt;
+        }
         Result result;
         result.plan                = std::move(*sealed);
         result.candidate           = candidates[incumbent.candidate_index].id;

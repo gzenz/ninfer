@@ -1794,7 +1794,70 @@ private:
             const ActiveAdmissionSet active =
                 scheduler_.active_admission_set(slots_, max_concurrency_);
             if (active.size == 0) {
-                throw std::logic_error("isolated-feasible request is blocked in an idle Engine");
+                // A stall, not a corruption. What this throw actually did, corrected 2026-09-25
+                // after a review checked it: the logic_error goes through WORKER RECOVER (it does not
+                // kill the worker directly). The journal shows nine RECOVER lines over about 35 ms,
+                // then "8 consecutive recoveries -- failing all", and only then the worker exits --
+                // which left prod answering 503 to everything with a completely EMPTY scheduler
+                // while /stats still responded, a wedge only a restart cleared
+                // (tasks #14). Reporting no progress keeps the engine able to move and turns the
+                // condition into a client-visible outcome rather than a dead worker.
+                //
+                // What resolves it, stated accurately: the request's own deadline is 900 s
+                // (--pending-timeout-ms in prod), and the wedge sentinel's Class A fires far
+                // earlier at ~150 s. Its cap is two restarts per 30 min -- the third trigger sets
+                // its stopped flag instead of restarting -- so the sentinel is the resolver. Better
+                // than before, when the empty scheduler armed none of the sentinel's classes.
+                //
+                // NOTE: this line prints "[engine] admission stalled", which does NOT match the
+                // token list in CLAUDE.md's journal-monitor pattern -- add it there or the condition
+                // is invisible to the documented monitor. Rate-limited, because it can persist for
+                // the whole deadline.
+                // Fail-fast, rather than waiting for the head's deadline. With an empty active set
+                // there is nothing that can free what the head waits for, so the block cannot be
+                // satisfied by waiting -- and a stalled FIFO head blocks *every* request behind it,
+                // so the cost of waiting is not one request but the queue. The 2026-09-25 wedge was
+                // exactly this: a recovery left occupancy owned by nothing, so a request above the
+                // remaining capacity was classed feasible and then blocked forever, and the only
+                // resolver was a restart (the sentinel's Class A, twice, then it stops).
+                //
+                // Bounded by a persistence window so a transient race does not fail a request the next
+                // boundary would admit: the condition must hold continuously for the grace period
+                // before the head is rejected. `Overloaded` is the honest kind -- the engine is up and
+                // answering, it simply cannot serve this request.
+                static Clock::time_point idle_block_since{};
+                static std::uint64_t idle_block_request = 0;
+                const auto now = Clock::now();
+                if (idle_block_request != head->id ||
+                    now - idle_block_since > kIdleBlockGracePeriod) {
+                    idle_block_request = head->id;
+                    idle_block_since   = now;
+                }
+                if (now - idle_block_since >= kIdleBlockGracePeriod) {
+                    std::fprintf(stderr,
+                                 "[engine] admission rejected: request %llu stayed blocked for %lld s "
+                                 "with an empty active set; nothing can free what it waits for\n",
+                                 static_cast<unsigned long long>(head->id),
+                                 static_cast<long long>(kIdleBlockGracePeriod.count()));
+                    std::fflush(stderr);
+                    (void)remove_pending_error(
+                        head, std::make_exception_ptr(RequestError(
+                                  RequestErrorKind::Overloaded,
+                                  "the engine is idle and cannot admit this request within its "
+                                  "remaining capacity")));
+                    return AdmissionProgress::ControlProgress;
+                }
+                static auto last_report = Clock::time_point{};
+                if (now - last_report > std::chrono::seconds(5)) {
+                    last_report = now;
+                    std::fprintf(stderr,
+                                 "[engine] admission stalled: request %llu is feasible but the active "
+                                 "set is empty (engine idle); grace %lld s before it is rejected\n",
+                                 static_cast<unsigned long long>(head->id),
+                                 static_cast<long long>(kIdleBlockGracePeriod.count()));
+                    std::fflush(stderr);
+                }
+                return control_progress ? AdmissionProgress::ControlProgress : AdmissionProgress::None;
             }
             if (!scheduler_.protect_blocked_head(head->id, active.span(),
                                                  instance_.program->resource_revision())) {
@@ -2012,6 +2075,38 @@ private:
     // the scheduler and program state, but leaves pending requests in the FIFO so they
     // can retry once memory is freed.  The worker loop continues after this.
     // The worker holds execution_mutex_ across the failing operation and this cleanup.
+    // Post-recovery residual (I1). A recovery clears the scheduler and the program's catalogs, and is
+    // *expected* to release every page and slot those were holding -- so the occupancy measured
+    // immediately afterwards should be zero, and a non-zero line here is the leak, named.
+    //
+    // This exists because of the 2026-09-25 wedge, whose first stage was a recovery that left about
+    // 958 device pages and one host state slot owned by nothing. Nothing reported it: the residual was
+    // visible only to someone who later correlated `/stats` by hand, and the block it left could not
+    // be freed by any path, so a request above the remaining capacity was classed feasible and then
+    // blocked forever. The point of printing at the moment of recovery is that the journal -- which is
+    // what the monitor watches -- then carries the residual next to the recovery line.
+    //
+    // Runs only on an exceptional path, so it is not gated and costs nothing in normal operation.
+    // Reports the same quantities the request log's throughput records carry (`program.physical_usage`
+    // is the accessor behind both), so a residual here can be compared with them directly.
+    void report_recovery_residual(const char* what) noexcept {
+        try {
+            const auto usage = instance_.program->physical_usage();
+            std::fprintf(stderr,
+                         "[engine] post-recovery residual (%s): main_kv_pages=%u backend_kv_pages=%u "
+                         "device_state_slots=%u host_state_slots=%u host_kv_bytes=%zu\n",
+                         what, usage.device_main_kv_pages, usage.device_backend_kv_pages,
+                         usage.device_state_slots, usage.host_state_slots, usage.host_kv_bytes);
+            std::fflush(stderr);
+        } catch (...) {}
+    }
+
+    // How long a head may remain blocked with an *empty* active set before it is rejected outright.
+    // Nothing can free resources while no lane is active, so this is a persistence window that
+    // separates a transient race from the unsatisfiable block the 2026-09-25 wedge was; 5 s is far
+    // below the 900 s request deadline and far below the sentinel's ~150 s Class A restart.
+    static constexpr std::chrono::seconds kIdleBlockGracePeriod{5};
+
     void recover_from_oom_locked(std::exception_ptr error) noexcept {
         if (!error) { error = oom_fallback_error_; }
         try { scheduler_.reset(); } catch (...) {}
@@ -2034,6 +2129,7 @@ private:
         // FIFO requests are re-inspected on the next boundary without waiting for a new submission.
         request_admission_check();
         try { publish_runtime_stats(); } catch (...) {}
+        report_recovery_residual("recover");
     }
 
     // The worker holds execution_mutex_ across the failing operation and this cleanup, so no
@@ -2063,6 +2159,7 @@ private:
         }
         for (const auto& request : pending) { force_complete_error(request, error); }
         try { publish_runtime_stats(); } catch (...) {}
+        report_recovery_residual("fail-all");
     }
 
     void worker_loop() noexcept {

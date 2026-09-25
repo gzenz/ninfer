@@ -599,6 +599,28 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
             }
             refresh_state_views(sequence);
             bind_sequence_kv(sequence);
+
+    // The DFlash sink has the same defect as the KV row above, and it matters on prod's backend: the
+    // sink reads its destination slot and table row from `io.dflash_decode->ingress`, a single device
+    // buffer that is uploaded once at materialization and then overwritten by EVERY dflash decode round
+    // of ANY lane. A prefill interleaved with other lanes' decode rounds therefore appended drafter
+    // context into another lane's dflash KV and consumed another lane's state destination slot. Re-derive
+    // and re-upload this lane's own values at each step, exactly as the row scalars are re-bound.
+    if (is_masked_draft_backend(speculative_backend) && dflash_host_ingress != nullptr &&
+        io.dflash_decode.has_value()) {
+        const StateImageSelectors dflash_selectors = state_selectors(sequence);
+        *dflash_host_ingress                            = {};
+        dflash_host_ingress->active_lanes[0]            = static_cast<std::int32_t>(sequence.lane);
+        dflash_host_ingress->state_source_slots[0]      = dflash_selectors.source;
+        dflash_host_ingress->state_destination_slots[0] = dflash_selectors.destination;
+        dflash_host_ingress->dflash_kv_table_rows[0] =
+            (sequence.kv && sequence.kv->backend)
+                ? backend_kv_addresses->bound_row(*sequence.kv->backend)
+                : 0;
+        CUDA_CHECK(cudaMemcpyAsync(io.dflash_decode->ingress.data, dflash_host_ingress,
+                                   sizeof(qwen3_5::DFlashDecodeIngress), cudaMemcpyHostToDevice,
+                                   device.stream));
+    }
         } else if (request_plan.reuse == ReusePath::PrivateEndpoint) {
             if (!state_store->valid(sequence.state.read) ||
                 sequence.state.read != sequence.state.write || sequence.state.fork_pending ||
@@ -1160,6 +1182,23 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
     if (staged.pending_capture_offer != 0) {
         throw std::logic_error("prefill cannot advance while a capture offer is pending");
     }
+    // Re-bind THIS lane's KV row at every prefill step.
+    //
+    // The prefill forward pass does not use the lane-specific KV view it is handed: `TextContext`
+    // stores `state.text_kv` as `kv_` and never reads it, and `attn_mix` takes the row from the single
+    // shared device scalar `io_.text_kv_table_row` instead. Nothing rewrote that scalar during a
+    // prefill -- only materialization and capture publication call `bind_sequence_kv` -- so as soon as
+    // the next lane was admitted while this lane was still prefilling, this lane's remaining chunks
+    // wrote and attended through THAT lane's row. One session's document landed in another's pages,
+    // which is D2: the victim continues with the previously admitted session's content, the last
+    // admitted lane looks clean (its own prefill overwrites the borrowed row), and column-zero-ish
+    // lanes lose the writes that were redirected.
+    //
+    // Every audit missed it because they all checked KV *bindings* -- page identity, block tables,
+    // table contents -- and the decode ingress, never the row *selector* the prefill kernel reads.
+    // Idempotent for an active address (it skips `activate`), so calling it here costs two 4-byte
+    // device writes per step.
+    bind_sequence_kv(sequence);
     // Admission-side prompt tail (NINFER_LEDGER_PROBE=1): the same 64-entry hash the decode-side
     // LEDGER-FP prints, over the same region (the tail of the admitted prompt), so the two can be
     // compared per lane without any cross-lane alignment. The canary sits at the prompt's END, so

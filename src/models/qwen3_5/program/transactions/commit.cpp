@@ -336,6 +336,16 @@ runtime::ExecutionTiming ProgramImpl::append_forced_tokens(
                 bind_dflash_prefill_sink(sequence);
             }
 
+            // Re-bind THIS row's KV row before the chunk loop, for the same reason `advance_prefill`
+            // does at every step: the prefill kernels read the shared scalar `io.text_kv_table_row`
+            // (the lane-specific KV view handed to them is stored and never read -- the D2 carrier,
+            // 479c92c4), so with several rows in one batch every row would otherwise write and attend
+            // through whichever lane bound last. `commit_sequence_kv` below does not bind it: that only
+            // commits frontiers. Latent so far -- this path needs thinking-control forced tokens, and
+            // the request log shows `units.control == 0` in every entry logged -- but it is the same
+            // mechanism that produced measurable contamination under concurrency (8 foreign rebinds in
+            // 272 observed steps, 2026-09-25), and one line closes it.
+            bind_sequence_kv(sequence);
             std::uint32_t cursor = base;
             while (cursor < end) {
                 const std::uint32_t count           = std::min(prefill_chunk, end - cursor);

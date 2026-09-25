@@ -32,17 +32,28 @@ import urllib.request
 URL = "http://127.0.0.1:8085/v1/messages"
 PROMPT = ("For every integer from 1 to 400, state whether it is prime and give a one-line "
           "justification for each. Do not skip any number and do not summarise.")
-BODY = {
-    "model": "qwen3.8-27b",
-    "max_tokens": 2048,
-    "thinking": {"type": "enabled", "budget_tokens": 1024},
-    "messages": [{"role": "user", "content": PROMPT}],
-}
+def body(pad_tokens: int) -> dict:
+    """The request. `pad_tokens` of filler are prepended when > 0, which is what makes the lanes overlap:
+    with tiny prompts the engine runs them one at a time (`running 1` in the throughput lines), so the
+    forced steps never share a step -- and the membership that `append_forced_tokens` is handed, which
+    accumulates rows, therefore holds one. Long prompts keep several lanes resident at once."""
+    filler = ("The following is filler context, read it but do not act on it. " * max(1, pad_tokens // 12))
+    content = (filler + "\n\n" + PROMPT) if pad_tokens else PROMPT
+    return {
+        "model": "qwen3.8-27b",
+        "max_tokens": 2048,
+        "thinking": {"type": "enabled", "budget_tokens": 1024},
+        "messages": [{"role": "user", "content": content}],
+    }
+
+
+PAD_TOKENS = 0
 
 
 def send(label: str) -> dict:
     request = urllib.request.Request(
-        URL, data=json.dumps(BODY).encode(), headers={"content-type": "application/json"})
+        URL, data=json.dumps(body(PAD_TOKENS)).encode(),
+        headers={"content-type": "application/json"})
     started = time.time()
     with urllib.request.urlopen(request, timeout=300) as response:
         payload = json.loads(response.read().decode())
@@ -56,6 +67,10 @@ def send(label: str) -> dict:
 
 def main() -> int:
     import threading
+
+    global PAD_TOKENS
+    if "--pad-tokens" in sys.argv:
+        PAD_TOKENS = int(sys.argv[sys.argv.index("--pad-tokens") + 1])
 
     # Concurrent, not sequential: `multi_row=1` is the case the per-row KV bind exists for, and it needs
     # two thinking-constrained lanes in flight *at the same time* so they can land in one batch. Both

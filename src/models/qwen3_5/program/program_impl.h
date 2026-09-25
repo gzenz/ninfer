@@ -16,6 +16,7 @@
 #include "models/qwen3_5/program/storage/state_store.h"
 #include "models/qwen3_5/program/prefix_identity.h"
 #include "models/qwen3_5/program/kv_row_binding.h"
+#include "models/qwen3_5/program/shared_slot_release.h"
 #include "models/qwen3_5/program/planning/resource_projection.h"
 #include "models/qwen3_5/execution/text.h"
 #include "models/qwen3_5/execution/vision.h"
@@ -406,13 +407,6 @@ struct SharedPrefixState {
     std::uint64_t state_epoch      = 0;  // W1-B: see RewriteCheckpoint.
     runtime::PrefillWork rebuild_work;
     std::uint32_t active_references = 0;
-};
-
-enum class SharedPrefixSlotRole : std::uint8_t {
-    Free,
-    ReservedCapture,
-    ReservedReplacement,
-    Catalogued,
 };
 
 struct SharedPrefixSlot {

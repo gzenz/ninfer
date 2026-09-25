@@ -1,3 +1,6 @@
+ninfer_add_test(ninfer_shared_slot_release_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_shared_slot_release.cpp")
+
 ninfer_add_test(ninfer_qwen3_5_loading_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_loading_real.cpp"
   LIBRARIES ninfer_model_loading)

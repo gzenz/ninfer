@@ -864,17 +864,26 @@ void ProgramImpl::abort_active_capture(ActiveCaptureTransaction& transaction) no
     }
     if (transaction.shared_index && *transaction.shared_index < shared_prefix_capacity) {
         SharedPrefixSlot& slot = shared_prefix_slots[*transaction.shared_index];
-        if (transaction.replaces_shared && transaction.replacement_removed &&
-            slot.role == SharedPrefixSlotRole::ReservedCapture &&
-            slot.generation == transaction.replacement_generation) {
-            slot.role = SharedPrefixSlotRole::Free;
-        } else if (transaction.replaces_shared && !transaction.replacement_removed &&
-                   slot.role == SharedPrefixSlotRole::ReservedReplacement &&
-                   slot.generation == transaction.replacement_generation) {
-            slot.role = SharedPrefixSlotRole::Catalogued;
-        } else if (!transaction.replaces_shared &&
-                   slot.role == SharedPrefixSlotRole::ReservedCapture) {
-            slot.role = SharedPrefixSlotRole::Free;
+        // A reserved role belonging to a transaction that is going away is never left reserved
+        // (shared_slot_release.h, enumerated and unit-tested). The chain this replaces matched only
+        // three combinations of (replaces_shared, replacement_removed, role): a slot in either of the
+        // other two kept its KV addresses and its state checkpoint reference with no owner, and
+        // `fail_all_cleanup` releases only `Catalogued` slots, so nothing could free it -- the
+        // 2026-09-25 leak candidate (#9).
+        //
+        // The generation guard is kept where the old chain had it: for a replacement flow the slot may
+        // have been re-reserved by a later transaction, and touching that one would corrupt it.
+        const bool ours = !transaction.replaces_shared ||
+                          slot.generation == transaction.replacement_generation;
+        if (ours) {
+            switch (resolve_shared_slot_release(transaction.replaces_shared,
+                                                transaction.replacement_removed, slot.role)) {
+            case SharedSlotReleaseAction::Free: slot.role = SharedPrefixSlotRole::Free; break;
+            case SharedSlotReleaseAction::Catalogue:
+                slot.role = SharedPrefixSlotRole::Catalogued;
+                break;
+            case SharedSlotReleaseAction::Leave: break;
+            }
         }
     }
     transaction.prepared = false;

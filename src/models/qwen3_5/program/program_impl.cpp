@@ -374,6 +374,16 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
         if (text_kv_addresses->bound_row(*address) != 0) {
             throw std::logic_error("causal score did not bind the unique Main KV row");
         }
+        // Publish that row into the shared scalar the prefill kernels actually read. The
+        // lane-specific KV view handed to `PrefillContext` below is stored and never read (the D2
+        // carrier, fixed for the serving path in 479c92c4), so without this the score's prefill
+        // attends through whatever row the last `bind_sequence_kv` left -- another lane's, in the
+        // serving engine. Latent rather than live: `EnginePurpose::CausalScoring` is instanced only
+        // by `apps/perplexity/main.cpp`, a single-owner offline core with no lanes, where the scalar
+        // is still at its initialisation value. The assert above proves the row is 0, so this is the
+        // same value the initialisation wrote; it exists so the dependence is stated in code rather
+        // than resting on an uninitialised scalar happening to be zero.
+        set_device_i32(io.text_kv_table_row, text_kv_addresses->bound_row(*address));
         text_kv_addresses->ensure_mapped_to_tokens(*address, predictor_count, device.stream);
 
         const std::int32_t state_slot = state_store->physical_slot(*state);

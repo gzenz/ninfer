@@ -349,9 +349,16 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
                 const StateImageSelectors selectors = state_store->begin_fork(selected, current);
                 // Fork completeness control (NINFER_FORK_COPY=1): initialize the whole
                 // destination image from the source before the ops run, so a region the ops
-                // read but never write cannot carry the previous occupant's state. The zeroing
-                // control above changed behaviour (a lane returned an empty reply), which says
-                // some region IS read before it is written.
+                // read but never write cannot carry the previous occupant's state.
+                //
+                // An earlier version of this comment asserted as fact that "the zeroing control above
+                // changed behaviour (a lane returned an empty reply), which says some region IS read
+                // before it is written". That observation is recorded here, but the plan's own table
+                // records the same control as leaving bleed unchanged, and the two cannot both stand.
+                // Neither is verified: the control is compiled out unless the build enables
+                // -DNINFER_HARMFUL_CONTROLS=ON, so the run that would settle it has not been made.
+                // Stated as a contradiction rather than resolved, so a reader does not inherit the
+                // stronger of two unverified claims.
                 if (diagnostic_control_enabled("NINFER_FORK_COPY")) {
                     state_images->copy_slot(selectors.source, selectors.destination, device.stream);
                 }

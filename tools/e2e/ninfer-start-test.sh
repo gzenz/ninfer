@@ -92,9 +92,15 @@ CT_FLAGS_EXTRA=""
 [ "${PRESERVE_THINKING:-0}" = "1" ] && CT_FLAGS_EXTRA="$CT_FLAGS_EXTRA --preserve-thinking"
 [ "${NO_CUDA_GRAPH:-0}" = "1" ] && CT_FLAGS_EXTRA="$CT_FLAGS_EXTRA --no-cuda-graph"
 
-export NINFER_MAT_DEBUG="${NINFER_MAT_DEBUG:-}" NINFER_MAT_GRID="${NINFER_MAT_GRID:-}" \
-       NINFER_MAT_TAIL="${NINFER_MAT_TAIL:-}" NINFER_MAT_FRONT="${NINFER_MAT_FRONT:-}" \
-       NINFER_MAT_FINE="${NINFER_MAT_FINE:-}"
+# Export these only when they carry a value. `std::getenv` returns non-NULL for an EMPTY string, so
+# the previous form (`export NINFER_MAT_DEBUG="${NINFER_MAT_DEBUG:-}"`) switched every MAT_* probe ON
+# in every e2e run: 1.7 MB of probe output for one prod4 run, a 678 MB serve log, and all of it on
+# the paths the suite times. Unset is what "off" means here.
+for _mat_name in NINFER_MAT_DEBUG NINFER_MAT_GRID NINFER_MAT_TAIL NINFER_MAT_FRONT NINFER_MAT_FINE; do
+  _mat_value="${!_mat_name:-}"
+  if [ -n "$_mat_value" ]; then export "$_mat_name=$_mat_value"; else unset "$_mat_name"; fi
+done
+unset _mat_name _mat_value
 
 # The server runs in the background of this wrapper so that `$!` here is the SERVER's pid. Writing
 # the wrapper's pid instead (the previous form, `echo $! > ~/ninfer-test.pid` outside) made the pid

@@ -1,10 +1,12 @@
 #include "models/qwen3_5/program/program_impl.h"
+#include "core/diagnostics.h"
 #include "models/qwen3_5/program/context_work.h"
 #include "models/qwen3_5/program/planning/pressure_planner.h"
 
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <cstdio>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -354,8 +356,24 @@ runtime::ContextTransactionReserveStatus ProgramImpl::reserve_active_capture_imp
     const SharedPrefixHandle* replacement,
     std::optional<runtime::CheckpointRef> private_replacement, bool permit_shared_publication,
     std::optional<CapturePressureCandidate> pressure, runtime::CancellationFlagView cancellation) {
-    if (has_context_transaction() || has_unsettled_state_fork() || !valid_capture_offer(offer)) {
-        throw std::logic_error("capture transaction is not reservable");
+    // Contention is not corruption. Another context transaction, or an unsettled state
+    // fork left by a shared-prefix reuse, owns the program; a capture is optional
+    // retention, and §12 invariant 15 requires a retention/capture failure to degrade to
+    // skip so the active lane still reaches a finite terminal state. Throwing here failed
+    // the whole batch with HTTP 500 (reproduced: 4 concurrent sessions sharing a large
+    // prefix, all four killed by "WORKER RECOVER: capture transaction is not reservable").
+    if (has_context_transaction() || has_unsettled_state_fork()) {
+        skip_capture(std::move(offer));
+        return runtime::ContextTransactionReserveStatus::Aborted;
+    }
+    if (!valid_capture_offer(offer)) {
+        // A DISTINCT message on purpose. The contention branch above and this one used to share
+        // "capture transaction is not reservable", which is the string the pre-fix HTTP 500 was
+        // reported as ("WORKER RECOVER: capture transaction is not reservable") -- so the evidence
+        // "that line no longer appears" could not tell the fixed branch from this one, which still
+        // throws. A stale offer is an internal-consistency failure, not contention, and it is not
+        // expected on this path; keep it loud and separable.
+        throw std::logic_error("capture offer is stale (invalid for this program state)");
     }
     if (cancellation.requested()) {
         skip_capture(std::move(offer));
@@ -683,7 +701,15 @@ void ProgramImpl::prepare_active_capture(ActiveCaptureTransaction& transaction) 
 
     state_store->freeze(transaction.source_state);
     if (transaction.state_placement == qwen3_5::CaptureStatePlacement::DeviceFork) {
-        (void)state_store->begin_fork(transaction.source_state, transaction.destination_state);
+        const StateImageSelectors capture_fork =
+            state_store->begin_fork(transaction.source_state, transaction.destination_state);
+        // Fork completeness control (NINFER_FORK_COPY=1): the publishing lane continues in the
+        // fork destination, and the ops that consume the selector pair write only the regions
+        // they own -- anything else keeps the previous occupant's bytes. This site is the
+        // *publisher's* continuation fork (the consumer-side sites are in prefill.cpp).
+        if (diagnostic_control_enabled("NINFER_FORK_COPY")) {
+            state_images->copy_slot(capture_fork.source, capture_fork.destination, device.stream);
+        }
         sequence.state = ActiveStateBinding{.read         = transaction.source_state,
                                             .write        = transaction.destination_state,
                                             .fork_pending = true};
@@ -947,6 +973,21 @@ ActiveCaptureResult ProgramImpl::publish_active_capture(ActiveCaptureTransaction
         shared.state    = transaction.source_state;
         shared.identity = transaction.group.identity;
         shared.frontier = transaction.group.frontier;
+        // Frontier audit (NINFER_MAT_DEBUG=1): the state image was frozen from
+        // `sequence.state.write`, whose position is the sequence's execution frontier -- NOT
+        // necessarily the marker group's frontier. When they differ, the entry advertises a
+        // frontier its state does not correspond to, and a session matching only the shorter
+        // common boundary forks another session's later tokens (cross-session bleed,
+        // reproduced by tools/e2e/canary-e2e.py).
+        if (std::getenv("NINFER_MAT_DEBUG")) {
+            std::fprintf(stderr,
+                         "[mat-debug] SHARED-PUBLISH group_frontier=%u exec_frontier=%u "
+                         "identity_frontier=%u prefill_cursor=%u prefill_prompt=%u\n",
+                         transaction.group.frontier, sequence.execution_frontier,
+                         transaction.group.identity ? transaction.group.identity->shortlist_key.frontier : 0U,
+                         prefill.cursor, prefill.prompt_tokens);
+            std::fflush(stderr);
+        }
         shared.backend_frontier =
             speculative_backend == SpeculativeBackend::Mtp      ? transaction.group.frontier - 1U
             : speculative_backend == SpeculativeBackend::DFlash ? transaction.group.frontier

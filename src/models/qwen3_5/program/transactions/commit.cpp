@@ -341,10 +341,20 @@ runtime::ExecutionTiming ProgramImpl::append_forced_tokens(
             // (the lane-specific KV view handed to them is stored and never read -- the D2 carrier,
             // 479c92c4), so with several rows in one batch every row would otherwise write and attend
             // through whichever lane bound last. `commit_sequence_kv` below does not bind it: that only
-            // commits frontiers. Latent so far -- this path needs thinking-control forced tokens, and
-            // the request log shows `units.control == 0` in every entry logged -- but it is the same
-            // mechanism that produced measurable contamination under concurrency (8 foreign rebinds in
-            // 272 observed steps, 2026-09-25), and one line closes it.
+            // commits frontiers. Latent so far: this path needs thinking-control forced tokens.
+            //
+            // CORRECTED 2026-09-25. This comment used to say "the request log shows `units.control == 0`
+            // in every entry logged", offered as evidence the path had never run. That is false: the
+            // log's `units.control` is `timing.control_units` (request_log.cpp:354), a control-plane
+            // work counter that is non-zero in 3842 of 19163 records -- it has nothing to do with forced
+            // tokens and never was an indicator for this path. What is true is that the *condition* is
+            // reproducible: `thinking.budget_tokens` with a prompt that exceeds it gives
+            // `stop_reason: max_tokens` and thinking beyond the budget, which is when the engine forces
+            // the close. Whether `append_forced_tokens` then runs is not yet observed -- it needs a
+            // probe in that function, not a counter borrowed from an unrelated axis.
+            //
+            // The defect itself stands, and it is the same mechanism that produced measurable
+            // contamination under concurrency (8 foreign rebinds in 272 observed steps, 2026-09-25).
             bind_sequence_kv(sequence);
             std::uint32_t cursor = base;
             while (cursor < end) {

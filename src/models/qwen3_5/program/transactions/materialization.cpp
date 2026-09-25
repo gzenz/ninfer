@@ -650,6 +650,59 @@ void ProgramImpl::prepare_materialization(MaterializationTransaction& transactio
             source_state != nullptr
                 ? selected_state(*source_state, details.reuse, details.selected_checkpoint)
                 : shared_state->state;
+        // Durable pairing (W1-B, plan form): the entry advertises a state, and that state carries a
+        // content epoch which changes whenever its content does. Comparing the epoch recorded when
+        // the checkpoint was installed against the live one detects a state whose content moved
+        // underneath its owner record -- the "wrong bytes behind valid bookkeeping" class this
+        // repository has twice paid for (the recycled rewrite checkpoint, and the shared entry whose
+        // state did not correspond to its advertised frontier).
+        //
+        // Counted with its denominator in every build, and NOT enforced: a mismatch has never been
+        // observed, and a throw on this path kills the worker -- which is the lesson of the wedge
+        // (2026-09-25), where an accurate detector was itself the outage. The recorded epoch is
+        // matched by *handle*, so an endpoint state or a state with no checkpoint record counts as
+        // unrecorded rather than as agreement.
+        {
+            std::uint64_t recorded_epoch = 0;
+            bool recorded                = false;
+            if (shared_state != nullptr) {
+                recorded_epoch = shared_state->state_epoch;
+                recorded       = recorded_epoch != 0;
+            } else if (source_state != nullptr) {
+                if (source_state->rewrite_state && *source_state->rewrite_state == state) {
+                    recorded_epoch = source_state->rewrite_checkpoint.state_epoch;
+                    recorded       = recorded_epoch != 0;
+                } else {
+                    for (const LongAnchorCheckpoint& anchor : source_state->long_anchors) {
+                        if (anchor.state == state) {
+                            recorded_epoch = anchor.state_epoch;
+                            recorded       = recorded_epoch != 0;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (recorded) {
+                ++state_epoch_checks_;
+                const std::uint64_t live_epoch = state_store->content_epoch(state);
+                if (live_epoch != recorded_epoch) { ++state_epoch_mismatches_; }
+                if (state_epoch_checks_ == 1ULL || state_epoch_checks_ % 512ULL == 0ULL ||
+                    live_epoch != recorded_epoch) {
+                    std::fprintf(stderr,
+                                 "[materialization] state-epoch lane=%u recorded=%llu live=%llu "
+                                 "mismatches=%llu/%llu unrecorded=%llu reuse=%d\n",
+                                 lane, static_cast<unsigned long long>(recorded_epoch),
+                                 static_cast<unsigned long long>(live_epoch),
+                                 static_cast<unsigned long long>(state_epoch_mismatches_),
+                                 static_cast<unsigned long long>(state_epoch_checks_),
+                                 static_cast<unsigned long long>(state_epoch_unrecorded_),
+                                 static_cast<int>(details.reuse));
+                    std::fflush(stderr);
+                }
+            } else {
+                ++state_epoch_unrecorded_;
+            }
+        }
         // Owner binding (W1.2): a *private* checkpoint may only be adopted by the session that
         // produced it. A shared entry is cross-session by design, so only the private side is
         // checked. Both sides are FNV-1a over the session key (0 = keyless request).
@@ -674,6 +727,24 @@ void ProgramImpl::prepare_materialization(MaterializationTransaction& transactio
             // impossible by construction, so this is evidence only if a denominator accompanies it.
             // Gated (it was the one new print without a NINFER_MAT_DEBUG guard) and reported as a
             // finding: if it ever fires, the adoption must be rejected, not merely logged.
+            // W1.2: counted in every build (a private checkpoint adopted by another session should be
+            // impossible by construction, so the count is the evidence and the print is rate-limited);
+            // still not a rejection, because it has never been observed to fire and rejecting would
+            // turn a rare mis-service into a request failure. The print stays gated so a served run
+            // does not pay for it.
+            if (source_owner != 0 && consumer_owner != 0 && source_owner != consumer_owner) {
+                ++cross_session_adoptions_;
+                if (cross_session_adoptions_ <= 8ULL) {
+                    std::fprintf(stderr,
+                                 "[materialization] CROSS-SESSION-ADOPT lane=%u source_owner=%llx "
+                                 "consumer_owner=%llx count=%llu reuse=%d\n",
+                                 lane, static_cast<unsigned long long>(source_owner),
+                                 static_cast<unsigned long long>(consumer_owner),
+                                 static_cast<unsigned long long>(cross_session_adoptions_),
+                                 static_cast<int>(details.reuse));
+                    std::fflush(stderr);
+                }
+            }
             if (std::getenv("NINFER_MAT_DEBUG") != nullptr && source_owner != 0 &&
                 consumer_owner != 0 && source_owner != consumer_owner) {
                 std::fprintf(stderr,

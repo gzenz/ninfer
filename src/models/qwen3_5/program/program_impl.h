@@ -307,6 +307,11 @@ struct RewriteCheckpoint {
     bool valid                 = false;
     RewriteCheckpointKind kind = RewriteCheckpointKind::TurnClosure;
     std::uint32_t frontier     = 0;
+    // W1-B (plan form): the content epoch of the StateImage this checkpoint points at, recorded when
+    // the checkpoint was installed. Compared against the live epoch when the state is selected for
+    // reuse, so a state whose content moved underneath its owner record is detectable -- the
+    // "wrong bytes behind valid bookkeeping" class the plan was written for.
+    std::uint64_t state_epoch  = 0;
     runtime::PrefillWork rebuild_work;
 };
 
@@ -314,6 +319,7 @@ struct LongAnchorCheckpoint {
     StateImageHandle state;
     std::uint32_t frontier = 0;
     std::uint32_t ordinal  = 0;
+    std::uint64_t state_epoch = 0;  // W1-B: see RewriteCheckpoint.
     runtime::PrefillWork rebuild_work;
 };
 
@@ -397,6 +403,7 @@ struct SharedPrefixState {
     std::uint32_t backend_frontier = 0;
     std::int32_t rope_delta        = 0;
     bool tail_hidden_valid         = false;
+    std::uint64_t state_epoch      = 0;  // W1-B: see RewriteCheckpoint.
     runtime::PrefillWork rebuild_work;
     std::uint32_t active_references = 0;
 };
@@ -882,6 +889,16 @@ private:
     // previously visible only under NINFER_MAT_DEBUG, which is how a live hazard stayed unmeasured.
     std::uint64_t shared_publishes_                      = 0;
     std::uint64_t shared_publish_frontier_mismatches_    = 0;
+    // W1-B (plan form): the durable {owner, state content epoch} pairing. Counted in every build with
+    // its denominator; deliberately not enforced until a mismatch has actually been observed -- a
+    // throw on this path kills the worker (the wedge, 2026-09-25), and an unobserved condition is not
+    // a licence to introduce one.
+    std::uint64_t recycled_checkpoint_restores_          = 0;
+    // W1.2: a private checkpoint adopted by a different session. Should be impossible by construction.
+    std::uint64_t cross_session_adoptions_               = 0;
+    std::uint64_t state_epoch_checks_                    = 0;
+    std::uint64_t state_epoch_mismatches_                = 0;
+    std::uint64_t state_epoch_unrecorded_                = 0;
 
     struct ActiveCaptureTransaction {
         std::uint64_t id         = 0;

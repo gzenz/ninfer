@@ -561,6 +561,7 @@ ProgramImpl::install_private_capture(SequenceState& sequence, const CaptureGroup
             .valid        = true,
             .kind         = *group.rewrite,
             .frontier     = group.frontier,
+            .state_epoch  = state_store->content_epoch(checkpoint),
             .rebuild_work = validated_rebuild_work(group.identity->rebuild_work, group.frontier),
         };
     }
@@ -606,6 +607,7 @@ ProgramImpl::install_private_capture(SequenceState& sequence, const CaptureGroup
             .state        = checkpoint,
             .frontier     = group.frontier,
             .ordinal      = ordinal,
+            .state_epoch  = state_store->content_epoch(checkpoint),
             .rebuild_work = validated_rebuild_work(group.identity->rebuild_work, group.frontier),
         });
         validate_long_anchor_ordinals(sequence.long_anchors, capacity_limit);
@@ -827,6 +829,28 @@ void ProgramImpl::abort_active_capture(ActiveCaptureTransaction& transaction) no
                                                             .write = transaction.source_state};
                     }
                     if (transaction.recycles_private_state) {
+                        // W1-B (plan step 3): this is the "recycled rewrite checkpoint" path the plan
+                        // names. The fork destination IS the sequence's rewrite checkpoint
+                        // (`destination_state = *sequence.rewrite_state`), so an abort here restores
+                        // the checkpoint's *old* content epoch -- over content the fork may have
+                        // written. If it did, the checkpoint survives with metadata that describes
+                        // bytes it no longer holds, and a later reuse forks the fork's state under the
+                        // checkpoint's name. Whether the bytes are in fact dirty depends on what
+                        // `abort_fork` restores, which is not established here; so this counts the
+                        // path with its denominator instead of asserting a hazard, and the fix (drop
+                        // the checkpoint rather than restore its epoch) waits until it is known to
+                        // matter.
+                        ++recycled_checkpoint_restores_;
+                        if (recycled_checkpoint_restores_ <= 8ULL ||
+                            recycled_checkpoint_restores_ % 512ULL == 0ULL) {
+                            std::fprintf(stderr,
+                                         "[capture] recycled-checkpoint restored on abort lane=%u "
+                                         "count=%llu\n",
+                                         sequence.lane,
+                                         static_cast<unsigned long long>(
+                                             recycled_checkpoint_restores_));
+                            std::fflush(stderr);
+                        }
                         state_store->restore_recycled_checkpoint(transaction.destination_state,
                                                                  transaction.recycled_state_epoch);
                     } else {
@@ -986,6 +1010,8 @@ ActiveCaptureResult ProgramImpl::publish_active_capture(ActiveCaptureTransaction
         }
         shared.kv       = *shared_bundle;
         shared.state    = transaction.source_state;
+        // W1-B (plan form): the epoch this entry's state is frozen at, recorded with the entry.
+        shared.state_epoch = state_store->content_epoch(transaction.source_state);
         shared.identity = transaction.group.identity;
         shared.frontier = transaction.group.frontier;
         // Frontier audit (NINFER_MAT_DEBUG=1). CORRECTED 2026-09-25: this said the frozen state's

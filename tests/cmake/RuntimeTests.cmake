@@ -1,3 +1,5 @@
+ninfer_add_test(ninfer_idle_block_grace_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/test_idle_block_grace.cpp")
+
 ninfer_add_test(ninfer_admission_policy_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_admission_policy.cpp"
   LIBRARIES ninfer_runtime_support)
 

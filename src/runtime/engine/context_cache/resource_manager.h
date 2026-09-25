@@ -488,7 +488,28 @@ public:
         std::optional<Choice> selected =
             plan_materialization(program, prompt, base, *destination, candidates, publication_order,
                                  planning_started, provisional_demand, allowance);
-        if (!selected) { return {.readiness = Readiness::TemporarilyBlocked}; }
+        if (!selected) {
+            // "No plan" is only *temporary* when something can change the answer: an occupied lane
+            // finishing, or a reclaimable owner. With every lane Free and no context transaction in
+            // flight (checked on entry), nothing can, so the verdict is final.
+            //
+            // This is the wedge's stage two (#14/#9, 2026-09-25): a recovery left ~958 device pages and
+            // one host state slot owned by nothing, so a request above the remaining capacity planned to
+            // nothing -- and because feasibility is asked against full capacity, it was never called
+            // infeasible either. The head then waited out its 900 s deadline, blocking every request
+            // queued behind it, and the only resolver was a restart. Reporting the unsatisfiable block
+            // as PermanentlyInfeasible turns it into the capacity error the engine already raises for
+            // that enum, at the moment it is decided rather than after a grace period.
+            //
+            // Safe in the other direction: `Materializing` and `TerminalPending` are not Free, so any
+            // lane that could still free or take capacity keeps the request temporarily blocked.
+            const bool any_lane_occupied =
+                std::any_of(lanes_.begin(), lanes_.end(), [](LogicalLaneState state) {
+                    return state != LogicalLaneState::Free;
+                });
+            if (!any_lane_occupied) { return {.readiness = Readiness::PermanentlyInfeasible}; }
+            return {.readiness = Readiness::TemporarilyBlocked};
+        }
         return {
             .readiness = selected->needs_transfer() ? Readiness::NeedsTransfer : Readiness::Ready,
             .choice    = std::move(selected),

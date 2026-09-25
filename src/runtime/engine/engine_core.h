@@ -12,6 +12,7 @@
 #include "runtime/engine/context_cache/resource_manager.h"
 #include "runtime/engine/scheduler.h"
 #include "runtime/engine/generation_budget.h"
+#include "runtime/engine/idle_block_grace.h"
 
 #include <algorithm>
 #include <array>
@@ -1825,15 +1826,13 @@ private:
                 // boundary would admit: the condition must hold continuously for the grace period
                 // before the head is rejected. `Overloaded` is the honest kind -- the engine is up and
                 // answering, it simply cannot serve this request.
-                static Clock::time_point idle_block_since{};
-                static std::uint64_t idle_block_request = 0;
+                // The window is monotone per head, in `IdleBlockGrace`, which has a unit test: the
+                // inline version this replaces reset its own start with the same condition it tested,
+                // so it could only fire if a poll landed exactly on the boundary -- and its "0
+                // rejections on healthy traffic" evidence was a negative that could not have failed.
+                static IdleBlockGrace idle_block_grace;
                 const auto now = Clock::now();
-                if (idle_block_request != head->id ||
-                    now - idle_block_since > kIdleBlockGracePeriod) {
-                    idle_block_request = head->id;
-                    idle_block_since   = now;
-                }
-                if (now - idle_block_since >= kIdleBlockGracePeriod) {
+                if (idle_block_grace.observe(head->id, now, kIdleBlockGracePeriod)) {
                     std::fprintf(stderr,
                                  "[engine] admission rejected: request %llu stayed blocked for %lld s "
                                  "with an empty active set; nothing can free what it waits for\n",

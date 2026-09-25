@@ -701,7 +701,18 @@ void ProgramImpl::prepare_active_capture(ActiveCaptureTransaction& transaction) 
 
     // W1-B: record the position the state is frozen at, before anything can move it. This is the
     // value the published entry's advertised frontier is compared against.
-    transaction.frozen_execution_frontier = sequence.execution_frontier;
+    //
+    // `sequence.text_kv_valid`, NOT `execution_frontier`. A shared capture is offered and frozen
+    // *mid-prefill* (`prefill.cpp` offers it when `staged.cursor == *capture_frontier`), and
+    // `execution_frontier` is written only at decode and forced commits -- during a prompt prefill
+    // it is still 0. Comparing the advertised frontier against it therefore counted every
+    // mid-prefill capture as a mismatch: the first version of this counter read 1/1 in the canary
+    // workload and I read that as a live hazard. The corpus says otherwise -- 62 of 62 publishes in
+    // the recorded logs have `group_frontier == prefill_cursor`, with `exec_frontier == 0` in all
+    // 62. The counter was measuring the wrong quantity, not the engine doing something wrong.
+    // `text_kv_valid` is the position the sequence's KV has been written to, i.e. what the frozen
+    // state corresponds to, both mid-prefill and after a Begin commit.
+    transaction.frozen_text_frontier = sequence.text_kv_valid;
     state_store->freeze(transaction.source_state);
     if (transaction.state_placement == qwen3_5::CaptureStatePlacement::DeviceFork) {
         const StateImageSelectors capture_fork =
@@ -976,12 +987,16 @@ ActiveCaptureResult ProgramImpl::publish_active_capture(ActiveCaptureTransaction
         shared.state    = transaction.source_state;
         shared.identity = transaction.group.identity;
         shared.frontier = transaction.group.frontier;
-        // Frontier audit (NINFER_MAT_DEBUG=1): the state image was frozen from
-        // `sequence.state.write`, whose position is the sequence's execution frontier -- NOT
-        // necessarily the marker group's frontier. When they differ, the entry advertises a
-        // frontier its state does not correspond to, and a session matching only the shorter
-        // common boundary forks another session's later tokens (cross-session bleed,
-        // reproduced by tools/e2e/canary-e2e.py).
+        // Frontier audit (NINFER_MAT_DEBUG=1). CORRECTED 2026-09-25: this said the frozen state's
+        // position "is the sequence's execution frontier", and that a difference meant cross-session
+        // bleed "reproduced by tools/e2e/canary-e2e.py". Both halves were wrong. A shared capture is
+        // frozen mid-prefill, where `execution_frontier` is still 0 -- so this print showed
+        // `exec_frontier=0` beside a non-zero `group_frontier` for every mid-prefill capture, which
+        // is not a mismatch but two different quantities. The position the state corresponds to is
+        // the prefill cursor, and against it the recorded corpus is 62 of 62 agreeing
+        // (`group_frontier == prefill_cursor`, `exec_frontier == 0` in all 62). No bleed was
+        // reproduced from this condition by that suite, and the bleed it did reproduce is
+        // attributable to the KV row selector (479c92c4).
         if (std::getenv("NINFER_MAT_DEBUG")) {
             std::fprintf(stderr,
                          "[mat-debug] SHARED-PUBLISH group_frontier=%u exec_frontier=%u "
@@ -1001,16 +1016,16 @@ ActiveCaptureResult ProgramImpl::publish_active_capture(ActiveCaptureTransaction
         // 2026-09-25).
         ++shared_publishes_;
         const bool frontier_matches =
-            transaction.group.frontier == transaction.frozen_execution_frontier;
+            transaction.group.frontier == transaction.frozen_text_frontier;
         if (!frontier_matches) { ++shared_publish_frontier_mismatches_; }
         // The denominator prints too, and on a schedule that cannot swallow it: a mismatch-only
         // print leaves "no line" meaning either "no mismatch" or "no publishes", which is the one
         // distinction this counter exists to make.
         if (shared_publishes_ == 1U || shared_publishes_ % 512U == 0U || !frontier_matches) {
             std::fprintf(stderr,
-                         "[capture] SHARED-FRONTIER advertised=%u frozen=%u live=%u lane=%u "
+                         "[capture] SHARED-FRONTIER advertised=%u frozen=%u exec=%u lane=%u "
                          "identity=%u mismatches=%llu/%llu\n",
-                         transaction.group.frontier, transaction.frozen_execution_frontier,
+                         transaction.group.frontier, transaction.frozen_text_frontier,
                          sequence.execution_frontier, transaction.lane,
                          transaction.group.identity
                              ? transaction.group.identity->shortlist_key.frontier

@@ -896,14 +896,15 @@ private:
         std::uint64_t replacement_generation = 0;
         StateImageHandle source_state;
         StateImageHandle destination_state;
-        // W1-B: the sequence's execution frontier at the moment its StateImage was frozen. The
-        // published entry advertises `group.frontier`, and the invariant is that the state it hands
-        // to a consumer corresponds to the frontier it advertises. Comparing the *live*
-        // execution_frontier at publish time instead measured a value that legitimately moves (and
-        // resets) between the freeze and the publication: the first canary run read this as
-        // `advertised=20538 state=0` and looked like a live mismatch, when it was the instrument
-        // reading the wrong moment.
-        std::uint32_t frozen_execution_frontier = 0;
+        // W1-B: the position the state image was frozen at, recorded at the freeze. The published
+        // entry advertises `group.frontier`, and the invariant is that the state a consumer receives
+        // corresponds to the frontier it advertises. `sequence.text_kv_valid` is that position --
+        // NOT `execution_frontier`, which is written only at decode and forced commits and is
+        // therefore still 0 while a prompt prefill (where shared captures are offered) is running.
+        // The first version recorded `execution_frontier` and reported a 1/1 mismatch that was the
+        // instrument reading the wrong quantity; against the correct one the recorded corpus agrees
+        // 62 of 62.
+        std::uint32_t frozen_text_frontier = 0;
         qwen3_5::CaptureStatePlacement state_placement = qwen3_5::CaptureStatePlacement::DeviceFork;
         std::optional<StateImageTransfer> state_snapshot;
         std::optional<KVAddressSpaceHandle> active_text_destination;

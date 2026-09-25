@@ -621,19 +621,12 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
             }
             refresh_state_views(sequence);
             bind_sequence_kv(sequence);
-            // The DFlash sink has the same defect as the KV row above, and it matters on prod's
-            // backend: the sink reads its destination slot and table row from
-            // `io.dflash_decode->ingress`, a single device buffer that is uploaded once at
-            // materialization and then overwritten by EVERY dflash decode round of ANY lane. A
-            // prefill interleaved with other lanes' decode rounds therefore appended drafter context
-            // into another lane's dflash KV and consumed another lane's state destination slot.
-            //
-            // 2026-09-25 correction: the 479c92c4 commit message claims this re-upload happens "at
-            // each step" and this comment said the same. It did not: the block below is inside
-            // `start_sequence`, so it ran once per materialization, and `advance_prefill` -- the
-            // multi-step path a long prompt actually takes -- re-bound only the KV row scalars. The
-            // shared helper is now called from both, which is what makes the claim true.
-            bind_dflash_prefill_sink(sequence);
+            // No DFlash publish here. This call was redundant: nothing between it and the
+            // end-of-function publish (which every reuse path reaches) reads the sink, so its only
+            // effect was to write values the later call overwrote -- and a review of 2026-09-25
+            // pointed out that a commit claiming "one derivation" is worth less when three copies
+            // exist. The derivation also missed this: 479c92c4's DFlash half changed *this* copy,
+            // which that same later call discarded, so it changed nothing at all on this path.
         } else if (request_plan.reuse == ReusePath::PrivateEndpoint) {
             if (!state_store->valid(sequence.state.read) ||
                 sequence.state.read != sequence.state.write || sequence.state.fork_pending ||
@@ -858,16 +851,10 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
             if (!dflash || !io.dflash_decode || (backend_kv_cache() && !sequence.kv->backend)) {
                 throw std::logic_error("DFlash prefill state is incomplete");
             }
-            *dflash_host_ingress                       = {};
-            dflash_host_ingress->active_lanes[0]       = static_cast<std::int32_t>(sequence.lane);
-            const StateImageSelectors selectors        = state_selectors(sequence);
-            dflash_host_ingress->state_source_slots[0] = selectors.source;
-            dflash_host_ingress->state_destination_slots[0] = selectors.destination;
-            dflash_host_ingress->dflash_kv_table_rows[0] =
-                sequence.kv->backend ? backend_kv_addresses->bound_row(*sequence.kv->backend) : 0;
-            CUDA_CHECK(cudaMemcpyAsync(io.dflash_decode->ingress.data, dflash_host_ingress,
-                                       sizeof(qwen3_5::DFlashDecodeIngress), cudaMemcpyHostToDevice,
-                                       device.stream));
+            // One derivation, shared with `advance_prefill` and the forced-continuation path. This
+            // site carried its own copy until 2026-09-25, which is how the copies drifted: the
+            // commit that claimed to re-publish "at each step" changed this copy and nothing else.
+            bind_dflash_prefill_sink(sequence);
         }
 
         staged.elapsed_seconds += std::chrono::duration<double>(Clock::now() - started).count();
@@ -1211,28 +1198,12 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
     // table contents -- and the decode ingress, never the row *selector* the prefill kernel reads.
     // Idempotent for an active address (it skips `activate`), so calling it here costs two 4-byte
     // device writes per step.
-    // W1-A: what the host record says the scalars named when this step began, judged against this
-    // lane's own rows. One comparison and two increments, always on. A foreign reading here is the
-    // pre-2026-09-25 condition -- the state the D2 fix exists to correct -- but the trigger is
-    // narrower than "another lane is running": `bind_sequence_kv` is called only from this step, from
-    // materialization and from shared-prefix publication, so a foreign reading means another lane
-    // was admitted or published a shared prefix between two of this lane's steps. Measured over the
-    // prod4 run of 2026-09-25: 0 of 512. So this is a recurrence detector with a low trigger rate,
-    // and 0 of N means the trigger did not occur, NOT that a guard passed. An earlier version of
-    // this comment claimed the count was expected to be high under concurrency; the run says
-    // otherwise, and the claim was wrong rather than the measurement.
-    {
-        const std::pair<std::int32_t, std::int32_t> step_rows = bound_kv_rows(sequence);
-        kv_row_binding_.observe(sequence.lane, step_rows.first, step_rows.second);
-    }
-    bind_sequence_kv(sequence);
-    // The DFlash sink's ingress is shared device state with the same exposure as the row scalars, and
-    // it must be re-published here for the same reason: this is the path a long prompt takes, and the
-    // fix that claimed to cover it only covered materialization (see the note in `start_sequence`).
-    bind_dflash_prefill_sink(sequence);
-    // W1-A: what the *device* says the two scalars name, now that this lane has re-bound them. This
-    // is the only form that can catch a second writer -- the host record agrees with itself by
-    // construction, and the D2 fix rests on `bind_sequence_kv` being the sole writer of both.
+    // W1-A: the device's own answer, read BEFORE this step re-binds. Placed after the re-bind it
+    // only confirmed that `set_device_i32` did what it had just done -- the same stream, the same
+    // thread, nothing able to write in between (a review caught that and was right). Here it
+    // tests the assumption the D2 fix rests on: that nothing but `bind_sequence_kv` writes these
+    // scalars, since the record is only updated on that path. It can therefore diverge exactly
+    // when a second writer appears, which is what it exists to catch.
     if (std::getenv("NINFER_KV_BINDING_CHECK") != nullptr) {
         std::int32_t device_text_row    = -1;
         std::int32_t device_backend_row = -1;
@@ -1274,6 +1245,25 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             std::fflush(stderr);
         }
     }
+    // W1-A: what the host record says the scalars named when this step began, judged against this
+    // lane's own rows. One comparison and two increments, always on. A foreign reading here is the
+    // pre-2026-09-25 condition -- the state the D2 fix exists to correct -- but the trigger is
+    // narrower than "another lane is running": `bind_sequence_kv` is called only from this step, from
+    // materialization and from shared-prefix publication, so a foreign reading means another lane
+    // was admitted or published a shared prefix between two of this lane's steps. Measured over the
+    // prod4 run of 2026-09-25: 0 of 512. So this is a recurrence detector with a low trigger rate,
+    // and 0 of N means the trigger did not occur, NOT that a guard passed. An earlier version of
+    // this comment claimed the count was expected to be high under concurrency; the run says
+    // otherwise, and the claim was wrong rather than the measurement.
+    {
+        const std::pair<std::int32_t, std::int32_t> step_rows = bound_kv_rows(sequence);
+        kv_row_binding_.observe(sequence.lane, step_rows.first, step_rows.second);
+    }
+    bind_sequence_kv(sequence);
+    // The DFlash sink's ingress is shared device state with the same exposure as the row scalars, and
+    // it must be re-published here for the same reason: this is the path a long prompt takes, and the
+    // fix that claimed to cover it only covered materialization (see the note in `start_sequence`).
+    bind_dflash_prefill_sink(sequence);
     // Admission-side prompt tail (NINFER_LEDGER_PROBE=1): the same 64-entry hash the decode-side
     // LEDGER-FP prints, over the same region (the tail of the admitted prompt), so the two can be
     // compared per lane without any cross-lane alignment. The canary sits at the prompt's END, so

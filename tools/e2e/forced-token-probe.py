@@ -55,10 +55,31 @@ def send(label: str) -> dict:
 
 
 def main() -> int:
-    send("budget-exhausting request")
-    print("[probe] now grep the server log for '[forced]' -- a line means append_forced_tokens ran, "
-          "and rows>1 means it saw the multi-row case the per-row bind exists for", flush=True)
-    return 0
+    import threading
+
+    # Concurrent, not sequential: `multi_row=1` is the case the per-row KV bind exists for, and it needs
+    # two thinking-constrained lanes in flight *at the same time* so they can land in one batch. Both
+    # requests are launched before either response is read.
+    count = int(sys.argv[sys.argv.index("--concurrent") + 1]) if "--concurrent" in sys.argv else 1
+    errors: list[str] = []
+
+    def worker(index: int) -> None:
+        try:
+            send(f"budget-exhausting request {index + 1}/{count}")
+        except Exception as error:  # noqa: BLE001 - reported, not swallowed
+            errors.append(f"{index}: {error}")
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(count)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    for error in errors:
+        print(f"[probe] ERROR {error}", flush=True)
+    print(f"[probe] {count - len(errors)}/{count} requests completed; now grep the server log for "
+          "'[forced]' -- a line means append_forced_tokens ran, and multi_row=1 means it saw the "
+          "multi-row case the per-row bind exists for", flush=True)
+    return 0 if not errors else 1
 
 
 if __name__ == "__main__":

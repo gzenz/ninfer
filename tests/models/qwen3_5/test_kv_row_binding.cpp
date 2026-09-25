@@ -73,22 +73,43 @@ void test_clear_reports_foreign() {
 }
 
 void test_verify_compares_the_device_reading() {
+    using Verdict = Binding::Verdict;
     Binding binding;
     binding.bind(0, 0, 0);
-    expect(binding.verify(0, 0), "a device reading equal to the record was reported as divergent");
+    expect(binding.verify(0, 0) == Verdict::Agrees, "a device reading equal to the written pair diverged");
     expect(binding.verified_readings() == 1 && binding.diverged_readings() == 0,
            "an agreeing reading moved the divergence counter");
     // A second writer of the scalar, which is what this check exists to catch: the host record is
     // untouched, the device says something else, and only one axis differs.
-    expect(!binding.verify(0, 5), "a divergent backend row was accepted");
-    expect(!binding.verify(9, 0), "a divergent text row was accepted");
+    expect(binding.verify(0, 5) == Verdict::Diverges, "a divergent backend row was accepted");
+    expect(binding.verify(9, 0) == Verdict::Diverges, "a divergent text row was accepted");
     expect(binding.verified_readings() == 3 && binding.diverged_readings() == 2,
            "the verification counters disagree with the three readings made");
+}
 
-    // A cleared record must not "agree" with a device reading that happens to match its defaults.
-    Binding cleared;
-    cleared.clear();
-    expect(!cleared.verify(-1, -1), "a cleared record agreed with a reading of its own defaults");
+void test_releasing_ownership_does_not_fabricate_divergence() {
+    using Verdict = Binding::Verdict;
+    // The defect a 2026-09-25 review caught, kept as a case: `unbind_sequence_kv` releases ownership
+    // while the device still holds what it last received. Comparing a reading against *ownership*
+    // made every readback after any other lane finished report a divergence that was not there.
+    Binding binding;
+    binding.bind(1, 1, 1);
+    binding.clear();
+    expect(binding.lane() == Binding::kUnboundLane, "clear did not release ownership");
+    expect(binding.has_written_values(), "clear discarded what the device last received");
+    expect(binding.verify(1, 1) == Verdict::Agrees,
+           "a released record reported divergence although the device holds what was written");
+    expect(binding.verify(1, 2) == Verdict::Diverges, "a real divergence after clear was accepted");
+}
+
+void test_unwritten_record_is_unverifiable_not_agreeing() {
+    using Verdict = Binding::Verdict;
+    Binding binding;
+    expect(binding.verify(-1, -1) == Verdict::Unverifiable,
+           "a record that was never written claimed agreement with its own defaults");
+    expect(binding.unverifiable_readings() == 1, "the unverifiable counter did not move");
+    expect(binding.verified_readings() == 0 && binding.diverged_readings() == 0,
+           "an unverifiable reading was counted as verified or as divergent");
 }
 
 } // namespace
@@ -99,6 +120,8 @@ int main() {
     test_observations_count_both_denominators();
     test_clear_reports_foreign();
     test_verify_compares_the_device_reading();
+    test_releasing_ownership_does_not_fabricate_divergence();
+    test_unwritten_record_is_unverifiable_not_agreeing();
     if (failures != 0) {
         std::cerr << failures << " KV row binding checks failed\n";
         return 1;

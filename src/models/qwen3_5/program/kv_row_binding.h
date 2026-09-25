@@ -33,15 +33,24 @@ public:
 
     void bind(std::uint32_t lane, std::int32_t text_row, std::int32_t backend_row) noexcept {
         lane_        = lane;
-        text_row_    = text_row;
-        backend_row_ = backend_row;
+        written_text_    = text_row;
+        written_backend_ = backend_row;
+        ever_written_    = true;
     }
 
-    void clear() noexcept { bind(kUnboundLane, -1, -1); }
+    // Releases *ownership* only. `unbind_sequence_kv` clears this while the device scalars keep the
+    // values they last received -- nothing writes them on unbind -- so the written pair survives it.
+    // An earlier version cleared the written pair too, and once `verify()` moved before the re-bind
+    // that made a lane's readback report DEVICE-DIVERGED every time any other lane finished between
+    // two of its steps (a 2026-09-25 review caught it): the record said "unbound", the check read
+    // that as a mismatch, and the device was untouched. Ownership and "what the device last got" are
+    // two different facts and this class now keeps them apart.
+    void clear() noexcept { lane_ = kUnboundLane; }
 
     [[nodiscard]] std::uint32_t lane() const noexcept { return lane_; }
-    [[nodiscard]] std::int32_t text_row() const noexcept { return text_row_; }
-    [[nodiscard]] std::int32_t backend_row() const noexcept { return backend_row_; }
+    [[nodiscard]] std::int32_t text_row() const noexcept { return written_text_; }
+    [[nodiscard]] std::int32_t backend_row() const noexcept { return written_backend_; }
+    [[nodiscard]] bool has_written_values() const noexcept { return ever_written_; }
 
     // True when the shared scalars still name exactly this lane's pair of rows. An unbound record
     // holds nothing: without this guard `held_by(kUnboundLane, -1, -1)` is true on a cleared record,
@@ -50,7 +59,7 @@ public:
     [[nodiscard]] bool held_by(std::uint32_t lane, std::int32_t text_row,
                                std::int32_t backend_row) const noexcept {
         if (lane_ == kUnboundLane) { return false; }
-        return lane_ == lane && text_row_ == text_row && backend_row_ == backend_row;
+        return lane_ == lane && written_text_ == text_row && written_backend_ == backend_row;
     }
 
     // Record an observation of a lane's own expected pair, counting how often the shared scalars
@@ -71,30 +80,40 @@ public:
     // it agrees with itself by construction, and the D2 fix rests on `bind_sequence_kv` being the
     // sole writer of these scalars. Callers read the device back under a gate; both axes are
     // compared, for the same reason the observation compares both.
-    bool verify(std::int32_t observed_text, std::int32_t observed_backend) noexcept {
+    enum class Verdict { Agrees, Diverges, Unverifiable };
+
+    // Compares a device reading against the values the host last WROTE -- not against current
+    // ownership, which `clear()` may have released while the device still holds them. Divergence can
+    // therefore only mean a second writer, which is the one thing this check exists to catch.
+    // A record that has never been written yields Unverifiable rather than either answer: with no
+    // value to compare against, "agree" and "disagree" would both be fabrications.
+    Verdict verify(std::int32_t observed_text, std::int32_t observed_backend) noexcept {
+        if (!ever_written_) {
+            ++unverifiable_;
+            return Verdict::Unverifiable;
+        }
         ++verified_;
-        // An unbound record cannot agree with anything: after `clear()` the two -1 defaults would
-        // match a device reading of -1/-1 and the check would report agreement for a lane that never
-        // bound. Its only caller binds immediately before, so this is a guard against the class being
-        // reused somewhere that does not.
-        if (lane_ != kUnboundLane && observed_text == text_row_ && observed_backend == backend_row_) {
-            return true;
+        if (observed_text == written_text_ && observed_backend == written_backend_) {
+            return Verdict::Agrees;
         }
         ++diverged_;
-        return false;
+        return Verdict::Diverges;
     }
 
     [[nodiscard]] std::uint64_t verified_readings() const noexcept { return verified_; }
     [[nodiscard]] std::uint64_t diverged_readings() const noexcept { return diverged_; }
+    [[nodiscard]] std::uint64_t unverifiable_readings() const noexcept { return unverifiable_; }
 
 private:
-    std::uint32_t lane_       = kUnboundLane;
-    std::int32_t text_row_    = -1;
-    std::int32_t backend_row_ = -1;
-    std::uint64_t foreign_    = 0;
-    std::uint64_t observed_   = 0;
-    std::uint64_t verified_   = 0;
-    std::uint64_t diverged_   = 0;
+    std::uint32_t lane_          = kUnboundLane;
+    std::int32_t written_text_    = -1;
+    std::int32_t written_backend_ = -1;
+    bool ever_written_           = false;
+    std::uint64_t foreign_       = 0;
+    std::uint64_t observed_      = 0;
+    std::uint64_t verified_      = 0;
+    std::uint64_t diverged_      = 0;
+    std::uint64_t unverifiable_  = 0;
 };
 
 } // namespace ninfer::models::qwen3_5::detail

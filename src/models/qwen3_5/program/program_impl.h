@@ -897,13 +897,19 @@ private:
         StateImageHandle source_state;
         StateImageHandle destination_state;
         // W1-B: the position the state image was frozen at, recorded at the freeze. The published
-        // entry advertises `group.frontier`, and the invariant is that the state a consumer receives
-        // corresponds to the frontier it advertises. `sequence.text_kv_valid` is that position --
-        // NOT `execution_frontier`, which is written only at decode and forced commits and is
-        // therefore still 0 while a prompt prefill (where shared captures are offered) is running.
-        // The first version recorded `execution_frontier` and reported a 1/1 mismatch that was the
-        // instrument reading the wrong quantity; against the correct one the recorded corpus agrees
-        // 62 of 62.
+        // entry advertises `group.frontier`; `sequence.text_kv_valid` is the position the frozen
+        // state corresponds to -- NOT `execution_frontier`, which is written only at decode and
+        // forced commits and is therefore still 0 while a prompt prefill (where shared captures are
+        // offered) is running. The first version recorded `execution_frontier` and reported a 1/1
+        // mismatch that was the instrument reading the wrong quantity.
+        //
+        // What this can and cannot detect, per a 2026-09-25 review: on each of the four offer paths
+        // the offer is triggered by the same cursor that `text_kv_valid` holds, so the comparison is
+        // equal *by construction* -- it can fire only on drift between the offer and the freeze, and
+        // it never inspects the StateImage itself. The recorded corpus (62 `SHARED-PUBLISH` lines)
+        // is one mid-prefill event in one workload repeated 62 times, all `group_frontier=12516`;
+        // it settles that `execution_frontier` was the wrong quantity and is not evidence that
+        // states match frontiers.
         std::uint32_t frozen_text_frontier = 0;
         qwen3_5::CaptureStatePlacement state_placement = qwen3_5::CaptureStatePlacement::DeviceFork;
         std::optional<StateImageTransfer> state_snapshot;

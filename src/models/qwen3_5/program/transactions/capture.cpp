@@ -703,15 +703,16 @@ void ProgramImpl::prepare_active_capture(ActiveCaptureTransaction& transaction) 
     // value the published entry's advertised frontier is compared against.
     //
     // `sequence.text_kv_valid`, NOT `execution_frontier`. A shared capture is offered and frozen
-    // *mid-prefill* (`prefill.cpp` offers it when `staged.cursor == *capture_frontier`), and
-    // `execution_frontier` is written only at decode and forced commits -- during a prompt prefill
-    // it is still 0. Comparing the advertised frontier against it therefore counted every
-    // mid-prefill capture as a mismatch: the first version of this counter read 1/1 in the canary
-    // workload and I read that as a live hazard. The corpus says otherwise -- 62 of 62 publishes in
-    // the recorded logs have `group_frontier == prefill_cursor`, with `exec_frontier == 0` in all
-    // 62. The counter was measuring the wrong quantity, not the engine doing something wrong.
-    // `text_kv_valid` is the position the sequence's KV has been written to, i.e. what the frozen
-    // state corresponds to, both mid-prefill and after a Begin commit.
+    // *mid-prefill*, and `execution_frontier` is written only at decode and forced commits -- during
+    // a prompt prefill it is still 0. Comparing the advertised frontier against it therefore
+    // counted every mid-prefill capture as a mismatch: the first version of this counter read 1/1
+    // in the canary workload and I read that as a live hazard. The counter was measuring the wrong
+    // quantity, not the engine doing something wrong. `text_kv_valid` is the position the
+    // sequence's KV has been written to, i.e. what the frozen state corresponds to.
+    //
+    // Scope, per a 2026-09-25 review: every offer path triggers on the same cursor this holds, so
+    // the comparison is equal by construction and can fire only on drift between offer and freeze.
+    // It is a drift detector, not a check that the state matches the frontier it advertises.
     transaction.frozen_text_frontier = sequence.text_kv_valid;
     state_store->freeze(transaction.source_state);
     if (transaction.state_placement == qwen3_5::CaptureStatePlacement::DeviceFork) {

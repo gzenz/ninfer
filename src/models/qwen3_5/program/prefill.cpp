@@ -1198,6 +1198,26 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
     // table contents -- and the decode ingress, never the row *selector* the prefill kernel reads.
     // Idempotent for an active address (it skips `activate`), so calling it here costs two 4-byte
     // device writes per step.
+    // W1-A: what the host record says the scalars named when this step began, judged against this
+    // lane's own rows. One comparison and two increments, always on.
+    //
+    // A foreign reading here is the pre-2026-09-25 condition -- the state the D2 fix exists to
+    // correct -- but the trigger is not "another lane is running". These scalars are re-bound by
+    // `bind_sequence_kv` only, and the host record is *also* released by `unbind_sequence_kv`, i.e.
+    // by `finish()` or `release_sequence_kv()` of any lane. So a foreign or unbound reading means
+    // some lane was admitted, published a shared prefix, finished or released between two of this
+    // lane's steps -- which is what a 2026-09-25 review pointed out this comment had got wrong.
+    //
+    // On measurement: the only run that printed these counters is the prod4 run of 2026-09-25, and
+    // that run had `active=0` in every PREFILL-CENSUS line -- no lane was ever occupied when a
+    // request was admitted, so it cannot speak to behaviour under concurrency at all. An earlier
+    // version of this comment cited its 0 of 512 as refuting the expectation of foreign readings.
+    // It refutes nothing. What is true is weaker and stays true: 0 of N means the trigger did not
+    // occur in that workload, never that a guard passed.
+    {
+        const std::pair<std::int32_t, std::int32_t> step_rows = bound_kv_rows(sequence);
+        kv_row_binding_.observe(sequence.lane, step_rows.first, step_rows.second);
+    }
     // W1-A: the device's own answer, read BEFORE this step re-binds. Placed after the re-bind it
     // only confirmed that `set_device_i32` did what it had just done -- the same stream, the same
     // thread, nothing able to write in between (a review caught that and was right). Here it
@@ -1216,8 +1236,11 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                                    static_cast<std::size_t>(sizeof(device_backend_row)),
                                    cudaMemcpyDeviceToHost, device.stream));
         CUDA_CHECK(cudaStreamSynchronize(device.stream));
-        const bool device_agrees = kv_row_binding_.verify(device_text_row, device_backend_row);
-        if (!device_agrees && kv_row_binding_.diverged_readings() <= 8) {
+        const KvRowBinding::Verdict verdict =
+            kv_row_binding_.verify(device_text_row, device_backend_row);
+        const bool device_agrees = verdict == KvRowBinding::Verdict::Agrees;
+        if (verdict == KvRowBinding::Verdict::Diverges &&
+            kv_row_binding_.diverged_readings() <= 8) {
             std::fprintf(stderr,
                          "[kv-binding] DEVICE-DIVERGED lane=%u device=(%d,%d) recorded=(%d,%d) "
                          "diverged=%llu/%llu\n",
@@ -1244,20 +1267,6 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                          device_text_row, device_backend_row);
             std::fflush(stderr);
         }
-    }
-    // W1-A: what the host record says the scalars named when this step began, judged against this
-    // lane's own rows. One comparison and two increments, always on. A foreign reading here is the
-    // pre-2026-09-25 condition -- the state the D2 fix exists to correct -- but the trigger is
-    // narrower than "another lane is running": `bind_sequence_kv` is called only from this step, from
-    // materialization and from shared-prefix publication, so a foreign reading means another lane
-    // was admitted or published a shared prefix between two of this lane's steps. Measured over the
-    // prod4 run of 2026-09-25: 0 of 512. So this is a recurrence detector with a low trigger rate,
-    // and 0 of N means the trigger did not occur, NOT that a guard passed. An earlier version of
-    // this comment claimed the count was expected to be high under concurrency; the run says
-    // otherwise, and the claim was wrong rather than the measurement.
-    {
-        const std::pair<std::int32_t, std::int32_t> step_rows = bound_kv_rows(sequence);
-        kv_row_binding_.observe(sequence.lane, step_rows.first, step_rows.second);
     }
     bind_sequence_kv(sequence);
     // The DFlash sink's ingress is shared device state with the same exposure as the row scalars, and

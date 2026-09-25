@@ -1065,6 +1065,14 @@ ProgramImpl::progress_active_capture_transaction(runtime::CancellationFlagView c
                 ? std::numeric_limits<std::uint64_t>::max()
                 : transaction.operations.pressure_spill_pages + work.spill_pages;
         work.spill_pages = 0;
+        if (work.kv_demoted_to_host && !work.shared_owner) {
+            ++transaction.operations.pressure_private_owners_demoted_kv;
+            if (!work.state_transfer_published) {
+                ++transaction.operations.pressure_private_owners_demoted_kv_only;
+            }
+        }
+        work.kv_demoted_to_host       = false;
+        work.state_transfer_published = false;
     };
 
     if (has_pressure() && pressure_transition.phase == PressureTransitionPhase::HostReleases) {

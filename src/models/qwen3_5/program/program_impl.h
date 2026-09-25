@@ -790,6 +790,13 @@ private:
             bool checkpoint_drop_published = false;
             bool mutation_published        = false;
             std::uint64_t spill_pages      = 0;
+            // Attribution for the two demote axes, recorded where the information exists: this work's
+            // KV went to host (spill_pages is set only on PressureKVDecisionKind::DemoteToHost), and
+            // whether the same action also published a state transfer. The state counter cannot see a
+            // KV-only demotion, and CheckpointSummary carries no KV residency, so without these two
+            // /stats showed degraded=2 demoted=0 with 899 pages on host (live, 2026-09-25).
+            bool kv_demoted_to_host        = false;
+            bool state_transfer_published  = false;
         };
 
         std::uint64_t id = 0;

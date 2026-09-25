@@ -968,6 +968,12 @@ struct RuntimeStats {
     std::size_t host_kv_occupied_bytes                 = 0;
     std::uint64_t pressure_private_owners_degraded     = 0;
     std::uint64_t pressure_private_owners_demoted      = 0;
+    // The KV half of a demote-to-host. The counter above fires only on STATE residency, and
+    // CheckpointSummary carries no KV-residency field, so a KV-only demotion -- legal under the
+    // decided policy ("state/KV pairing is about hits, not eviction") -- was invisible in /stats:
+    // a live run showed degraded=2, demoted=0, with 899 pages on host.
+    std::uint64_t pressure_private_owners_demoted_kv      = 0;
+    std::uint64_t pressure_private_owners_demoted_kv_only = 0;
     std::uint64_t pressure_private_owners_evicted      = 0;
     std::uint64_t pressure_shared_owners_degraded      = 0;
     std::uint64_t pressure_shared_owners_evicted       = 0;

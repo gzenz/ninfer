@@ -1179,6 +1179,8 @@ public:
         out.partial_tail_cow_pages             = context_stats_.partial_tail_cow_pages;
         out.pressure_private_owners_degraded   = context_stats_.pressure_private_owners_degraded;
         out.pressure_private_owners_demoted    = context_stats_.pressure_private_owners_demoted;
+        out.pressure_private_owners_demoted_kv      = context_stats_.pressure_private_owners_demoted_kv;
+        out.pressure_private_owners_demoted_kv_only = context_stats_.pressure_private_owners_demoted_kv_only;
         out.pressure_private_owners_evicted    = context_stats_.pressure_private_owners_evicted;
         out.pressure_shared_owners_degraded    = context_stats_.pressure_shared_owners_degraded;
         out.pressure_shared_owners_evicted     = context_stats_.pressure_shared_owners_evicted;
@@ -2709,11 +2711,19 @@ private:
         // Both) is a demote-to-host: the checkpoint stays Catalogued + session-cell (restorable)
         // rather than dropped. Track it separately from a plain in-device degrade.
         const auto& final_summary = *result.final_summary;
-        if (final_summary.endpoint &&
+        const bool state_hosted =
+            final_summary.endpoint &&
             (final_summary.endpoint->state_residency == runtime::ReplicaResidency::HostOnly ||
-             final_summary.endpoint->state_residency == runtime::ReplicaResidency::Both)) {
+             final_summary.endpoint->state_residency == runtime::ReplicaResidency::Both);
+        if (state_hosted) {
             saturating_increment(context_stats_.pressure_private_owners_demoted);
         }
+        // The KV axis of a demote is NOT countable here: `MaterializationVictimResult` carries no
+        // operation counts and `CheckpointSummary` carries no KV residency, so the only place the
+        // information exists is the pressure work that performs the spill
+        // (publish_pressure_work -> ContextOperationCounts, folded into context_stats_ by
+        // observe_operations). An attempt to count it here did not compile, which is the honest reason
+        // it lives there instead.
         record_checkpoint_drops(context_stats_, dropped);
         entry.state = CatalogState::Catalogued;
     }
@@ -3458,6 +3468,10 @@ private:
         context_stats_.state_forks += result.operations.state_forks;
         context_stats_.state_restores += result.operations.state_restores;
         context_stats_.pressure_spill_pages += result.operations.pressure_spill_pages;
+        context_stats_.pressure_private_owners_demoted_kv +=
+            result.operations.pressure_private_owners_demoted_kv;
+        context_stats_.pressure_private_owners_demoted_kv_only +=
+            result.operations.pressure_private_owners_demoted_kv_only;
         context_stats_.partial_tail_cow_pages += result.operations.partial_tail_cow_pages;
         context_stats_.historical_fork_hits += result.operations.historical_fork_hits;
     }

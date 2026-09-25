@@ -804,11 +804,15 @@ void ProgramImpl::abort_active_capture(ActiveCaptureTransaction& transaction) no
         }
         if (transaction.active_backend_destination &&
             backend_kv_addresses->valid(*transaction.active_backend_destination)) {
-            (void)backend_kv_addresses->release(*transaction.active_backend_destination);
+            if (!backend_kv_addresses->release(*transaction.active_backend_destination)) {
+                note_nonstrict_release_refusal("abort-backend-destination");
+            }
         }
         if (transaction.active_text_destination &&
             text_kv_addresses->valid(*transaction.active_text_destination)) {
-            (void)text_kv_addresses->release(*transaction.active_text_destination);
+            if (!text_kv_addresses->release(*transaction.active_text_destination)) {
+                note_nonstrict_release_refusal("abort-text-destination");
+            }
         }
         if (transaction.state_snapshot) {
             state_store->abort_transfer(std::move(*transaction.state_snapshot));
@@ -818,7 +822,9 @@ void ProgramImpl::abort_active_capture(ActiveCaptureTransaction& transaction) no
             state_store->valid(transaction.destination_state)) {
             try {
                 if (transaction.state_placement == qwen3_5::CaptureStatePlacement::HostSnapshot) {
-                    (void)state_store->release(transaction.destination_state);
+                    if (!state_store->release(transaction.destination_state)) {
+                        note_nonstrict_release_refusal("abort-snapshot-destination");
+                    }
                 } else {
                     if (sequence.state.fork_pending &&
                         sequence.state.read == transaction.source_state &&
@@ -854,7 +860,9 @@ void ProgramImpl::abort_active_capture(ActiveCaptureTransaction& transaction) no
                         state_store->restore_recycled_checkpoint(transaction.destination_state,
                                                                  transaction.recycled_state_epoch);
                     } else {
-                        (void)state_store->release(transaction.destination_state);
+                        if (!state_store->release(transaction.destination_state)) {
+                            note_nonstrict_release_refusal("abort-destination");
+                        }
                     }
                 }
                 state_store->thaw(transaction.source_state);

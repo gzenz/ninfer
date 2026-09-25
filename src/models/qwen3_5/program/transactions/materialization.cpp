@@ -417,19 +417,27 @@ void ProgramImpl::release_materialization_staging(
     transaction.backend_activation.reset();
     transaction.text_activation.reset();
     if (transaction.root_backend_address && backend_kv_addresses) {
-        (void)backend_kv_addresses->release(*transaction.root_backend_address);
+        if (!backend_kv_addresses->release(*transaction.root_backend_address)) {
+            note_nonstrict_release_refusal("staging-root-backend");
+        }
         transaction.root_backend_address.reset();
     }
     if (transaction.root_text_address && text_kv_addresses) {
-        (void)text_kv_addresses->release(*transaction.root_text_address);
+        if (!text_kv_addresses->release(*transaction.root_text_address)) {
+            note_nonstrict_release_refusal("staging-root-text");
+        }
         transaction.root_text_address.reset();
     }
     if (transaction.state_fork_destination) {
-        if (state_store) { (void)state_store->release(*transaction.state_fork_destination); }
+        if (state_store && !state_store->release(*transaction.state_fork_destination)) {
+            note_nonstrict_release_refusal("staging-fork-destination");
+        }
         transaction.state_fork_destination.reset();
     }
     for (std::size_t index = 0; index < transaction.reserved_state_count; ++index) {
-        if (state_store) { (void)state_store->release(transaction.reserved_states[index]); }
+        if (state_store && !state_store->release(transaction.reserved_states[index])) {
+            note_nonstrict_release_refusal("staging-reserved-state");
+        }
         transaction.reserved_states[index] = {};
     }
     transaction.reserved_state_count = 0;

@@ -739,6 +739,16 @@ ProgramImpl::release_shared_prefix_state_strict(std::uint32_t index,
 }
 
 ReleaseResult ProgramImpl::release_shared_prefix(SharedPrefixHandle&& handle) noexcept {
+    // I3(a): every refusal here is silent by design (this is a noexcept release path), which is how a
+    // slot whose role is wrong, or whose KV address cannot be released, keeps its occupancy without
+    // anyone learning why. `NINFER_RELEASE_PROBE=1` names the reason instead. Read-only.
+    const auto refusal = [](const char* reason, std::uint32_t index) noexcept {
+        if (std::getenv("NINFER_RELEASE_PROBE") != nullptr) {
+            std::fprintf(stderr, "[release-probe] shared-prefix release refused: %s index=%u\n",
+                         reason, index);
+            std::fflush(stderr);
+        }
+    };
     ReleaseResult out;
     const std::uint32_t index      = ContractAccess::index(handle);
     const std::uint64_t generation = ContractAccess::epoch(handle);
@@ -746,13 +756,19 @@ ReleaseResult ProgramImpl::release_shared_prefix(SharedPrefixHandle&& handle) no
         !has_context_transaction() && !pending_transaction_ && valid_shared_prefix(handle);
     if (!valid || index >= shared_prefix_capacity ||
         shared_prefix_slots[index].generation != generation) {
+        refusal(valid ? "stale-generation-or-index" : "transaction-in-flight-or-invalid-handle",
+                index);
         return out;
     }
     try {
         if (!can_release_shared_prefix_state(index, SharedPrefixSlotRole::Catalogued)) {
+            refusal("state-not-releasable", index);
             return out;
         }
-    } catch (...) { return out; }
+    } catch (...) {
+        refusal("state-releasable-check-threw", index);
+        return out;
+    }
     (void)release_shared_prefix_state_strict(index, SharedPrefixSlotRole::Catalogued);
     ContractAccess::consume(handle);
     advance_resource_revision();
@@ -781,18 +797,54 @@ void ProgramImpl::fail_all_cleanup() noexcept {
         }
         invalidate_lane(lane);
     }
+    std::uint32_t continuations_live = 0;
     for (std::uint32_t index = 0; index < continuation_capacity; ++index) {
         if (continuation_slots[index].role != ContinuationSlotRole::Free) {
+            ++continuations_live;
             release_continuation_slot_best_effort(index);
         }
     }
+    // I3(b): what this cleanup actually released. The shared loop below skips any slot whose role is
+    // not `Catalogued`, so a slot parked in `ReservedCapture` -- which `abort_active_capture` does not
+    // reach when the transaction no longer holds that capture -- keeps its KV and state occupancy with
+    // no owner, and nothing reports it. That is the shape of the 2026-09-25 leak: ~958 device pages
+    // and one host state slot survived a recovery and no path could free them.
+    //
+    // One line, on an exceptional path only, so it needs no gate: the expected counts are one release
+    // per Catalogued slot and zero of everything else, and any other number here is the leak named.
+    std::uint32_t shared_catalogued    = 0;
+    std::uint32_t shared_skipped       = 0;
+    std::uint32_t shared_reserved_cap  = 0;
+    std::uint32_t shared_reserved_rep  = 0;
+    std::uint32_t shared_release_refus = 0;
     for (std::uint32_t index = 0; index < shared_prefix_capacity; ++index) {
-        if (shared_prefix_slots[index].role != SharedPrefixSlotRole::Catalogued) { continue; }
+        const SharedPrefixSlotRole role = shared_prefix_slots[index].role;
+        if (role != SharedPrefixSlotRole::Catalogued) {
+            if (role != SharedPrefixSlotRole::Free) {
+                ++shared_skipped;
+                if (role == SharedPrefixSlotRole::ReservedCapture) { ++shared_reserved_cap; }
+                if (role == SharedPrefixSlotRole::ReservedReplacement) { ++shared_reserved_rep; }
+            }
+            continue;
+        }
+        ++shared_catalogued;
         shared_prefix_states[index].active_references = 0;
         auto handle =
             ContractAccess::make_shared_prefix(this, index, shared_prefix_slots[index].generation);
-        (void)release_shared_prefix(std::move(handle));
+        const ReleaseResult released = release_shared_prefix(std::move(handle));
+        if (released.status != runtime::ConsumeStatus::Consumed) { ++shared_release_refus; }
     }
+    // The continuation count is a denominator, not an outcome: those releases are the non-strict
+    // variants (`release_sequence_kv`/`release_sequence_state` are void and noexcept), so a refusal
+    // cannot be counted from here. What it buys is attribution by elimination -- if the residual line
+    // is non-zero while every live continuation was released and the shared counts are clean, the leak
+    // is inside the non-strict release path or below it, not in a skipped slot.
+    std::fprintf(stderr,
+                 "[engine] fail-all cleanup: shared catalogued=%u released-refused=%u skipped=%u "
+                 "(reserved-capture=%u reserved-replacement=%u) continuations-live=%u\n",
+                 shared_catalogued, shared_release_refus, shared_skipped, shared_reserved_cap,
+                 shared_reserved_rep, continuations_live);
+    std::fflush(stderr);
 }
 
 

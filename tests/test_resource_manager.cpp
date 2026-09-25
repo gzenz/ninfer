@@ -2566,6 +2566,45 @@ void test_aborted_source_selection_does_not_create_hit_history() {
             "aborted source selection incorrectly biased later retention policy");
 }
 
+// #10 / #14 stage two. An unplannable request used to be reported as `TemporarilyBlocked` whatever
+// the engine's state, so when the capacity it needed was occupied by something no owner could free, the
+// request waited out its deadline for ever and blocked every request behind it (the 2026-09-25 wedge).
+// A block is only temporary when something can end it -- an occupied lane can finish -- so with every
+// lane Free and the plan finding nothing, the verdict is final.
+//
+// The control matters as much as the assertion: this must NOT pass against a manager that simply never
+// blocks anything, so the same request is re-inspected while a lane is occupied and must then be
+// *temporary*.
+void test_unplannable_request_with_no_active_lane_is_permanently_infeasible() {
+    FakeManager manager = make_manager(2, 3);
+    FakeProgram program;
+    program.required_pressure_actions = 1;  // the plan must reclaim something; nothing exists to reclaim
+
+    // No lane has been started, so every lane is Free: the request is classed feasible against total
+    // capacity (isolated_feasible) yet the plan can place it nowhere, and nothing is occupied that
+    // could finish and change that. This is #10's condition, and it must be final rather than a wait.
+    FakeRequestBasePlan idle_base = make_base(77);
+    idle_base.isolated_feasible   = true;
+    auto idle = manager.inspect(program, FakePreparedPrompt{77}, idle_base, 1);
+    require(idle.readiness == Readiness::PermanentlyInfeasible && !idle.choice,
+            "an unplannable request with every lane free was reported as merely blocked");
+
+    // Control, taken afterwards because establishing a lane requires an admittable request: with a lane
+    // occupied the same shape must remain a *temporary* block, or the assertion above would pass
+    // against a manager that never blocks anything.
+    program.required_pressure_actions = 0;
+    const FakeCacheSessionKey session{1};
+    const ActiveRequest active = start_active(
+        manager, program, 9, make_base(9, session, RetentionClass::LiveSession), 2);
+    program.required_pressure_actions = 1;
+    FakeRequestBasePlan busy_base = make_base(78);
+    busy_base.isolated_feasible   = true;
+    auto blocked = manager.inspect(program, FakePreparedPrompt{78}, busy_base, 3);
+    require(blocked.readiness == Readiness::TemporarilyBlocked && !blocked.choice,
+            "the same request with a lane occupied must remain a temporary block");
+    (void)finish_active(manager, program, active);
+}
+
 void test_retained_source_is_protected_until_terminal() {
     FakeManager manager = make_manager(2, 3);
     FakeProgram program;
@@ -3710,6 +3749,8 @@ void test_value_weights_rank_private_victims_by_rebuild_cost() {
 int main() {
     run_test("independent complete-target oracle",
              test_complete_search_against_small_exhaustive_oracle);
+    run_test("unplannable request with no active lane is permanently infeasible",
+             test_unplannable_request_with_no_active_lane_is_permanently_infeasible);
     run_test("publication-only construction",
              test_publication_only_pressure_constructs_adoptable_target);
     run_test("value-aware demotes high-value victim over eviction",

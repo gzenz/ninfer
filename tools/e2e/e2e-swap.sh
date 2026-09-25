@@ -66,7 +66,12 @@ trap 'on_signal' INT TERM HUP
 # One port variable for the whole script. It used to be three (E2E_PORT here, PORT in the start
 # script, a hard-coded 8080 in the health probes), so setting E2E_PORT aborted every swap AFTER prod
 # had been stopped -- a latent false abort. `PORT` is forwarded to the start script explicitly.
-PORT="${E2E_PORT:-${PORT:-8080}}"
+# The TEST server's port. It must NOT be 8080: that is prod *and* this session's own model port,
+# so a test server there would serve normal session traffic (the classifier, my own requests) and
+# taint the measurement with a workload the suite never asked for -- and those queries 400 on the
+# test profile's smaller context. 8085 is the established test port; prod stays on 8080 via
+# PROD_PORT below, which is what the restore checks probe.
+PORT="${E2E_PORT:-${PORT:-8085}}"
 # Prod's port is NOT the swap's port: prod binds 8080 from ~/.config/ninfer.conf unconditionally, while
 # the test server binds $PORT. Probing the restore with $PORT would report FATAL: prod did not come up
 # for an E2E_PORT of anything but 8080 while prod is up on 8080 -- and would leave the sentinel stopped
@@ -153,7 +158,7 @@ fi
 #    hardcodes a v2 artifact (--spec mtp + YaRN) that the v3 engine rejects.
 #    Prod parity: swift artifact + froggeric v225 template + dflash2.
 BIN=$HOME/ninfer/build/apps/ninfer-serve \
-MODEL=$HOME/ninfer-models/swift/qwen3_8_27b_nvfp4swift.ninfer \
+MODEL=$HOME/ninfer-models/swift15/qwen3_8_27b_nvfp4swift15.ninfer \
 CHAT_TEMPLATE=$HOME/froggeric_v225_chat_template.jinja \
 SPEC="${SPEC:-dflash2}" \
 HOST_KV_MIB="${E2E_HOST_KV_MIB:-12288}" \

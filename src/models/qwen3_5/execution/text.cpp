@@ -42,6 +42,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <set>
 #include <initializer_list>
 #include <limits>
 #include <stdexcept>
@@ -1233,6 +1234,12 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                              error.what());
                 std::fflush(stderr);
             }
+            // Control, printed rather than assumed: for each layer, how many distinct residual
+            // digests the rows of THIS step produced. If that count is 1 while the rows hold different
+            // tokens, the rows are reading one buffer -- the shared-scratch hypothesis. If it equals
+            // the row count, the probe can see content and the surface is clean for this step. An
+            // instrument that cannot show it distinguishes two rows is not allowed to report "clean".
+            std::vector<std::uint64_t> layer_digests;
             if (layer_probe) {
                 constexpr std::size_t kSample = 4096U;
                 // A decode step has a single column (the row's own position); a wide step is a
@@ -1265,19 +1272,44 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                         sum += static_cast<double>(value);
                         peak = std::max(peak, std::abs(value));
                     }
-                    std::uint64_t digest = 0;
-                    (void)digest;
+                    // A digest as well as the magnitudes, because the question here is CONTENT and
+                    // magnitudes cannot answer it: two rows carrying the same foreign bytes and two
+                    // rows merely differing in their low bits look identical as sums/peaks. A digest
+                    // is all-or-nothing -- wrong for a cross-RUN comparison (batch composition changes
+                    // the low bits) and exactly right for a cross-ROW one: two rows of one step hold
+                    // different tokens, so equal digests mean the rows are reading the same bytes.
+                    std::uint64_t digest = 1469598103934665603ULL;
+                    for (std::size_t i = 0; i < sample.size(); ++i) {
+                        digest ^= sample[i];
+                        digest *= 1099511628211ULL;
+                    }
+                    layer_digests.push_back(digest);
                     std::fprintf(stderr,
                                  "[mat-debug] LAYER-FP layer=%zu column=%d pos=%d phase=%s "
-                                 "sum=%.6f peak=%.6f\n",
+                                 "sum=%.6f peak=%.6f digest=%llx\n",
                                  layer, column,
                                  column < static_cast<std::int32_t>(probe_positions.size())
                                      ? probe_positions[static_cast<std::size_t>(column)]
                                      : -1,
                                  prefill ? "prefill" : "verify", sum,
-                                 static_cast<double>(peak));
+                                 static_cast<double>(peak),
+                                 static_cast<unsigned long long>(digest));
                 }
                 std::fflush(stderr);
+            }
+            // The control must be evaluated AFTER the sampling loop: placed before it (the first
+            // attempt) the vector was always empty and the line never printed, so the run looked like
+            // "no result" rather than "instrument dead".
+            if (layer_probe && !layer_digests.empty()) {
+                const std::size_t distinct =
+                    std::set<std::uint64_t>(layer_digests.begin(), layer_digests.end()).size();
+                std::fprintf(stderr,
+                             "[mat-debug] LAYER-CONTROL layer=%zu rows=%zu distinct_digests=%zu%s\n",
+                             layer, layer_digests.size(), distinct,
+                             distinct == 1 && layer_digests.size() > 1
+                                 ? "  <-- ALL ROWS READ THE SAME BYTES" : "");
+                std::fflush(stderr);
+                layer_digests.clear();
             }
         } catch (const std::exception& error) {
             throw std::runtime_error("text/layers/" + std::to_string(layer) +

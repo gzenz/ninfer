@@ -696,7 +696,15 @@ void ProgramImpl::prepare_materialization(MaterializationTransaction& transactio
                          "[mat-debug] ADOPT source=%s src_frontier=%u shared_frontier=%u "
                          "state_slot=%d state_epoch=%llu\n",
                          source_state != nullptr ? "private" : "shared",
-                         source_state != nullptr ? source_state->execution_frontier : 0U,
+                         // The source's OWN frontier, whichever kind it is. This printed a literal 0U
+                         // for every shared adoption, because `source_state` is null there by
+                         // construction -- and that 0 read as "the state being forked has frontier 0",
+                         // i.e. as evidence of exactly the mismatch it was being used to hunt. It is
+                         // the same class of artifact as the `dst_tail_committed=0` print found the day
+                         // before; a default is not a measurement.
+                         source_state != nullptr
+                             ? source_state->execution_frontier
+                             : (shared_state != nullptr ? shared_state->frontier : 0U),
                          shared_state != nullptr ? shared_state->frontier : 0U, slot,
                          static_cast<unsigned long long>(state_store->content_epoch(state)));
             std::fflush(stderr);
@@ -1668,7 +1676,8 @@ void ProgramImpl::publish_pressure_work(MaterializationTransaction::PressureWork
             if (change.transfer) {
                 state_store->publish_transfer(std::move(*change.transfer), false);
                 change.transfer.reset();
-                work.mutation_published = true;
+                work.mutation_published      = true;
+                work.state_transfer_published = true;
             } else if (!change.host_released) {
                 if (pressure_state_drops_host(action)
                         ? !state_store->drop_host_replica(*source)
@@ -1711,6 +1720,7 @@ void ProgramImpl::publish_pressure_work(MaterializationTransaction::PressureWork
             if (work.option.main_kv_changes[index].kind ==
                 qwen3_5::detail::PressureKVDecisionKind::DemoteToHost) {
                 work.spill_pages += work.main_kv_changes[index].pages.size();
+                work.kv_demoted_to_host = true;
             }
         }
         if (!work.option.backend_kv_changes.empty()) {
@@ -1721,6 +1731,7 @@ void ProgramImpl::publish_pressure_work(MaterializationTransaction::PressureWork
                 if (work.option.backend_kv_changes[index].kind ==
                     qwen3_5::detail::PressureKVDecisionKind::DemoteToHost) {
                     work.spill_pages += work.backend_kv_changes[index].pages.size();
+                    work.kv_demoted_to_host = true;
                 }
             }
         }
@@ -1794,6 +1805,21 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
             transaction.operations.pressure_spill_pages += work.spill_pages;
         }
         work.spill_pages = 0;
+        // The KV axis of a demote, attributed per owner. Private only: the shared axis already has its
+        // own eviction counter and the policy treats the two differently.
+        if (work.kv_demoted_to_host && !work.shared_owner) {
+            if (transaction.operations.pressure_private_owners_demoted_kv <
+                std::numeric_limits<std::uint64_t>::max()) {
+                ++transaction.operations.pressure_private_owners_demoted_kv;
+            }
+            if (!work.state_transfer_published &&
+                transaction.operations.pressure_private_owners_demoted_kv_only <
+                    std::numeric_limits<std::uint64_t>::max()) {
+                ++transaction.operations.pressure_private_owners_demoted_kv_only;
+            }
+        }
+        work.kv_demoted_to_host       = false;
+        work.state_transfer_published = false;
     };
     const auto retain_private_result = [&](auto& result, const SequenceState& state) {
         if (!result.final_summary) {

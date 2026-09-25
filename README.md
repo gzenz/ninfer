@@ -46,12 +46,12 @@ behavior, not an attention/cache/YaRN defect. We therefore currently recommend r
 YaRN-extended NVFP4 context.
 
 **Swift model artifact.** We run the single-file v3 NInfer artifact
-[`CaptainArni/Swift-Qwen3.8-27B-NInfer`](https://huggingface.co/CaptainArni/Swift-Qwen3.8-27B-NInfer)
+[`CaptainArni/Swift-1.5-Qwen3.8-27B-NInfer`](https://huggingface.co/CaptainArni/Swift-1.5-Qwen3.8-27B-NInfer)
 (21.2 GiB, DFlash2 draft included, sha256 `5412a0e7…`):
 
 ```bash
-hf download CaptainArni/Swift-Qwen3.8-27B-NInfer \
-  qwen3_8_27b_nvfp4swift.ninfer --local-dir ~/ninfer-models
+hf download CaptainArni/Swift-1.5-Qwen3.8-27B-NInfer \
+  qwen3_8_27b_nvfp4swift15.ninfer --local-dir ~/ninfer-models/swift15
 ```
 
 Provenance: built from

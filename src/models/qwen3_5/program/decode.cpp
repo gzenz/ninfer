@@ -341,7 +341,27 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
     //
     // `sum`/`peak` are gone deliberately: they decoded an NVFP4 KV buffer as float words and printed
     // `-nan` / 3.3e38, values that invite a reader to believe the probe measured magnitudes it did not.
+    // Page size in tokens for the label above, and the shared/private split for the region digests: a
+    // page holds kKvPageTokens columns, and the boundary is where this lane's reused prefix ends, so
+    // "private" means the region that is this lane's own document.
+    constexpr std::uint32_t kKvPageTokens = 64U;
+    // Where "shared" ends and this lane's own document begins, in tokens, supplied by the experiment
+    // (`NINFER_KV_SHARED_TOKENS`, e.g. the harness's shared system block) rather than inferred from the
+    // engine: the region split is the question being asked, so it must not come from the code under
+    // test. 0 means "no split known" and every page counts as private.
+    const auto kv_shared_tokens = [] {
+        const char* value = std::getenv("NINFER_KV_SHARED_TOKENS");
+        return value != nullptr ? static_cast<std::uint32_t>(std::strtoul(value, nullptr, 10)) : 0U;
+    }();
+    const auto head_is_zero = [](const char* hex) {
+        for (const char* p = hex; *p != '\0'; ++p) {
+            if (*p != '0') { return false; }
+        }
+        return true;
+    };
     if (std::getenv("NINFER_KV_PROBE") != nullptr) {
+        const bool verbose_pages = std::strcmp(std::getenv("NINFER_KV_PROBE"), "pages") == 0;
+        const std::uint32_t shared_page_boundary = kv_shared_tokens / kKvPageTokens;
         const DeviceKVPagePool& pool = text_kv_pages->physical_pool();
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             const SequenceState& state = active_sequence(lanes[row]);
@@ -363,6 +383,18 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             } else {
                 offsets = {pages / 3U, (2U * pages) / 3U, pages - 1U};
             }
+            // WHAT THE ROW READS, as one digest per region. A row's attention window covers its whole
+            // prefix, so hashing it page by page says little; what matters is whether lane i's own
+            // PRIVATE region reads the same bytes as lane j's -- which is the cross-session question
+            // asked of what the kernel actually consumes, not of the bindings. Per page the sample is
+            // also LABELLED: `expect_written` says whether that page's columns fall inside this lane's
+            // frontier. Without that label a zero is ambiguous (unwritten vs mis-addressed), which is
+            // exactly how an earlier version of this probe produced a negative that had to be withdrawn.
+            const std::uint32_t written_pages =
+                (state.execution_frontier + kKvPageTokens - 1U) / kKvPageTokens;
+            std::uint64_t shared_digest  = 1469598103934665603ULL;
+            std::uint64_t private_digest = 1469598103934665603ULL;
+            std::uint32_t zero_expected = 0, zero_unexpected = 0, sampled = 0;
             for (const std::uint32_t logical : offsets) {
                 const std::int32_t phys =
                     text_kv_addresses->physical_page_index(state.kv->text, logical);
@@ -387,10 +419,54 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
                         digest *= 1099511628211ULL;
                     }
                 }
-                std::fprintf(stderr, "[mat-debug] KV-FP lane=%u frontier=%u logical=%u page=%u digest=%llx\n",
-                             lanes[row], state.execution_frontier, logical, static_cast<unsigned>(phys),
-                             static_cast<unsigned long long>(digest));
+                // The first plane's first bytes, printed beside the digest. This is the positive
+                // control the probe has never had: several hundred of a lane's pages hashed
+                // identically, which means the bytes it reads are identical -- most plausibly zeros --
+                // and a digest alone cannot say whether the probe is addressing a region that carries
+                // content at all. With the bytes visible, "all zero" and "mis-addressed" are
+                // distinguishable, and a page that must differ (the shared prefix vs a private page)
+                // can be checked by eye before any negative is believed.
+                unsigned char preview[16] = {};
+                std::size_t preview_bytes   = 0;
+                for (std::size_t plane_index = 0; plane_index < pool.plane_count() && preview_bytes == 0;
+                     ++plane_index) {
+                    const Tensor& plane = pool.plane(plane_index);
+                    if (plane.data == nullptr || plane.nb[3] <= 0) { continue; }
+                    const auto* base = static_cast<const unsigned char*>(plane.data) +
+                                       static_cast<std::size_t>(phys) * plane.nb[3];
+                    CUDA_CHECK(cudaMemcpyAsync(preview, base, sizeof(preview), cudaMemcpyDeviceToHost,
+                                               device.stream));
+                    device.synchronize();
+                    preview_bytes = sizeof(preview);
+                }
+                char hex[sizeof(preview) * 2 + 1] = {};
+                for (std::size_t i = 0; i < sizeof(preview); ++i) {
+                    std::snprintf(hex + i * 2, 3, "%02x", preview[i]);
+                }
+                const bool expect_written = logical < written_pages;
+                const bool all_zero       = (head_is_zero(hex));
+                if (all_zero) { (expect_written ? zero_unexpected : zero_expected)++; }
+                ++sampled;
+                const bool shared_region = logical < shared_page_boundary;
+                std::uint64_t& acc       = shared_region ? shared_digest : private_digest;
+                acc ^= digest;
+                acc *= 1099511628211ULL;
+                if (verbose_pages) {
+                    std::fprintf(stderr,
+                                 "[mat-debug] KV-FP lane=%u frontier=%u logical=%u page=%u digest=%llx "
+                                 "head=%s expect_written=%d\n",
+                                 lanes[row], state.execution_frontier, logical,
+                                 static_cast<unsigned>(phys),
+                                 static_cast<unsigned long long>(digest), hex,
+                                 expect_written ? 1 : 0);
+                }
             }
+            std::fprintf(stderr,
+                         "[mat-debug] READ-SUMMARY lane=%u frontier=%u sampled=%u zero_expected=%u "
+                         "zero_unexpected=%u shared_digest=%llx private_digest=%llx\n",
+                         lanes[row], state.execution_frontier, sampled, zero_expected, zero_unexpected,
+                         static_cast<unsigned long long>(shared_digest),
+                         static_cast<unsigned long long>(private_digest));
         }
         std::fflush(stderr);
     }
@@ -889,16 +965,31 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
                 const std::int32_t host_token  = ordinary_host_ingress->tokens[row];
                 const std::int32_t host_row    = ordinary_host_ingress->text_kv_table_rows[row];
                 const std::int32_t host_source = ordinary_host_ingress->state_source_slots[row];
+                // Positions too -- and their absence was a real gap in every "the ingress is verified"
+                // claim made before 2026-09-25. `cache_positions[row]` and `rope_positions[row]` decide
+                // WHERE the row reads in the KV (the attention window is derived from the position, not
+                // from the token), so a stale or mis-filled position makes a row read another lane's
+                // columns while tokens, KV rows and state slots all still agree -- which is exactly the
+                // observed signature: own tokens, foreign content.
+                const std::int32_t host_cache_pos = ordinary_host_ingress->cache_positions[row];
+                const std::int32_t host_rope_pos  = ordinary_host_ingress->rope_positions[row];
                 const std::int32_t dev_token   = device_ingress.tokens[row];
                 const std::int32_t dev_row     = device_ingress.text_kv_table_rows[row];
                 const std::int32_t dev_source  = device_ingress.state_source_slots[row];
+                const std::int32_t dev_cache_pos = device_ingress.cache_positions[row];
+                const std::int32_t dev_rope_pos  = device_ingress.rope_positions[row];
                 const bool agree = host_token == dev_token && host_row == dev_row &&
                                    host_source == dev_source;
+                // Kept separate from `agree` so a position mismatch is visible even when the three
+                // original fields match -- which is the case this probe was blind to.
+                const bool pos_agree = (host_cache_pos == dev_cache_pos && host_rope_pos == dev_rope_pos);
                 std::fprintf(stderr,
-                             "[mat-debug] INGRESS-FP lane=%u agree=%d host(tok=%d row=%d src=%d) "
-                             "device(tok=%d row=%d src=%d)\n",
-                             lanes[row], agree ? 1 : 0, host_token, host_row, host_source, dev_token,
-                             dev_row, dev_source);
+                             "[mat-debug] INGRESS-FP lane=%u agree=%d pos_agree=%d "
+                             "host(tok=%d row=%d src=%d cpos=%d rpos=%d) "
+                             "device(tok=%d row=%d src=%d cpos=%d rpos=%d)\n",
+                             lanes[row], agree ? 1 : 0, pos_agree ? 1 : 0, host_token, host_row,
+                             host_source, host_cache_pos, host_rope_pos, dev_token, dev_row,
+                             dev_source, dev_cache_pos, dev_rope_pos);
             }
             std::fflush(stderr);
         }

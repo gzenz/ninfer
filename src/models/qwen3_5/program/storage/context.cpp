@@ -1514,6 +1514,13 @@ void ProgramImpl::resize_sequence_kv_entitlement(SequenceState& sequence, std::u
     }
 }
 
+std::pair<std::int32_t, std::int32_t> ProgramImpl::bound_kv_rows(
+    const SequenceState& sequence) const {
+    if (!sequence.kv) { throw std::logic_error("KV allocation bundle is unavailable"); }
+    return {text_kv_addresses->bound_row(sequence.kv->text),
+            sequence.kv->backend ? backend_kv_addresses->bound_row(*sequence.kv->backend) : 0};
+}
+
 void ProgramImpl::bind_sequence_kv(SequenceState& sequence) {
     if (!sequence.kv) { throw std::logic_error("KV allocation bundle is unavailable"); }
     const std::int32_t row = static_cast<std::int32_t>(sequence.lane);
@@ -1533,10 +1540,13 @@ void ProgramImpl::bind_sequence_kv(SequenceState& sequence) {
                     backend_kv_addresses->mapped_pages(*sequence.kv->backend), row);
             }
         }
-        set_device_i32(io.text_kv_table_row, text_kv_addresses->bound_row(sequence.kv->text));
-        set_device_i32(io.backend_kv_table_row,
-                       sequence.kv->backend ? backend_kv_addresses->bound_row(*sequence.kv->backend)
-                                            : 0);
+        const std::pair<std::int32_t, std::int32_t> rows = bound_kv_rows(sequence);
+        set_device_i32(io.text_kv_table_row, rows.first);
+        set_device_i32(io.backend_kv_table_row, rows.second);
+        // W1-A: remember what the two scalars now name. Recorded only here, after both writes have
+        // settled (`set_device_i32` syncs the stream), and only on the success path -- the rollback
+        // below must leave the record describing the device as it actually is.
+        kv_row_binding_.bind(sequence.lane, rows.first, rows.second);
     } catch (...) {
         if (!text_active) {
             if (sequence.kv->backend && backend_kv_addresses->active(*sequence.kv->backend)) {
@@ -1562,6 +1572,10 @@ void ProgramImpl::unbind_sequence_kv(SequenceState& sequence) noexcept {
             text_kv_addresses->deactivate(sequence.kv->text);
         }
     } catch (...) {}
+    // W1-A: the device scalars still hold whatever they last held, but nothing is bound any more, so
+    // the record must not keep claiming a lane -- an observation after this point is foreign by
+    // definition, which is what the counters are for.
+    kv_row_binding_.clear();
 }
 
 void ProgramImpl::ensure_sequence_kv_mapped(SequenceState& sequence, std::uint32_t main_tokens,

@@ -15,6 +15,7 @@
 #include "models/qwen3_5/program/storage/kv_store.h"
 #include "models/qwen3_5/program/storage/state_store.h"
 #include "models/qwen3_5/program/prefix_identity.h"
+#include "models/qwen3_5/program/kv_row_binding.h"
 #include "models/qwen3_5/program/planning/resource_projection.h"
 #include "models/qwen3_5/execution/text.h"
 #include "models/qwen3_5/execution/vision.h"
@@ -871,6 +872,16 @@ private:
     std::vector<TokenId> materialization_ledger_;
     qwen3_5::detail::ResidentPrefixIdentity materialization_identity_;
     qwen3_5::detail::PrefixShortlistDigests materialization_prefix_digests_;
+    // W1-A: which lane the shared KV row scalars name (see kv_row_binding.h). A host-side record of
+    // what `bind_sequence_kv` last wrote, so a prefill step can see whether the row it is about to
+    // use is still its own. The 2026-09-25 cross-session contamination (D2) was exactly this scalar
+    // naming another lane while a lane was mid-prefill.
+    qwen3_5::detail::KvRowBinding kv_row_binding_;
+    // W1-B: the invariant a published shared prefix must satisfy is that the frontier it advertises
+    // is the frontier its state was frozen at. These count it in every build; the mismatch was
+    // previously visible only under NINFER_MAT_DEBUG, which is how a live hazard stayed unmeasured.
+    std::uint64_t shared_publishes_                      = 0;
+    std::uint64_t shared_publish_frontier_mismatches_    = 0;
 
     struct ActiveCaptureTransaction {
         std::uint64_t id         = 0;
@@ -885,6 +896,14 @@ private:
         std::uint64_t replacement_generation = 0;
         StateImageHandle source_state;
         StateImageHandle destination_state;
+        // W1-B: the sequence's execution frontier at the moment its StateImage was frozen. The
+        // published entry advertises `group.frontier`, and the invariant is that the state it hands
+        // to a consumer corresponds to the frontier it advertises. Comparing the *live*
+        // execution_frontier at publish time instead measured a value that legitimately moves (and
+        // resets) between the freeze and the publication: the first canary run read this as
+        // `advertised=20538 state=0` and looked like a live mismatch, when it was the instrument
+        // reading the wrong moment.
+        std::uint32_t frozen_execution_frontier = 0;
         qwen3_5::CaptureStatePlacement state_placement = qwen3_5::CaptureStatePlacement::DeviceFork;
         std::optional<StateImageTransfer> state_snapshot;
         std::optional<KVAddressSpaceHandle> active_text_destination;
@@ -1213,6 +1232,13 @@ private:
     // row) into the single device ingress the sink reads. Must be called at every prefill step, not
     // only at materialization: other lanes' decode rounds overwrite that ingress.
     void bind_dflash_prefill_sink(SequenceState& sequence);
+    // The (text, backend) row pair a sequence's KV addresses are bound to -- the single derivation
+    // that both `bind_sequence_kv` and the W1-A observation use, so the two cannot drift apart.
+    [[nodiscard]] std::pair<std::int32_t, std::int32_t> bound_kv_rows(
+        const SequenceState& sequence) const;
+    [[nodiscard]] const qwen3_5::detail::KvRowBinding& kv_row_binding() const noexcept {
+        return kv_row_binding_;
+    }
     void ensure_sequence_kv_mapped(SequenceState& sequence, std::uint32_t main_tokens,
                                    std::uint32_t backend_tokens = 0);
     void trim_sequence_kv(SequenceState& sequence, std::uint32_t main_tokens,

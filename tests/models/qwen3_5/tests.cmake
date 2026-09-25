@@ -19,6 +19,10 @@ ninfer_add_test(ninfer_qwen3_5_runtime_mechanisms_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_runtime_mechanisms.cpp"
   LIBRARIES ninfer_engine ninfer_core)
 
+# Host-only: the record of which lane the shared KV row scalars name (W1-A). No engine, no device.
+ninfer_add_test(ninfer_qwen3_5_kv_row_binding_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_kv_row_binding.cpp")
+
 ninfer_add_test(ninfer_qwen3_5_state_image_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_state_image.cpp"
   LIBRARIES ninfer_engine ninfer_core)

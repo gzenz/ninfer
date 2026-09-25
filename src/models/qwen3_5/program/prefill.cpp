@@ -1211,11 +1211,69 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
     // table contents -- and the decode ingress, never the row *selector* the prefill kernel reads.
     // Idempotent for an active address (it skips `activate`), so calling it here costs two 4-byte
     // device writes per step.
+    // W1-A: what the host record says the scalars named when this step began, judged against this
+    // lane's own rows. One comparison and two increments, always on. A foreign reading here is the
+    // pre-2026-09-25 condition -- the state the D2 fix exists to correct -- but the trigger is
+    // narrower than "another lane is running": `bind_sequence_kv` is called only from this step, from
+    // materialization and from shared-prefix publication, so a foreign reading means another lane
+    // was admitted or published a shared prefix between two of this lane's steps. Measured over the
+    // prod4 run of 2026-09-25: 0 of 512. So this is a recurrence detector with a low trigger rate,
+    // and 0 of N means the trigger did not occur, NOT that a guard passed. An earlier version of
+    // this comment claimed the count was expected to be high under concurrency; the run says
+    // otherwise, and the claim was wrong rather than the measurement.
+    {
+        const std::pair<std::int32_t, std::int32_t> step_rows = bound_kv_rows(sequence);
+        kv_row_binding_.observe(sequence.lane, step_rows.first, step_rows.second);
+    }
     bind_sequence_kv(sequence);
     // The DFlash sink's ingress is shared device state with the same exposure as the row scalars, and
     // it must be re-published here for the same reason: this is the path a long prompt takes, and the
     // fix that claimed to cover it only covered materialization (see the note in `start_sequence`).
     bind_dflash_prefill_sink(sequence);
+    // W1-A: what the *device* says the two scalars name, now that this lane has re-bound them. This
+    // is the only form that can catch a second writer -- the host record agrees with itself by
+    // construction, and the D2 fix rests on `bind_sequence_kv` being the sole writer of both.
+    if (std::getenv("NINFER_KV_BINDING_CHECK") != nullptr) {
+        std::int32_t device_text_row    = -1;
+        std::int32_t device_backend_row = -1;
+        // `set_device_i32` settles the stream, so the scalars hold what the host last wrote and no
+        // extra ordering is needed beyond this copy's own.
+        CUDA_CHECK(cudaMemcpyAsync(&device_text_row, io.text_kv_table_row.data,
+                                   static_cast<std::size_t>(sizeof(device_text_row)),
+                                   cudaMemcpyDeviceToHost, device.stream));
+        CUDA_CHECK(cudaMemcpyAsync(&device_backend_row, io.backend_kv_table_row.data,
+                                   static_cast<std::size_t>(sizeof(device_backend_row)),
+                                   cudaMemcpyDeviceToHost, device.stream));
+        CUDA_CHECK(cudaStreamSynchronize(device.stream));
+        const bool device_agrees = kv_row_binding_.verify(device_text_row, device_backend_row);
+        if (!device_agrees && kv_row_binding_.diverged_readings() <= 8) {
+            std::fprintf(stderr,
+                         "[kv-binding] DEVICE-DIVERGED lane=%u device=(%d,%d) recorded=(%d,%d) "
+                         "diverged=%llu/%llu\n",
+                         sequence.lane, device_text_row, device_backend_row,
+                         kv_row_binding_.text_row(), kv_row_binding_.backend_row(),
+                         static_cast<unsigned long long>(kv_row_binding_.diverged_readings()),
+                         static_cast<unsigned long long>(kv_row_binding_.verified_readings()));
+            std::fflush(stderr);
+        }
+        const std::uint64_t verified = kv_row_binding_.verified_readings();
+        // `verified % 512 == 0` alone was a rate limit that swallowed the denominator: the counter
+        // starts at 1 after the first check, so only a run that reached *exactly* a multiple of 512
+        // printed anything -- the prod4 run of 14:22 printed once at 512, the one at 14:31 printed
+        // nothing, and the silence read as "nothing to report". Print the first reading
+        // unconditionally, then every 512th, and every divergence.
+        if (verified == 1ULL || verified % 512ULL == 0ULL || !device_agrees) {
+            std::fprintf(stderr,
+                         "[kv-binding] lane=%u checks=%llu diverged=%llu foreign_rebinds=%llu/%llu "
+                         "device=(%d,%d)\n",
+                         sequence.lane, static_cast<unsigned long long>(verified),
+                         static_cast<unsigned long long>(kv_row_binding_.diverged_readings()),
+                         static_cast<unsigned long long>(kv_row_binding_.foreign_observations()),
+                         static_cast<unsigned long long>(kv_row_binding_.total_observations()),
+                         device_text_row, device_backend_row);
+            std::fflush(stderr);
+        }
+    }
     // Admission-side prompt tail (NINFER_LEDGER_PROBE=1): the same 64-entry hash the decode-side
     // LEDGER-FP prints, over the same region (the tail of the admitted prompt), so the two can be
     // compared per lane without any cross-lane alignment. The canary sits at the prompt's END, so

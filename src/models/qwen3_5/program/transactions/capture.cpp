@@ -699,6 +699,9 @@ void ProgramImpl::prepare_active_capture(ActiveCaptureTransaction& transaction) 
         }
     }
 
+    // W1-B: record the position the state is frozen at, before anything can move it. This is the
+    // value the published entry's advertised frontier is compared against.
+    transaction.frozen_execution_frontier = sequence.execution_frontier;
     state_store->freeze(transaction.source_state);
     if (transaction.state_placement == qwen3_5::CaptureStatePlacement::DeviceFork) {
         const StateImageSelectors capture_fork =
@@ -986,6 +989,34 @@ ActiveCaptureResult ProgramImpl::publish_active_capture(ActiveCaptureTransaction
                          transaction.group.frontier, sequence.execution_frontier,
                          transaction.group.identity ? transaction.group.identity->shortlist_key.frontier : 0U,
                          prefill.cursor, prefill.prompt_tokens);
+            std::fflush(stderr);
+        }
+        // W1-B: the same condition, counted in every build. The entry advertises
+        // `group.frontier` while its state was frozen at the sequence's execution frontier; when
+        // those differ the entry does not correspond to the state behind it, and a session matching
+        // only the shorter common boundary forks another session's later tokens. That was visible
+        // only under NINFER_MAT_DEBUG, so the rate was never measured in a served run -- counted
+        // here with its denominator, and deliberately NOT enforced: suppression is a cache-behaviour
+        // change that needs the rate first, and a throw here would kill the worker (the wedge,
+        // 2026-09-25).
+        ++shared_publishes_;
+        const bool frontier_matches =
+            transaction.group.frontier == transaction.frozen_execution_frontier;
+        if (!frontier_matches) { ++shared_publish_frontier_mismatches_; }
+        // The denominator prints too, and on a schedule that cannot swallow it: a mismatch-only
+        // print leaves "no line" meaning either "no mismatch" or "no publishes", which is the one
+        // distinction this counter exists to make.
+        if (shared_publishes_ == 1U || shared_publishes_ % 512U == 0U || !frontier_matches) {
+            std::fprintf(stderr,
+                         "[capture] SHARED-FRONTIER advertised=%u frozen=%u live=%u lane=%u "
+                         "identity=%u mismatches=%llu/%llu\n",
+                         transaction.group.frontier, transaction.frozen_execution_frontier,
+                         sequence.execution_frontier, transaction.lane,
+                         transaction.group.identity
+                             ? transaction.group.identity->shortlist_key.frontier
+                             : 0U,
+                         static_cast<unsigned long long>(shared_publish_frontier_mismatches_),
+                         static_cast<unsigned long long>(shared_publishes_));
             std::fflush(stderr);
         }
         shared.backend_frontier =

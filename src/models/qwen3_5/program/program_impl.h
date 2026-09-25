@@ -890,6 +890,11 @@ private:
     std::uint64_t recycled_checkpoint_restores_          = 0;
     // W1.2: a private checkpoint adopted by a different session. Should be impossible by construction.
     std::uint64_t cross_session_adoptions_               = 0;
+    // The non-strict releases deliberately discard the `[[nodiscard]] bool` their stores return, so a
+    // refusal -- the address or image not actually freed -- is invisible. That is a leak in the exact
+    // shape of #9's: the books drop the handle, the pages stay. Counted and named here rather than
+    // guessed at; no behaviour change.
+    std::uint64_t nonstrict_release_refusals_            = 0;
     std::uint64_t state_epoch_checks_                    = 0;
     std::uint64_t state_epoch_mismatches_                = 0;
     std::uint64_t state_epoch_unrecorded_                = 0;
@@ -1252,6 +1257,9 @@ private:
     // strict releases (a non-publishing finish) -- because emitting from only one of them was a seam
     // a review found: `clear_lane_strict` freed the KV and never reported or released anything.
     void release_kv_row_binding(std::uint32_t lane) noexcept;
+    // Report a non-strict release that refused (see `nonstrict_release_refusals_`). Rate-limited: the
+    // condition can persist for a whole cleanup.
+    void note_nonstrict_release_refusal(const char* what) noexcept;
     // Publish this lane's own DFlash prefill-sink controls (lane, source/destination slots, backend
     // row) into the single device ingress the sink reads. Must be called at every prefill step, not
     // only at materialization: other lanes' decode rounds overwrite that ingress.

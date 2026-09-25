@@ -1427,17 +1427,21 @@ void ProgramImpl::release_sequence_state(SequenceState& sequence) noexcept {
     } catch (...) {}
 
     const auto releasable = [&](StateImageHandle handle) { return state_store->valid(handle); };
-    if (releasable(sequence.state.write)) { (void)state_store->release(sequence.state.write); }
+    if (releasable(sequence.state.write) && !state_store->release(sequence.state.write)) {
+        note_nonstrict_release_refusal("state-write");
+    }
     if (!sequence.state.read_has_external_owner() && sequence.state.read != sequence.state.write &&
         releasable(sequence.state.read)) {
-        (void)state_store->release(sequence.state.read);
+        if (!state_store->release(sequence.state.read)) { note_nonstrict_release_refusal("state-read"); }
     }
     if (sequence.rewrite_state) {
         const StateImageHandle handle = *sequence.rewrite_state;
         const bool duplicates_binding =
             handle == sequence.state.write ||
             (!sequence.state.read_has_external_owner() && handle == sequence.state.read);
-        if (!duplicates_binding && releasable(handle)) { (void)state_store->release(handle); }
+        if (!duplicates_binding && releasable(handle) && !state_store->release(handle)) {
+            note_nonstrict_release_refusal("state-rewrite");
+        }
     }
     for (std::size_t index = 0; index < sequence.long_anchors.size(); ++index) {
         const StateImageHandle handle = sequence.long_anchors[index].state;
@@ -1448,7 +1452,9 @@ void ProgramImpl::release_sequence_state(SequenceState& sequence) noexcept {
         for (std::size_t previous = 0; !duplicate && previous < index; ++previous) {
             duplicate = sequence.long_anchors[previous].state == handle;
         }
-        if (!duplicate && releasable(handle)) { (void)state_store->release(handle); }
+        if (!duplicate && releasable(handle) && !state_store->release(handle)) {
+            note_nonstrict_release_refusal("state-long-anchor");
+        }
     }
     if (sequence.reserved_state) {
         const StateImageHandle handle = *sequence.reserved_state;
@@ -1459,7 +1465,9 @@ void ProgramImpl::release_sequence_state(SequenceState& sequence) noexcept {
         for (const LongAnchorCheckpoint& anchor : sequence.long_anchors) {
             duplicate = duplicate || anchor.state == handle;
         }
-        if (!duplicate && releasable(handle)) { (void)state_store->release(handle); }
+        if (!duplicate && releasable(handle) && !state_store->release(handle)) {
+            note_nonstrict_release_refusal("state-long-anchor");
+        }
     }
     sequence.state          = {};
     sequence.rewrite_state  = std::nullopt;
@@ -1696,13 +1704,25 @@ void ProgramImpl::release_sequence_kv_strict(SequenceState& sequence) noexcept {
     release_kv_row_binding(sequence.lane);
 }
 
+void ProgramImpl::note_nonstrict_release_refusal(const char* what) noexcept {
+    if (++nonstrict_release_refusals_ <= 8ULL || nonstrict_release_refusals_ % 512ULL == 0ULL) {
+        std::fprintf(stderr,
+                     "[engine] non-strict release REFUSED (%s): the handle is dropped and its pages or "
+                     "state slot are not freed -- a leak of the #9 shape, count=%llu\n",
+                     what, static_cast<unsigned long long>(nonstrict_release_refusals_));
+        std::fflush(stderr);
+    }
+}
+
 void ProgramImpl::release_sequence_kv(SequenceState& sequence) noexcept {
     if (!sequence.kv) { return; }
     unbind_sequence_kv(sequence);
     if (sequence.kv->backend && backend_kv_addresses) {
-        (void)backend_kv_addresses->release(*sequence.kv->backend);
+        if (!backend_kv_addresses->release(*sequence.kv->backend)) { note_nonstrict_release_refusal("kv-backend"); }
     }
-    if (text_kv_addresses) { (void)text_kv_addresses->release(sequence.kv->text); }
+    if (text_kv_addresses) {
+        if (!text_kv_addresses->release(sequence.kv->text)) { note_nonstrict_release_refusal("kv-text"); }
+    }
     sequence.kv.reset();
     if (host_kv_extents) { (void)host_kv_extents->release_unreferenced(); }
 }

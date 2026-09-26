@@ -1423,8 +1423,17 @@ it is an engine regression, which `git stash` settles in one run.
    `forty-heavy`'s rc=1 is the harness's own over-budget 400s on its last rounds, not an engine error.
 5. **Re-run the gate before quoting an acceptance** for any tree that has since changed — only an
    artifact whose own `build_id` re-hashes equal to the binary describes it.
-6. **Make host growth REACHABLE from planning** — the step that would make the elastic pool address
-   anything. The pool can grow (see §1b for the commit) but no path asks it to: `physical_peak_fits` prices
+6. **Make host growth REACHABLE from planning — IMPLEMENTED 2026-09-26 (`d629061c`); effect UNOBSERVED.**
+   `ensure_host_state_headroom()` grows the host state pool by one slot when it is FULL, called once from
+   the pressure planning session's constructor (not from the search -- see the commit). The tier-disabled
+   guard is in (`--host-state-slots 0` is DISABLED, not full: `0 < 0` would otherwise have conjured a
+   host tier the operator switched off), and it is instrumented so "never fires" and "fires constantly"
+   are distinguishable at last. **But nothing runnable here reaches the condition**: `all` and its
+   `host_restore` 2-slot pool produce zero `PRE-GROWN` lines, a forced 1-slot pool does not either
+   (twice), and the engine output is byte-identical to the pre-change run. **So the effect is argued from
+   the code path, not measured** -- the validation that settles it is a saturated host pool during a
+   soak, where the observable is the `PRE-GROWN` line plus `host_state_capacity_slots` above the
+   configured count. Original framing follows. The pool can grow (see §1b for the commit) but no path asks it to: `physical_peak_fits` prices
    `host.state_slots` against `admission_capacity()`, which is the slot count that exists NOW, so every
    demote passing feasibility already has a free slot and `allocate_growing()`'s grow branch cannot run.
    **The evidence it matters:** the day has **60** `private victim evicted` lines, of which **44 carry a

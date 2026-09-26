@@ -8,7 +8,7 @@ git_head_tree=7a5d886afb77240a554207ccefa06ab8b72b8dd7
 tree_diff_sha256=41c7cdbae21ae6d3c6f4c9a04b47c36434db551f15fa5dbc530a340aa31e7b9a
 git_dirty_paths=3
 scenario=all (NINFER_PREFIX_REAL_SCENARIO); this proves state-image-restore runs INSIDE the battery
-started=2026-09-26T23:26:32+02:00
+started=2026-09-26T23:24:03+02:00   # hand-written: the FIRST window of the pair (the journal has the stop/start cycles); the value here used to record the second
 all-1 rc=0 log_sha256=1831cf183afea9e9d74bb47b06824042f58144280b8e352a46c1bcfa790ade08
 all-2 rc=0 log_sha256=1831cf183afea9e9d74bb47b06824042f58144280b8e352a46c1bcfa790ade08
 finished=2026-09-26T23:29:14+02:00

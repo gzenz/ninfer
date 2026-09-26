@@ -46,7 +46,6 @@ for the session that produced it -- read and edit `plan.md`, not those.
   both missed the `WORKER OOM` path -- the OOM catch prints `WORKER OOM: … - recovering`, then the same
   recovery, then the residual -- and would have discarded a non-zero `(fail-all)` line. The line carries
   its own discriminator, `(recover)` or `(fail-all)`; the amount is what a reader needs.)
-  window.
 
   `checkpoint StateImage INCOMPLETE` is #11(b)'s alerting line: checkpoint pricing found a state image
   that is not a restorable checkpoint (invalid, not immutable, no settled replica, or zero epoch). It is rate-limited on its own count, so the FIRST occurrence prints whatever
@@ -86,7 +85,9 @@ for the session that produced it -- read and edit `plan.md`, not those.
   every `private victim evicted` -- go to the log file only (`~/ninfer-watch/latest.log`), so the alert
   stream stays signal and the log still proves the instrument ran.
 - One monitor at a time (duplicates double-notify). After stopping one,
-  `pkill -f 'journalctl -u ninfer'` any orphaned process.
+  `pkill -f 'journalctl -u ninfe[r]'` any orphaned process (bracketed so the pattern cannot match its own
+  command line -- the unbracketed form is the very trap described below, and it was left standing here for
+  a day after that description was added).
 
 ## Working
 - All development, commits, builds, and tests happen on this host (Strix,
@@ -132,7 +133,10 @@ cost an outage:
   Bash tool call matches the *calling shell's own command line*, including text that is only a regex:
   `pkill -f 'journalctl -u ninfer'` killed its own shell on 2026-09-26 and returned **exit 144** with no
   output, which reads like a failed kill rather than a self-kill. Bracket one character (`ninfe[r]`) so the
-  pattern cannot match its own text, or put the pattern in a script and call the script;
+  pattern cannot match its own text, or put the pattern in a script and call the script. **And bracketing
+  only helps if the unbracketed text appears nowhere ELSE on that command line** -- a call that both ran
+  `journalctl -u ninfer` and bracketed-pgrep'd for it matched its own shell anyway, because the plain form
+  was still in the command. Two invocations, or a script, when both are needed;
 - after any window or swap, prod is restored and *verified* — `/health` 200, wedge sentinel active;
 - the sentinel is stopped FIRST and re-armed LAST around a window;
 - one journal monitor at a time.

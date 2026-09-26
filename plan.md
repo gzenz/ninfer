@@ -33,27 +33,32 @@ correction history lives *there*, not here — this section states what is true 
 ### 0. Where things stand
 
 - **Tree**: the unpushed series is `d4386bcf`, `765f305f` (#9's census and fault site; message rewritten),
-  `ee4c4748`, `aea1b9ce`, `e7c07e60` (`5aff7b3c` with its MESSAGE amended -- same tree `98e7cf08…`), and
-  the repair commit, which is the tip. **Read the tip hash from `git log -1`, never from this file** --
-  a hash written here goes stale the moment this file is amended into it, which is what happened to the
-  three revisions of this bullet before (one of them named a superseded hash on its first line while its
-  next sentence told the reader not to trust it).
-- **The series is NOT pushable as it stands: the fork has MOVED.** Live `fork/master` is `e919931a` and
-  local tracking was `da0298c8` (stale), so `git rev-list --left-right --count fork/master...HEAD` reads
-  `1  50` -- one commit on the remote (`Update README.md`) that this branch lacks. A plain push is
-  rejected, and a force would discard that commit, which is not in this clone. **Integrating it is the
-  first step of the push**, not a detail of it. Every range in this file computed before 2026-09-26 18:0x
-  was computed against the stale ref, and `origin/master` is stale too (`e31bc99b` live vs `594930e7`
-  local).
+  `ee4c4748`, `aea1b9ce`, `e7c07e60` (`5aff7b3c` after the rewrite: **same SOURCE, the 117 logs removed,
+  and the message amended** -- tree `a92a5893…`, not `98e7cf08…`, which was the pre-rewrite tree; an earlier
+  revision of this line claimed the trees were identical, and `git diff --stat 5aff7b3c e7c07e60` shows 117
+  files and 6754 deletions to refute it), `a18d82e8` (the repair; the merge's FIRST PARENT), and
+  `a8d9e895` (the merge, which brought the fork's `README.md` edit).
+  **NOTHING NEWER THAN `a8d9e895` IS NAMED HERE, and that is a rule rather than an omission:** a file
+  committed into a series cannot correctly name the commit that contains it -- any edit to this file makes
+  a new commit, so "X is the tip" is false the instant it is written. The tail is therefore a range,
+  `git log --oneline a8d9e895..HEAD`, and everything in it is documentation-only. The phrase "the tip" was
+  written here four times and went stale four times, the last time inside the sentence forbidding it.
+- **Push state:** `fork/master` (`e919931a`) is an ancestor of `a8d9e895`, so the push fast-forwards.
+  (While this work was in progress the fork's `master` moved by one commit -- an edit to `README.md`, not
+  other work; the local tracking ref was stale, so the ranges computed before that were computed against
+  it.)
   What those revisions got wrong, corrected: the tracked tree is CLEAN once this commit lands (they listed
   five modified files); `5aff7b3c` still RESOLVES as an object (`git cat-file -t 5aff7b3c` -> `commit`;
   `--amend` leaves it until gc), so "a hash that no longer resolves" was false; and the evidence binary was
   built from a DIRTY tree -- `171507`'s manifest says `git_dirty_paths=31` -- so "the tree it was built
-  from is unchanged" was false too. Untracked now: `results/` (logs are gitignored by policy) and
+  from is unchanged" was false too. Untracked: `results/` only where it is NOT tracked -- the manifests and `tree.diff` in it ARE (`git ls-files results`), `*.log` is gitignored by policy -- plus
   `tests/fixtures/frontend/`; the committed artifact for a run is its `manifest`.
-- **Two review passes (opus, 2026-09-26) on the `5aff7b3c` series; the SECOND said NOT fit to push.** The
-  first found nine defects in `5aff7b3c`, the second found ten in the repair, including two that blocked
-  the push. Both passes' actionable findings are repaired in the repair commit.
+- **Review passes (opus, 2026-09-26): four so far, and each found real defects in work the previous one had
+  passed.** Pass 1 found nine in `5aff7b3c`; pass 2 found ten in the repair, two of them push-blocking;
+  pass 3 returned "not yet, close" with three documentation blockers (a `CLAUDE.md` instruction that kills
+  the shell that follows it, §0 stale after the merge, and a false tree-identity claim) plus five smaller
+  ones, **all closed in the commit after `a8d9e895`** -- not in the repair commit, which is where passes 1
+  and 2's findings live. Pass 4 is the convergence test and its verdict is recorded below when it returns.
 
   **Blocker 1 was MY REFUSAL, and the refusal was wrong.** The first pass asked for `765f305f`'s subject to
   be reworded "since its change was later removed as dead"; I refused, arguing the fix was alive at HEAD
@@ -79,7 +84,7 @@ correction history lives *there*, not here — this section states what is true 
   was refuted by saving the runs (two failed byte-identically, which is how the false "no host read"
   assertion was found) and then REPLACED by the passing saved pair (`172831`, byte-identical, plus
   `172138` for the earlier version of the assertion) that the record had never cited; the watcher's blindness to a non-zero residual after `WORKER OOM`,
-  `journalctl -f`'s tail replay, and the manifest's missing `tree.diff` are all fixed in the same commit.
+  `journalctl -f`'s tail replay, and the manifest's missing `tree.diff` are all fixed in the same commit -- with one caveat stated where the fix is: the script now WRITES `tree_diff_sha256`/`git_status_sha256`/`untracked_sha256`, but NO RUN HAS PRODUCED THEM YET, so the committed manifests still carry the old fields.
   **Convergence requires a fresh pass with zero actionable defects** (`CLAUDE.md`, Commits) -- not this
   list of repairs.
 - **Prod**: `:8080` (`:8081` stats), **running the current build** -- restarted 2026-09-26 17:35, running
@@ -99,7 +104,7 @@ correction history lives *there*, not here — this section states what is true 
   is log-only**; `WORKER OOM` alerts explicitly; and `private victim evicted: demotable=1` is an ALERT
   because it is #6's evidence rather than an error. The first version armed on
   `WORKER RECOVER`/`WORKER CRASH` instead, which silently dropped a non-zero residual after an OOM. The
-  test found three bugs that would each have made it silently
+  test found two bugs that would each have made it silently
   useless -- `gawk`'s `log` builtin as a variable name, and a rule-ordering swallow.
 - **Acceptance**: **STALE — the tree has changed since it was taken** (the series has since been rewritten
   and the tree committed), so the gate below describes a build that is no longer what runs. Re-run it before quoting
@@ -111,7 +116,7 @@ correction history lives *there*, not here — this section states what is true 
   only an artifact whose `build_id` equals the running exe describes it. **Identify the running
   binary by hash of `/proc/$(ss -ltnp | grep :8080 | grep -oP 'pid=\K[0-9]+')/exe`, never by
   `build/apps/ninfer-serve`** -- the build directory is replaced by the next rebuild (it already has
-  been: the build now hashes `d61297a2c837`), so that rule breaks the moment anything is compiled. The
+  been: the build now hashes `e706e96090bd199d`, which is also the running exe as §0's Prod bullet says), so that rule breaks the moment anything is compiled. The
   artifact's `build_id` must equal the *running* exe's hash. **Corrected 2026-09-26:** the sentence that
   stood here said prod's exe was "an unlinked `(deleted)` inode from a 17:39 build" -- it is neither:
   `ls -l /proc/767167/exe` -> `build/apps/ninfer-serve`, not deleted, from the 17:35 restart whose exe
@@ -156,7 +161,7 @@ through descendants is how a message ends up citing a commit that no longer exis
 | `3bebc96c` | `ee4c4748` |
 | `66157867` | `aea1b9ce` |
 | `5aff7b3c` / `d4cd4d67` | `e7c07e60` |
-| `5dd4d18d` / `65841c88` / `22d3ad70` / `6a9160fb` | the repair commit, the tip -- read `git log -1` |
+| `5dd4d18d` / `65841c88` / `22d3ad70` / `6a9160fb` | `a18d82e8` (the repair commit) |
 
 The pre-rewrite objects still exist locally (`git cat-file -t 5aff7b3c` -> `commit`) because `--amend` and
 `filter-branch` leave them until gc; they are NOT on any remote, so a reader elsewhere can only resolve the

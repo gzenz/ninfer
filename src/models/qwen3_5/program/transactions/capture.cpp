@@ -1412,6 +1412,17 @@ ProgramImpl::progress_active_capture_transaction(runtime::CancellationFlagView c
             transaction.published = true;
             throw;
         }
+        // Fault injection (NINFER_INJECT_THROW=capture-submitted, harmful-controls build). Placed AFTER
+        // the enqueue succeeded, so `transfer_submitted` is true and the fork's copy into the recycled
+        // rewrite-checkpoint slot has been issued -- which is exactly the precondition `abort_active_capture`
+        // needs to take its recycling branch and call `restore_recycled_checkpoint`, re-asserting the
+        // checkpoint's old content epoch over bytes the fork has just written (#11(a)). Throwing here
+        // unwinds to the engine, whose failure path runs `abort_active_capture` with that state in flight.
+        // The counter `[capture] recycled-checkpoint restored on abort` has never fired; this is the
+        // deliberate route to make it, rather than hoping a client cancels at the right instant.
+        if (ninfer::harmful_inject_throw("capture-submitted")) {
+            throw std::bad_alloc();
+        }
         return ActiveCaptureResult{.status = runtime::ContextTransactionStatus::InProgress};
     }
     if (transaction.transfer_submitted && !context_completion_.ready()) {

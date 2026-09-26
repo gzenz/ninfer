@@ -2160,6 +2160,28 @@ int main() {
         options.context_cache.max_shared_prefixes = 0;
         ninfer::Engine engine(std::move(options));
         result = exercise_rewrite_checkpoints(engine, RewriteCheckpointCacheTopology::PrivateOnly);
+    } else if (scenario == "recycling-capture") {
+        // Same shape as `rewrite-checkpoint`, on a MASKED-DRAFT backend, because that is what the
+        // recycling branch of `abort_active_capture` needs (#11(a)): `recycles_private_state` is set only
+        // when a rewrite capture group exists, a live `rewrite_state` carries `rewrite_checkpoint.valid`,
+        // that checkpoint's slot differs from the state's write slot, and the store agrees it can recycle
+        // it as a fork destination (capture.cpp:110-112) -- i.e. a SECOND turn-closure capture while a
+        // first rewrite checkpoint is still held. On dflash2 the fork's `copy_dflash_local` writes into
+        // that recycled slot, which is what makes the abort's `restore_recycled_checkpoint` re-assert an
+        // old content epoch over bytes the fork just wrote; with MTP and no transfer, nothing is written
+        // before the last cancellation check and the mixture cannot arise.
+        //
+        // Drive it with NINFER_INJECT_THROW=capture-submitted (harmful-controls build) to abort *after*
+        // the transfer is submitted. The observable is `[capture] recycled-checkpoint restored on abort`,
+        // a counter that has never fired. Without the injection the scenario still runs and asserts what
+        // `exercise_rewrite_checkpoints` always asserts -- it just never reaches the abort.
+        auto options                              = engine_options(artifact);
+        options.speculative.backend               = ninfer::SpeculativeBackend::DFlash2;
+        options.speculative.draft_tokens          = 7;  // prod's --draft-tokens
+        options.context_cache.device_state_slots  = 2;
+        options.context_cache.max_shared_prefixes = 0;
+        ninfer::Engine engine(std::move(options));
+        result = exercise_rewrite_checkpoints(engine, RewriteCheckpointCacheTopology::PrivateOnly);
     } else if (scenario == "stream-observations") {
         auto options          = engine_options(artifact);
         options.enable_vision = false;

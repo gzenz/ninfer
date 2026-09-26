@@ -1420,6 +1420,36 @@ ProgramImpl::progress_active_capture_transaction(runtime::CancellationFlagView c
         // unwinds to the engine, whose failure path runs `abort_active_capture` with that state in flight.
         // The counter `[capture] recycled-checkpoint restored on abort` has never fired; this is the
         // deliberate route to make it, rather than hoping a client cancels at the right instant.
+        // Probe before throwing, not after the abort: the first version of this probe sat inside
+        // `abort_active_capture`, *after* that function's state restoration had already released the
+        // rewrite checkpoint -- so it reported `rewrite_state_live=0` for a value it had destroyed the
+        // ability to observe, and three windows were spent on a reading that could not vary. Here the
+        // four conditions `recycles_private_state` is built from (capture.cpp:110-112) are measured as
+        // the abort will find them.
+        if (std::getenv("NINFER_ABORT_PROBE") != nullptr &&
+            transaction.lane < max_concurrency &&
+            active_continuations[transaction.lane] < continuation_capacity) {
+            SequenceState& probe_sequence = active_sequence(transaction.lane);
+            const bool state_live =
+                probe_sequence.rewrite_state.has_value() &&
+                state_store->valid(*probe_sequence.rewrite_state);
+            std::fprintf(stderr,
+                         "[capture] pre-abort probe lane=%u recycling=%d rewrite_group=%d "
+                         "rewrite_state_live=%d checkpoint_valid=%d slot_differs=%d can_recycle=%d "
+                         "transfer_submitted=%d\n",
+                         transaction.lane, static_cast<int>(transaction.recycles_private_state),
+                         static_cast<int>(transaction.group.rewrite.has_value()),
+                         static_cast<int>(state_live),
+                         static_cast<int>(probe_sequence.rewrite_checkpoint.valid),
+                         static_cast<int>(state_live &&
+                                          *probe_sequence.rewrite_state !=
+                                              probe_sequence.state.write),
+                         static_cast<int>(state_live &&
+                                          state_store->can_recycle_checkpoint_destination(
+                                              *probe_sequence.rewrite_state)),
+                         static_cast<int>(transaction.transfer_submitted));
+            std::fflush(stderr);
+        }
         if (ninfer::harmful_inject_throw("capture-submitted")) {
             throw std::bad_alloc();
         }

@@ -257,11 +257,22 @@ while it lasts. In dev time that is the entire cost; in prod time it is the smal
 - User-directed. Conventional Commit subjects (`fix(scope):`, `feat(scope):`,
   `chore(scope):`, `docs(scope):`) + descriptive body, no attribution line.
 - Run brutal-honesty-review agent on commit.
-  1. Triage findings: actionable code defect vs documentation/PR-body item. Fix real defects; document inherent limits
-  (e.g. a path untestable without mock infra this suite lacks) in the PR body.
-  2. Re-run the  brutal-honesty-review  agent on the new state. Convergence = a fresh pass finds ZERO actionable
-  defects. Fixing the findings is NOT convergence; a clean review pass is. Never self-attest "looks clean" from a
-  manual skim — re-run the agent.
+  1. Triage findings: **load-bearing** vs documentation. Fix both, but only one of them gates another pass.
+     * **LOAD-BEARING** — it can change behaviour or the validity of a measurement: memory unsafety, wrong
+       state, a control or instrument that cannot fail on a path production uses, a test whose failure is
+       what would catch that. A finding about the *test* is load-bearing exactly when production reaches the
+       code it covers (`grep` the call sites: an uncovered helper with no caller is not).
+     * **NOT LOAD-BEARING** — every claim, comment, doc, PR-body or commit-message wording issue, *including
+       a false one*: a stale copy, a denominator that does not hold, a sentence citing a run that says
+       something else. These are cheap to fix and expensive to leave (a message is immutable once pushed),
+       so fix them in place where a reader meets them — but they do not by themselves buy another pass.
+  2. **Convergence = a fresh pass with ZERO LOAD-BEARING findings.** A pass whose findings are all
+     documentation IS converged: fix them in place, note them in one line, and push. Do not chain a pass to
+     re-audit prose — ten consecutive prose passes once ran here while the last five had no e2e test, and
+     they found real defects in the *documentation* while the bugs sat untouched. Only a load-bearing finding
+     sends the tree back for another pass. Never self-attest "looks clean" from a manual skim — the pass is
+     what decides, and the fix list you hand the next pass must itself be verified, because a wrong finding
+     costs a whole cycle.
   3. Repeat until converged, then push.
 - **A commit message cannot be corrected after a push, so a hash or a run path it cites must resolve for
   every reader.** Cite ids that exist on the remote, never a pre-rewrite id; put the mapping in `plan.md`

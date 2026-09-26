@@ -21,7 +21,7 @@ with prod's own host KV:
 
 Watch for the three signatures: `resource subtraction underflow`, any `WORKER RECOVER`, and a **non-zero**
 `post-recovery residual` line -- that last one is the leak, named in the units the incident used. The
-counters `[capture] recycled-checkpoint restored on abort` and `fail-all cleanup: ... skipped=...` name
+counters `[capture] recycled-checkpoint DROPPED on abort (was 'restored' before the #11(a) disposal)` and `fail-all cleanup: ... skipped=...` name
 the site if it fires.
 
 Run through the swap, ~50 minutes, `E2E_TIMEOUT` above 3300 (the whole sequence plus startup):

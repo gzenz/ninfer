@@ -2376,22 +2376,54 @@ int main() {
         ninfer::PromptInput capturing_input =
             session_turn("hs-capture", "Describe deterministic scheduling in one paragraph.");
         capturing_input.options.enable_thinking = true;
-        const ninfer::GenerationResult capturing =
-            engine.generate(engine.prepare(std::move(capturing_input)), fixed_output(4));
-        const ninfer::GenerationResult occupant_result = occupant.wait();
+        // The capturing turn is expected to FAIL when the fault control is armed -- that is how the
+        // abort (and therefore the orphan) is produced -- so the fault is caught here and the scenario
+        // proceeds. Without this the injected bad_alloc unwound the whole scenario and the tail below
+        // never ran, which is how the first version of this reported nothing at all.
+        std::optional<ninfer::GenerationResult> capturing;
+        const bool fault_armed = std::getenv("NINFER_INJECT_THROW") != nullptr;
+        try {
+            capturing.emplace(
+                engine.generate(engine.prepare(std::move(capturing_input)), fixed_output(4)));
+        } catch (const std::exception& error) {
+            // Only a fault we ARMED may be swallowed. Swallowing unconditionally would hide a real
+            // failure of the ordinary path behind a pass -- and the first version of this did exactly
+            // that, dropping the `generated_token_ids.empty()` assertion with it. (That version existed
+            // to serve a #10 tail that has since been reverted; the gating stays because it is right on
+            // its own.)
+            if (!fault_armed) { throw; }
+            std::cerr << "capture-host-snapshot: capturing turn failed as armed: " << error.what() << '\n';
+        }
+        // The occupant is failed too by a recovery (`recover_from_oom_locked` forces an error on every
+        // active slot), and `wait()` therefore throws when a fault is armed. Left uncaught this terminated
+        // the scenario (rc=134) before anything after it ran. Gated on `fault_armed` for the same reason
+        // as the capture above: an unarmed failure must not be swallowed.
+        ninfer::GenerationResult occupant_result;
+        try {
+            occupant_result = occupant.wait();
+        } catch (const std::exception& error) {
+            if (!fault_armed) { throw; }
+            std::cerr << "capture-host-snapshot: occupant failed as armed: " << error.what() << '\n';
+        }
 
         const ninfer::RuntimeStats stats = engine.runtime_stats();
         std::cout << "capture-host-snapshot occupant_tokens=" << occupant_result.generated_token_ids.size()
-                  << " capture_tokens=" << capturing.generated_token_ids.size()
-                  << " path=" << static_cast<int>(capturing.prefix_reuse_path)
+                  << " capture_tokens=" << (capturing ? capturing->generated_token_ids.size() : 0U)
+                  << " path=" << (capturing ? static_cast<int>(capturing->prefix_reuse_path) : -1)
                   << " captures=" << stats.active_captures_completed
                   << " aborts=" << stats.active_captures_aborted
                   << " (expect the capture's assess line to read placement=1; placement=0 means the "
                      "device pool was not full and this run proves nothing)\n";
-        if (occupant_result.generated_token_ids.empty() || capturing.generated_token_ids.empty()) {
+        // Asymmetric on purpose, and said out loud: with a fault armed the OCCUPANT is expected to fail
+        // too (the recovery errors every active slot), so a run that proceeds far enough to print its
+        // stats line still returns 1 -- an armed run is a diagnostic, not a pass. An unarmed run must
+        // produce both turns.
+        if (occupant_result.generated_token_ids.empty() ||
+            (!fault_armed && (!capturing || capturing->generated_token_ids.empty()))) {
             std::cerr << "capture-host-snapshot: a turn produced no output\n";
             return 1;
         }
+
         result = 0;
     } else if (scenario == "stream-observations") {
         auto options          = engine_options(artifact);

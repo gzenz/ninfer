@@ -886,11 +886,22 @@ private:
     // previously visible only under NINFER_MAT_DEBUG, which is how a live hazard stayed unmeasured.
     std::uint64_t shared_publishes_                      = 0;
     std::uint64_t shared_publish_frontier_mismatches_    = 0;
-    // W1-B (plan form): the durable {owner, state content epoch} pairing. Counted in every build with
-    // its denominator; deliberately not enforced until a mismatch has actually been observed -- a
-    // throw on this path kills the worker (the wedge, 2026-09-25), and an unobserved condition is not
-    // a licence to introduce one.
-    std::uint64_t recycled_checkpoint_restores_          = 0;
+    // W1-B's observation, now a DROP counter: the abort arm drops a recycled checkpoint instead of
+    // restoring its epoch (see the arm in `capture.cpp`). It has no denominator and can only read zero --
+    // the branch is unreachable by the argument in plan.md §2 item 3. It is kept for the one reason given
+    // at that counter (`capture.cpp`, `recycled_checkpoint_drops_`): if the reachability argument is ever
+    // refuted, the first evidence will be this counter firing.
+    // #11(a): the abort arm now DROPS a recycled rewrite checkpoint rather than restoring its epoch, so
+    // this counts drops. The old `recycled_checkpoint_restores_` counter is gone with the behaviour: it
+    // could only ever read 0 (the branch is unreachable), and a counter that can only read zero is a
+    // claim, not an instrument.
+    std::uint64_t recycled_checkpoint_drops_             = 0;
+    // #11(b): a checkpoint priced with no settled StateImage replica. Counted with its denominator, never
+    // thrown on -- see the comment at the observation site.
+    // `mutable`: the observation site is a const pricing walk, which is where the condition has to be
+    // seen. Counters only -- nothing here changes behaviour.
+    mutable std::uint64_t incomplete_checkpoint_states_   = 0;
+    mutable std::uint64_t checkpoint_state_checks_        = 0;
     // W1.2: a private checkpoint adopted by a different session. Should be impossible by construction.
     std::uint64_t cross_session_adoptions_               = 0;
     // The non-strict releases deliberately discard the `[[nodiscard]] bool` their stores return, so a
@@ -908,6 +919,10 @@ private:
     // Every eviction the check above ran for -- the denominator. Without it a zero numerator cannot be
     // told from a gate that never had a chance to be true.
     std::uint64_t demotable_eviction_checks_             = 0;
+    // W1-B (plan form): the durable {owner, state content epoch} pairing. Counted in every build with
+    // its denominator; deliberately not enforced until a mismatch has actually been observed -- a throw
+    // on this path kills the worker (the wedge, 2026-09-25), and an unobserved condition is not a licence
+    // to introduce one.
     std::uint64_t state_epoch_checks_                    = 0;
     std::uint64_t state_epoch_mismatches_                = 0;
     std::uint64_t state_epoch_unrecorded_                = 0;
@@ -966,7 +981,6 @@ private:
         bool recycles_private_state        = false;
         bool replacement_removed           = false;
         bool prepared                      = false;
-        std::uint64_t recycled_state_epoch = 0;
         bool transfer_enqueue_pending      = false;
         bool transfer_submitted            = false;
         std::uint8_t transfer_timer_mask   = 0;

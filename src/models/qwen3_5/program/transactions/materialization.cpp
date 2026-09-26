@@ -977,23 +977,6 @@ void ProgramImpl::prepare_materialization(MaterializationTransaction& transactio
             if (source_reservation) {
                 pages.physical_pool().resize_reservation(reservation, missing);
             }
-            // Capacity up front so the two recordings below cannot allocate, and therefore cannot
-            // throw. THIS IS THE #9 FIX, and it is a fix of ordering, not of the reservation:
-            // `reserve_device_replica` pins the logical page (`pending_device_replica` +
-            // `destination_pinned`), and a pinned page can neither release its reference nor be dropped.
-            // The existing abort walks the *recorded* restores, so a replica that is pinned but not yet
-            // recorded is invisible to every cleanup path -- the sequence's KV release then refuses, the
-            // address stays `occupied` with its pages resident, and the recovery leaves 117 device pages
-            // and 8.45 MB of host KV owned by nothing. Before this, `restores.push_back` (a vector
-            // growth) was a real throw source inside that window; reserving the capacity first removes
-            // it, so the recording cannot fail and the window cannot be entered by an allocation fault.
-            //
-            // What remains open, stated rather than implied: a throw *inside* `reserve_device_replica`
-            // after it has materialized the physical page would still leave an unrecorded pin. That is
-            // unproven here -- it needs a fault site inside `kv_store.h`, not in this file -- and no fix
-            // is claimed for it.
-            restores.reserve(restores.size() + mapped);
-            destinations.reserve(destinations.size() + mapped);
             for (std::uint32_t page = 0; page < mapped; ++page) {
                 const LogicalKVPageHandle logical = addresses.logical_page(address, page);
                 if (pages.device_resident(logical)) { continue; }
@@ -1003,29 +986,70 @@ void ProgramImpl::prepare_materialization(MaterializationTransaction& transactio
                 const HostKVPageReplica replica = pages.host_replica(logical);
                 const DeviceKVPageHandle destination =
                     pages.reserve_device_replica(logical, reservation);
+                // Fault injection (NINFER_INJECT_THROW=mat-reserve-replica): the ONLY placement that
+                // reproduces the #9 leak is HERE -- between taking the replica and recording it. The
+                // existing abort (`abort_materialization_transfers`, materialization.cpp:1464) walks
+                // `text_restores`/`backend_restores` and calls `abort_device_replica` for each, so a
+                // RECORDED replica is cleaned up; a replica pinned but not yet recorded is invisible to
+                // it, and the recovery then leaves the address occupied with its pages resident
+                // (117 device pages, 8.45 MB host KV, `REFUSED (kv-text)`).
+                //
+                // This site spent a while on the far side of the recording, and a run placed there reads
+                // `residual ... all zero` -- not because anything was fixed, but because the fault had
+                // been moved past the point where the damage happens. The one-variable rule applies to
+                // fault sites too, and that is the mistake this comment exists to prevent repeating.
+                // Evidence: results/n9-evidence/. Only `20260926-130452` carries a `tree.diff`, so it is
+                // the one run whose source record shows this site where it is; three directories predate
+                // the diff-saving (`125144`, `125427`, `125703`). `125703` reads the same deciding lines as
+                // `130452` and is counted as a second gap-placement run, but its placement is INFERRED from
+                // that output; `125144` and `125427` read a zero residual, and their placement is inferred
+                // too. Read those three as a contrast, not as provenance.
+                if (ninfer::harmful_inject_throw("mat-reserve-replica")) { throw std::bad_alloc(); }
                 restores.push_back(MaterializationTransaction::KVRestorePage{
                     .logical     = logical,
                     .extent      = replica.extent,
                     .extent_page = replica.page_offset,
                 });
                 destinations.push_back(destination);
-                // Fault injection (NINFER_INJECT_THROW=mat-reserve-replica): a failure with the device
-                // page replica reserved and RECORDED but not yet published. Recorded is the point: the
-                // existing abort (`abort_materialization_transfers`, materialization.cpp:1519-1537)
-                // already walks `text_restores`/`backend_restores` and calls `abort_device_replica` for
-                // each, so a recorded replica is cleaned up correctly -- verified, residual zero. What it
-                // cannot see is a replica reserved and NOT yet recorded, which is where this leak lived
-                // (see the comment on the capacity reservation above).
-                if (ninfer::harmful_inject_throw("mat-reserve-replica")) { throw std::bad_alloc(); }
 
             }
         };
     DeviceKVPageReservation& text_restore_reservation =
         text_prefix_fork ? *transaction.text_source_restore_reservation
                          : text_kv_addresses->page_reservation(*transaction.text_activation);
+    // #9 probe (NINFER_CAPTURE_PROBE): does the recording exceed the capacity the construction-time
+    // reserve gave it (`materialization.cpp:93-103`, which runs only when the transaction has a source
+    // KV)? It cannot: with a source, `mapped` is bounded by that address's mapped pages (the lambda
+    // throws otherwise), and without one `text_address` is a fresh root whose `page_count` is 0, so
+    // nothing is recorded. The probe watches for a change that breaks that, which is the property the
+    // removed pre-reserve was mistakenly believed to be protecting.
+    // `cap_before < size_after` would mean growth happened, i.e. the recording allocated and could have
+    // thrown. It reads `would_have_grown=0` on every path measured, which is what retired the pre-reserve
+    // that used to follow it. Kept because it measures a real property of the call, and would catch a
+    // future change that lets the recording exceed the capacity reserved for it.
+    const std::size_t text_restores_cap_before = transaction.text_restores.capacity();
+    const std::size_t text_dest_cap_before     = transaction.text_restore_destinations.capacity();
     prepare_kv_restores(*text_kv_addresses, *text_kv_pages, text_address,
                         transaction.text_activation_frontier, text_prefix_fork, text_restore_reservation,
                         transaction.text_restores, transaction.text_restore_destinations);
+    if (std::getenv("NINFER_CAPTURE_PROBE") != nullptr) {
+        // `cap_before` is what this call started with. `cap_before=0` together with `size=0` means the
+        // call recorded nothing (the no-source root case), not that a recording had to grow; every
+        // measured call reads `would_have_grown=0`.
+        const std::size_t grew =
+            (text_restores_cap_before < transaction.text_restores.size() ||
+             text_dest_cap_before < transaction.text_restore_destinations.size())
+                ? 1U
+                : 0U;
+        std::fprintf(stderr,
+                     "[kv-restore] would_have_grown=%zu restores: cap_before=%zu cap_now=%zu size=%zu | "
+                     "destinations: cap_before=%zu cap_now=%zu size=%zu\n",
+                     grew, text_restores_cap_before, transaction.text_restores.capacity(),
+                     transaction.text_restores.size(), text_dest_cap_before,
+                     transaction.text_restore_destinations.capacity(),
+                     transaction.text_restore_destinations.size());
+        std::fflush(stderr);
+    }
     if (backend_address) {
         DeviceKVPageReservation& backend_restore_reservation =
             backend_prefix_fork
@@ -1979,10 +2003,21 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
             // version printed only when the condition held, and its first run said nothing at all.)
             ++demotable_eviction_checks_;
             if (demotable_eviction_checks_ <= 8ULL || demotable_eviction_checks_ % 512ULL == 0ULL) {
+                // #6 follow-up: WHICH victim, not just how many. A count of `demotable` evictions
+                // cannot be judged without knowing whether the victim was worth keeping. The planner's
+                // own value weight is not reachable from here (it lives in the search,
+                // `pressure_planner.cpp`), so this prints the one identifier the commit site has.
+                // An earlier version also carried the victim's endpoint frontier and live reference
+                // count; both are structurally zero here -- the summary is emplaced empty
+                // (`materialization.cpp:120`) and filled only on the RETAIN path
+                // (`retain_private_result`, :1973), so an evicted victim never has one. Dropped rather
+                // than printed as zeros that look like data. `owner` is a per-plan ordinal
+                // (`details.pressure_owner_ids`), not a stable identity.
                 std::fprintf(stderr,
-                             "[engine] private victim evicted: demotable=%d host_state_slots=%u/%llu "
-                             "host_kv=%zu/%llu evictions_checked=%llu demotable_total=%llu\n",
-                             static_cast<int>(demotable), usage.host_state_slots,
+                             "[engine] private victim evicted: demotable=%d plan_owner_ordinal=%u "
+                             "host_state_slots=%u/%llu host_kv=%zu/%llu evictions_checked=%llu "
+                             "demotable_total=%llu\n",
+                             static_cast<int>(demotable), result.owner.value, usage.host_state_slots,
                              static_cast<unsigned long long>(capacity.host.state_slots),
                              usage.host_kv_bytes,
                              static_cast<unsigned long long>(capacity.host.kv_bytes),

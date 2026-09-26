@@ -1,0 +1,640 @@
+diff --git a/CLAUDE.md b/CLAUDE.md
+index 8f9adf3a..bcacc771 100644
+--- a/CLAUDE.md
++++ b/CLAUDE.md
+@@ -23,7 +23,7 @@ for the session that produced it -- read and edit `plan.md`, not those.
+ - Keep a journal monitor armed during a soak/prod. It expires at 30 min —
+   re-arm on expiry and after any stop.
+ - Pattern (full, not crash-only):
+-  `CUDA error|cudaError|bad_alloc|terminate called|Assertion|Segmentation|core dumped|Killed [0-9]|WORKER RECOVER|WORKER CRASH|host-arena|single_alloc|admission stalled|admission rejected|subtraction underflow|post-recovery residual|non-strict release REFUSED|recycled-checkpoint`
++  `CUDA error|cudaError|bad_alloc|terminate called|Assertion|Segmentation|core dumped|Killed [0-9]|WORKER RECOVER|WORKER CRASH|host-arena|single_alloc|admission stalled|admission rejected|subtraction underflow|post-recovery residual|non-strict release REFUSED|recycled-checkpoint|checkpoint StateImage INCOMPLETE`
+   on `journalctl -u ninfer.service -f -q --output=short-iso`.
+ 
+   The last four were added 2026-09-25. `admission stalled` / `admission rejected` are the two
+diff --git a/plan.md b/plan.md
+index 425c00d5..668bfdbd 100644
+--- a/plan.md
++++ b/plan.md
+@@ -96,7 +96,10 @@ wedge; when it says `#13`, the accounting underflow.
+ 1. **#9 — the leak (the wedge's actual cause).** A recovery leaves occupancy owned by nothing: two
+    readings agree to the byte (main 958 pages, host 1 state slot, `host_kv 418,775,040 B`), which drops
+    usable capacity to 3138 pages while `isolated_request_feasible` still compares against 4096 — so a
+-   request in that band is called feasible and blocked. **Blocked on producing the condition**: a
++   request in that band is called feasible and blocked. **A trigger has now been produced under injection
++   and then shown not to be a trigger** (2026-09-26): the pinned-but-unrecorded window is real and
++   reproduces the shape, but nothing on any measured path throws inside it, so the incident remains
++   unexplained. Earlier attempts to produce the condition: a
+    240-turn load (the 14:10 provocation, `prod-load.py --sessions 4 --rounds 60` driven at `:8080`:
+    `ok=180 failed=60`, the 60 being the harness's own over-budget 400s) and the L2 rewind arm both
+    failed to produce it.
+@@ -129,7 +132,11 @@ wedge; when it says `#13`, the accounting underflow.
+    `isolated_request_feasible` account for occupancy it cannot evict, so the honest outcome is a clean
+    "infeasible" rather than a rejection-by-timeout. No leak needed to make sense of it.
+ 3. **#11 — W1 residues.** (a) the recycled-checkpoint abort restores an old content epoch over content
+-   the fork may have written — counted, denominator 0 so far; fix waits on what `abort_fork` restores.
++   the fork may have written — the abort arm now DROPS the checkpoint instead of restoring its epoch
++   (disposal implemented 2026-09-26), which makes the question moot: a dropped checkpoint cannot carry
++   stale bytes under a live name. `restore_recycled_checkpoint` stays in the store because it has its own
++   test (`test_context_store.cpp`) covering the rotation contract — deleting the primitive deleted tested
++   behaviour and broke that build.
+    **#11(a) IS (PLAUSIBLY) A DEAD BRANCH — the recycled-checkpoint path looks unreachable from any
+    request shape, not merely from one scenario (2026-09-26 10:32).** This replaces an earlier
+    conclusion of mine that is now withdrawn: I claimed the branch needed "one closure captured twice,
+@@ -273,10 +280,13 @@ wedge; when it says `#13`, the accounting underflow.
+      the field too. That
+      needs the operator, both because it removes a designed-in path and because it is unclear whether the
+      branch is upstream's (fork divergence).
+-   The counter `recycled_checkpoint_restores_` and the `[capture] ASSERT` probe are what say the branch
++   The counter `recycled_checkpoint_drops_` and the `[capture] ASSERT` probe are what say the branch
+    has never executed; neither says it is safe to delete.
+-      (b) invariant #6's completeness half: the KV side walks every required page and throws, nothing
+-   asserts the StateImage is complete; needs an API that can express it.
++      (b) invariant #6's completeness half: **implemented as an observation, not an assertion.**
++   `StateImageStore::complete` expresses it (immutable, a settled replica, non-zero epoch), and the
++   pricing walk that already checks the KV half now counts incomplete states with its denominator and
++   prints rather than throwing — this file's neighbours are explicit that a throw on that path kills the
++   worker, and the condition has never been observed.
+    **CONSTRUCTED SCENARIOS ALSO NEGATIVE (2026-09-25 23:26).** Five real-engine scenarios ran in GPU
+    windows via the new `tools/e2e/ninfer-gpu-window.sh`, each against prod's own artifact with every
+    leak instrument enabled: `pressure-resume`, `private-checkpoint-pressure`,
+@@ -354,7 +364,40 @@ wedge; when it says `#13`, the accounting underflow.
+    **Two other scenarios with the same injection stayed clean** (`private-checkpoint-pressure`,
+    `source-pressure-protection`: residual all zero), so this is not "every recovery leaks" -- it is a
+    specific reserve-then-record window that only `pressure-resume`'s restore path enters.
+-   **#9: CAUSE FOUND, CENSUS NAMES THE SURVIVOR, FIX IMPLEMENTED AND VERIFIED 2026-09-26 12:07.**
++   **CORRECTION 2026-09-26 12:24 — the committed fix is DECORATION on the reproduce path, measured.**
++   The causality probe (`[kv-restore]`, `NINFER_CAPTURE_PROBE=1`, at the `prepare_kv_restores` call site)
++   prints the recording vectors' capacity before the call and their size after it. On `pressure-resume`
++   the one call that prepares pages reads
++   `would_have_grown=0 restores: cap_before=120 cap_now=120 size=4 | destinations: cap_before=120
++   cap_now=120 size=4`: capacity 120 was already there (the construction-time reserve at
++   `materialization.cpp:93-103` ran, because this transaction DOES have a source KV) and four entries
++   were appended. So `restores.push_back` could not have allocated, and the claim in commit `8925190b`
++   that it was "the throw source inside that window" is **false for this path**. What the window
++   actually contained was only the failure I injected into it.
++   What that does and does not leave:
++   * **The mechanism is real and demonstrated**: a replica pinned but not recorded is invisible to
++     `abort_materialization_transfers`, which walks the recorded ones; the recovery then leaves the
++     address occupied with its pages resident (117 device pages, 8.45 MB host KV, `REFUSED (kv-text)`),
++     named by the census.
++   * **But no real trigger is demonstrated for it on any measured path.** Every restore call observed
++     either prepared nothing (`size=0`, so no pin) or had enough capacity (`cap_before=120 >= size=4`).
++     The reproduction's failure was injected, so #9 remains **unexplained as an incident** -- what was
++     found is a latent fragility, not the wedge's first stage.
++   * The pre-reserve has been REMOVED, not kept: it was dead on both branches (with a source the
++     construction reserve already covers `mapped`; without one the root address has `page_count == 0`), so
++     there was no window for it to close on any path. The earlier sentence here -- that it "closes the
++     window for the paths where the construction reserve does not run" -- was that same false claim in a
++     smaller form, and `8925190b`'s commit message calls it a fix; the overstatement is recorded rather
++     than quietly left standing.
++   * The inner window needs no guard and has none now, and **there is no injection control for it**: the
++     site was removed with the guard. What closed it is a SOURCE ARGUMENT -- the lease is RAII
++     (`~DeviceKVPageLease` releases, `paged_kv_cache.cpp:123`), `optional::emplace` over a noexcept move
++     cannot throw, and a boolean store cannot -- so nothing in that gap can fail. **This is not a
++     measurement and is not presented as one.** The comment in the tree briefly claimed a guard-off run
++     showed residual zero; no such run was made, and the injection site went with the guard, so the
++     experiment is now to re-add it. The earlier claim that it "would leak without it" was equally
++     unmeasured, in the other direction.
++   **#9: MECHANISM FOUND AND REPRODUCED; THE COMMITTED "FIX" IS NOT A FIX (corrected 2026-09-26).**
+    * **The survivor, named by the census** (new `KVAddressSpaceStore::census`, called from
+      `report_recovery_residual` when the residual is non-zero):
+      `[census] text address=1 active=0 occupied=1 row=0 reserved_pages=0 page_count=120
+@@ -367,11 +410,18 @@ wedge; when it says `#13`, the accounting underflow.
+      walks the *recorded* restores and aborts them correctly -- so a replica that is pinned but **not yet
+      recorded** is invisible to every cleanup path. The sequence's KV release then refuses
+      (`non-strict release REFUSED (kv-text)`), and the address stays occupied.
+-   * **The defect**: `restores.push_back` -- a vector growth -- was a real throw source inside that
+-     window. Injected failure there reproduced the whole thing, twice, byte-identical.
+-   * **The fix**: reserve the recording vectors' capacity before the loop, so the recording cannot
+-     allocate and the window cannot be entered by an allocation fault. **Verified**: the same injection
+-     that produced 117 pages and 8.45 MB now leaves `post-recovery residual ... all zero`, twice.
++   * **What was NOT a defect**: `restores.push_back` -- a vector growth -- was never a throw source in
++     that window. The construction-time reserve (`materialization.cpp:93-103`) already covers `mapped`
++     (the lambda throws if `mapped` exceeds the address's mapped pages, `:969`), and without a source KV
++     the root address has `page_count == 0` so nothing is ever recorded. So the pre-reserve added in
++     `8925190b` is dead on both branches and has been removed. The failure in the window was the one I
++     injected.
++   * **The change that used to be called "the fix"** -- reserving the recording vectors' capacity -- is
++     NOT in the tree any more, for the reason immediately above. **The "verified" claim that stood here
++     was false**: the two runs it compared put the injection at *different sites* -- the reproduction's site sat in the gap between the reserve and the
++     recording, the second run's sat after the recording. Moving a fault past the point where the damage
++     happened is not a fix, and it changed a variable as well as the code, which is the one thing an A/B
++     may not do.
+    * **The method, recorded because it cost two wrong attempts**: my first two fixes (a guard in
+      `release_materialization_staging`, then one at the call site) changed *nothing* -- byte-identical
+      residual. The kill-switch control showed the guard was not the mechanism, and that is what pointed
+@@ -385,6 +435,31 @@ wedge; when it says `#13`, the accounting underflow.
+      the physical page would still leave an unrecorded pin -- unproven, and no fix is claimed; (2) that
+      prod's 2026-09-25 incident entered *this* window is not established, since the reproduction was
+      injected -- what is established is that the window exists and leaks.
++   **EVIDENCE SAVED, AND ONE MORE CORRECTION (2026-09-26 12:57).** `tools/e2e/n9-evidence.sh` runs the
++   claims and saves every log, so they are artifacts rather than transcript readings -- a review pass
++   flagged exactly that gap. Run `results/n9-evidence/20260926-125703/`:
++   * `repro-pressure-resume.log`: `WORKER OOM ... recovering mat=4` -> `non-strict release REFUSED
++     (kv-text)` -> **`post-recovery residual (recover): main_kv_pages=117 ... host_kv_bytes=8454144`** ->
++     `[census] text address=1 active=0 occupied=1 row=0 reserved_pages=0 page_count=120
++     device_resident=116 host_resident=4`. The reproduction is intact.
++   * `probe-pressure-resume.log`: `[kv-restore]` recording-capacity readings, and
++     `[engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=1..8)` -- the #11(b)
++     counter printing **its denominator at zero**, which is the property that makes it an instrument.
++   * `plain-pressure-resume.log`: the same counters with no probe variable set (they are ungated and
++     rate-limited), so the denominator is visible **in the scenario** -- not on real traffic: prod runs
++     whatever binary it was started with, and the tree's counters first appear there only after a deploy.
++   **Note on the injected runs:** every `repro-*` log ends in `terminate called after throwing an instance
++   of 'std::bad_alloc'` and a core dump. The readings above are printed BEFORE that, so they stand, but an
++   injected run is a crash, not a clean run -- "all four affected scenarios pass again, rc=0 with ok"
++   applies only to the runs without injection.
++
++   **The correction that run forced:** the leak had stopped reproducing, and the cause was my own fault
++   placement -- `mat-reserve-replica` had been moved to the far side of the recording, where
++   `abort_materialization_transfers` can see the replica and clean it. A run there reads `residual ...
++   all zero` **because the fault was moved past the point where the damage happens, not because anything
++   was fixed** -- which is the same one-variable error as the "verified" claim this section retracts
++   above, committed a second time in the opposite direction. The site is back in the gap, and the code
++   comment says why it belongs there.
+    **What is NOT yet established, and the next instrument.** The reservation object is RAII --
+    `~DeviceKVPageReservation() { release(); }` (`paged_kv_cache.cpp:165`) -- and the transaction's
+    activation *does* get reset on the failure path (`release_materialization_staging` resets both
+diff --git a/src/models/qwen3_5/program/planning/checkpoint_recovery.cpp b/src/models/qwen3_5/program/planning/checkpoint_recovery.cpp
+index c2ded94a..fc0435bf 100644
+--- a/src/models/qwen3_5/program/planning/checkpoint_recovery.cpp
++++ b/src/models/qwen3_5/program/planning/checkpoint_recovery.cpp
+@@ -112,6 +112,49 @@ ProgramImpl::checkpoint_restore_requirements(const SequenceKVBundle& kv,
+     }
+     std::vector<runtime::ContextTransferRequirement> requirements;
+     requirements.reserve(3);
++    // #11(b): the KV half of this checkpoint is walked below, page by page. The state half had no
++    // equivalent check. It gets a COUNTER and not a throw, because this file's neighbours are explicit
++    // that a throw on this path kills the worker and that such conditions are "deliberately not enforced
++    // until a mismatch has actually been observed" (`program_impl.h:889-892`) -- and this one has never
++    // been observed. The promotion criterion is the opposite of the obvious one: a non-zero numerator
++    // means the condition DOES occur on real traffic, and a throw there would kill the worker -- so it
++    // argues for keeping the counter. What would justify promoting it is a large denominator with the
++    // numerator still at zero, i.e. the invariant holding across everything real traffic does.
++    // The denominator prints whether or not the numerator fires. Printing only on the numerator -- which
++    // the first version did -- makes a run where pricing happened with no incomplete state look identical
++    // to a run where pricing never happened, and that is the shape this repo has been burned by before
++    // (`materialization.cpp`'s demotable counter carries the same note: "a counter that never fires is
++    // indistinguishable from a gate that can never be true").
++    ++checkpoint_state_checks_;
++    // TWO prints, rate-limited on their OWN counter, because each answers a different question and one
++    // gate cannot serve both. The denominator line says "pricing happened, and here is how often" -- the
++    // property without which a zero numerator is indistinguishable from never having run. The numerator
++    // line says "the condition occurred", and it prints the moment it does: gating the numerator on the
++    // DENOMINATOR's counter (the first version) meant an incomplete state found on checks 9..511 printed
++    // nothing until the next multiple of 512, which on light traffic is hours away or never. The repo has
++    // been burned by an instrument that cannot fire, so the alerting line must not depend on traffic
++    // volume.
++    const bool incomplete = !state_store->complete(state);
++    if (incomplete) {
++        ++incomplete_checkpoint_states_;
++        if (incomplete_checkpoint_states_ <= 8ULL || incomplete_checkpoint_states_ % 512ULL == 0ULL) {
++            std::fprintf(stderr,
++                         "[engine] checkpoint StateImage INCOMPLETE at pricing: no settled replica "
++                         "(numerator=%llu, denominator=%llu)\n",
++                         static_cast<unsigned long long>(incomplete_checkpoint_states_),
++                         static_cast<unsigned long long>(checkpoint_state_checks_));
++            std::fflush(stderr);
++        }
++    }
++    if (checkpoint_state_checks_ <= 8ULL || checkpoint_state_checks_ % 512ULL == 0ULL) {
++        std::fprintf(stderr,
++                     "[engine] checkpoint StateImage priced: incomplete=%d (numerator=%llu, "
++                     "denominator=%llu)\n",
++                     static_cast<int>(incomplete),
++                     static_cast<unsigned long long>(incomplete_checkpoint_states_),
++                     static_cast<unsigned long long>(checkpoint_state_checks_));
++        std::fflush(stderr);
++    }
+     if (state_store->residency(state) == StateReplicaResidency::HostOnly) {
+         if (host_state_images == nullptr) {
+             throw std::logic_error("Host-only checkpoint has no Host StateImage pool");
+diff --git a/src/models/qwen3_5/program/program_impl.h b/src/models/qwen3_5/program/program_impl.h
+index 32beadf0..71a6face 100644
+--- a/src/models/qwen3_5/program/program_impl.h
++++ b/src/models/qwen3_5/program/program_impl.h
+@@ -890,7 +890,17 @@ private:
+     // its denominator; deliberately not enforced until a mismatch has actually been observed -- a
+     // throw on this path kills the worker (the wedge, 2026-09-25), and an unobserved condition is not
+     // a licence to introduce one.
+-    std::uint64_t recycled_checkpoint_restores_          = 0;
++    // #11(a): the abort arm now DROPS a recycled rewrite checkpoint rather than restoring its epoch, so
++    // this counts drops. The old `recycled_checkpoint_restores_` counter is gone with the behaviour: it
++    // could only ever read 0 (the branch is unreachable), and a counter that can only read zero is a
++    // claim, not an instrument.
++    std::uint64_t recycled_checkpoint_drops_             = 0;
++    // #11(b): a checkpoint priced with no settled StateImage replica. Counted with its denominator, never
++    // thrown on -- see the comment at the observation site.
++    // `mutable`: the observation site is a const pricing walk, which is where the condition has to be
++    // seen. Counters only -- nothing here changes behaviour.
++    mutable std::uint64_t incomplete_checkpoint_states_   = 0;
++    mutable std::uint64_t checkpoint_state_checks_        = 0;
+     // W1.2: a private checkpoint adopted by a different session. Should be impossible by construction.
+     std::uint64_t cross_session_adoptions_               = 0;
+     // The non-strict releases deliberately discard the `[[nodiscard]] bool` their stores return, so a
+@@ -966,7 +976,6 @@ private:
+         bool recycles_private_state        = false;
+         bool replacement_removed           = false;
+         bool prepared                      = false;
+-        std::uint64_t recycled_state_epoch = 0;
+         bool transfer_enqueue_pending      = false;
+         bool transfer_submitted            = false;
+         std::uint8_t transfer_timer_mask   = 0;
+diff --git a/src/models/qwen3_5/program/storage/kv_store.h b/src/models/qwen3_5/program/storage/kv_store.h
+index f061fc54..0175a651 100644
+--- a/src/models/qwen3_5/program/storage/kv_store.h
++++ b/src/models/qwen3_5/program/storage/kv_store.h
+@@ -465,6 +465,17 @@ public:
+             page.host_replica->committed_columns != page.committed_columns) {
+             throw std::logic_error("logical KV Device restore is not reservable");
+         }
++        // There is no window between taking the physical page and recording it, and this is an ARGUMENT
++        // FROM THE SOURCE, not a measurement: the lease is RAII (`~DeviceKVPageLease` releases it,
++        // `paged_kv_cache.cpp:123`), `optional::emplace` over a noexcept-move type cannot throw, and
++        // `destination_pinned = true` cannot either, so nothing in the gap can fail. A try/catch was
++        // written here and removed on that reasoning.
++        //
++        // It was NOT verified by a control, and the comment that stood here said it was -- "removing the
++        // catch leaves residual at zero under the injection" was never run, and the injection site was
++        // removed with the catch, so it cannot be run without restoring both. If this is ever doubted,
++        // that is the experiment: re-add the site after `destination_pinned = true`, run `pressure-resume`
++        // twice with no catch, and require the runs to agree.
+         page.pending_device_replica.emplace(physical_->materialize_one(reservation));
+         page.destination_pinned = true;
+         return page.pending_device_replica->handle();
+diff --git a/src/models/qwen3_5/program/storage/state_store.h b/src/models/qwen3_5/program/storage/state_store.h
+index 88a0f6bc..8b465bc3 100644
+--- a/src/models/qwen3_5/program/storage/state_store.h
++++ b/src/models/qwen3_5/program/storage/state_store.h
+@@ -353,6 +353,11 @@ public:
+         return epoch;
+     }
+ 
++    // Still here, and still tested (`test_context_store.cpp` covers the rotation contract). The abort arm
++    // no longer calls it -- it DROPS the recycled checkpoint instead of restoring the epoch, because the
++    // branch is unreachable and the epoch restore is the hazard -- but deleting the primitive deleted a
++    // tested behaviour and broke that test's build, which is not what a disposal should do. The primitive
++    // and the policy that stops using it are separate changes.
+     void restore_recycled_checkpoint(StateImageHandle handle, std::uint64_t content_epoch) {
+         Object& object = require(handle);
+         if (content_epoch == 0 || object.role != StateImageRole::ReservedDestination ||
+@@ -365,6 +370,27 @@ public:
+         object.role                  = StateImageRole::CheckpointImmutable;
+     }
+ 
++    // #11(b): invariant #6's completeness half. The KV side walks every required page of a checkpoint and
++    // throws when one is missing (`context.cpp:609-679`, `checkpoint_recovery.cpp:127`); nothing
++    // equivalent existed for the StateImage half -- an image could be valid, referenced and role-correct
++    // while having no replica to restore from, and every check would pass until something tried to read
++    // it. This expresses it. A replica in flight is NOT incompleteness: what matters is whether any
++    // replica is settled, which the two slot tests below decide.
++    [[nodiscard]] bool complete(StateImageHandle handle) const noexcept {
++        if (!valid(handle)) { return false; }
++        const Object& object = objects_[handle.index_];
++        // A restorable checkpoint, precisely: immutable (an ActiveMutable image with a slot is not a
++        // checkpoint), with a replica that is present and settled.
++        if (object.role != StateImageRole::CheckpointImmutable) { return false; }
++        if (!object.device_slot && !object.host_slot) { return false; }
++        // A replica in flight is NOT incomplete. The first version of this returned false on any pending
++        // replica, which includes an in-flight Device-to-Host demotion (`reserve_device_to_host` sets
++        // `pending_host_slot`, `transfer_id` and `destination_pinned`) -- and a checkpoint mid-demotion
++        // still has a readable device slot, so rejecting it would have failed pricing for the whole owner
++        // on healthy traffic. Only a pending replica with no settled replica anywhere is incomplete.
++        return object.content_epoch != 0;
++    }
++
+     [[nodiscard]] StateImageSelectors begin_fork(StateImageHandle source,
+                                                  StateImageHandle destination) {
+         Object& source_object      = require(source);
+diff --git a/src/models/qwen3_5/program/transactions/capture.cpp b/src/models/qwen3_5/program/transactions/capture.cpp
+index b26e5354..f63109ea 100644
+--- a/src/models/qwen3_5/program/transactions/capture.cpp
++++ b/src/models/qwen3_5/program/transactions/capture.cpp
+@@ -743,8 +743,7 @@ void ProgramImpl::prepare_active_capture(ActiveCaptureTransaction& transaction)
+             throw std::logic_error("recycled rewrite destination is unavailable");
+         }
+         transaction.destination_state = *sequence.rewrite_state;
+-        transaction.recycled_state_epoch =
+-            state_store->recycle_checkpoint_destination(transaction.destination_state);
++        (void)state_store->recycle_checkpoint_destination(transaction.destination_state);
+     } else {
+         std::optional<StateImageHandle> destination = state_store->reserve_destination();
+         if (!destination) {
+@@ -911,30 +910,62 @@ void ProgramImpl::abort_active_capture(ActiveCaptureTransaction& transaction) no
+                                                             .write = transaction.source_state};
+                     }
+                     if (transaction.recycles_private_state) {
+-                        // W1-B (plan step 3): this is the "recycled rewrite checkpoint" path the plan
+-                        // names. The fork destination IS the sequence's rewrite checkpoint
+-                        // (`destination_state = *sequence.rewrite_state`), so an abort here restores
+-                        // the checkpoint's *old* content epoch -- over content the fork may have
+-                        // written. If it did, the checkpoint survives with metadata that describes
+-                        // bytes it no longer holds, and a later reuse forks the fork's state under the
+-                        // checkpoint's name. Whether the bytes are in fact dirty depends on what
+-                        // `abort_fork` restores, which is not established here; so this counts the
+-                        // path with its denominator instead of asserting a hazard, and the fix (drop
+-                        // the checkpoint rather than restore its epoch) waits until it is known to
+-                        // matter.
+-                        ++recycled_checkpoint_restores_;
+-                        if (recycled_checkpoint_restores_ <= 8ULL ||
+-                            recycled_checkpoint_restores_ % 512ULL == 0ULL) {
+-                            std::fprintf(stderr,
+-                                         "[capture] recycled-checkpoint restored on abort lane=%u "
+-                                         "count=%llu\n",
+-                                         sequence.lane,
+-                                         static_cast<unsigned long long>(
+-                                             recycled_checkpoint_restores_));
+-                            std::fflush(stderr);
++                        // W1-B, and now #11(a)'s disposal. The fork destination IS the sequence's rewrite
++                        // checkpoint (`destination_state = *sequence.rewrite_state`), so an abort used to
++                        // restore the checkpoint's *old* content epoch -- over content the fork may have
++                        // written, which is the hazard W1-B named. It no longer does: the checkpoint is
++                        // DROPPED here instead. The branch is unreachable by
++                        // construction (plan.md §2 item 3), and the epoch restore is the hazard the
++                        // counter here used to watch for; dropping is safe whether or not the branch is
++                        // ever entered, and costs at most one cache entry -- a checkpoint whose bytes may
++                        // be dirty is worth less than one whose bytes are known good.
++                        //
++                        // "Release" is spelled out because the literal version is unsafe: after
++                        // `recycle_checkpoint_destination` the object is `ReservedDestination` with
++                        // `checkpoint_references == 0`, so a bare release would leave
++                        // `sequence.rewrite_state` pointing at it with `rewrite_checkpoint.valid` still
++                        // true -- and this file's own guard tests exactly those two fields, without a
++                        // `valid()` check, so a later `release_checkpoint_reference` would `require()` a
++                        // stale handle.
++                        const StateImageHandle recycled = transaction.destination_state;
++                        // The reset and the count hang on the release SUCCEEDING. Resetting the sequence's
++                        // handle after a refused release would drop the handle while the occupancy stayed
++                        // -- #9's exact shape, created by the fix -- and counting a "drop" that did not
++                        // happen is the kind of instrument this change removes elsewhere.
++                        //
++                        // `recycled_checkpoint_drops_` can only read zero: this branch is unreachable
++                        // (`recycles_private_state` requires a state the planner never produces). It is
++                        // kept as the denominator's numerator for the day the branch is entered by
++                        // something the reachability argument missed, and it is honest only because it is
++                        // named here as unreachable rather than presented as an instrument that fired.
++                        if (state_store->release(recycled)) {
++                            if (sequence.rewrite_state && *sequence.rewrite_state == recycled) {
++                                sequence.rewrite_state.reset();
++                                sequence.rewrite_checkpoint = {};
++                            }
++                            ++recycled_checkpoint_drops_;
++                            if (recycled_checkpoint_drops_ <= 8ULL ||
++                                recycled_checkpoint_drops_ % 512ULL == 0ULL) {
++                                std::fprintf(stderr,
++                                             "[capture] recycled-checkpoint DROPPED on abort lane=%u "
++                                             "count=%llu (not restored: its bytes may hold the fork's "
++                                             "writes)\n",
++                                             sequence.lane,
++                                             static_cast<unsigned long long>(recycled_checkpoint_drops_));
++                                std::fflush(stderr);
++                            }
++                        } else {
++                            // A refused release leaves an inconsistent binding that this arm does NOT
++                            // repair: `recycle_checkpoint_destination` has already turned the object into
++                            // `ReservedDestination` with `checkpoint_references == 0`, so
++                            // `sequence.rewrite_state` still names it while `rewrite_checkpoint.valid` stays
++                            // true -- and a later `release_checkpoint_reference` would `require()` a role
++                            // and refcount that no longer match. The gating above is still right (dropping
++                            // the handle on a refusal is #9's shape), but the residual risk is named here
++                            // rather than left to be discovered. Unreachable in practice: the arm requires
++                            // a state the planner never produces.
++                            note_nonstrict_release_refusal("abort-recycled-checkpoint");
+                         }
+-                        state_store->restore_recycled_checkpoint(transaction.destination_state,
+-                                                                 transaction.recycled_state_epoch);
+                     } else {
+                         if (!state_store->release(transaction.destination_state)) {
+                             note_nonstrict_release_refusal("abort-destination");
+@@ -1502,12 +1533,17 @@ ProgramImpl::progress_active_capture_transaction(runtime::CancellationFlagView c
+         }
+         // Fault injection (NINFER_INJECT_THROW=capture-submitted, harmful-controls build). Placed AFTER
+         // the enqueue succeeded, so `transfer_submitted` is true and the fork's copy into the recycled
+-        // rewrite-checkpoint slot has been issued -- which is exactly the precondition `abort_active_capture`
+-        // needs to take its recycling branch and call `restore_recycled_checkpoint`, re-asserting the
+-        // checkpoint's old content epoch over bytes the fork has just written (#11(a)). Throwing here
+-        // unwinds to the engine, whose failure path runs `abort_active_capture` with that state in flight.
+-        // The counter `[capture] recycled-checkpoint restored on abort` has never fired; this is the
+-        // deliberate route to make it, rather than hoping a client cancels at the right instant.
++        // rewrite-checkpoint slot has been issued -- the precondition `abort_active_capture`'s recycling
++        // branch was written for. Throwing here unwinds to the engine, whose failure path runs
++        // `abort_active_capture` with that state in flight.
++        //
++        // That branch is unreachable by construction (plan.md §2 item 3: the planner strips
++        // `group.rewrite` unless the disposition is `ReplaceAtCommittedFrontier`, and every `Replace`
++        // activation clears the checkpoint first), and its epoch restore was replaced by a DROP when the
++        // disposal was implemented. (`restore_recycled_checkpoint` still exists in the store: it is a
++        // primitive with its own test, and only its use here was removed.) The injection is
++        // kept because it is the control for the reachability claim: the probe in `inspect_capture`
++        // aborts if `recycles_private_state` is ever true, and this is the site that would run next.
+         // Probe before throwing, not after the abort: the first version of this probe sat inside
+         // `abort_active_capture`, *after* that function's state restoration had already released the
+         // rewrite checkpoint -- so it reported `rewrite_state_live=0` for a value it had destroyed the
+diff --git a/src/models/qwen3_5/program/transactions/materialization.cpp b/src/models/qwen3_5/program/transactions/materialization.cpp
+index c4e15fd4..994ed320 100644
+--- a/src/models/qwen3_5/program/transactions/materialization.cpp
++++ b/src/models/qwen3_5/program/transactions/materialization.cpp
+@@ -977,23 +977,6 @@ void ProgramImpl::prepare_materialization(MaterializationTransaction& transactio
+             if (source_reservation) {
+                 pages.physical_pool().resize_reservation(reservation, missing);
+             }
+-            // Capacity up front so the two recordings below cannot allocate, and therefore cannot
+-            // throw. THIS IS THE #9 FIX, and it is a fix of ordering, not of the reservation:
+-            // `reserve_device_replica` pins the logical page (`pending_device_replica` +
+-            // `destination_pinned`), and a pinned page can neither release its reference nor be dropped.
+-            // The existing abort walks the *recorded* restores, so a replica that is pinned but not yet
+-            // recorded is invisible to every cleanup path -- the sequence's KV release then refuses, the
+-            // address stays `occupied` with its pages resident, and the recovery leaves 117 device pages
+-            // and 8.45 MB of host KV owned by nothing. Before this, `restores.push_back` (a vector
+-            // growth) was a real throw source inside that window; reserving the capacity first removes
+-            // it, so the recording cannot fail and the window cannot be entered by an allocation fault.
+-            //
+-            // What remains open, stated rather than implied: a throw *inside* `reserve_device_replica`
+-            // after it has materialized the physical page would still leave an unrecorded pin. That is
+-            // unproven here -- it needs a fault site inside `kv_store.h`, not in this file -- and no fix
+-            // is claimed for it.
+-            restores.reserve(restores.size() + mapped);
+-            destinations.reserve(destinations.size() + mapped);
+             for (std::uint32_t page = 0; page < mapped; ++page) {
+                 const LogicalKVPageHandle logical = addresses.logical_page(address, page);
+                 if (pages.device_resident(logical)) { continue; }
+@@ -1003,29 +986,68 @@ void ProgramImpl::prepare_materialization(MaterializationTransaction& transactio
+                 const HostKVPageReplica replica = pages.host_replica(logical);
+                 const DeviceKVPageHandle destination =
+                     pages.reserve_device_replica(logical, reservation);
++                // Fault injection (NINFER_INJECT_THROW=mat-reserve-replica): the ONLY placement that
++                // reproduces the #9 leak is HERE -- between taking the replica and recording it. The
++                // existing abort (`abort_materialization_transfers`, materialization.cpp:1519-1537) walks
++                // `text_restores`/`backend_restores` and calls `abort_device_replica` for each, so a
++                // RECORDED replica is cleaned up; a replica pinned but not yet recorded is invisible to
++                // it, and the recovery then leaves the address occupied with its pages resident
++                // (117 device pages, 8.45 MB host KV, `REFUSED (kv-text)`).
++                //
++                // This site spent a while on the far side of the recording, and a run placed there reads
++                // `residual ... all zero` -- not because anything was fixed, but because the fault had
++                // been moved past the point where the damage happens. The one-variable rule applies to
++                // fault sites too, and that is the mistake this comment exists to prevent repeating.
++                // Evidence: results/n9-evidence/. The gap-placement runs are the `repro-*` logs in the
++                // directories whose `tree.diff` shows this site before the recording; the two earliest
++                // directories predate the script saving its diff, so what they show is a zero residual
++                // with the site elsewhere -- read them as a contrast, not as provenance.
++                if (ninfer::harmful_inject_throw("mat-reserve-replica")) { throw std::bad_alloc(); }
+                 restores.push_back(MaterializationTransaction::KVRestorePage{
+                     .logical     = logical,
+                     .extent      = replica.extent,
+                     .extent_page = replica.page_offset,
+                 });
+                 destinations.push_back(destination);
+-                // Fault injection (NINFER_INJECT_THROW=mat-reserve-replica): a failure with the device
+-                // page replica reserved and RECORDED but not yet published. Recorded is the point: the
+-                // existing abort (`abort_materialization_transfers`, materialization.cpp:1519-1537)
+-                // already walks `text_restores`/`backend_restores` and calls `abort_device_replica` for
+-                // each, so a recorded replica is cleaned up correctly -- verified, residual zero. What it
+-                // cannot see is a replica reserved and NOT yet recorded, which is where this leak lived
+-                // (see the comment on the capacity reservation above).
+-                if (ninfer::harmful_inject_throw("mat-reserve-replica")) { throw std::bad_alloc(); }
+ 
+             }
+         };
+     DeviceKVPageReservation& text_restore_reservation =
+         text_prefix_fork ? *transaction.text_source_restore_reservation
+                          : text_kv_addresses->page_reservation(*transaction.text_activation);
++    // #9 probe (NINFER_CAPTURE_PROBE): does the recording exceed the capacity the construction-time
++    // reserve gave it (`materialization.cpp:93-103`, which runs only when the transaction has a source
++    // KV)? It cannot: with a source, `mapped` is bounded by that address's mapped pages (the lambda
++    // throws otherwise), and without one `text_address` is a fresh root whose `page_count` is 0, so
++    // nothing is recorded. The probe watches for a change that breaks that, which is the property the
++    // removed pre-reserve was mistakenly believed to be protecting.
++    // `cap_before < size_after` would mean growth happened, i.e. the recording allocated and could have
++    // thrown. It reads `would_have_grown=0` on every path measured, which is what retired the pre-reserve
++    // that used to follow it. Kept because it measures a real property of the call, and would catch a
++    // future change that lets the recording exceed the capacity reserved for it.
++    const std::size_t text_restores_cap_before = transaction.text_restores.capacity();
++    const std::size_t text_dest_cap_before     = transaction.text_restore_destinations.capacity();
+     prepare_kv_restores(*text_kv_addresses, *text_kv_pages, text_address,
+                         transaction.text_activation_frontier, text_prefix_fork, text_restore_reservation,
+                         transaction.text_restores, transaction.text_restore_destinations);
++    if (std::getenv("NINFER_CAPTURE_PROBE") != nullptr) {
++        // `cap_before` is what this call started with. `cap_before=0` together with `size=0` means the
++        // call recorded nothing (the no-source root case), not that a recording had to grow; every
++        // measured call reads `would_have_grown=0`.
++        const std::size_t grew =
++            (text_restores_cap_before < transaction.text_restores.size() ||
++             text_dest_cap_before < transaction.text_restore_destinations.size())
++                ? 1U
++                : 0U;
++        std::fprintf(stderr,
++                     "[kv-restore] would_have_grown=%zu restores: cap_before=%zu cap_now=%zu size=%zu | "
++                     "destinations: cap_before=%zu cap_now=%zu size=%zu\n",
++                     grew, text_restores_cap_before, transaction.text_restores.capacity(),
++                     transaction.text_restores.size(), text_dest_cap_before,
++                     transaction.text_restore_destinations.capacity(),
++                     transaction.text_restore_destinations.size());
++        std::fflush(stderr);
++    }
+     if (backend_address) {
+         DeviceKVPageReservation& backend_restore_reservation =
+             backend_prefix_fork
+@@ -1979,10 +2001,21 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView
+             // version printed only when the condition held, and its first run said nothing at all.)
+             ++demotable_eviction_checks_;
+             if (demotable_eviction_checks_ <= 8ULL || demotable_eviction_checks_ % 512ULL == 0ULL) {
++                // #6 follow-up: WHICH victim, not just how many. A count of `demotable` evictions
++                // cannot be judged without knowing whether the victim was worth keeping. The planner's
++                // own value weight is not reachable from here (it lives in the search,
++                // `pressure_planner.cpp`), so this prints the one identifier the commit site has.
++                // An earlier version also carried the victim's endpoint frontier and live reference
++                // count; both are structurally zero here -- the summary is emplaced empty
++                // (`materialization.cpp:120`) and filled only on the RETAIN path
++                // (`retain_private_result`, :1961), so an evicted victim never has one. Dropped rather
++                // than printed as zeros that look like data. `owner` is a per-plan ordinal
++                // (`details.pressure_owner_ids`), not a stable identity.
+                 std::fprintf(stderr,
+-                             "[engine] private victim evicted: demotable=%d host_state_slots=%u/%llu "
+-                             "host_kv=%zu/%llu evictions_checked=%llu demotable_total=%llu\n",
+-                             static_cast<int>(demotable), usage.host_state_slots,
++                             "[engine] private victim evicted: demotable=%d plan_owner_ordinal=%u "
++                             "host_state_slots=%u/%llu host_kv=%zu/%llu evictions_checked=%llu "
++                             "demotable_total=%llu\n",
++                             static_cast<int>(demotable), result.owner.value, usage.host_state_slots,
+                              static_cast<unsigned long long>(capacity.host.state_slots),
+                              usage.host_kv_bytes,
+                              static_cast<unsigned long long>(capacity.host.kv_bytes),
+diff --git a/tests/models/qwen3_5/test_engine_prefix_real.cpp b/tests/models/qwen3_5/test_engine_prefix_real.cpp
+index 4246967c..45e4138a 100644
+--- a/tests/models/qwen3_5/test_engine_prefix_real.cpp
++++ b/tests/models/qwen3_5/test_engine_prefix_real.cpp
+@@ -2376,22 +2376,54 @@ int main() {
+         ninfer::PromptInput capturing_input =
+             session_turn("hs-capture", "Describe deterministic scheduling in one paragraph.");
+         capturing_input.options.enable_thinking = true;
+-        const ninfer::GenerationResult capturing =
+-            engine.generate(engine.prepare(std::move(capturing_input)), fixed_output(4));
+-        const ninfer::GenerationResult occupant_result = occupant.wait();
++        // The capturing turn is expected to FAIL when the fault control is armed -- that is how the
++        // abort (and therefore the orphan) is produced -- so the fault is caught here and the scenario
++        // proceeds. Without this the injected bad_alloc unwound the whole scenario and the tail below
++        // never ran, which is how the first version of this reported nothing at all.
++        std::optional<ninfer::GenerationResult> capturing;
++        const bool fault_armed = std::getenv("NINFER_INJECT_THROW") != nullptr;
++        try {
++            capturing.emplace(
++                engine.generate(engine.prepare(std::move(capturing_input)), fixed_output(4)));
++        } catch (const std::exception& error) {
++            // Only a fault we ARMED may be swallowed. Swallowing unconditionally would hide a real
++            // failure of the ordinary path behind a pass -- and the first version of this did exactly
++            // that, dropping the `generated_token_ids.empty()` assertion with it. (That version existed
++            // to serve a #10 tail that has since been reverted; the gating stays because it is right on
++            // its own.)
++            if (!fault_armed) { throw; }
++            std::cerr << "capture-host-snapshot: capturing turn failed as armed: " << error.what() << '\n';
++        }
++        // The occupant is failed too by a recovery (`recover_from_oom_locked` forces an error on every
++        // active slot), and `wait()` therefore throws when a fault is armed. Left uncaught this terminated
++        // the scenario (rc=134) before anything after it ran. Gated on `fault_armed` for the same reason
++        // as the capture above: an unarmed failure must not be swallowed.
++        ninfer::GenerationResult occupant_result;
++        try {
++            occupant_result = occupant.wait();
++        } catch (const std::exception& error) {
++            if (!fault_armed) { throw; }
++            std::cerr << "capture-host-snapshot: occupant failed as armed: " << error.what() << '\n';
++        }
+ 
+         const ninfer::RuntimeStats stats = engine.runtime_stats();
+         std::cout << "capture-host-snapshot occupant_tokens=" << occupant_result.generated_token_ids.size()
+-                  << " capture_tokens=" << capturing.generated_token_ids.size()
+-                  << " path=" << static_cast<int>(capturing.prefix_reuse_path)
++                  << " capture_tokens=" << (capturing ? capturing->generated_token_ids.size() : 0U)
++                  << " path=" << (capturing ? static_cast<int>(capturing->prefix_reuse_path) : -1)
+                   << " captures=" << stats.active_captures_completed
+                   << " aborts=" << stats.active_captures_aborted
+                   << " (expect the capture's assess line to read placement=1; placement=0 means the "
+                      "device pool was not full and this run proves nothing)\n";
+-        if (occupant_result.generated_token_ids.empty() || capturing.generated_token_ids.empty()) {
++        // Asymmetric on purpose, and said out loud: with a fault armed the OCCUPANT is expected to fail
++        // too (the recovery errors every active slot), so a run that proceeds far enough to print its
++        // stats line still returns 1 -- an armed run is a diagnostic, not a pass. An unarmed run must
++        // produce both turns.
++        if (occupant_result.generated_token_ids.empty() ||
++            (!fault_armed && (!capturing || capturing->generated_token_ids.empty()))) {
+             std::cerr << "capture-host-snapshot: a turn produced no output\n";
+             return 1;
+         }
++
+         result = 0;
+     } else if (scenario == "stream-observations") {
+         auto options          = engine_options(artifact);
+diff --git a/tools/e2e/wedge-faithful-replay.py b/tools/e2e/wedge-faithful-replay.py
+index d1a8998c..43984332 100644
+--- a/tools/e2e/wedge-faithful-replay.py
++++ b/tools/e2e/wedge-faithful-replay.py
+@@ -21,7 +21,7 @@ with prod's own host KV:
+ 
+ Watch for the three signatures: `resource subtraction underflow`, any `WORKER RECOVER`, and a **non-zero**
+ `post-recovery residual` line -- that last one is the leak, named in the units the incident used. The
+-counters `[capture] recycled-checkpoint restored on abort` and `fail-all cleanup: ... skipped=...` name
++counters `[capture] recycled-checkpoint DROPPED on abort (was 'restored' before the #11(a) disposal)` and `fail-all cleanup: ... skipped=...` name
+ the site if it fires.
+ 
+ Run through the swap, ~50 minutes, `E2E_TIMEOUT` above 3300 (the whole sequence plus startup):

@@ -112,6 +112,50 @@ ProgramImpl::checkpoint_restore_requirements(const SequenceKVBundle& kv,
     }
     std::vector<runtime::ContextTransferRequirement> requirements;
     requirements.reserve(3);
+    // #11(b): the KV half of this checkpoint is walked below, page by page. The state half had no
+    // equivalent check. It gets a COUNTER and not a throw, because this file's neighbours are explicit
+    // that a throw on this path kills the worker and that such conditions are "deliberately not enforced
+    // until a mismatch has actually been observed" (`program_impl.h:923-926`) -- and this one has never
+    // been observed. The promotion criterion is the opposite of the obvious one: a non-zero numerator
+    // means the condition DOES occur on real traffic, and a throw there would kill the worker -- so it
+    // argues for keeping the counter. What would justify promoting it is a large denominator with the
+    // numerator still at zero, i.e. the invariant holding across everything real traffic does.
+    // The denominator prints whether or not the numerator fires. Printing only on the numerator -- which
+    // the first version did -- makes a run where pricing happened with no incomplete state look identical
+    // to a run where pricing never happened, and that is the shape this repo has been burned by before
+    // (`materialization.cpp`'s demotable counter carries the same note: "a counter that never fires is
+    // indistinguishable from a gate that can never be true").
+    ++checkpoint_state_checks_;
+    // TWO prints, rate-limited on their OWN counter, because each answers a different question and one
+    // gate cannot serve both. The denominator line says "pricing happened, and here is how often" -- the
+    // property without which a zero numerator is indistinguishable from never having run. The numerator
+    // line says "the condition occurred", and it prints the moment it does: gating the numerator on the
+    // DENOMINATOR's counter (the first version) meant an incomplete state found on checks 9..511 printed
+    // nothing until the next multiple of 512, which on light traffic is hours away or never. The repo has
+    // been burned by an instrument that cannot fire, so the alerting line must not depend on traffic
+    // volume.
+    const bool incomplete = !state_store->complete(state);
+    if (incomplete) {
+        ++incomplete_checkpoint_states_;
+        if (incomplete_checkpoint_states_ <= 8ULL || incomplete_checkpoint_states_ % 512ULL == 0ULL) {
+            std::fprintf(stderr,
+                         "[engine] checkpoint StateImage INCOMPLETE at pricing: not a restorable "
+                         "checkpoint (invalid, not immutable, no settled replica, or zero epoch) "
+                         "(numerator=%llu, denominator=%llu)\n",
+                         static_cast<unsigned long long>(incomplete_checkpoint_states_),
+                         static_cast<unsigned long long>(checkpoint_state_checks_));
+            std::fflush(stderr);
+        }
+    }
+    if (checkpoint_state_checks_ <= 8ULL || checkpoint_state_checks_ % 512ULL == 0ULL) {
+        std::fprintf(stderr,
+                     "[engine] checkpoint StateImage priced: incomplete=%d (numerator=%llu, "
+                     "denominator=%llu)\n",
+                     static_cast<int>(incomplete),
+                     static_cast<unsigned long long>(incomplete_checkpoint_states_),
+                     static_cast<unsigned long long>(checkpoint_state_checks_));
+        std::fflush(stderr);
+    }
     if (state_store->residency(state) == StateReplicaResidency::HostOnly) {
         if (host_state_images == nullptr) {
             throw std::logic_error("Host-only checkpoint has no Host StateImage pool");

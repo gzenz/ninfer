@@ -743,8 +743,7 @@ void ProgramImpl::prepare_active_capture(ActiveCaptureTransaction& transaction) 
             throw std::logic_error("recycled rewrite destination is unavailable");
         }
         transaction.destination_state = *sequence.rewrite_state;
-        transaction.recycled_state_epoch =
-            state_store->recycle_checkpoint_destination(transaction.destination_state);
+        (void)state_store->recycle_checkpoint_destination(transaction.destination_state);
     } else {
         std::optional<StateImageHandle> destination = state_store->reserve_destination();
         if (!destination) {
@@ -911,30 +910,63 @@ void ProgramImpl::abort_active_capture(ActiveCaptureTransaction& transaction) no
                                                             .write = transaction.source_state};
                     }
                     if (transaction.recycles_private_state) {
-                        // W1-B (plan step 3): this is the "recycled rewrite checkpoint" path the plan
-                        // names. The fork destination IS the sequence's rewrite checkpoint
-                        // (`destination_state = *sequence.rewrite_state`), so an abort here restores
-                        // the checkpoint's *old* content epoch -- over content the fork may have
-                        // written. If it did, the checkpoint survives with metadata that describes
-                        // bytes it no longer holds, and a later reuse forks the fork's state under the
-                        // checkpoint's name. Whether the bytes are in fact dirty depends on what
-                        // `abort_fork` restores, which is not established here; so this counts the
-                        // path with its denominator instead of asserting a hazard, and the fix (drop
-                        // the checkpoint rather than restore its epoch) waits until it is known to
-                        // matter.
-                        ++recycled_checkpoint_restores_;
-                        if (recycled_checkpoint_restores_ <= 8ULL ||
-                            recycled_checkpoint_restores_ % 512ULL == 0ULL) {
-                            std::fprintf(stderr,
-                                         "[capture] recycled-checkpoint restored on abort lane=%u "
-                                         "count=%llu\n",
-                                         sequence.lane,
-                                         static_cast<unsigned long long>(
-                                             recycled_checkpoint_restores_));
-                            std::fflush(stderr);
+                        // W1-B, and now #11(a)'s disposal. The fork destination IS the sequence's rewrite
+                        // checkpoint (`destination_state = *sequence.rewrite_state`), so an abort used to
+                        // restore the checkpoint's *old* content epoch -- over content the fork may have
+                        // written, which is the hazard W1-B named. It no longer does: the checkpoint is
+                        // DROPPED here instead. The branch is unreachable by
+                        // construction (plan.md §2 item 3), and the epoch restore is the hazard the
+                        // counter here used to watch for; dropping is safe whether or not the branch is
+                        // ever entered, and costs at most one cache entry -- a checkpoint whose bytes may
+                        // be dirty is worth less than one whose bytes are known good.
+                        //
+                        // "Release" is spelled out because the literal version is unsafe: after
+                        // `recycle_checkpoint_destination` the object is `ReservedDestination` with
+                        // `checkpoint_references == 0`, so a bare release would leave
+                        // `sequence.rewrite_state` pointing at it with `rewrite_checkpoint.valid` still
+                        // true -- and this file's own guard tests exactly those two fields, without a
+                        // `valid()` check, so a later `release_checkpoint_reference` would `require()` a
+                        // stale handle.
+                        const StateImageHandle recycled = transaction.destination_state;
+                        // The reset and the count hang on the release SUCCEEDING. Resetting the sequence's
+                        // handle after a refused release would drop the handle while the occupancy stayed
+                        // -- #9's exact shape, created by the fix -- and counting a "drop" that did not
+                        // happen is the kind of instrument this change removes elsewhere.
+                        //
+                        // `recycled_checkpoint_drops_` can only read zero: this branch is unreachable
+                        // (`recycles_private_state` requires a state the planner never produces). It has no
+                        // denominator -- it is not an instrument that can report a rate -- and it is kept
+                        // for one reason only: if the reachability argument is ever refuted, the first
+                        // evidence will be this counter firing. Named here as unreachable rather than
+                        // presented as something that measures.
+                        if (state_store->release(recycled)) {
+                            if (sequence.rewrite_state && *sequence.rewrite_state == recycled) {
+                                sequence.rewrite_state.reset();
+                                sequence.rewrite_checkpoint = {};
+                            }
+                            ++recycled_checkpoint_drops_;
+                            if (recycled_checkpoint_drops_ <= 8ULL ||
+                                recycled_checkpoint_drops_ % 512ULL == 0ULL) {
+                                std::fprintf(stderr,
+                                             "[capture] recycled-checkpoint DROPPED on abort lane=%u "
+                                             "count=%llu (not restored: its bytes may hold the fork's "
+                                             "writes)\n",
+                                             sequence.lane,
+                                             static_cast<unsigned long long>(recycled_checkpoint_drops_));
+                                std::fflush(stderr);
+                            }
+                        } else {
+                            // A refused release leaves an inconsistent binding that this arm does NOT
+                            // repair: `recycle_checkpoint_destination` has already turned the object into
+                            // `ReservedDestination` with `checkpoint_references == 0`, so
+                            // `sequence.rewrite_state` still names it while `rewrite_checkpoint.valid` stays
+                            // true -- and a later `release_checkpoint_reference` would `require()` a role
+                            // and refcount that no longer match. The gating above is still right (dropping
+                            // the handle on a refusal is #9's shape), but the residual risk is named here
+                            // rather than left to be discovered. Unreachable in practice: the arm requires
+                            // a state the planner never produces.
+                            note_nonstrict_release_refusal("abort-recycled-checkpoint");
                         }
-                        state_store->restore_recycled_checkpoint(transaction.destination_state,
-                                                                 transaction.recycled_state_epoch);
                     } else {
                         if (!state_store->release(transaction.destination_state)) {
                             note_nonstrict_release_refusal("abort-destination");
@@ -1502,12 +1534,17 @@ ProgramImpl::progress_active_capture_transaction(runtime::CancellationFlagView c
         }
         // Fault injection (NINFER_INJECT_THROW=capture-submitted, harmful-controls build). Placed AFTER
         // the enqueue succeeded, so `transfer_submitted` is true and the fork's copy into the recycled
-        // rewrite-checkpoint slot has been issued -- which is exactly the precondition `abort_active_capture`
-        // needs to take its recycling branch and call `restore_recycled_checkpoint`, re-asserting the
-        // checkpoint's old content epoch over bytes the fork has just written (#11(a)). Throwing here
-        // unwinds to the engine, whose failure path runs `abort_active_capture` with that state in flight.
-        // The counter `[capture] recycled-checkpoint restored on abort` has never fired; this is the
-        // deliberate route to make it, rather than hoping a client cancels at the right instant.
+        // rewrite-checkpoint slot has been issued -- the precondition `abort_active_capture`'s recycling
+        // branch was written for. Throwing here unwinds to the engine, whose failure path runs
+        // `abort_active_capture` with that state in flight.
+        //
+        // That branch is unreachable by construction (plan.md §2 item 3: the planner strips
+        // `group.rewrite` unless the disposition is `ReplaceAtCommittedFrontier`, and every `Replace`
+        // activation clears the checkpoint first), and its epoch restore was replaced by a DROP when the
+        // disposal was implemented. (`restore_recycled_checkpoint` still exists in the store: it is a
+        // primitive with its own test, and only its use here was removed.) The injection is
+        // kept because it is the control for the reachability claim: the probe in `inspect_capture`
+        // aborts if `recycles_private_state` is ever true, and this is the site that would run next.
         // Probe before throwing, not after the abort: the first version of this probe sat inside
         // `abort_active_capture`, *after* that function's state restoration had already released the
         // rewrite checkpoint -- so it reported `rewrite_state_live=0` for a value it had destroyed the

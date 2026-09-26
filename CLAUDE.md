@@ -23,10 +23,11 @@ for the session that produced it -- read and edit `plan.md`, not those.
 - Keep a journal monitor armed during a soak/prod. It expires at 30 min —
   re-arm on expiry and after any stop.
 - Pattern (full, not crash-only):
-  `CUDA error|cudaError|bad_alloc|terminate called|Assertion|Segmentation|core dumped|Killed [0-9]|WORKER RECOVER|WORKER CRASH|host-arena|single_alloc|admission stalled|admission rejected|subtraction underflow|post-recovery residual|non-strict release REFUSED|recycled-checkpoint`
+  `CUDA error|cudaError|bad_alloc|terminate called|Assertion|Segmentation|core dumped|Killed [0-9]|WORKER RECOVER|WORKER CRASH|host-arena|single_alloc|admission stalled|admission rejected|subtraction underflow|post-recovery residual|non-strict release REFUSED|recycled-checkpoint|checkpoint StateImage INCOMPLETE`
   on `journalctl -u ninfer.service -f -q --output=short-iso`.
 
-  The last four were added 2026-09-25. `admission stalled` / `admission rejected` are the two
+  (That sentence used to say "the last four were added 2026-09-25"; the pattern has grown since, so the
+  count no longer identifies them and the tokens are named individually below instead.) `admission stalled` / `admission rejected` are the two
   admission-path outcomes `5fe12cf3` introduced (a head blocked with an empty active set: reported
   during its 5 s grace window, then rejected with `Overloaded`); without them the condition is
   invisible to this monitor, which is the whole reason the wedge looked like a silent outage.
@@ -43,6 +44,13 @@ for the session that produced it -- read and edit `plan.md`, not those.
   precedes it**; alone it is the noise of a restart -- and with GPU windows in use there is one per
   window.
 
+  `checkpoint StateImage INCOMPLETE` is #11(b)'s alerting line: checkpoint pricing found a state image
+  that is not a restorable checkpoint (invalid, not immutable, no settled replica, or zero epoch). It is rate-limited on its own count, so the FIRST occurrence prints whatever
+  the traffic volume; the companion line `checkpoint StateImage priced: incomplete=0 (... denominator=...)`
+  prints on a separate schedule and exists so that "priced, none incomplete" can be told from "never
+  priced". If the denominator line is absent from a long journal, pricing is not running -- do not read
+  its silence as a healthy zero.
+
   **Corrected 2026-09-26, and the correction was made by grep rather than by taste.** Four tokens this
   pattern used to carry match *nothing* in `src/` -- `WEDGE`, `planner-no-plan`, `relief-shared`,
   `host-state-pool` -- so they could never fire, and a pattern that cannot fire reads exactly like a
@@ -52,8 +60,12 @@ for the session that produced it -- read and edit `plan.md`, not those.
   checkpoint, #11a).
 
   When adding or removing a token: check it with `grep -rl '<token>' src/`. Most tokens are strings the
-  engine prints, so they should match a source file; **two are journal-level signatures and match none** --
-  `Killed [0-9]` (the kernel's OOM killer) and `CUDA error|cudaError` (the driver). An engine instrument
+  engine prints, so they should match a source file; some are journal-level signatures and match none --
+  `Killed [0-9]` (the kernel's OOM killer), `terminate called`, `Assertion`, `Segmentation` and
+  `core dumped` (the C++ runtime, libc and the kernel; all five are absent from `src/`, and all five can
+  fire -- `terminate called` appears in the #9 reproduction logs). `CUDA error|cudaError` is the driver's
+  and does appear in `src/` (30 files for the alternation; `cudaError` alone is 29), so it is NOT in that class: the corrected claim here used to list
+  it among the ones that match nothing, which a `grep -rl cudaError src/` refutes. An engine instrument
   that prints to the journal belongs here; a token nothing can ever emit does not.
 - One monitor at a time (duplicates double-notify). After stopping one,
   `pkill -f 'journalctl -u ninfer'` any orphaned process.

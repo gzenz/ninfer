@@ -1,0 +1,3 @@
+binary: 3658069d6e725ac262539e4b6a6aed689307d6b39af93a310a99231af51d05df  ./build-diag/tests/ninfer_qwen3_5_prefix_real_test
+git-diff: 087f57387d595e5bf055ab8ae70796a009b71ed316f78574a2375ba1ee7c5c2f  -
+git-head: 8925190b74ae7b22efbe49e4b7e1d3ecffe051d3

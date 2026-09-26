@@ -465,6 +465,17 @@ public:
             page.host_replica->committed_columns != page.committed_columns) {
             throw std::logic_error("logical KV Device restore is not reservable");
         }
+        // There is no window between taking the physical page and recording it, and this is an ARGUMENT
+        // FROM THE SOURCE, not a measurement: the lease is RAII (`~DeviceKVPageLease` releases it,
+        // `paged_kv_cache.cpp:123`), `optional::emplace` over a noexcept-move type cannot throw, and
+        // `destination_pinned = true` cannot either, so nothing in the gap can fail. A try/catch was
+        // written here and removed on that reasoning.
+        //
+        // It was NOT verified by a control, and the comment that stood here said it was -- "removing the
+        // catch leaves residual at zero under the injection" was never run, and the injection site was
+        // removed with the catch, so it cannot be run without restoring both. If this is ever doubted,
+        // that is the experiment: re-add the site after `destination_pinned = true`, run `pressure-resume`
+        // twice with no catch, and require the runs to agree.
         page.pending_device_replica.emplace(physical_->materialize_one(reservation));
         page.destination_pinned = true;
         return page.pending_device_replica->handle();

@@ -96,7 +96,10 @@ wedge; when it says `#13`, the accounting underflow.
 1. **#9 — the leak (the wedge's actual cause).** A recovery leaves occupancy owned by nothing: two
    readings agree to the byte (main 958 pages, host 1 state slot, `host_kv 418,775,040 B`), which drops
    usable capacity to 3138 pages while `isolated_request_feasible` still compares against 4096 — so a
-   request in that band is called feasible and blocked. **Blocked on producing the condition**: a
+   request in that band is called feasible and blocked. **A trigger has now been produced under injection
+   and then shown not to be a trigger** (2026-09-26): the pinned-but-unrecorded window is real and
+   reproduces the shape, but nothing on any measured path throws inside it, so the incident remains
+   unexplained. Earlier attempts to produce the condition: a
    240-turn load (the 14:10 provocation, `prod-load.py --sessions 4 --rounds 60` driven at `:8080`:
    `ok=180 failed=60`, the 60 being the harness's own over-budget 400s) and the L2 rewind arm both
    failed to produce it.
@@ -129,7 +132,11 @@ wedge; when it says `#13`, the accounting underflow.
    `isolated_request_feasible` account for occupancy it cannot evict, so the honest outcome is a clean
    "infeasible" rather than a rejection-by-timeout. No leak needed to make sense of it.
 3. **#11 — W1 residues.** (a) the recycled-checkpoint abort restores an old content epoch over content
-   the fork may have written — counted, denominator 0 so far; fix waits on what `abort_fork` restores.
+   the fork may have written — the abort arm now DROPS the checkpoint instead of restoring its epoch
+   (disposal implemented 2026-09-26), which makes the question moot: a dropped checkpoint cannot carry
+   stale bytes under a live name. `restore_recycled_checkpoint` stays in the store because it has its own
+   test (`test_context_store.cpp`) covering the rotation contract — deleting the primitive deleted tested
+   behaviour and broke that build.
    **#11(a) IS (PLAUSIBLY) A DEAD BRANCH — the recycled-checkpoint path looks unreachable from any
    request shape, not merely from one scenario (2026-09-26 10:32).** This replaces an earlier
    conclusion of mine that is now withdrawn: I claimed the branch needed "one closure captured twice,
@@ -273,16 +280,19 @@ wedge; when it says `#13`, the accounting underflow.
      the field too. That
      needs the operator, both because it removes a designed-in path and because it is unclear whether the
      branch is upstream's (fork divergence).
-   The counter `recycled_checkpoint_restores_` and the `[capture] ASSERT` probe are what say the branch
+   The counter `recycled_checkpoint_drops_` and the `[capture] ASSERT` probe are what say the branch
    has never executed; neither says it is safe to delete.
-      (b) invariant #6's completeness half: the KV side walks every required page and throws, nothing
-   asserts the StateImage is complete; needs an API that can express it.
+      (b) invariant #6's completeness half: **implemented as an observation, not an assertion.**
+   `StateImageStore::complete` expresses it (immutable, a settled replica, non-zero epoch), and the
+   pricing walk that already checks the KV half now counts incomplete states with its denominator and
+   prints rather than throwing — this file's neighbours are explicit that a throw on that path kills the
+   worker, and the condition has never been observed.
    **CONSTRUCTED SCENARIOS ALSO NEGATIVE (2026-09-25 23:26).** Five real-engine scenarios ran in GPU
    windows via the new `tools/e2e/ninfer-gpu-window.sh`, each against prod's own artifact with every
    leak instrument enabled: `pressure-resume`, `private-checkpoint-pressure`,
    `source-pressure-protection`, `concurrent`, `shared-rewrite-materialization`. All five returned `ok`
    with **zero** firings -- no `post-recovery residual`, no `non-strict release REFUSED`, no
-   `fail-all cleanup: skipped=...`, no `recycled-checkpoint restored`, no `unsatisfiable`, no
+   `fail-all cleanup: skipped=...`, no `recycled-checkpoint`, no `unsatisfiable`, no
    `WORKER RECOVER`, no `resource subtraction underflow`. These scenarios *construct* the states the
    load attempts hoped for and still produced none of the wanted occurrences, so together with the three
    load attempts that closes the "build the conditions and watch" approach for these defects.
@@ -296,7 +306,7 @@ wedge; when it says `#13`, the accounting underflow.
    succeeds so `transfer_submitted` is true and the fork's copy into the recycled rewrite-checkpoint slot
    has been issued -- the precondition `abort_active_capture`'s recycling branch needs. Three windows:
    `shared-rewrite-materialization` (injection fired 3x, `WORKER OOM ... recovering`, residual all zero,
-   `recycled-checkpoint restored` **0**, cleanup found `continuations-live=0`); `pressure-resume`
+   `recycled-checkpoint` **0**, cleanup found `continuations-live=0`); `pressure-resume`
    (injection fired **0** -- that scenario never submits a capture transfer at all); `all` (see below).
    So the site is reachable and the injection is proven, but **the recycling branch did not run in either
    scenario**, and the reason is now exact rather than vague. `recycles_private_state` is set
@@ -354,24 +364,65 @@ wedge; when it says `#13`, the accounting underflow.
    **Two other scenarios with the same injection stayed clean** (`private-checkpoint-pressure`,
    `source-pressure-protection`: residual all zero), so this is not "every recovery leaks" -- it is a
    specific reserve-then-record window that only `pressure-resume`'s restore path enters.
-   **#9: CAUSE FOUND, CENSUS NAMES THE SURVIVOR, FIX IMPLEMENTED AND VERIFIED 2026-09-26 12:07.**
+   **CORRECTION 2026-09-26 12:24 — the committed fix is DECORATION on the reproduce path, measured.**
+   The causality probe (`[kv-restore]`, `NINFER_CAPTURE_PROBE=1`, at the `prepare_kv_restores` call site)
+   prints the recording vectors' capacity before the call and their size after it. On `pressure-resume`
+   the one call that prepares pages reads
+   `would_have_grown=0 restores: cap_before=120 cap_now=120 size=4 | destinations: cap_before=120
+   cap_now=120 size=4`: capacity 120 was already there (the construction-time reserve at
+   `materialization.cpp:93-103` ran, because this transaction DOES have a source KV) and four entries
+   were appended. So `restores.push_back` could not have allocated, and the claim in commit `8925190b`
+   that it was "the throw source inside that window" is **false for this path**. What the window
+   actually contained was only the failure I injected into it.
+   What that does and does not leave:
+   * **The mechanism is real and demonstrated**: a replica pinned but not recorded is invisible to
+     `abort_materialization_transfers`, which walks the recorded ones; the recovery then leaves the
+     address occupied with its pages resident (117 device pages, 8.45 MB host KV, `REFUSED (kv-text)`),
+     named by the census.
+   * **But no real trigger is demonstrated for it on any measured path.** Every restore call observed
+     either prepared nothing (`size=0`, so no pin) or had enough capacity (`cap_before=120 >= size=4`).
+     The reproduction's failure was injected, so #9 remains **unexplained as an incident** -- what was
+     found is a latent fragility, not the wedge's first stage.
+   * The pre-reserve has been REMOVED, not kept: it was dead on both branches (with a source the
+     construction reserve already covers `mapped`; without one the root address has `page_count == 0`), so
+     there was no window for it to close on any path. The earlier sentence here -- that it "closes the
+     window for the paths where the construction reserve does not run" -- was that same false claim in a
+     smaller form, and `8925190b`'s commit message calls it a fix; the overstatement is recorded rather
+     than quietly left standing.
+   * The inner window needs no guard and has none now, and **there is no injection control for it**: the
+     site was removed with the guard. What closed it is a SOURCE ARGUMENT -- the lease is RAII
+     (`~DeviceKVPageLease` releases, `paged_kv_cache.cpp:123`), `optional::emplace` over a noexcept move
+     cannot throw, and a boolean store cannot -- so nothing in that gap can fail. **This is not a
+     measurement and is not presented as one.** The comment in the tree briefly claimed a guard-off run
+     showed residual zero; no such run was made, and the injection site went with the guard, so the
+     experiment is now to re-add it. The earlier claim that it "would leak without it" was equally
+     unmeasured, in the other direction.
+   **#9: MECHANISM FOUND AND REPRODUCED; THE COMMITTED "FIX" IS NOT A FIX (corrected 2026-09-26).**
    * **The survivor, named by the census** (new `KVAddressSpaceStore::census`, called from
      `report_recovery_residual` when the residual is non-zero):
      `[census] text address=1 active=0 occupied=1 row=0 reserved_pages=0 page_count=120
      device_resident=116 host_resident=4 frontier=7676`. A KV address still `occupied` with its pages
-     resident, but inactive, holding no execution row and no reservation -- 116 device pages and
-     4 host pages (4 x 2 MiB = the 8.45 MB), owned by nothing.
+     resident, but inactive, holding no execution row and no reservation -- 116 device pages (the residual
+     line reads 117; the census counts the resident ones) and 4 host pages whose bytes are the measured
+     8,454,144 (the page size is 2,113,536 bytes, not a round 2 MiB), owned by nothing.
    * **The mechanism.** `reserve_device_replica` pins the logical page (`pending_device_replica` +
      `destination_pinned`, `kv_store.h:459-471`); a pinned page can neither release its reference nor be
-     dropped. The pre-existing abort (`abort_materialization_transfers`, `materialization.cpp:1519-1537`)
+     dropped. The pre-existing abort (`abort_materialization_transfers`, `materialization.cpp:1464`)
      walks the *recorded* restores and aborts them correctly -- so a replica that is pinned but **not yet
      recorded** is invisible to every cleanup path. The sequence's KV release then refuses
      (`non-strict release REFUSED (kv-text)`), and the address stays occupied.
-   * **The defect**: `restores.push_back` -- a vector growth -- was a real throw source inside that
-     window. Injected failure there reproduced the whole thing, twice, byte-identical.
-   * **The fix**: reserve the recording vectors' capacity before the loop, so the recording cannot
-     allocate and the window cannot be entered by an allocation fault. **Verified**: the same injection
-     that produced 117 pages and 8.45 MB now leaves `post-recovery residual ... all zero`, twice.
+   * **What was NOT a defect**: `restores.push_back` -- a vector growth -- was never a throw source in
+     that window. The construction-time reserve (`materialization.cpp:93-103`) already covers `mapped`
+     (the lambda throws if `mapped` exceeds the address's mapped pages, `:971`), and without a source KV
+     the root address has `page_count == 0` so nothing is ever recorded. So the pre-reserve added in
+     `8925190b` is dead on both branches and has been removed. The failure in the window was the one I
+     injected.
+   * **The change that used to be called "the fix"** -- reserving the recording vectors' capacity -- is
+     NOT in the tree any more, for the reason immediately above. **The "verified" claim that stood here
+     was false**: the two runs it compared put the injection at *different sites* -- the reproduction's site sat in the gap between the reserve and the
+     recording, the second run's sat after the recording. Moving a fault past the point where the damage
+     happened is not a fix, and it changed a variable as well as the code, which is the one thing an A/B
+     may not do.
    * **The method, recorded because it cost two wrong attempts**: my first two fixes (a guard in
      `release_materialization_staging`, then one at the call site) changed *nothing* -- byte-identical
      residual. The kill-switch control showed the guard was not the mechanism, and that is what pointed
@@ -385,6 +436,50 @@ wedge; when it says `#13`, the accounting underflow.
      the physical page would still leave an unrecorded pin -- unproven, and no fix is claimed; (2) that
      prod's 2026-09-25 incident entered *this* window is not established, since the reproduction was
      injected -- what is established is that the window exists and leaks.
+   **SECOND RUN CONFIRMS IT (2026-09-26 13:04):** `results/n9-evidence/20260926-130452/` reproduces
+   `main_kv_pages=117 ... host_kv_bytes=8454144`, `REFUSED (kv-text)` and the census line, and `diff`
+   against `20260926-125703`'s deciding lines is empty -- two runs that agree, which is the
+   standard this repo requires of a result. **Only `20260926-130452` carries a `tree.diff`** -- three directories predate the diff-saving
+   (`125144`, `125427`, `125703`), so for those the placement of the fault is *inferred from their
+   output*, not read from their source. That is the same provenance gap in a smaller form, and it is why
+   the script now saves the diff: a hash cannot be turned back into source, and where an injected fault
+   sat is exactly what a reader needs.
+   **Prod's binary, checked rather than assumed (2026-09-26 13:10):** `ninfer.service` restarted at
+   13:06:12 and **already runs the two-print code** -- `grep -c -a 'checkpoint StateImage INCOMPLETE'
+   /proc/$(systemctl show -p MainPID --value ninfer.service)/exe` gives 1, the intermediate build's
+   `incomplete at pricing` string gives 0, and `StateImage priced` gives 1. The paragraph that stood here
+   said prod ran a 12:45 binary and told readers to ignore its pricing lines; that was false on both
+   counts (the restart was later, and the binary already had the final counters), and an instruction to
+   distrust output that cannot occur is worse than no instruction. What is still unshown: prod's journal
+   since 12:00 has **zero** `checkpoint StateImage priced` lines, so the denominator printing *on real
+   traffic* remains to be seen -- the next pricing event should make
+   `journalctl -u ninfer.service | grep -c 'checkpoint StateImage priced'` non-zero. (`build/apps/ninfer-serve`
+   has since been relinked from this tree, so a restart deploys it.)
+   **EVIDENCE SAVED, AND ONE MORE CORRECTION (2026-09-26 12:57).** `tools/e2e/n9-evidence.sh` runs the
+   claims and saves every log, so they are artifacts rather than transcript readings -- a review pass
+   flagged exactly that gap. Run `results/n9-evidence/20260926-125703/`:
+   * `repro-pressure-resume.log`: `WORKER OOM ... recovering mat=4` -> `non-strict release REFUSED
+     (kv-text)` -> **`post-recovery residual (recover): main_kv_pages=117 ... host_kv_bytes=8454144`** ->
+     `[census] text address=1 active=0 occupied=1 row=0 reserved_pages=0 page_count=120
+     device_resident=116 host_resident=4`. The reproduction is intact.
+   * `probe-pressure-resume.log`: `[kv-restore]` recording-capacity readings, and
+     `[engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=1..8)` -- the #11(b)
+     counter printing **its denominator at zero**, which is the property that makes it an instrument.
+   * `plain-pressure-resume.log`: the same counters with no probe variable set (they are ungated and
+     rate-limited), so the denominator is visible **in the scenario** -- not on real traffic: prod runs
+     whatever binary it was started with, and the tree's counters first appear there only after a deploy.
+   **Note on the injected runs:** every `repro-*` log ends in `terminate called after throwing an instance
+   of 'std::bad_alloc'` and a core dump. The readings above are printed BEFORE that, so they stand, but an
+   injected run is a crash, not a clean run -- "all four affected scenarios pass again, rc=0 with ok"
+   applies only to the runs without injection.
+
+   **The correction that run forced:** the leak had stopped reproducing, and the cause was my own fault
+   placement -- `mat-reserve-replica` had been moved to the far side of the recording, where
+   `abort_materialization_transfers` can see the replica and clean it. A run there reads `residual ...
+   all zero` **because the fault was moved past the point where the damage happens, not because anything
+   was fixed** -- which is the same one-variable error as the "verified" claim this section retracts
+   above, committed a second time in the opposite direction. The site is back in the gap, and the code
+   comment says why it belongs there.
    **What is NOT yet established, and the next instrument.** The reservation object is RAII --
    `~DeviceKVPageReservation() { release(); }` (`paged_kv_cache.cpp:165`) -- and the transaction's
    activation *does* get reset on the failure path (`release_materialization_staging` resets both
@@ -425,7 +520,7 @@ wedge; when it says `#13`, the accounting underflow.
    is therefore a scenario whose device pool is full at a capture (`device_state_slots` small,
    `host_state_slots > 0`, enough resident continuations to occupy it), not another injection site.
    **Next injection sites, in order:** the capture commit path (force an abort after the fork/transfer
-   started -- serves #11(a) and the `recycled-checkpoint restored` counter, never fired); then an eviction
+   started -- serves #11(a) and the `recycled-checkpoint DROPPED` counter, never fired); then an eviction
    path for the non-strict releases. The injector makes each one an env var, not a rebuild.
 4. **#2 — #13's accounting underflow.** Instrumented (the message now names the axis) and deployed;
    waiting on one occurrence. Do not guess a fix before it names itself.

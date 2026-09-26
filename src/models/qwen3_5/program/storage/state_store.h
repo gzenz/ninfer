@@ -353,6 +353,11 @@ public:
         return epoch;
     }
 
+    // Still here, and still tested (`test_context_store.cpp` covers the rotation contract). The abort arm
+    // no longer calls it -- it DROPS the recycled checkpoint instead of restoring the epoch, because the
+    // branch is unreachable and the epoch restore is the hazard -- but deleting the primitive deleted a
+    // tested behaviour and broke that test's build, which is not what a disposal should do. The primitive
+    // and the policy that stops using it are separate changes.
     void restore_recycled_checkpoint(StateImageHandle handle, std::uint64_t content_epoch) {
         Object& object = require(handle);
         if (content_epoch == 0 || object.role != StateImageRole::ReservedDestination ||
@@ -363,6 +368,28 @@ public:
         object.content_epoch         = content_epoch;
         object.checkpoint_references = 1;
         object.role                  = StateImageRole::CheckpointImmutable;
+    }
+
+    // #11(b): invariant #6's completeness half. The KV side walks every required page of a checkpoint and
+    // throws when one is missing (`context.cpp:609-679`, `checkpoint_recovery.cpp:127`); nothing
+    // equivalent existed for the StateImage half -- an image could be valid, referenced and role-correct
+    // while having no replica to restore from, and every check would pass until something tried to read
+    // it. This expresses it. A replica in flight is NOT incompleteness: what matters is whether any
+    // replica is settled, which the two slot tests below decide.
+    [[nodiscard]] bool complete(StateImageHandle handle) const noexcept {
+        if (!valid(handle)) { return false; }
+        const Object& object = objects_[handle.index_];
+        // A restorable checkpoint, precisely: immutable (an ActiveMutable image with a slot is not a
+        // checkpoint), with a replica that is present and settled.
+        if (object.role != StateImageRole::CheckpointImmutable) { return false; }
+        if (!object.device_slot && !object.host_slot) { return false; }
+        // A replica in flight is NOT incompleteness: what matters is whether any replica is settled, and
+        // the two slot tests above decide that. The first version tested `has_pending_replica` instead,
+        // which includes an in-flight Device-to-Host demotion (`reserve_device_to_host` sets
+        // `pending_host_slot`, `transfer_id` and `destination_pinned`) -- a checkpoint mid-demotion still
+        // has a readable device slot, so rejecting it would have failed pricing for the whole owner on
+        // healthy traffic.
+        return object.content_epoch != 0;
     }
 
     [[nodiscard]] StateImageSelectors begin_fork(StateImageHandle source,

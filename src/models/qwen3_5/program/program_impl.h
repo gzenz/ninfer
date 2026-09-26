@@ -1108,6 +1108,15 @@ private:
     // a D2H/H2D copy onto it is still in flight, and unpinning then is a use-after-free. Never trims below
     // `retain_bytes`, so a demote that just succeeded cannot immediately lose its room and thrash.
     void maintain_host_memory(std::size_t retain_bytes) noexcept;
+    // Make the host state pool one slot bigger when it is FULL, before planning prices anything (§3
+    // item 6). Called once per planning session -- never per search node, where pinning would be a side
+    // effect inside the cost model's loop.
+    void ensure_host_state_headroom() noexcept;
+    // "the pool was full at planning and we asked it to grow" vs "it grew": two counters because a refusal
+    // and a success look identical from outside, and because a growth that never happens must be
+    // distinguishable from one that happens constantly.
+    std::uint64_t host_state_pregrow_attempts_ = 0;
+    std::uint64_t host_state_pregrows_          = 0;
     [[nodiscard]] StateImageHandle
     selected_state(const SequenceState& sequence, ReusePath reuse,
                    std::optional<runtime::CheckpointRef> checkpoint) const;

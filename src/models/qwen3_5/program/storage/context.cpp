@@ -1756,6 +1756,55 @@ void ProgramImpl::maintain_host_memory(std::size_t retain_bytes) noexcept {
     }
 }
 
+void ProgramImpl::ensure_host_state_headroom() noexcept {
+    if (host_state_images == nullptr || pinned_host_pool == nullptr) { return; }
+    // §3 item 6, and this is the whole of it: make the host state pool ONE slot bigger BEFORE the planner
+    // prices anything, so a demote can be chosen where it could only be evicted before.
+    //
+    // Why it is needed at all: `admission_capacity()` reports `HostStatePool::capacity()` -- the slots that
+    // exist NOW -- so a demote option is priced against a full pool, fails feasibility, and is never
+    // offered. The pool could grow; nothing asked it to. The measured shape this addresses is
+    // `demotable=0 restorable=1` with `host_state_slots=16/16` while the KV arena held 20+ GB free: the room
+    // existed, in the other dimension, and two blind allocations could not see it.
+    //
+    // Why HERE and not in the search: growth pins real memory (~1 s/GiB on the engine thread, measured from
+    // the journal) and reads /proc/meminfo, so it cannot sit in a loop the search runs per assessed node --
+    // an earlier version did exactly that and was removed. This is called once per planning session, before
+    // the first candidate is assessed.
+    //
+    // Why it is bounded: growth happens ONLY when there is no free slot, so a pool with room costs a
+    // comparison and pins nothing, and each growth buys exactly one slot -- the next session sees that slot
+    // free and does not grow again until it is consumed. The pool's budget is fail-closed, so a refusal here
+    // costs exactly what the old behaviour cost: no slot, and the planner evicts as before.
+    const std::uint32_t capacity = host_state_images->capacity();
+    // ZERO CAPACITY IS "DISABLED", NOT "FULL", and the distinction is the whole reason this line exists:
+    // with `--host-state-slots 0` the pool has no slots by configuration, `occupied() < capacity` reads
+    // `0 < 0` = false, and the growth below would conjure a host tier the operator switched off --
+    // `pressure-resume` runs exactly that configuration, and "preserve the tier-disabled meaning" is a
+    // constraint on this change, not a nicety.
+    if (capacity == 0U) { return; }
+    if (host_state_images->occupied() < capacity) { return; }
+    const std::uint64_t before = host_state_images->growth_count();
+    (void)host_state_images->reserve_slots(capacity + 1U);
+    // PRINTED, because otherwise a mechanism that never fires and one that fires constantly are the same
+    // observation -- which is how this change's own pool growth went unobserved for a day. Rate-limited to
+    // the first 8 like the eviction line, plus a total, so "it never grew" can be told from "it grew 200
+    // times and spoke 8 times".
+    ++host_state_pregrow_attempts_;
+    if (host_state_images->growth_count() > before) {
+        ++host_state_pregrows_;
+        if (host_state_pregrows_ <= 8ULL || host_state_pregrows_ % 512ULL == 0ULL) {
+            std::fprintf(stderr,
+                         "[engine] host state pool PRE-GROWN before planning: slots=%u occupied=%u "
+                         "grows=%llu attempts=%llu\n",
+                         host_state_images->capacity(), host_state_images->occupied(),
+                         static_cast<unsigned long long>(host_state_pregrows_),
+                         static_cast<unsigned long long>(host_state_pregrow_attempts_));
+            std::fflush(stderr);
+        }
+    }
+}
+
 void ProgramImpl::release_sequence_kv(SequenceState& sequence) noexcept {
     if (!sequence.kv) { return; }
     unbind_sequence_kv(sequence);

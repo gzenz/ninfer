@@ -43,6 +43,10 @@ PressurePlanningSessionImpl::PressurePlanningSessionImpl(
         throw std::logic_error("pressure planning session cannot start in the current state");
     }
 
+    // BEFORE any candidate is priced: if the host state pool is full, grow it by one slot so the demote
+    // options the search is about to assess can be affordable at all. See ensure_host_state_headroom.
+    program->ensure_host_state_headroom();
+
     candidates.assign(physical_candidates.begin(), physical_candidates.end());
     candidate_ids.assign(admission_candidate_ids.begin(), admission_candidate_ids.end());
     for (std::size_t index = 0; index < candidate_ids.size(); ++index) {

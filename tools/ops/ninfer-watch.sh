@@ -39,8 +39,16 @@ ln -sfn "$(basename "$LOG")" "$LOGDIR/latest.log"
 mainpid=$(systemctl show -p MainPID --value "$UNIT" 2>/dev/null || echo 0)
 exe_sha=$(sha256sum "/proc/${mainpid}/exe" 2>/dev/null | awk '{print $1}')
 {
-  echo "unit=$UNIT started=$(date -Is) pid=$mainpid exe_sha256=${exe_sha:-unknown}"
-  echo "health_url=$HEALTH_URL poll_s=$POLL_S"
+  # Say plainly what state the unit is in. `pid=0 exe_sha256=unknown` reads as "the exe could not be
+  # identified", when what it means is "the unit is not running" -- and a monitor that starts while prod is
+  # deliberately stopped is a normal state, not an anomaly (the operator stops prod to work on it).
+  if [ "${mainpid:-0}" = "0" ]; then
+    echo "unit=$UNIT INACTIVE (watcher started $(date -Is)) -- MainPID is 0, so there is no running exe to"
+    echo "  hash; the watch is on the journal and the request log, and /health will report when it returns"
+  else
+    echo "unit=$UNIT running pid=$mainpid exe_sha256=${exe_sha:-unknown} (watcher started $(date -Is))"
+  fi
+  echo "health_url=$HEALTH_URL poll_s=$POLL_S request_log=$REQUEST_LOG"
 } | tee "$LOG"
 
 # The filter lives in ninfer-watch.awk so it can be run against a fixture (`ninfer-watch-test.sh`); a

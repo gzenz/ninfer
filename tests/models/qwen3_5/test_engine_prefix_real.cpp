@@ -645,7 +645,17 @@ int exercise_host_restore(const char* artifact) {
 // like a clean zero. (The precondition proves MOVEMENT, not demotion: `state_d2h_count` is fed by both
 // pressure demotion and a capture that places a checkpoint straight on host.)
 int exercise_state_image_restore(const char* artifact) {
-    ninfer::Engine engine(host_restore_engine_options(artifact));
+    auto engine_options = host_restore_engine_options(artifact);
+    // THE NEGATIVE CONTROL, and it is the point of the knob: with `NINFER_STATE_IMAGE_HOST_SLOTS=0` the
+    // engine has no host state pool, so no state image can be demoted and none can be restored. The
+    // scenario must then FAIL -- at the precondition or at the H2D check -- which is what shows the
+    // assertion can fail at all. Two passing runs prove the instrument is deterministic; they do not prove
+    // it discriminates, and a test that cannot fail is the defect this repo keeps recording.
+    if (const char* override_slots = std::getenv("NINFER_STATE_IMAGE_HOST_SLOTS")) {
+        engine_options.context_cache.host_state_slots =
+            static_cast<std::uint32_t>(std::atoi(override_slots));
+    }
+    ninfer::Engine engine(std::move(engine_options));
     auto options = [](std::uint32_t outputs, bool reuse) {
         ninfer::RequestOptions request;
         request.execution.requested_output_tokens = outputs;

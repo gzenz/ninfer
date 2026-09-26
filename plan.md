@@ -230,7 +230,11 @@ Two documentation defects the review named, NOT yet fixed, recorded here so they
    "hand-written manifest" caveat warns about, and it happened inside the caveat's own commit.
 
 **And one claim still unverified, which the review called the cheapest real improvement:** that the new
-state-image assertion can FAIL. Two identical passing runs show it executes and is deterministic; they do not
+state-image assertion can FAIL. **NOW VERIFIED (2026-09-26):** `NINFER_STATE_IMAGE_HOST_SLOTS=0` removes the
+host state pool, and the scenario then refuses -- two runs, identical, `rc=1`, stopping at its own
+precondition (`state_d2h 0 -> 0`). What that control shows is the GUARD firing; the H2D check's own
+reachability still rests on the contrast with `host_restore` (0 there, 1 here) rather than on a second
+negative. `build-diag` has been rebuilt with the new scenario, so the battery's name lookup no longer dies. Two identical passing runs show it executes and is deterministic; they do not
 show it can fail. The control: the same scenario with `host_state_slots = 0`, twice, expecting a non-zero
 exit at the precondition or the H2D check. It needs a small scenario parameter (the options come from
 `host_restore_engine_options`) and a GPU window; the battery's half of the wiring has likewise never been run

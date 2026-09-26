@@ -45,18 +45,12 @@ correction history lives *there*, not here — this section states what is true 
   `git log --oneline a8d9e895..HEAD` -- and the invariant that tail is documentation-only is a CHECK, not a
   claim: `git diff --stat a8d9e895 HEAD -- . ':!plan.md' ':!CLAUDE.md'` must be empty. The phrase "the tip" was
   written here four times and went stale four times, the last time inside the sentence forbidding it.
-- **Push state:** `fork/master` (`e919931a`) is an ancestor of `a8d9e895`, so the push fast-forwards.
-  (While this work was in progress the fork's `master` moved by one commit -- an edit to `README.md`, not
-  other work; the local tracking ref was stale, so the ranges computed before that were computed against
-  it.)
-  What those revisions got wrong, corrected: the tracked tree is clean, which is `git status --porcelain --untracked-files=no | wc -l` -> 0 (they listed
-  five modified files); `5aff7b3c` still RESOLVES as an object (`git cat-file -t 5aff7b3c` -> `commit`;
-  `--amend` leaves it until gc), so "a hash that no longer resolves" was false; and the evidence binary was
-  built from a DIRTY tree -- `171507`'s manifest says `git_dirty_paths=31` -- so "the tree it was built
-  from is unchanged" was false too. Untracked: `results/` only where it is NOT tracked -- the manifests and `tree.diff` in it ARE (`git ls-files results`), `*.log` is gitignored by policy -- plus
-  `tests/fixtures/frontend/`; the committed artifact for a run is its `manifest`.
+- **Publication is NOT tracked here (removed 2026-09-26).** Whether and when this series is pushed is the
+  operator's action outside this plan: no open item, next action or acceptance criterion below depends on
+  it, and nothing here should be read as "awaiting a push". The commit ids this file cites are local ids
+  for the reader's benefit; a message that must resolve for everyone cites the subject line instead.
 - **Review passes (opus, 2026-09-26): four so far, and each found real defects in work the previous one had
-  passed.** Pass 1 found nine in `5aff7b3c`; pass 2 found ten in the repair, two of them push-blocking;
+  passed.** Pass 1 found nine in `5aff7b3c`; pass 2 found ten in the repair, two of them blocking;
   pass 3 returned "not yet, close" with three documentation blockers (a `CLAUDE.md` instruction that kills
   the shell that follows it, §0 stale after the merge, and a false tree-identity claim) plus five smaller
   ones, **all closed in the commit after `a8d9e895`** -- not in the repair commit, which is where passes 1
@@ -85,8 +79,12 @@ correction history lives *there*, not here — this section states what is true 
   FALSE** (it deleted the real-engine assertion of the host-to-device restore direction, parent
   `aea1b9ce:528-533`, and substituted a claim about `pressure-resume` that cannot hold -- §2 item 6); **main-KV
   and backend-KV H2D restore are re-homed by measurement**, on the deltas two saved runs agreed on, with
-  the state image as the residue (§2 #17); the battery now passes with its denominator saved
-  (`12 scenarios, reachable=0, failed-or-inconclusive=0, assessments=184`); the `all` "passes twice" claim
+  the state image as the residue, **closed 2026-09-26** (§2 #17, by the `state-image-restore` scenario); the battery now passes with its denominator saved
+  (`12 scenarios, reachable=0, failed-or-inconclusive=0, assessments=184` **-- that denominator is stale as of
+  2026-09-26: the list is now 13 (state-image-restore was added) and the battery has NOT been re-run since,
+  so quote it only with this note.** It will also need `build-diag` rebuilt first: that binary (mtime 17:28)
+  predates the new scenario name, so a battery run as it stands dies on `unknown prefix integration
+  scenario` and reports failed=1 -- loudly, not silently); the `all` "passes twice" claim
   was refuted by saving the runs (two failed byte-identically, which is how the false "no host read"
   assertion was found) and then REPLACED by the passing saved pair (`172831`, byte-identical, plus
   `172138` for the earlier version of the assertion) that the record had never cited; the watcher's blindness to a non-zero residual after `WORKER OOM`,
@@ -151,7 +149,7 @@ wedge; when it says `#13`, the accounting underflow.
 | #8 | — | the forced-token row binding (fixed, unverifiable) |
 | #11 | — | W1's two residues |
 | #5 | — | W1 (complete) |
-| #17 | `#17` | the state-image H2D coverage gap (§2 item 6) |
+| #17 | `#17` | the state-image H2D coverage gap (§2 item 6) — **closed 2026-09-26** by the `state-image-restore` scenario |
 | #16 | — | the 2026-09-26 review repair (a session task, not a code id) |
 
 **Commit-id map for the 2026-09-26 rewrite.** Three `filter-branch` passes rewrote the unpushed series --
@@ -214,9 +212,29 @@ commit. A message citing a pre-rewrite id resolves for nobody after a push, so t
 | `66ce0707` | + the second pass's repairs; the state the THIRD pass reviewed and refused |
 | `7238c552` | the CLAUDE.md convergence rule, briefly its own commit before the amends absorbed it |
 | `3afc6109`, `bb732dea` | the third and fourth passes' repairs, amended onto `7238c552` in error |
-| the squashed `feat(engine)` commit | everything above with the corrected message; **its own id cannot appear here -- a commit cannot cite itself -- and is appended by the first commit after the push** |
+| the squashed `feat(engine)` commit | everything above with the corrected message; **its own id cannot appear here -- a commit cannot cite itself -- and any later commit that touches this map may add it** |
 
-**Cite the subject line, or the id that is on the remote after the push, never a row above it.**
+**Cite the subject line, or an id that resolves on the remote, never a row above it.**
+
+### 1c. Review findings left open (2026-09-26, from the pass on the state-image-restore commit)
+
+Two documentation defects the review named, NOT yet fixed, recorded here so they are not re-derived:
+
+1. **The test commit's message says both manifests carry `tree_diff_sha256`; only `232403` does.** The
+   `231449` manifest has `git_head` + `git_dirty_paths` only, and its binary (`2ec23c8e`) predates the
+   commit, so that hash cannot be reconstructed from a later tree. Fix: correct the message (or state the
+   asymmetry). Either way it needs an amend of that commit, not of HEAD.
+2. **Both manifests' hand-written `started=` fields are wrong** -- each records the SECOND window's start
+   (23:15:54 and 23:26:32) rather than the first (23:14:49 and 23:24:03); the journal has the cycles. Fix in
+   the manifests, or drop the field: a hand-written timestamp that is 65 s late is exactly what the
+   "hand-written manifest" caveat warns about, and it happened inside the caveat's own commit.
+
+**And one claim still unverified, which the review called the cheapest real improvement:** that the new
+state-image assertion can FAIL. Two identical passing runs show it executes and is deterministic; they do not
+show it can fail. The control: the same scenario with `host_state_slots = 0`, twice, expecting a non-zero
+exit at the precondition or the H2D check. It needs a small scenario parameter (the options come from
+`host_restore_engine_options`) and a GPU window; the battery's half of the wiring has likewise never been run
+(see the note in §1's battery line).
 
 ### 2. Open, in priority order
 
@@ -511,14 +529,12 @@ commit. A message citing a pre-rewrite id resolves for nobody after a push, so t
      is what the scenario asserts -- the path half of the old assertion was unsatisfiable here.
    * **main-KV and backend-KV host-to-device restore ARE asserted again**, positively (`>` on both). The
      review's finding that `5aff7b3c` deleted them was correct when it was made; this is the re-homing.
-   * **the STATE image's host-to-device restore remains unasserted end-to-end** -- delta 0 here by
-     construction, and `pressure-resume` cannot cover it (`SpeculativeBackend::None`,
-     `host_state_slots = 0`, `:171-186`; its `restored_pages == 4` is MAIN-KV only). That is the coverage
-     behind `fc5d0cf3` (demote-before-H2D) and `9521103d` (the restore timer), and it is open item `#17`:
-     the route is a scenario where the demoted checkpoint is the reuse WINNER, i.e. a second session
-     (§2c), which this file's `:526-541` shows cannot be built with one.
-   **The two repairs tried before that are worth keeping as a record of why it looked fixable:**
-
+   * **the STATE image's host-to-device restore is FLAT HERE (delta 0) -- and that is a property of this
+     scenario, not of the engine.** Its reuse winner is the SAME session's device-resident endpoint, so no
+     state image comes back. **The axis is no longer unasserted end-to-end, as of 2026-09-26**: the
+     `state-image-restore` scenario makes a SECOND session the reuse winner and measures
+     `state_h2d_delta=1` on two runs that agree exactly; see §2 item 6, which is closed by it. The two
+     attempts recorded below are what showed this shape cannot carry the assertion:
    * *Make the restore a genuine next turn* (a different follow-up) -- no change, and the trace says why:
      the endpoint's frontier sits inside the ASSISTANT CONTENT, so it is a prefix of the prompt whatever
      the next user message says. Diverging at the follow-up is too late.
@@ -530,13 +546,13 @@ commit. A message citing a pre-rewrite id resolves for nobody after a push, so t
    in-place candidate AND is protected as the current state. That is a construction limit, not a policy
    bug, and it explains why the assertion has been unsatisfiable without anything being wrong in the engine.
    Both edits were reverted (build clean) rather than kept with rationales their runs refute.
-   **Disposition, and it is now clearly the operator's:** rebuild it around a shape where the endpoint
-   cannot serve -- which, given the above, means a SECOND session reusing the demoted closure, i.e. the
-   cross-session path from §2c. Retiring it instead (which an earlier version of this line offered, on the
-   claim that host materialization was covered elsewhere) is no longer an option on the evidence: it is the
-   positive H2D direction that only this scenario asserted, so retiring it retires that coverage for good.
-   The rebuild and the re-homing are one item, and it is **not fixed here** -- re-baselining the battery is
-   a piece of work in its own right.
+   **Disposition, and it is DONE (2026-09-26):** the shape this line prescribed -- "a SECOND session reusing
+   the demoted closure, i.e. the cross-session path from §2c" -- is what `state-image-restore` builds, and
+   it measures the state axis (`state_h2d_delta=1`, path=2 = `PrivateTurnClosure`) on two runs that agree exactly. **So `host_restore` is
+   NOT rebuilt: it keeps asserting the endpoint path plus the main/backend H2D direction, which is what it
+   can reach, and the state-image axis lives in the new scenario.** Retiring `host_restore` in favour of the
+   new one was the other option, and it stays rejected on this section's own evidence: `host_restore` is
+   what asserts the positive main/backend H2D direction, so retiring it retires that coverage for good.
    (`all` is excluded from the reachability battery because its own status is unresolved, NOT because it
    aborts on the golden mismatch still named in that script's header: the mismatch was repaired in
    `aea1b9ce`, and an unsaved run at 16:51 reported `all` `ok` twice -- but no log of it exists, so under
@@ -900,21 +916,28 @@ commit. A message citing a pre-rewrite id resolves for nobody after a push, so t
    request, not by config text), the wiring is in `~/ninfer-ensure.sh` so it survives a reboot, and the
    old 22 GB artifact was referenced- or held-open-checked before deletion (`df`: 655 ->
    676 GB free).
-6. **#17 — the STATE image's host-to-device restore has no end-to-end assertion. A COVERAGE gap, not a
-   suspect behaviour** (this is the residue of the finding the second review pass raised; it is a real
-   numbered item here because until now the citations to it resolved to nothing). The host-restore
-   scenario now asserts the endpoint path, no state image, and main+backend KV read back -- which re-homed
-   the positive main/backend direction that `5aff7b3c` deleted. But the STATE image's restore is flat
-   (delta 0) in that scenario -- OBSERVED in both saved runs, not "by construction": what the runs show is
-   the value, and the reason for it is an argument -- and `pressure-resume` cannot cover it
-   (`SpeculativeBackend::None` with `host_state_slots = 0`; its `restored_pages == 4` is MAIN-KV only), so
-   `grep -rn 'state_h2d_count' tests/` finds no assertion of a state-image restore anywhere. That is the
-   coverage behind `fc5d0cf3` (demote-before-H2D) and `9521103d` (the restore timer).
-   **Next instrument:** a scenario in which the demoted checkpoint is the reuse WINNER -- a second session
-   reusing the demoted closure (§2c) -- asserting `state_h2d_count` increases. **Validation:** run it twice
-   and require agreement, and make the success path print the delta: a `state_h2d_count` delta of 0 in both
-   runs would mean the scenario never restored anything, which is the silent-instrument failure this file
-   keeps recording.
+6. **#17 — CLOSED (2026-09-26): the STATE image's host-to-device restore is asserted end-to-end.** The
+   coverage behind `fc5d0cf3` (demote-before-H2D) and `9521103d` (the restore timer) now has a live
+   assertion, in the scenario the item itself prescribed: **`state-image-restore`**
+   (`tests/models/qwen3_5/test_engine_prefix_real.cpp`), whose route is §2c's cross-session adoption.
+   `host_restore` could not carry it -- its reuse winner is the SAME session's device-resident endpoint, so
+   the state image stays flat (delta 0, observed in both saved runs) -- and `pressure-resume` cannot either
+   (`SpeculativeBackend::None` with `host_state_slots = 0`). The new scenario keeps `host_restore`'s host
+   tier and its demotion step and changes only the reuser: session A publishes and is pressured into
+   demoting, then session B -- different `session_key`, identical prompt -- ADOPTS that checkpoint. It fires
+   the state axis, and the run says so twice, identically: `CROSS-SESSION-ADOPT lane=0
+   source_owner=6ae578ca007f4575 consumer_owner=6ae575ca007f405c count=1 reuse=2`, then
+   `state_h2d_delta=1 main_h2d_delta=3 backend_h2d_delta=2` (path=2, reused=305, outputs=5), `rc=0`, in a
+   GPU window of its own (the journal shows two stop/start cycles: these were two windows, not one), prod
+   restored after each. **Evidence:** `results/prefix-real-evidence/20260926-231449/manifest` (the two
+   hand-run windows; binary `2ec23c8e`, which predates the commit and so is NOT tied to the committed
+   source) and `results/prefix-real-evidence/20260926-232403/manifest` (two full `all` runs, binary
+   `21556de3`, `tree_diff_sha256=41c7cdba` -- this is the one that ties a run to the committed source,
+   and it is the one to cite). **The scenario asserts its own PRECONDITION first** (a state image MOVED device-to-host -- demotion or host
+   capture, since `state_d2h_count` is fed by both -- `state_d2h_count` up), because a run whose demotion never happened would measure
+   nothing and its flat H2D would read as a clean zero -- the silent-instrument failure this file keeps
+   recording. A negative stays a possible result: if the adopter had restored main/backend WITHOUT the state
+   image, that would have said the state axis is not on this path.
 ### W5 port: `guided_closure` before `root_maximal` — DESIGNED, NOT IMPLEMENTED (2026-09-26)
 
 Read to the point where an implementation is a directed task rather than a loop step, and recorded so that
@@ -4269,7 +4292,12 @@ binaries pass; and most of the A/B paragraph was already right (400 ms arm 16/16
 18.7-23.4 ms). It also corrected one of my citations: the 22:38 `rc=124` restore came from the *normal*
 step-4 path, not from `on_signal` — so it does not evidence the new handler.
 
-## PUSH READINESS (2026-09-25 00:45) — what a push would contain, and what each part claims
+## PUSH READINESS (2026-09-25 00:45) — HISTORICAL ONLY, not a plan item (2026-09-26)
+
+> **Superseded as an actionable section: publication is not tracked in this file (see Current state §0).**
+> Kept as the dated record of what the series contained at that time; nothing below is a next action,
+> and "readiness" here is not a claim about the tree as it stands today.
+
 
 Six commits are staged in `results/commit-split.md` (per-hunk: several files carry hunks from more than
 one group). Nothing is committed — commits are user-directed. **[SUPERSEDED 2026-09-25: 24 commits

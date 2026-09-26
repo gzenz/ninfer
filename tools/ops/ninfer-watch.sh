@@ -27,6 +27,10 @@
 set -uo pipefail
 
 UNIT="${UNIT:-ninfer.service}"
+# The sentinel is a SECOND unit and it is where the wedge is announced (`WEDGE (A/B): engine idle with
+# work pending Ns -- restarting ninfer`). Watching only ninfer.service means the one event that explains a
+# dead prod is invisible; on 2026-09-26 the watcher reported a bare health failure and no cause.
+SENTINEL_UNIT="${SENTINEL_UNIT:-ninfer-wedge-sentinel.service}"
 HEALTH_URL="${HEALTH_URL:-http://127.0.0.1:8080/health}"
 POLL_S="${POLL_S:-30}"
 LOGDIR="${LOGDIR:-$HOME/ninfer-watch}"
@@ -61,7 +65,7 @@ exe_sha=$(sha256sum "/proc/${mainpid}/exe" 2>/dev/null | awk '{print $1}')
 # is never seen. A tail replay would re-show the last 10 lines, which is not the same thing as covering the
 # gap -- it re-shows what was already reported and still misses everything older. Each arm writes its own
 # timestamped log, so a gap shows up as an interval no log covers rather than as silence inside one.
-JOURNAL_CMD="${JOURNAL_CMD:-journalctl -u $UNIT -f -q -n 0 --output=short-iso}"
+JOURNAL_CMD="${JOURNAL_CMD:-journalctl -u $UNIT -u $SENTINEL_UNIT -f -q -n 0 --output=short-iso}"
 # The request log is a SECOND instrument, not a duplicate of the journal: the journal says what the engine
 # did (evictions, recoveries), this says what a client got (reuse, prefill time). Both thresholds are a
 # first cut and are settable, so they can be tuned from the log rather than recompiled.

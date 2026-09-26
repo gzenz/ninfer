@@ -34,6 +34,7 @@ cat >"$work/journal" <<'EOF'
 2026-09-26T17:15:14+02:00 Strix bash[1]: [engine] post-recovery residual (recover): main_kv_pages=958 backend_kv_pages=0 device_state_slots=0 host_state_slots=1 host_kv_bytes=0
 2026-09-26T18:39:12+02:00 Strix systemd[1]: ninfer.service: Main process exited, code=killed, status=9/KILL
 2026-09-26T18:39:16+02:00 Strix systemd[1]: ninfer.service: Scheduled restart job, restart counter is at 1.
+2026-09-26T19:54:37+02:00 Strix bash[766721]: WEDGE (A/B): engine idle with work pending 163s — restarting ninfer (restart #2)
 EOF
 gawk -v logpath="$work/log" -f ninfer-watch.awk <"$work/journal" >"$work/alerts"
 cat >"$work/expected" <<'EOF'
@@ -49,6 +50,7 @@ cat >"$work/expected" <<'EOF'
 2026-09-26T17:15:14+02:00 Strix bash[1]: [engine] post-recovery residual (recover): main_kv_pages=958 backend_kv_pages=0 device_state_slots=0 host_state_slots=1 host_kv_bytes=0
 2026-09-26T18:39:12+02:00 Strix systemd[1]: ninfer.service: Main process exited, code=killed, status=9/KILL
 2026-09-26T18:39:16+02:00 Strix systemd[1]: ninfer.service: Scheduled restart job, restart counter is at 1.
+2026-09-26T19:54:37+02:00 Strix bash[766721]: WEDGE (A/B): engine idle with work pending 163s — restarting ninfer (restart #2)
 EOF
 total=$(wc -l <"$work/journal")
 rc=0

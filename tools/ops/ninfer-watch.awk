@@ -37,6 +37,13 @@ function alert(line) { print line; fflush(); keep(line) }
 # appears means the instrument stopped running, not that the count is zero.
 /checkpoint StateImage priced|fail-all cleanup|private victim evicted/ { keep($0); next }
 
+# THE WEDGE ITSELF. It lives in the SENTINEL's journal, not ninfer.service's: the sentinel is what
+# detects "engine idle with work pending" and restarts prod. The watcher tailed ONE unit, so on
+# 2026-09-26 it missed the most important event of the evening -- a live wedge at 19:51:54 followed by
+# the sentinel's restart -- and reported only "health 200 -> 000" three minutes later, with no cause.
+# JOURNAL_CMD now follows both units, and this rule alerts on it.
+/WEDGE|restarting ninfer/ { alert($0); next }
+
 # A KILLED OR RESTARTED UNIT, which is what took prod down on 2026-09-26 and which NOTHING here matched:
 # the `Killed [0-9]` token below is written for the KERNEL's "Killed process" message, and that message
 # never appears in a unit-scoped journal (WSL2 publishes no kernel log to the guest at all). What does

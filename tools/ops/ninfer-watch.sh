@@ -92,13 +92,20 @@ requests() {
 }
 
 health() {
+  # Two fixes here, both found by running it while the operator had stopped prod on purpose:
+  #  * a failure gave the code "000000", because curl's -w printed 000 AND the `|| echo 000` fallback
+  #    appended a second one -- so the reported code was not a code. Normalise instead of doubling.
+  #  * the FIRST reading being non-200 paged, which is wrong: arming a monitor during a planned stop (which
+  #    is exactly when this is done) is not an incident. A transition only means something once a reading
+  #    exists -- so a first non-200 is logged, and only later changes alert. Coming back UP does alert:
+  #    recovery is information, and the 2026-09-25 wedge is why liveness is watched at all.
   local last="" code
   while sleep "$POLL_S"; do
-    code=$(curl -s -o /dev/null -w '%{http_code}' -m5 "$HEALTH_URL" 2>/dev/null || echo 000)
-    [ -z "$code" ] && code=000
+    code=$(curl -s -o /dev/null -w '%{http_code}' -m5 "$HEALTH_URL" 2>/dev/null)
+    [ -n "$code" ] || code=000
     if [ "$code" != "$last" ]; then
-      local line="[watch] health ${last:-none} -> ${code} at $(date -Is)"
-      echo "$line"
+      local line="[watch] health ${last:-no-reading} -> ${code} at $(date -Is)"
+      if [ -n "$last" ]; then echo "$line"; fi
       echo "$line" >>"$LOG"
       last="$code"
     fi

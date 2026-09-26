@@ -195,6 +195,14 @@ while it lasts. In dev time that is the entire cost; in prod time it is the smal
   **running exe's hash**, not the build directory's: `sha256sum /proc/$(systemctl show -p MainPID --value
   ninfer.service)/exe` must equal `sha256sum build/apps/ninfer-serve`. A build-directory hash changes on
   every relink and proves nothing on its own.
+- **Stopping prod is not a "kill it if busy" operation.** The unit runs with `TimeoutStopSec=300` (raised
+  from 30 on 2026-09-26, `/etc/systemd/system/ninfer.service`; nothing else writes it, and
+  `~/ninfer-ensure.sh` does not, so an edit there is authoritative). A stop-timeout SIGKILL destroys the
+  engine's OWN shutdown path — `fail-all cleanup` and `post-recovery residual`, the only lines that report
+  whether a shutdown left occupancy unowned — and 30 s is not a budget a server can meet while unpinning
+  30 GiB of host KV and tearing down CUDA on WSL2: measured 39 s from `Stopping` to SIGKILL, so the shutdown
+  never ran and every stop silently lost that evidence. **A stop that still times out at 300 s is a HANG to
+  diagnose, not a budget to shrink back.**
 - **A wedged engine is NOT fixed by `~/ninfer-ensure.sh`.** That script is idempotent and
   reports "already running with desired config" whenever the unit is *active* — and a wedge
   is internal to the engine, not a unit failure (observed 2026-09-25: unit active,

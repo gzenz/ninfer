@@ -77,40 +77,39 @@ else
   rc=1
 fi
 # --- the request-log leg (tools/ops/ninfer-watch-requests.jq) -----------------
-# The cases that make the filter WRONG are asserted, including the negatives. Two of them are the
-# false alarms that a standalone "prefill > 2s" rule produced on live traffic (92.4% and 89.3% hit,
-# 2.6-3.1 s): at fraction 0.9 the 92.4% one must be silent, and the 89.3% one alerts only because it is
-# just under the fraction -- which is the rule doing its job, not the slow rule misfiring.
+# The negatives carry the value: two cases that a 0.9 threshold flagged on live traffic (89.3% and 92.4%
+# hit) must now be SILENT, because the fraction is set from the log's valley. A borderline case just under
+# the new threshold must still fire, so the boundary is tested and not merely moved.
 cat >"$work/requests.jsonl" <<JSONL
 {"event":"request_done","request":{"request_id":"sharedonly"},"result":{"prompt_tokens":89215,"prefix_cache_hit_tokens":23706,"prefix_reuse_path":"shared_stable_prefix","computed_prefill_tokens":65509},"timings_seconds":{"prefill":19.2}}
+{"event":"request_done","request":{"request_id":"boundary"},"result":{"prompt_tokens":60000,"prefix_cache_hit_tokens":33000,"prefix_reuse_path":"shared_stable_prefix","computed_prefill_tokens":27000},"timings_seconds":{"prefill":1}}
+{"event":"request_done","request":{"request_id":"wasflagged"},"result":{"prompt_tokens":82872,"prefix_cache_hit_tokens":74000,"prefix_reuse_path":"shared_stable_prefix","computed_prefill_tokens":8872},"timings_seconds":{"prefill":3.09}}
 {"event":"request_done","request":{"request_id":"goodslow"},"result":{"prompt_tokens":87848,"prefix_cache_hit_tokens":81208,"prefix_reuse_path":"shared_stable_prefix","computed_prefill_tokens":6640},"timings_seconds":{"prefill":2.61}}
-{"event":"request_done","request":{"request_id":"justunder"},"result":{"prompt_tokens":82872,"prefix_cache_hit_tokens":74000,"prefix_reuse_path":"shared_stable_prefix","computed_prefill_tokens":8872},"timings_seconds":{"prefill":3.09}}
 {"event":"request_done","request":{"request_id":"rootpath"},"result":{"prompt_tokens":65059,"prefix_cache_hit_tokens":0,"prefix_reuse_path":"root","computed_prefill_tokens":65059},"timings_seconds":{"prefill":14.5}}
 JSONL
-jq -rc --argjson fraction 0.9 --argjson max_prefill_s 2.0 -f ninfer-watch-requests.jq <"$work/requests.jsonl" >"$work/reqout"
+jq -rc --argjson fraction 0.6 --argjson max_prefill_s 2.0 -f ninfer-watch-requests.jq <"$work/requests.jsonl" >"$work/reqout"
 printf '%s\n' \
  '[watch] LOW PREFIX USE on reuse (SLOW): sharedonly path=shared_stable_prefix hit=23706/89215 computed=65509 prefill_s=19.2' \
+ '[watch] LOW PREFIX USE on reuse: boundary path=shared_stable_prefix hit=33000/60000 computed=27000 prefill_s=1' \
+ '[watch] reuse-ok: wasflagged path=shared_stable_prefix hit=74000/82872 computed=8872 prefill_s=3.09' \
  '[watch] reuse-ok: goodslow path=shared_stable_prefix hit=81208/87848 computed=6640 prefill_s=2.61' \
- '[watch] LOW PREFIX USE on reuse (SLOW): justunder path=shared_stable_prefix hit=74000/82872 computed=8872 prefill_s=3.09' \
  >"$work/reqexpected"
 if diff -u "$work/reqexpected" "$work/reqout" >"$work/reqdiff"; then
-  echo "[watch-test] requests PASS: $(grep -c . "$work/reqout") of 4 classified"
+  echo "[watch-test] requests PASS: $(grep -c . "$work/reqout") of 5 classified"
 else
   echo "[watch-test] requests FAIL:" >&2
   cat "$work/reqdiff" >&2
   rc=1
 fi
-if grep -q 'rootpath' "$work/reqout"; then
-  echo "[watch-test] requests FAIL: a root-path request produced output (nothing was reused)" >&2
-  rc=1
-else
-  echo "[watch-test] requests: root path correctly silent"
-fi
-if grep -q 'goodslow' "$work/reqout" && grep -q 'reuse-ok: goodslow' "$work/reqout"; then
-  echo "[watch-test] requests: the 92.4% + 2.6s false alarm is silenced"
-else
-  echo "[watch-test] requests FAIL: the 92.4%/2.6s case must not alert" >&2
-  rc=1
-fi
+# Only assert NOT-flagged. `rootpath` is absent from the output entirely (a root path emits nothing, which is
+# the point), so a check that also demanded its presence failed on correct behaviour.
+for silent in rootpath wasflagged goodslow; do
+  if grep -q 'LOW PREFIX USE.*'"$silent" "$work/reqout"; then
+    echo "[watch-test] requests FAIL: $silent must not be flagged as low use" >&2
+    rc=1
+  else
+    echo "[watch-test] requests: $silent correctly NOT flagged"
+  fi
+done
 
 exit "$rc"

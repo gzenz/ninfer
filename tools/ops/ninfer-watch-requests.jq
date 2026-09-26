@@ -18,9 +18,12 @@
 # second branch unreachable (the first would already have fired), and a branch that cannot fire is the
 # defect this repo keeps recording. So there is one alert, and slowness is carried inside it.
 #
-# THRESHOLDS: `fraction` 0.9 is a first cut -- the operator's reported cases were 36% and 76% hit -- and it
-# is deliberately high, because "reused something, re-prefilled a lot" is the interesting shape. Both
-# thresholds are arguments so they can be set from the log rather than recompiled. Every request_done with a
+# THRESHOLD: `fraction` is 0.6, SET FROM THE LOG rather than chosen. Over 4,439 non-root reuse requests
+# with prompt >= 20k the hit fraction is strongly bimodal -- 0.1-0.5 holds 1,016 requests (the
+# shared-prefix-only cluster) and 0.9-1.0 holds 3,292 (healthy), with only 69 requests anywhere in the
+# 0.4-0.8 valley. The threshold belongs in that valley. The first cut, 0.9, sat ON the healthy cluster's
+# floor, so an 89%-reuse request was reported as low use -- measured noise, not judgement. Both thresholds
+# are arguments so they can be re-set from the log as traffic changes. Every request_done with a
 # non-root path is LOGGED either way, so "no alert" can be told from "no reuse happened at all".
 select(.event == "request_done") |
 (.result // {}) as $r |

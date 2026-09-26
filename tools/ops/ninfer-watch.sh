@@ -66,7 +66,12 @@ JOURNAL_CMD="${JOURNAL_CMD:-journalctl -u $UNIT -f -q -n 0 --output=short-iso}"
 # did (evictions, recoveries), this says what a client got (reuse, prefill time). Both thresholds are a
 # first cut and are settable, so they can be tuned from the log rather than recompiled.
 REQUEST_LOG="${REQUEST_LOG:-$HOME/ninfer-requests.jsonl}"
-WATCH_REUSE_MIN_FRACTION="${WATCH_REUSE_MIN_FRACTION:-0.9}"
+# 0.6, SET FROM THE LOG (2026-09-26), not chosen: over 4,439 non-root reuse requests with
+# prompt >= 20k the hit fraction is bimodal -- 0.1-0.5 (1,016 requests, the shared-prefix-only cluster)
+# and 0.9-1.0 (3,292, healthy) -- with only 69 requests in the 0.4-0.8 valley. The threshold belongs in
+# that valley; the first cut of 0.9 sat on the healthy cluster's floor and so called an 89%-reuse request
+# "low use".
+WATCH_REUSE_MIN_FRACTION="${WATCH_REUSE_MIN_FRACTION:-0.6}"
 WATCH_REUSE_MAX_PREFILL_S="${WATCH_REUSE_MAX_PREFILL_S:-2.0}"
 AWK_FILTER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/ninfer-watch.awk"
 JQ_FILTER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/ninfer-watch-requests.jq"

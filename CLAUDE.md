@@ -37,11 +37,15 @@ for the session that produced it -- read and edit `plan.md`, not those.
   of the wedge (tasks #9), visible at the moment it happens rather than hours later in `/stats`.
 
   **The zero case proves nothing (corrected 2026-09-26).** `fail_all_locked` also runs on the
-  **shutdown** path (`engine_core.h:2152-2178`), so every clean prod stop logs this line for an empty
+  **shutdown** path (`engine_core.h:2170-2196`), so every clean prod stop logs this line for an empty
   engine. On 2026-09-26 I read 19 of those zero lines as "19 recoveries, residual zero" and wrote it
   into plan.md; every one was a shutdown, with `server stopped` before it and `WORKER RECOVER` = 0 in
-  the whole journal. A residual line is evidence **only when a `WORKER RECOVER` or `WORKER CRASH`
-  precedes it**; alone it is the noise of a restart -- and with GPU windows in use there is one per
+  the whole journal. **A residual line is evidence when it is NON-ZERO**, whatever produced it; an all-zero
+  one is the noise of a restart, and with GPU windows in use there is one per
+  window. (The rule was first written as "only when a `WORKER RECOVER`/`WORKER CRASH` precedes it", which
+  both missed the `WORKER OOM` path -- the OOM catch prints `WORKER OOM: … - recovering`, then the same
+  recovery, then the residual -- and would have discarded a non-zero `(fail-all)` line. The line carries
+  its own discriminator, `(recover)` or `(fail-all)`; the amount is what a reader needs.)
   window.
 
   `checkpoint StateImage INCOMPLETE` is #11(b)'s alerting line: checkpoint pricing found a state image
@@ -67,6 +71,20 @@ for the session that produced it -- read and edit `plan.md`, not those.
   and does appear in `src/` (30 files for the alternation; `cudaError` alone is 29), so it is NOT in that class: the corrected claim here used to list
   it among the ones that match nothing, which a `grep -rl cudaError src/` refutes. An engine instrument
   that prints to the journal belongs here; a token nothing can ever emit does not.
+- **The pattern is now a program: `tools/ops/ninfer-watch.sh`** (filter `tools/ops/ninfer-watch.awk`,
+  contract tested by `tools/ops/ninfer-watch-test.sh`, whose fixture is the specification):
+  * a `post-recovery residual` line **alerts when it is non-zero, whatever its prefix**, and an all-zero
+    one is log-only -- `fail_all_locked` also runs on the shutdown path, which is how 19 null readings got
+    mistaken for 19 healthy recoveries. (An earlier version armed on `WORKER RECOVER`/`WORKER CRASH` and
+    alerted only when armed: that dropped a non-zero residual after `WORKER OOM` -- the wedge signature --
+    and a non-zero `(fail-all)` line. `WORKER OOM` is now in the alert set explicitly.)
+  * `private victim evicted: demotable=1` is an **alert** even though it is not an error: it is #6's
+    evidence (an eviction taken while the host tier had room), and a crash-only pattern drops it.
+  It also **polls `/health` and reports transitions**, because the 2026-09-25 wedge had the unit `active`,
+  an empty scheduler, and nothing in the journal to grep. The token list above is its alert set; the
+  insight lines whose *absence* is the signal -- `checkpoint StateImage priced`, `fail-all cleanup`, and
+  every `private victim evicted` -- go to the log file only (`~/ninfer-watch/latest.log`), so the alert
+  stream stays signal and the log still proves the instrument ran.
 - One monitor at a time (duplicates double-notify). After stopping one,
   `pkill -f 'journalctl -u ninfer'` any orphaned process.
 
@@ -110,6 +128,11 @@ cost an outage:
 - the swap is ONE blocking foreground command, never split, never detached;
 - never put the string `build/apps/ninfer-serve` in a command line that runs `tools/e2e/e2e-swap.sh`
   (its `pkill -f` matches the caller and has killed this session three times);
+- **and that rule is about `-f`, not about that string.** Any `pkill -f`/`pgrep -f` pattern written into a
+  Bash tool call matches the *calling shell's own command line*, including text that is only a regex:
+  `pkill -f 'journalctl -u ninfer'` killed its own shell on 2026-09-26 and returned **exit 144** with no
+  output, which reads like a failed kill rather than a self-kill. Bracket one character (`ninfe[r]`) so the
+  pattern cannot match its own text, or put the pattern in a script and call the script;
 - after any window or swap, prod is restored and *verified* — `/health` 200, wedge sentinel active;
 - the sentinel is stopped FIRST and re-armed LAST around a window;
 - one journal monitor at a time.
@@ -204,8 +227,22 @@ while it lasts. In dev time that is the entire cost; in prod time it is the smal
 - Stats: `curl -s http://127.0.0.1:8080/stats` → host-KV census (per-tier
   {entries,bytes}: dead/live/idle/active), host-KV unit bytes, `pressure.*`,
   `scheduler.*`.
-- Eviction lines carry `tier=` (dead/live/idle/active); the reaper logs
-  `[host-state-pool] reap=stale`.
+- **The eviction line is**
+  `[engine] private victim evicted: demotable=%d frontier=%u endpoint=%d rewrite=%d anchors=%zu
+  host_state_slots=%u/%llu host_kv=%zu/%llu checked=%llu demotable_total=%llu`
+  (`materialization.cpp:2157`), rate-limited to the first 8 and then every 512th. **Corrected 2026-09-26:**
+  the two sentences that stood here -- "eviction lines carry `tier=` (dead/live/idle/active)" and "the
+  reaper logs `[host-state-pool] reap=stale`" -- name instruments that **cannot emit anything**:
+  `grep -rn 'host-state-pool' src/` and `grep -rn 'reap=' src/` are both empty, and `tier=` occurs in
+  `src/` only inside `frontier=`. They are pre-v3 strings, and they are the same defect this file warns
+  about for monitor tokens. The per-tier `{dead,live,idle,active}` census is real, but it is in `/stats`
+  (the line above), not in the journal. `tools/ops/ninfer-watch.sh` reads the journal for the rest.
+- **Evidence logs are gitignored on purpose (`*.log`, `.gitignore:45`) and are NOT tracked.** What is
+  committed is the MANIFEST beside them: it names the binary's sha256, the artifact, `git-head`, and -- for
+  runs made by `tools/e2e/prefix-real-evidence.sh` -- each log's own sha256 and rc. So a claim cites
+  `results/<run>/manifest` in the repo and the log locally. Two consequences worth stating: a log that was
+  never written down is not evidence (the defect the 2026-09-26 review found), and force-adding a log past
+  the ignore rule is a mistake -- made that same day, and undone.
 
 ## Commits
 - User-directed. Conventional Commit subjects (`fix(scope):`, `feat(scope):`,

@@ -27,8 +27,9 @@ if [ ! -x "$BIN" ]; then echo "[reach] no such binary: $BIN" >&2; exit 2; fi
 
 # Every in-process scenario of this target that builds a capture, `vision` included -- it generates its
 # own image (`gradient_ppm()`), needs no fixture, runs two turns with reuse enabled and asserts a nonzero
-# reuse. `all` is excluded: it fails early on a pre-existing golden mismatch ("registered tokenizer/chat
-# template changed the thinking prompt golden"), so a pass or a fail there would say nothing here.
+# reuse. `all` is excluded because its own status is unresolved: the golden mismatch that used to abort it
+# ("registered tokenizer/chat template changed the thinking prompt golden") was repaired in `66157867`, and
+# an unsaved run after that reported `ok` twice -- with no log kept, so it is evidence for nothing yet.
 SCENARIOS=(
   recycling-capture
   rewrite-checkpoint
@@ -106,7 +107,10 @@ for scenario in rewrite-checkpoint-shared shared-replacement; do
   env -u NINFER_CAPTURE_PROBE NINFER_PREFIX_REAL_SCENARIO="$scenario" timeout 600 "$BIN" >"$log" 2>&1
   rc=$?
   if [ "$rc" = 0 ]; then
-    echo "[reach] $scenario: PASSES without the probe (informational only -- the goldens were CORRECTED\n          2026-09-26, so these two pass either way and this phase no longer discriminates anything)"
+    # The `\n` here used to be literal: `echo` does not interpret it, so the banner printed the two
+    # characters and wrapped mid-sentence in every battery log. Use a real break.
+    printf '[reach] %s: PASSES without the probe (informational only -- the goldens were CORRECTED\n' "$scenario"
+    printf '[reach]   on 2026-09-26, so these two pass either way and this phase no longer discriminates anything)\n'
   else
     echo "[reach] $scenario: fails the same way without the probe (rc=$rc) -- not probe timing;"
     echo "[reach]   whether it pre-dates the diff is still unestablished; read $log"

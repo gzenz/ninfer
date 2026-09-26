@@ -752,15 +752,18 @@ void ProgramImpl::prepare_materialization(MaterializationTransaction& transactio
                                                }()
                                              : 0ULL
                                        : 0ULL;
-            // Detector, not a fix: a private checkpoint adopted by a different session should be
-            // impossible by construction, so this is evidence only if a denominator accompanies it.
-            // Gated (it was the one new print without a NINFER_MAT_DEBUG guard) and reported as a
-            // finding: if it ever fires, the adoption must be rejected, not merely logged.
-            // W1.2: counted in every build (a private checkpoint adopted by another session should be
-            // impossible by construction, so the count is the evidence and the print is rate-limited);
-            // still not a rejection, because it has never been observed to fire and rejecting would
-            // turn a rare mis-service into a request failure. The print stays gated so a served run
-            // does not pay for it.
+            // Detector, not a fix, and CORRECTED 2026-09-26 -- the two sentences this replaced
+            // ("should be impossible by construction", "must be rejected, not merely logged") were
+            // wrong about the design. Cross-session reuse is deliberate and safe: the candidate
+            // inspection forces `retain = true` when the sessions differ
+            // (`resource_manager.h:420-423`), so the adopter forks the source's endpoint and the other
+            // session keeps its state -- the lifetime coupling that flag exists to prevent. What is
+            // ruled out is not the adoption but the serving of FOREIGN content, and that is ruled out
+            // elsewhere: `prefix_matches(prompt, source->ledger, …)` requires the requester's own
+            // prompt tokens to equal the source's ledger prefix (`request_plan.cpp:582-636`).
+            // So this counts an event that is expected, and is worth having only as the denominator
+            // that says whether the path is reached at all. The print stays gated so a served run does
+            // not pay for it.
             if (source_owner != 0 && consumer_owner != 0 && source_owner != consumer_owner) {
                 ++cross_session_adoptions_;
                 if (cross_session_adoptions_ <= 8ULL) {
@@ -2130,6 +2133,16 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
                 // path -- so it reported `frontier=0 refs=0` for every eviction and told a reader nothing.
                 // These fields come from the state itself and are the ones a demote-first policy weighs:
                 // how much work the victim represents, and which restorable checkpoints it holds.
+                //
+                // WHAT THIS MEASURES, since a counter read for more than it measures is a false result
+                // (noted by the review of `5aff7b3c`, and it is right): the check runs at the DECISION
+                // point, before `release_materialization_victim` runs, so (a) `usage` still includes the
+                // victim's OWN host pages, which a demote would free and which are not yet free here, and
+                // (b) an eviction that subsequently throws is counted anyway. `demotable` is therefore
+                // "the host tier had room at the moment of the decision", not "this victim would have fit
+                // after demotion" -- and neither the planner's degradation-unit weighting nor the
+                // victim's value is modelled by it. It is the denominator evidence for #6, not a verdict
+                // on the policy.
                 {
                     const SequenceState& victim = continuation_states[work.continuation_index];
                     const PhysicalUsageSnapshot usage    = physical_usage();

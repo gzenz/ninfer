@@ -2115,11 +2115,17 @@ private:
                          usage.device_state_slots, usage.host_state_slots, usage.host_kv_bytes);
             std::fflush(stderr);
             // #9: the amount is printed above; this names the owner -- but ONLY when there is something
-            // to name. The census walks the KV stores, and this function also runs on the shutdown path
-            // (`fail-all`), where the stores may already be torn down: called unconditionally it
-            // segfaulted every scenario at teardown, which is how this guard was learned (the `try`
-            // below cannot catch a segfault, and the crash also swallowed the scenarios' own `ok` line,
-            // because stdout was never flushed). A zero residual needs no owner.
+            // to name. A zero residual needs no owner, and the census itself is the expensive part.
+            //
+            // CORRECTED 2026-09-26 (this comment used to blame teardown -- "also runs on the shutdown
+            // path (`fail-all`), where the stores may already be torn down" -- and that attribution was
+            // wrong): the guard is here for the residual check, and the crash that taught it was a NULL
+            // STORE, not a torn-down one. Under gdb the fault was `census(this=0x0, label="backend")`:
+            // `backend_kv_addresses` is only constructed when `backend_kv_cache()` is non-null
+            // (`program_impl.cpp:174-181`), so in every scenario without a backend KV cache the pointer
+            // is null for the whole life of the engine, not merely at the end of it. The lesson that
+            // holds is narrower than the old sentence: a `try` cannot catch a segfault, and a fault here
+            // is worth the null-check in `resource_census` rather than a call-site condition.
             if (usage.device_main_kv_pages != 0 || usage.device_backend_kv_pages != 0 ||
                 usage.device_state_slots != 0 || usage.host_state_slots != 0 ||
                 usage.host_kv_bytes != 0) {

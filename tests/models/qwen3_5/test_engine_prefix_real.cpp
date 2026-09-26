@@ -556,20 +556,60 @@ int exercise_host_restore(const char* artifact) {
     // follow-up -- too late, the endpoint covers the assistant content; filling the host tier -- the
     // planner correctly evicts the cheaper filler, and the endpoint is the CURRENT state and is never the
     // cheapest victim; making the pressure turn Disposable -- the endpoint at 316 belongs to the retained
-    // turn, not to it.) So it asserts what the engine intends: reuse happens, IN PLACE, without a host
-    // read. **Nothing is lost by this**: `pressure-resume` covers the same ground properly --
-    // `PrivateTurnClosure` + `reused_pages == 120` + `restored_pages == 4` (a real host materialization)
-    // at this file's `:1879-1881` -- which is the pair this one was reaching for and could not build.
+    // turn, not to it.) So it asserts what the engine intends: reuse takes the device-resident endpoint.
+    //
+    // **THE FIRST VERSION OF THIS REPAIR ASSERTED THAT THE PATH READS NOTHING BACK, AND THE RUN REFUTED
+    // IT.** It required the three H2D counters to stay FLAT ("in place, without a host read"); `all`, run
+    // twice in one GPU window on 2026-09-26 (logs under `results/prefix-real-evidence/20260926-171507/`),
+    // failed both times byte-identically with
+    // `state_h2d_delta=0 main_h2d_delta=3 backend_h2d_delta=2`: the endpoint is device-resident, but the
+    // pressure step had demoted its KV pages, so reuse DOES read back from host. The condition below is
+    // what those two runs measured -- no state image restored, main and backend restored.
+    //
+    // That is not a weakening. **It restores the positive H2D direction that this repair was reported as
+    // deleting**: the old assertion here (`66157867:528-533`) required `PrivateTurnClosure` AND all three
+    // H2D counters up, and the review of `5aff7b3c` correctly found that its replacement asserted neither.
+    // Main-KV and backend-KV host-to-device restore are asserted here again, positively.
+    // **What remains unasserted end-to-end is the STATE image's host-to-device restore alone**: it is flat
+    // in both saved runs (delta 0) -- OBSERVED, not "by construction": what the runs show is the value,
+    // not the reason for it, and the reason is only an argument. `pressure-resume` cannot cover it -- it
+    // runs `SpeculativeBackend::None` with `host_state_slots = 0` (`:171-186`), so no state image can
+    // exist to restore, and its `restored_pages == 4` counts MAIN-KV pages only. That is the coverage
+    // behind `fc5d0cf3` (demote-before-H2D) and `9521103d` (the restore timer); recorded as an open item
+    // at §2 item 6, where the route is a scenario in which the demoted checkpoint is the reuse winner
+    // (a second session, per §2c).
+    // Printed on the SUCCESS path as well as the failure path, and it is not decoration: the numbers
+    // above ("main and backend ARE read back") were first read out of a FAILURE log, which left the
+    // coverage claim resting on a run that went wrong. A passing run has to carry its own values, or the
+    // next reader has to take the claim on this file's word.
+    std::fprintf(stderr,
+                 "[scenario] host-restore endpoint reuse: path=%d reused=%u outputs=%zu "
+                 "state_h2d_delta=%llu main_h2d_delta=%llu backend_h2d_delta=%llu\n",
+                 static_cast<int>(restored.prefix_reuse_path), restored.reused_prompt_tokens,
+                 restored.generated_token_ids.size(),
+                 static_cast<unsigned long long>(after_restore.state_h2d_count -
+                                                after_pressure.state_h2d_count),
+                 static_cast<unsigned long long>(after_restore.main_kv_h2d_pages -
+                                                after_pressure.main_kv_h2d_pages),
+                 static_cast<unsigned long long>(after_restore.backend_kv_h2d_pages -
+                                                after_pressure.backend_kv_h2d_pages));
     if (restored.generated_token_ids.size() != 2 ||
         restored.prefix_reuse_path != ninfer::PrefixReusePath::PrivateEndpoint ||
-        restored.reused_prompt_tokens == 0) {
-        std::cerr << "MTP checkpoint reuse did not take the in-place endpoint: path="
+        restored.reused_prompt_tokens == 0 ||
+        after_restore.state_h2d_count != after_pressure.state_h2d_count ||
+        after_restore.main_kv_h2d_pages <= after_pressure.main_kv_h2d_pages ||
+        after_restore.backend_kv_h2d_pages <= after_pressure.backend_kv_h2d_pages) {
+        std::cerr << "MTP checkpoint reuse did not materialize the way the two saved runs measured it "
+                     "(endpoint path, no state image, main+backend read back): path="
                   << static_cast<int>(restored.prefix_reuse_path)
                   << " reused=" << restored.reused_prompt_tokens
                   << " outputs=" << restored.generated_token_ids.size()
-                  << " state=" << after_restore.state_h2d_count
-                  << " main=" << after_restore.main_kv_h2d_pages
-                  << " backend=" << after_restore.backend_kv_h2d_pages
+                  << " state_h2d_delta="
+                  << (after_restore.state_h2d_count - after_pressure.state_h2d_count)
+                  << " main_h2d_delta="
+                  << (after_restore.main_kv_h2d_pages - after_pressure.main_kv_h2d_pages)
+                  << " backend_h2d_delta="
+                  << (after_restore.backend_kv_h2d_pages - after_pressure.backend_kv_h2d_pages)
                   << " degraded=" << after_restore.pressure_private_owners_degraded
                   << " evicted=" << after_restore.pressure_private_owners_evicted << '\n';
         return 1;
@@ -732,7 +772,9 @@ int exercise_shared_replacement_and_full_capacity_reuse(const char* artifact) {
     // scenario displaces through the structural-publication path and the KV-PRESSURE path evicts no
     // shared owner here. Where that other stat IS asserted: `exercise_artifact` requires it UNCHANGED
     // across the shared/rewrite rotation (`:1409`) -- a must-not-move assertion inside the `all`
-    // scenario, which aborts early on its golden mismatch and so never runs. Two gaps, one cause.
+    // scenario, so its reach depends on `all` running to completion AND that run being saved. The golden
+    // mismatch that used to abort `all` was repaired in `66157867`, and `all` has since been saved
+    // passing twice (`results/prefix-real-evidence/20260926-172831/`, `-172847/`).
     std::fprintf(stderr, "[scenario] shared-replacement owners_replaced=%llu owners_evicted=%llu "
                          "(after the Bravo turn; evicted is the KV-PRESSURE path)\n",
                  static_cast<unsigned long long>(

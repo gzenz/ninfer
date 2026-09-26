@@ -556,6 +556,10 @@ runtime::ContextTransactionReserveStatus ProgramImpl::reserve_active_capture_imp
                 shared_prefix_slots[index].role    = SharedPrefixSlotRole::ReservedReplacement;
                 // Counted HERE, at the decision, because this is the only place that knows a catalogued
                 // shared owner is being displaced. Nothing else reported it -- see the field's comment.
+                // Consequence, stated so this counter is not read as more than it is: the abort path
+                // (`abort_prepared_capture`, the `Catalogue` arm below) puts the slot back without
+                // decrementing, so this counts reservations that reached the path, and a reservation
+                // that was undone is included.
                 ++shared_replacements_;
             } else {
                 for (std::uint32_t index = 0; index < shared_prefix_capacity; ++index) {

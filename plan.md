@@ -32,17 +32,77 @@ correction history lives *there*, not here — this section states what is true 
 
 ### 0. Where things stand
 
-- **Tree**: `master` tip **`66157867`** (today's commits: `8925190b`, `3bebc96c`, `66157867`), **none
-  pushed**. Working tree NOT clean: **15 tracked files modified and 30 paths untracked** -- the
-  uncommitted work is listed and verified in the task list (`#12`), and it includes the census null-check,
-  so its state matters. Untracked: `CLAUDE.md`, `plan.md`, `results/`, `tests/fixtures/frontend/`, and the
-  new `tools/e2e/{recycling-reachability,n9-evidence}.sh`.
-- **Prod**: `:8080` (`:8081` stats), active, **serving Swift-1.5** (`~/ninfer-models/swift15/`), and
-  **restarted repeatedly today** by GPU windows and deploys -- last start 2026-09-26 16:54:30, exe
-  `3d78489da8e2`, which equals the current `build/apps/ninfer-serve`. Earlier today it ran binaries built
-  BEFORE the last edits, so any reading of its journal must be tied to a start time, not assumed current.
-- **Acceptance**: **STALE — the tree has changed since it was taken** (three commits and 15 uncommitted
-  files today), so the gate below describes a build that is no longer what runs. Re-run it before quoting
+- **Tree**: the unpushed series is `d4386bcf`, `765f305f` (#9's census and fault site; message rewritten),
+  `ee4c4748`, `aea1b9ce`, `e7c07e60` (`5aff7b3c` with its MESSAGE amended -- same tree `98e7cf08…`), and
+  the repair commit, which is the tip. **Read the tip hash from `git log -1`, never from this file** --
+  a hash written here goes stale the moment this file is amended into it, which is what happened to the
+  three revisions of this bullet before (one of them named a superseded hash on its first line while its
+  next sentence told the reader not to trust it).
+- **The series is NOT pushable as it stands: the fork has MOVED.** Live `fork/master` is `e919931a` and
+  local tracking was `da0298c8` (stale), so `git rev-list --left-right --count fork/master...HEAD` reads
+  `1  50` -- one commit on the remote (`Update README.md`) that this branch lacks. A plain push is
+  rejected, and a force would discard that commit, which is not in this clone. **Integrating it is the
+  first step of the push**, not a detail of it. Every range in this file computed before 2026-09-26 18:0x
+  was computed against the stale ref, and `origin/master` is stale too (`e31bc99b` live vs `594930e7`
+  local).
+  What those revisions got wrong, corrected: the tracked tree is CLEAN once this commit lands (they listed
+  five modified files); `5aff7b3c` still RESOLVES as an object (`git cat-file -t 5aff7b3c` -> `commit`;
+  `--amend` leaves it until gc), so "a hash that no longer resolves" was false; and the evidence binary was
+  built from a DIRTY tree -- `171507`'s manifest says `git_dirty_paths=31` -- so "the tree it was built
+  from is unchanged" was false too. Untracked now: `results/` (logs are gitignored by policy) and
+  `tests/fixtures/frontend/`; the committed artifact for a run is its `manifest`.
+- **Two review passes (opus, 2026-09-26) on the `5aff7b3c` series; the SECOND said NOT fit to push.** The
+  first found nine defects in `5aff7b3c`, the second found ten in the repair, including two that blocked
+  the push. Both passes' actionable findings are repaired in the repair commit.
+
+  **Blocker 1 was MY REFUSAL, and the refusal was wrong.** The first pass asked for `765f305f`'s subject to
+  be reworded "since its change was later removed as dead"; I refused, arguing the fix was alive at HEAD
+  `materialization.cpp:93-103` after the `04350ba9` refactor. The second pass refuted that, and the
+  chronology is checkable: `git merge-base --is-ancestor 04350ba9 765f305f` is TRUE and `04350ba9` is
+  dated **2026-09-14 -- twelve days EARLIER**, so it cannot have introduced anything later; and the
+  construction reserve was already in `765f305f`'s PARENT
+  (`git show 765f305f^:…/materialization.cpp` -> `:95-96`), which `ee4c4748`'s own message says in as many
+  words ("dead on both branches"). **I had read a `git blame` hit -- which names a line's ORIGIN -- as
+  evidence about ORDER.** `765f305f`'s message is therefore rewritten in history (it claimed "reproduced on
+  demand here and fixed"), and its window is recorded as **STILL OPEN at HEAD**.
+
+  **Blocker 2 was the logs.** `git rm --cached` on top of a commit removes nothing from history, so the
+  policy required rewriting the unpushed commits rather than another commit on top; the range now adds ZERO
+  logs (`git log -p origin/master..HEAD --name-status | grep -c '^A.*\.log$'` -> 0).
+
+  The rest, each fixed where a reader meets it rather than here: that commit's **"nothing is lost" was
+  FALSE** (it deleted the real-engine assertion of the host-to-device restore direction, parent
+  `aea1b9ce:528-533`, and substituted a claim about `pressure-resume` that cannot hold -- §2 item 6); **main-KV
+  and backend-KV H2D restore are re-homed by measurement**, on the deltas two saved runs agreed on, with
+  the state image as the residue (§2 #17); the battery now passes with its denominator saved
+  (`12 scenarios, reachable=0, failed-or-inconclusive=0, assessments=184`); the `all` "passes twice" claim
+  was refuted by saving the runs (two failed byte-identically, which is how the false "no host read"
+  assertion was found) and then REPLACED by the passing saved pair (`172831`, byte-identical, plus
+  `172138` for the earlier version of the assertion) that the record had never cited; the watcher's blindness to a non-zero residual after `WORKER OOM`,
+  `journalctl -f`'s tail replay, and the manifest's missing `tree.diff` are all fixed in the same commit.
+  **Convergence requires a fresh pass with zero actionable defects** (`CLAUDE.md`, Commits) -- not this
+  list of repairs.
+- **Prod**: `:8080` (`:8081` stats), **running the current build** -- restarted 2026-09-26 17:35, running
+  exe `e706e96090bd199d` == `build/apps/ninfer-serve` rebuilt from this tree, verified by hashing
+  `/proc/767167/exe` AND by serving (`/v1/messages` 200 with a well-formed reply, `/stats` answering).
+  Before that it ran `0634afb8…`, which **predated the census null-check committed in `ee4c4748`** --
+  established by disassembly, not by hash: `resource_census` was 10 instructions in that exe and 17 in the
+  build from the committed tree. A hash of the build *directory* proves nothing (it changes on every
+  relink); the running exe's hash is what ties a reading to a build.
+- **Monitor** (armed 17:54:41 (first arm; re-armed after the filter changed), 30 min -- re-arm on expiry): `tools/ops/ninfer-watch.sh`, log
+  `~/ninfer-watch/latest.log`, whose first line records the running exe's sha256. Validated twice over,
+  because a filter that matches nothing reads exactly like a quiet system: by
+  `tools/ops/ninfer-watch-test.sh` (exact alert set from a synthetic journal -- **10 of 16 lines**, run
+  twice, identical) and live, by driving prod and watching the log grow with
+  `checkpoint StateImage priced` (3 -> 6 lines on one request).
+  Its rule, corrected on the third pass: **a non-zero residual ALERTS whatever its prefix, an all-zero one
+  is log-only**; `WORKER OOM` alerts explicitly; and `private victim evicted: demotable=1` is an ALERT
+  because it is #6's evidence rather than an error. The first version armed on
+  `WORKER RECOVER`/`WORKER CRASH` instead, which silently dropped a non-zero residual after an OOM. The
+  test found three bugs that would each have made it silently
+  useless -- `gawk`'s `log` builtin as a variable name, and a rule-ordering swallow.
+- **Acceptance**: **STALE — the tree has changed since it was taken** (the series has since been rewritten
+  and the tree committed), so the gate below describes a build that is no longer what runs. Re-run it before quoting
   it; the rule that made it quotable is the one to keep: only an artifact whose `build_id` equals the
   running exe's hash describes the running server. The PASS itself was taken on `9617ce1a517a@1790365993` (gate
   `[]`, reuse `{root: 4, private_endpoint: 12}`, `n_errors 0`), identity checked by hashing the running
@@ -52,8 +112,11 @@ correction history lives *there*, not here — this section states what is true 
   binary by hash of `/proc/$(ss -ltnp | grep :8080 | grep -oP 'pid=\K[0-9]+')/exe`, never by
   `build/apps/ninfer-serve`** -- the build directory is replaced by the next rebuild (it already has
   been: the build now hashes `d61297a2c837`), so that rule breaks the moment anything is compiled. The
-  artifact's `build_id` must equal the *running* exe's hash. Prod's exe is currently an unlinked
-  `(deleted)` inode from a 17:39 build; state which commit it corresponds to, not just its id.
+  artifact's `build_id` must equal the *running* exe's hash. **Corrected 2026-09-26:** the sentence that
+  stood here said prod's exe was "an unlinked `(deleted)` inode from a 17:39 build" -- it is neither:
+  `ls -l /proc/767167/exe` -> `build/apps/ninfer-serve`, not deleted, from the 17:35 restart whose exe
+  `e706e96090bd199d` is this tree (§0's Prod bullet). State which commit an exe corresponds to, not only
+  its id.
 - **This file is the single record** since 2026-09-25: `results/HANDOFF.md` was merged into it and
   deleted, and `~/.claude/plans/ticklish-sniffing-wadler.md` is a superseded duplicate. Read and edit
   `plan.md`.
@@ -77,6 +140,27 @@ wedge; when it says `#13`, the accounting underflow.
 | #8 | — | the forced-token row binding (fixed, unverifiable) |
 | #11 | — | W1's two residues |
 | #5 | — | W1 (complete) |
+| #17 | `#17` | the state-image H2D coverage gap (§2 item 6) |
+| #16 | — | the 2026-09-26 review repair (a session task, not a code id) |
+
+**Commit-id map for the 2026-09-26 rewrite.** Three `filter-branch` passes rewrote the unpushed series --
+first to drop the 117 force-added logs and to stop `8925190b` claiming a fix it never made, then twice more
+to re-hash the ids those messages cite. Older hashes still appear in the narrative above and in
+`~/ninfer-watch/` logs, so the mapping is kept here rather than left to be rediscovered: one hash chased
+through descendants is how a message ends up citing a commit that no longer exists.
+
+| narrative id | current id |
+|---|---|
+| `ed8d534a`, `d4386bcf` | unchanged (not rewritten: `d4386bcf` is the series base) |
+| `8925190b` | `765f305f` |
+| `3bebc96c` | `ee4c4748` |
+| `66157867` | `aea1b9ce` |
+| `5aff7b3c` / `d4cd4d67` | `e7c07e60` |
+| `5dd4d18d` / `65841c88` / `22d3ad70` / `6a9160fb` | the repair commit, the tip -- read `git log -1` |
+
+The pre-rewrite objects still exist locally (`git cat-file -t 5aff7b3c` -> `commit`) because `--amend` and
+`filter-branch` leave them until gc; they are NOT on any remote, so a reader elsewhere can only resolve the
+current ids.
 
 ### 1. Fixed, with the evidence that closed it
 
@@ -125,12 +209,15 @@ wedge; when it says `#13`, the accounting underflow.
    showed every one is a **prod shutdown**. Verified myself, counts taken from a journal snapshot:
    `post-recovery residual` = 19, `server stopped` = 19, `Stopping ninfer.service` = 19,
    `WORKER RECOVER` = **0**, and `continuations-live=0` in 19 of 19 (the "3 live continuations" I
-   quoted never appears). `fail_all_locked` (`engine_core.h:2152-2178`) runs on the **shutdown** path,
+   quoted never appears). `fail_all_locked` (`engine_core.h:2170-2196`) runs on the **shutdown** path,
    which is why it logs a residual at all; the lines are teardowns of an empty engine, caused by my own
    GPU windows (19 stop/starts today, ~23 min of prod downtime), and they carry **zero** evidential
    weight about whether a recovery leaks. Two consequences worth more than the retraction:
    * the monitor's `post-recovery residual` token fires on every clean prod stop, so a *zero* line there
-     means nothing on its own -- it is only evidence when a `WORKER RECOVER`/`WORKER CRASH` precedes it.
+     means nothing on its own -- what makes it evidence is a NON-ZERO AMOUNT, whatever produced it (see
+     §0's monitor bullet). The clause that stood here, "only evidence when a `WORKER RECOVER`/`WORKER
+     CRASH` precedes it", was wrong on two counts: it dropped the `WORKER OOM` path, and it would have
+     discarded a non-zero `(fail-all)` line.
      CLAUDE.md's note on the token ("its expected value is all-zero -- a non-zero residual there is the
      leak") is right about the non-zero case and misleading about the zero one, and is corrected there.
    * the fail-all path is therefore **not** cleared, as I had claimed: it was never exercised today at
@@ -254,8 +341,8 @@ wedge; when it says `#13`, the accounting underflow.
    and the test diff touches only the `recycling-capture` block, so for those two scenarios a probe-off
    run of the four-file tree is HEAD-equivalent. (The *current* working tree is not: the W2/#6 counter in
    `materialization.cpp` is always on. That file is excluded from this commit, and the 10:33 and 10:25
-   runs predate it.) They remain a new open item of their own. The `all` scenario is excluded by the script because it
-   aborts on a known golden mismatch.
+   runs predate it.) They remain a new open item of their own. The `all` scenario is excluded by the script because
+   its own status is unresolved, NOT because it aborts -- see `:407-409`.
    **So the branch is unreachable across all 12 capture-building scenarios this target dispatches**
    **ATTRIBUTED 2026-09-26: the two golden failures PRE-DATE this work.** Run against a build of
    `ed8d534a` -- the commit before any of it, binary `840c23ddb7c1`, in a `git worktree` so nothing in the
@@ -317,9 +404,10 @@ wedge; when it says `#13`, the accounting underflow.
      BOTH counters and reads `owners_replaced=1 owners_evicted=0` on two runs -- the displacement is the
      structural-publication path, and the **KV-pressure** path evicts no shared owner in it. That stat IS
      asserted somewhere (`exercise_artifact` requires it unchanged across the shared/rewrite rotation,
-     `test_engine_prefix_real.cpp:1409`), but that lives in the `all` scenario, which aborts early on its
-     golden mismatch -- so the assertion never runs. Two gaps with one cause, and closing the `all`
-     mismatch would give the second one reach. Not lost: `test_shared_slot_release.cpp` covers the slot-release
+     `test_engine_prefix_real.cpp:1409`), but that lives in the `all` scenario, so its reach depends on `all`
+     being run to completion AND that run being saved -- which no run of it has been (an unsaved 16:51 run
+     reported `ok` twice). So this is not the second gap of one cause any more: the golden mismatch
+     blocking `all` was repaired in `aea1b9ce`, and what is missing is a saved run. Not lost: `test_shared_slot_release.cpp` covers the slot-release
      disposition at unit level and `anthropic-prefix-regression` covers shared reuse -- so it is
      real-engine *replacement* that is uncovered, not shared reuse in general.
    Verified, with the logs saved this time (`results/golden-attribution/20260926-142216/`, run twice):
@@ -367,12 +455,34 @@ wedge; when it says `#13`, the accounting underflow.
    available in-place one -- i.e. to pay a host restore to gain 11 tokens -- which is the opposite of what
    a cost model should do, and the opposite of what this engine's does. The assertion is not merely stale:
    it encodes the inverse preference.
-   **RESOLVED 2026-09-26: the assertion is REPAIRED, and `all` now passes -- twice.** The disposition was
-   decidable on evidence once the coverage question was checked: `pressure-resume` asserts the same pair
-   this scenario was reaching for -- `PrivateTurnClosure` + `reused_pages == 120` + `restored_pages == 4`
-   (a real host materialization) at `:1879-1881` -- so nothing is lost by asserting what this engine
-   actually intends here (reuse in place, no host read). `all` returns `ok` on two consecutive runs.
-   **The three repairs tried before that are worth keeping as a record of why it looked fixable:**
+   **REPAIRED 2026-09-26 IN TWO PASSES, AND THE SECOND PASS IS A CORRECTION OF THE FIRST -- THE RUN
+   SUPPLIED IT, WHICH IS THE ONLY REASON IT IS BELIEVED.** Pass one replaced the old assertion with
+   `PrivateEndpoint` + `reused>0` + the three H2D counters UNCHANGED, on the reasoning that the endpoint
+   path reads nothing back ("in place, no host read"). **Two saved runs refuted that** (`all`, one GPU
+   window, byte-identical logs, `results/prefix-real-evidence/20260926-171507/`):
+   `state_h2d_delta=0 main_h2d_delta=3 backend_h2d_delta=2` -- the endpoint is device-resident, but the
+   pressure step demoted its KV pages, so reuse DOES read back. The assertion now states what was measured:
+   no state image, main and backend restored. **And the corrected assertion PASSES, twice each, on saved
+   tree** -- `results/prefix-real-evidence/20260926-172831/`, whose `all-1`/`all-2` are byte-identical and
+   which carries the deltas in the passing log itself; `-172138/` passed the earlier version of the
+   assertion; `-171507/` is the failing pair that refuted it. Until the second review pass this record
+   cited only the FAILING run. (**Corrected:** an earlier revision of this line cited a `-172847/` pair --
+   that directory does not exist under `prefix-real-evidence/`, only under `recycling-reachability/`, and
+   it has no `all-*` logs. A cited run that does not exist is precisely the defect this section records.)
+   **So the coverage question has a different answer than the review's -- and the review was right about
+   the state BEFORE the fix, not after it.** The parent (`aea1b9ce:528-533`) required
+   `PrivateTurnClosure` (path 2) AND all three H2D counters up. What is true now:
+   * `PrivateTurnClosure` is NOT taken (the endpoint, path 1, is 316 tokens and device-resident), and that
+     is what the scenario asserts -- the path half of the old assertion was unsatisfiable here.
+   * **main-KV and backend-KV host-to-device restore ARE asserted again**, positively (`>` on both). The
+     review's finding that `5aff7b3c` deleted them was correct when it was made; this is the re-homing.
+   * **the STATE image's host-to-device restore remains unasserted end-to-end** -- delta 0 here by
+     construction, and `pressure-resume` cannot cover it (`SpeculativeBackend::None`,
+     `host_state_slots = 0`, `:171-186`; its `restored_pages == 4` is MAIN-KV only). That is the coverage
+     behind `fc5d0cf3` (demote-before-H2D) and `9521103d` (the restore timer), and it is open item `#17`:
+     the route is a scenario where the demoted checkpoint is the reuse WINNER, i.e. a second session
+     (§2c), which this file's `:526-541` shows cannot be built with one.
+   **The two repairs tried before that are worth keeping as a record of why it looked fixable:**
 
    * *Make the restore a genuine next turn* (a different follow-up) -- no change, and the trace says why:
      the endpoint's frontier sits inside the ASSISTANT CONTENT, so it is a prefix of the prompt whatever
@@ -385,16 +495,19 @@ wedge; when it says `#13`, the accounting underflow.
    in-place candidate AND is protected as the current state. That is a construction limit, not a policy
    bug, and it explains why the assertion has been unsatisfiable without anything being wrong in the engine.
    Both edits were reverted (build clean) rather than kept with rationales their runs refute.
-   **Disposition, and it is now clearly the operator's:** retire it (host materialization is covered by the
-   pressure/restore scenarios that do not depend on this preference), or rebuild it around a shape where
-   the endpoint cannot serve -- which, given the above, means a SECOND session reusing the demoted closure,
-   i.e. the cross-session path from §2c. **Until one is chosen, `all` stays evidence for nothing.** **Not fixed here:** re-baselining
-   the battery deliberately is a piece of work in its own right, and until it is done `all` remains
-   evidence for nothing -- which is what this line already said. What a fix would need: make the endpoint
-   genuinely unavailable (evicted) or accept the demotion path and assert THAT.
-   (`all` is excluded because it aborts on a known golden mismatch, and `stream-observations` because it
-   runs with `context_cache.enabled = false` and so builds no captures; `vision` generates its own image
-   via `gradient_ppm()` and needs no fixture). That is all of them, and it is still not "everything the
+   **Disposition, and it is now clearly the operator's:** rebuild it around a shape where the endpoint
+   cannot serve -- which, given the above, means a SECOND session reusing the demoted closure, i.e. the
+   cross-session path from §2c. Retiring it instead (which an earlier version of this line offered, on the
+   claim that host materialization was covered elsewhere) is no longer an option on the evidence: it is the
+   positive H2D direction that only this scenario asserted, so retiring it retires that coverage for good.
+   The rebuild and the re-homing are one item, and it is **not fixed here** -- re-baselining the battery is
+   a piece of work in its own right.
+   (`all` is excluded from the reachability battery because its own status is unresolved, NOT because it
+   aborts on the golden mismatch still named in that script's header: the mismatch was repaired in
+   `aea1b9ce`, and an unsaved run at 16:51 reported `all` `ok` twice -- but no log of it exists, so under
+   this repo's rule it stays evidence for nothing until a saved re-run. `stream-observations` is excluded
+   because it runs with `context_cache.enabled = false` and so builds no captures; `vision` generates its
+   own image via `gradient_ppm()` and needs no fixture.) That is all of them, and it is still not "everything the
    engine can be driven through", which no run of twelve scenarios could establish, which
    is strong support for the code argument above but not the proof the argument alone would be: the
    remaining gap is re-activation outside `prefill.cpp`'s branches. **The resolution is a choice between
@@ -527,7 +640,7 @@ wedge; when it says `#13`, the accounting underflow.
    `would_have_grown=0 restores: cap_before=120 cap_now=120 size=4 | destinations: cap_before=120
    cap_now=120 size=4`: capacity 120 was already there (the construction-time reserve at
    `materialization.cpp:93-103` ran, because this transaction DOES have a source KV) and four entries
-   were appended. So `restores.push_back` could not have allocated, and the claim in commit `8925190b`
+   were appended. So `restores.push_back` could not have allocated, and the claim in commit `765f305f`
    that it was "the throw source inside that window" is **false for this path**. What the window
    actually contained was only the failure I injected into it.
    What that does and does not leave:
@@ -543,8 +656,8 @@ wedge; when it says `#13`, the accounting underflow.
      construction reserve already covers `mapped`; without one the root address has `page_count == 0`), so
      there was no window for it to close on any path. The earlier sentence here -- that it "closes the
      window for the paths where the construction reserve does not run" -- was that same false claim in a
-     smaller form, and `8925190b`'s commit message calls it a fix; the overstatement is recorded rather
-     than quietly left standing.
+     smaller form. `765f305f`'s message CLAIMED a fix until 2026-09-26, when the second review pass checked
+     the chronology and the message was rewritten in history (see §0); it no longer claims one.
    * The inner window needs no guard and has none now, and **there is no injection control for it**: the
      site was removed with the guard. What closed it is a SOURCE ARGUMENT -- the lease is RAII
      (`~DeviceKVPageLease` releases, `paged_kv_cache.cpp:123`), `optional::emplace` over a noexcept move
@@ -571,7 +684,7 @@ wedge; when it says `#13`, the accounting underflow.
      that window. The construction-time reserve (`materialization.cpp:93-103`) already covers `mapped`
      (the lambda throws if `mapped` exceeds the address's mapped pages, `:971`), and without a source KV
      the root address has `page_count == 0` so nothing is ever recorded. So the pre-reserve added in
-     `8925190b` is dead on both branches and has been removed. The failure in the window was the one I
+     `765f305f` is dead on both branches and has been removed. The failure in the window was the one I
      injected.
    * **The change that used to be called "the fix"** -- reserving the recording vectors' capacity -- is
      NOT in the tree any more, for the reason immediately above. **The "verified" claim that stood here
@@ -750,8 +863,23 @@ wedge; when it says `#13`, the accounting underflow.
    different result.
 5. ~~**#7 — Swift-1.5**~~ — **done 2026-09-25**: prod runs `swift15` (verified by argv *and* a served
    request, not by config text), the wiring is in `~/ninfer-ensure.sh` so it survives a reboot, and the
-   old 22 GB artifact was deleted after checking that nothing referenced or held it open (`df`: 655 ->
+   old 22 GB artifact was referenced- or held-open-checked before deletion (`df`: 655 ->
    676 GB free).
+6. **#17 — the STATE image's host-to-device restore has no end-to-end assertion. A COVERAGE gap, not a
+   suspect behaviour** (this is the residue of the finding the second review pass raised; it is a real
+   numbered item here because until now the citations to it resolved to nothing). The host-restore
+   scenario now asserts the endpoint path, no state image, and main+backend KV read back -- which re-homed
+   the positive main/backend direction that `5aff7b3c` deleted. But the STATE image's restore is flat
+   (delta 0) in that scenario -- OBSERVED in both saved runs, not "by construction": what the runs show is
+   the value, and the reason for it is an argument -- and `pressure-resume` cannot cover it
+   (`SpeculativeBackend::None` with `host_state_slots = 0`; its `restored_pages == 4` is MAIN-KV only), so
+   `grep -rn 'state_h2d_count' tests/` finds no assertion of a state-image restore anywhere. That is the
+   coverage behind `fc5d0cf3` (demote-before-H2D) and `9521103d` (the restore timer).
+   **Next instrument:** a scenario in which the demoted checkpoint is the reuse WINNER -- a second session
+   reusing the demoted closure (§2c) -- asserting `state_h2d_count` increases. **Validation:** run it twice
+   and require agreement, and make the success path print the delta: a `state_h2d_count` delta of 0 in both
+   runs would mean the scenario never restored anything, which is the silent-instrument failure this file
+   keeps recording.
 ### W5 port: `guided_closure` before `root_maximal` — DESIGNED, NOT IMPLEMENTED (2026-09-26)
 
 Read to the point where an implementation is a directed task rather than a loop step, and recorded so that
@@ -808,7 +936,14 @@ task needs no re-derivation:
    `private victim evicted: demotable=1 frontier=190 endpoint=1 rewrite=1 anchors=0 host_state_slots=0/8
    host_kv=0/8589934592 demotable_total=1` -- in `vision`, the evicted victims held **both a valid endpoint
    and a valid rewrite checkpoint** with 190 tokens of frontier, while the host tier had **8 free slots and
-   8 GiB free**. A demote-first policy had something real to preserve, which is the case #6 exists to find.
+   8 GiB free**.
+   **CAVEAT ADDED 2026-09-26, and it is the difference between a result and a quotation:** that line is
+   NOT saved anywhere. It came from `/tmp/victim-print.sh`, which piped the run to `head -5` and kept
+   nothing; `grep -rn 'frontier=190' results/` is empty, and every committed battery run prints the OLD
+   #6 format (`plan_owner_ordinal=`) because `materialization.cpp` was edited at 16:17, AFTER the 16:11
+   battery started. So the line describes the current code's *intent* by construction, not a run of the
+   committed source. It is re-derived by the re-run recorded below; until that log exists, treat the
+   numbers as unverified. A demote-first policy had something real to preserve, which is the case #6 exists to find.
    What it does NOT settle: `demotable` is host CAPACITY available, not proof the planner should have
    demoted -- it weighs degradation units and victim value, and this counter does not model that trade. History: it began as "measure-first: nothing counts evictions that
    could have been demoted". The v2 safety-net items are **moot** (zero references in v3). `guided_closure` **STILL OPEN, and a claim of mine that it was "already in v3" is RETRACTED (2026-09-26).**
@@ -909,9 +1044,11 @@ A review pass found that the `[plan]` and `[capture] assess` line counts had bee
 ### 2c. NEW FINDING (2026-09-26): a cross-session private adoption, deterministic
 
 Found while building #2's constructive scenario, and more significant than it. The engine carries a
-detector for exactly this and calls it *"impossible by construction"*, counting it in every build
-"because it has never been observed to fire", with the note that **"if it ever fires, the adoption must be
-rejected, not merely logged"** (`materialization.cpp:755-775`). It fires:
+detector for exactly this and, as it read until 2026-09-26, called it *"impossible by construction"*,
+counting it in every build "because it has never been observed to fire", with the note that **"if it ever
+fires, the adoption must be rejected, not merely logged"** (`materialization.cpp:755-775`). **Both
+sentences are corrected in place at the detector** -- see the resolution below, which is that the adoption
+is by design. It fires:
 
     [materialization] CROSS-SESSION-ADOPT lane=0 source_owner=9e22d2a3cec766e1
                       consumer_owner=9e22cfa3cec761c8 count=1 reuse=1
@@ -924,8 +1061,10 @@ rejected, not merely logged"** (`materialization.cpp:755-775`). It fires:
 * **The construction is two lines**: two sessions, the same prompt, different `session_key`s. Session B
   then reuses session A's private continuation (`consumer_path=1`, `consumer_reused=4057`). The scenario
   is `underflow-shared-source` (built for #2; this fell out of it).
-* **RESOLVED BY READING (2026-09-26): the invariant's WORDING is wrong, and the finding is not a defect --
-  with one real risk left open.** The chain:
+* **RESOLVED BY READING (2026-09-26): the invariant's WORDING was wrong, and the finding is not a defect.**
+  (This line used to end "with one real risk left open", which the chain below closed three bullets later
+  -- the risk was the lifetime coupling, and `retain` is forced exactly to prevent it. One statement per
+  item.) The chain:
   * `session_key_hash` is set on the continuation at prefill (`prefill.cpp:248-256`) and its own comment
     says it exists "so a later adoption can tell whose checkpoint it is taking (W1.2)".
   * **Nothing reads it to gate anything.** `grep -rn session_key_hash src/` finds it in exactly four
@@ -989,7 +1128,7 @@ backend provides. Prod runs `--spec dflash2` (or `--spec mtp`), so it always has
 null dereference. The crash is confined to **backend-less configurations** (`SpeculativeBackend::None`,
 e.g. `pressure_resume_engine_options`), which is where it was found. The fix is still right and still
 wanted -- a backend-less engine can crash on the recovery path -- but it is a test-configuration crash,
-not a production one, and saying otherwise was alarmist. It IS deployed (`8925190b`), so the correction
+not a production one, and saying otherwise was alarmist. It IS deployed (`765f305f`), so the correction
 matters for how the tree is read: this is a latent bug in an instrument, not an outage waiting to happen.
 
 **The fix** (`commit.cpp`, `resource_census`): null-check both stores. Verified in the same scenario:
@@ -1017,11 +1156,21 @@ The cause: when I lengthened a suffix in the NEW `underflow-shared-source` scena
 began running a heavier load than its assertions were calibrated for. My own scenario kept 96. The
 whole edit landed on the wrong copy.
 
-Fixed by reverting it to 96 (verified `ok` twice) and leaving the new scenario at 96, which is what it
-ran with when it produced its pressure result. **Battery re-run clean: 12 scenarios, `reachable=0`,
-`failed-or-inconclusive=0`, rc=0** -- and that run's manifest is the fresh one
-(`results/recycling-reachability/20260926-161113/manifest`), which also closes the stale-manifest item:
-the logs and the committed source are tied again.
+Fixed by reverting it to 96 and leaving the new scenario at 96, which is what it ran with when it
+produced its pressure result. **Battery re-run: 12 scenarios, `reachable=0`,
+`failed-or-inconclusive=0`, rc=0** (`results/recycling-reachability/20260926-161113/manifest`).
+**CORRECTED 2026-09-26 -- this does NOT close the stale-manifest item, as the sentence here claimed.**
+Three facts, each checked: that battery started 16:11 on binary `f64ea790…`; `materialization.cpp` was
+edited at 16:17:26; and its logs print the OLD #6 format. So the manifest's binary predates the committed
+source and the quoted evidence is not tied to it -- the tie has to be re-made, not asserted. The two runs
+also disagree where it matters: `source-pressure-protection` reads `ok=0` in `155546` and `ok=1` in
+`161113`, so "12/0/0" rested on ONE run of the final configuration. **That is now two, both saved:**
+`results/recycling-reachability/20260926-171528/` reads `12 scenarios, reachable=0,
+failed-or-inconclusive=0, assessments=184` on the current binary, with `source-pressure-protection` at
+`ok, 8 assessments` -- the scenario the two old runs disagreed about. **Re-running
+the battery and `all` twice on the current binary, with logs saved under `results/`, is the open item
+that closes both** -- the reachability script keeps a manifest whose binary sha must be checked against
+the binary that produced it.
 
 **Two lessons, both recorded because both cost time here:** a `replace(..., 1)` over boilerplate that
 exists more than once is a coin flip -- anchor on something unique (a nearby line, the enclosing

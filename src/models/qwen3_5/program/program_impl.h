@@ -902,8 +902,15 @@ private:
     // could only ever read 0 (the branch is unreachable), and a counter that can only read zero is a
     // claim, not an instrument.
     std::uint64_t recycled_checkpoint_drops_             = 0;
-    // A shared catalogued slot replaced by a new capture (`prepare_active_capture`). Counted so the
-    // replacement path is observable at all; read back through `Program::shared_replacements()`.
+    // Replacements RESERVED: a capture that displaced a catalogued shared owner in
+    // `prepare_active_capture`. Counted at the reservation (`capture.cpp:554-559`), NOT at publication,
+    // and the two differ: the abort path can return the slot to `Catalogued`
+    // (`SharedSlotReleaseAction::Catalogue`, `capture.cpp:1006-1008`) without decrementing, so a
+    // transaction that reserved a replacement and then aborted is counted here and replaced nothing.
+    // That is the honest reading of what this measures -- the path being REACHED -- which is also why it
+    // is worth having (`/stats` `pressure_shared_owners_replaced`); it is not a count of replacements
+    // that took effect, and the earlier wording here ("a shared catalogued slot replaced by a new
+    // capture") overstated it. Read back through `Program::shared_replacements()`.
     std::uint64_t shared_replacements_                   = 0;
     // #11(b): a checkpoint priced with no settled StateImage replica. Counted with its denominator, never
     // thrown on -- see the comment at the observation site.
@@ -911,7 +918,12 @@ private:
     // seen. Counters only -- nothing here changes behaviour.
     mutable std::uint64_t incomplete_checkpoint_states_   = 0;
     mutable std::uint64_t checkpoint_state_checks_        = 0;
-    // W1.2: a private checkpoint adopted by a different session. Should be impossible by construction.
+    // W1.2: a private checkpoint adopted by a different session. CORRECTED 2026-09-26: this is NOT a
+    // violated invariant -- the design supports it, safely. `resource_manager.h:420-423` forces
+    // `retain = true` exactly when the sessions differ, so the other session keeps its state and the
+    // adopter forks its endpoint instead of consuming it. The counter is an observation, not an alarm:
+    // what is true is *harmless* by construction, and for a different reason than the old sentence
+    // ("should be impossible") claimed.
     std::uint64_t cross_session_adoptions_               = 0;
     // The non-strict releases deliberately discard the `[[nodiscard]] bool` their stores return, so a
     // refusal -- the address or image not actually freed -- is invisible. That is a leak in the exact

@@ -68,6 +68,14 @@ a superseded duplicate kept only for the session that produced it.
   "matches nothing in `src/`" is true and beside the point: it is a sentinel output, not an engine string,
   so the `grep src/` validation rule does not cover a token emitted by a helper script. That rule is what
   removed it, and tonight is what that cost.
+- **A wedge is now CAPTURED before it is restarted.** `tools/monitor/wedge-sentinel.sh` writes
+  `~/ninfer-watch/wedge-<ts>.waits` (per-thread `state=`/`wchan=`, which needs no symbols) and `.bt`
+  (best-effort backtrace) immediately before its `systemctl restart`. A wedged engine cannot run its own
+  shutdown path -- the shutdown needs the lock the wedge holds -- so this is the only moment the evidence
+  exists, and on 2026-09-26 the restart destroyed it. Read those two files FIRST when a wedge is reported.
+  The backtrace resolves only the innermost frame on a release build; the wait distribution is what
+  characterised the 2026-09-26 wedge (21 of 25 threads on `futex_do_wait`, five on one condvar, with ONE
+  thread spinning in `sched_yield`).
 - One monitor at a time (duplicates double-notify). After stopping one, kill any orphaned `journalctl` —
   by **`pkill -f 'journalctl -u ninfe[r]'`**, bracketed, because an unbracketed `-f` pattern matches the
   calling shell's own command line (see the traps below).

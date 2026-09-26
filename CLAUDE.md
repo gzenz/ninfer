@@ -76,6 +76,10 @@ a superseded duplicate kept only for the session that produced it.
   The backtrace resolves only the innermost frame on a release build; the wait distribution is what
   characterised the 2026-09-26 wedge (21 of 25 threads on `futex_do_wait`, five on one condvar, with ONE
   thread spinning in `sched_yield`).
+  **For a resolvable backtrace, run prod from the diagnostic build:** `build-diag` is configured
+  `RelWithDebInfo` and already contains `build-diag/apps/ninfer-serve`, so the next wedge captured while that
+  binary is running will name the caller of the spin -- which the release build cannot (its frames below the
+  innermost were `??`, and that caller is the frame that identifies the lock).
 - One monitor at a time (duplicates double-notify). After stopping one, kill any orphaned `journalctl` —
   by **`pkill -f 'journalctl -u ninfe[r]'`**, bracketed, because an unbracketed `-f` pattern matches the
   calling shell's own command line (see the traps below).

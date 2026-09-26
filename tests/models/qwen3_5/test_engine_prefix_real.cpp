@@ -570,14 +570,15 @@ int exercise_host_restore(const char* artifact) {
     // deleting**: the old assertion here (`66157867:528-533`) required `PrivateTurnClosure` AND all three
     // H2D counters up, and the review of `5aff7b3c` correctly found that its replacement asserted neither.
     // Main-KV and backend-KV host-to-device restore are asserted here again, positively.
-    // **What remains unasserted end-to-end is the STATE image's host-to-device restore alone**: it is flat
-    // in both saved runs (delta 0) -- OBSERVED, not "by construction": what the runs show is the value,
-    // not the reason for it, and the reason is only an argument. `pressure-resume` cannot cover it -- it
-    // runs `SpeculativeBackend::None` with `host_state_slots = 0` (`:171-186`), so no state image can
-    // exist to restore, and its `restored_pages == 4` counts MAIN-KV pages only. That is the coverage
-    // behind `fc5d0cf3` (demote-before-H2D) and `9521103d` (the restore timer); recorded as an open item
-    // at §2 item 6, where the route is a scenario in which the demoted checkpoint is the reuse winner
-    // (a second session, per §2c).
+    // **The STATE image's host-to-device restore is flat HERE, and that is a property of this scenario**
+    // (delta 0 in both saved runs -- OBSERVED, not "by construction": what the runs show is the value, not
+    // the reason for it). This scenario cannot cover it: its reuse winner is the SAME session's
+    // device-resident endpoint. `pressure-resume` cannot either (`SpeculativeBackend::None` with
+    // `host_state_slots = 0`, so no state image can exist to restore; its `restored_pages == 4` counts
+    // MAIN-KV pages only). **That axis is now asserted — CLOSED 2026-09-26 — by the `state-image-restore`
+    // scenario below, which makes a SECOND session (per §2c) the reuse winner and measures
+    // `state_h2d_delta=1` twice, identically.** Coverage behind `fc5d0cf3` (demote-before-H2D) and
+    // `9521103d` (the restore timer).
     // Printed on the SUCCESS path as well as the failure path, and it is not decoration: the numbers
     // above ("main and backend ARE read back") were first read out of a FAILURE log, which left the
     // coverage claim resting on a run that went wrong. A passing run has to carry its own values, or the
@@ -617,6 +618,117 @@ int exercise_host_restore(const char* artifact) {
 
     // The uncached pressure request and checkpoint resume use different valid prefill splits, so
     // the pressure result is a completion and transfer trigger rather than an exact-token oracle.
+    return 0;
+}
+
+// #17's route (plan.md §2 item 6): the STATE image's host-to-device restore, asserted alone.
+//
+// `host_restore` demotes the complete MTP checkpoint -- state, main KV and backend KV all go to host (it
+// asserts the D2H direction) -- but the turn that then reuses it is the SAME session continuing, so the
+// reuse winner is that session's device-resident endpoint and the state image stays flat: measured
+// `state_h2d_delta=0` on two saved runs (results/prefix-real-evidence/20260926-171507/). Main-KV and
+// backend-KV H2D are asserted positively there. The state image was the half with no assertion anywhere;
+// that is what the scenario below supplies, and it runs inside `all` rather than only on request.
+//
+// The missing ingredient is a reuse winner that IS the demoted checkpoint. plan.md §2c gives the shape: two
+// sessions, the SAME prompt, different `session_key`s, where the second ADOPTS the first's private
+// continuation (`CROSS-SESSION-ADOPT`). MEASURED path is 2 = `PrivateTurnClosure`, not
+// `PrivateEndpoint` (1) -- see `include/ninfer/types.h`; the first version of this comment named the
+// endpoint, copying it from the other scenario in plan.md §2c that did take one. So this scenario keeps
+// `host_restore`'s host tier and its demotion step, and changes only the reuser: session A publishes and is
+// pressured into demoting, then session B -- a different key, the identical prompt -- takes that checkpoint.
+//
+// It is a MEASUREMENT, and a negative is one of its two results: if the adopter restores main/backend KV
+// from host without restoring the state image either, then the state image is not on this path at all and
+// the axis is elsewhere (recorded as such rather than as a pass). The PRECONDITION is asserted first,
+// because a run in which no state image moved device-to-host would measure nothing and would look
+// like a clean zero. (The precondition proves MOVEMENT, not demotion: `state_d2h_count` is fed by both
+// pressure demotion and a capture that places a checkpoint straight on host.)
+int exercise_state_image_restore(const char* artifact) {
+    ninfer::Engine engine(host_restore_engine_options(artifact));
+    auto options = [](std::uint32_t outputs, bool reuse) {
+        ninfer::RequestOptions request;
+        request.execution.requested_output_tokens = outputs;
+        request.execution.sampling.temperature    = 0.0F;
+        request.execution.allow_prefix_reuse      = reuse;
+        request.stop.include_model_defaults       = false;
+        return request;
+    };
+
+    // The session key is the parameter: everything else about A's prompt and B's prompt is identical, which
+    // is what makes B's request a candidate to adopt A's private continuation.
+    const auto retained_input = [](const char* session) {
+        std::string text;
+        text.reserve(6U * 300U);
+        for (std::uint32_t index = 0; index < 300; ++index) { text += "alpha "; }
+        ninfer::ChatMessage message;
+        message.role = ninfer::ChatRole::User;
+        message.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text, .text = std::move(text), .media = {}});
+        ninfer::PromptInput input;
+        input.messages.push_back(std::move(message));
+        input.options.enable_thinking   = false;
+        input.context_cache.session_key = session;
+        input.context_cache.retention   = ninfer::CacheRetentionHint::LiveSession;
+        return input;
+    };
+
+    const ninfer::GenerationResult source =
+        engine.generate(engine.prepare(retained_input("state-h2d-a")), options(5, true));
+    if (source.prompt.prompt_tokens <= 256 || source.generated_token_ids.size() != 5) {
+        std::cerr << "state-image-restore source request did not complete\n";
+        return 1;
+    }
+
+    // A continues: this is the step that must demote A's checkpoint to host.
+    ninfer::PromptInput continuation = retained_input("state-h2d-a");
+    ninfer::ChatMessage assistant;
+    assistant.role              = ninfer::ChatRole::Assistant;
+    assistant.reasoning_content = source.reasoning;
+    assistant.parts.push_back(ninfer::MessagePart{
+        .kind = ninfer::MessagePartKind::Text, .text = source.content, .media = {}});
+    continuation.messages.push_back(std::move(assistant));
+    ninfer::ChatMessage followup;
+    followup.role = ninfer::ChatRole::User;
+    followup.parts.push_back(ninfer::MessagePart{
+        .kind = ninfer::MessagePartKind::Text, .text = "Continue briefly.", .media = {}});
+    continuation.messages.push_back(std::move(followup));
+
+    const ninfer::RuntimeStats before_pressure = engine.runtime_stats();
+    const ninfer::GenerationResult pressure_result =
+        engine.generate(engine.prepare(continuation), options(2, false));
+    const ninfer::RuntimeStats after_pressure = engine.runtime_stats();
+    if (pressure_result.generated_token_ids.size() != 2 ||
+        after_pressure.state_d2h_count <= before_pressure.state_d2h_count) {
+        std::cerr << "state-image-restore PRECONDITION failed: no state image moved device-to-host "
+                     "(demotion OR host capture; state_d2h "
+                  << before_pressure.state_d2h_count << " -> " << after_pressure.state_d2h_count
+                  << "), so a flat H2D below would measure nothing\n";
+        return 1;
+    }
+
+    // B: the same prompt, a different session -- the demoted checkpoint is the reuse winner.
+    const ninfer::GenerationResult adopter =
+        engine.generate(engine.prepare(retained_input("state-h2d-b")), options(5, true));
+    const ninfer::RuntimeStats after_reuse              = engine.runtime_stats();
+    const std::uint64_t       state_h2d_delta           = after_reuse.state_h2d_count - after_pressure.state_h2d_count;
+    const std::uint64_t       main_h2d_delta            = after_reuse.main_kv_h2d_pages - after_pressure.main_kv_h2d_pages;
+    const std::uint64_t       backend_h2d_delta         = after_reuse.backend_kv_h2d_pages - after_pressure.backend_kv_h2d_pages;
+    std::fprintf(stderr,
+                 "[scenario] state-image restore via cross-session adoption: path=%d reused=%u outputs=%zu "
+                 "state_h2d_delta=%llu main_h2d_delta=%llu backend_h2d_delta=%llu\n",
+                 static_cast<int>(adopter.prefix_reuse_path),
+                 adopter.reused_prompt_tokens,
+                 adopter.generated_token_ids.size(),
+                 static_cast<unsigned long long>(state_h2d_delta),
+                 static_cast<unsigned long long>(main_h2d_delta),
+                 static_cast<unsigned long long>(backend_h2d_delta));
+    if (adopter.generated_token_ids.size() != 5 || adopter.reused_prompt_tokens == 0 ||
+        state_h2d_delta == 0) {
+        std::cerr << "state-image-restore: the adopter did not restore a state image from host "
+                     "(this is the open item, not a crash: record which axis it used instead)\n";
+        return 1;
+    }
     return 0;
 }
 
@@ -2262,6 +2374,12 @@ int exercise_artifact(const char* artifact) {
         if (const int result = exercise_vision(engine); result != 0) { return result; }
     }
     if (const int result = exercise_host_restore(artifact); result != 0) { return result; }
+    // NEXT TO host_restore ON PURPOSE: together they are the two halves of the host tier's coverage. The
+    // scenario below owns the STATE image's host-to-device axis, which host_restore cannot reach (its reuse
+    // winner is the same session's device-resident endpoint). A review found the first version of this
+    // scenario was reachable only by setting `NINFER_PREFIX_REAL_SCENARIO=state-image-restore` by hand, so
+    // #17's closure rested on an assertion no routine run executed -- it runs in `all` now.
+    if (const int result = exercise_state_image_restore(artifact); result != 0) { return result; }
     {
         // Production C=1/H=1 topology. This used to read "repeated exact use promotes the shared prefix
         // under one cache Device slot"; a per-session prompt is no longer published as a shared stable
@@ -2870,6 +2988,8 @@ int main() {
         result = exercise_feasibility_orphan(artifact);
     } else if (scenario == "underflow-shared-source") {
         result = exercise_underflow_shared_source(artifact);
+    } else if (scenario == "state-image-restore") {
+        result = exercise_state_image_restore(artifact);
     } else if (scenario == "stream-observations") {
         auto options          = engine_options(artifact);
         options.enable_vision = false;

@@ -43,6 +43,7 @@ SCENARIOS=(
   source-pressure-protection
   concurrent
   anthropic-prefix-regression
+  state-image-restore
 )
 
 reachable=0

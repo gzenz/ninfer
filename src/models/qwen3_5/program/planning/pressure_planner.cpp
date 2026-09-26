@@ -437,10 +437,29 @@ void PressurePlanningSessionImpl::populate_options(std::uint32_t selected_candid
                 const auto& sequence =
                     program->continuation_states[PlanningContractAccess::index(*owner.private_handle)];
                 const qwen3_5::ContinuationSummary summary = program->continuation_summary(sequence);
-                if (summary.endpoint) {
-                    const auto& work = summary.endpoint->rebuild_work;
-                    planning_saturating_add(cost, work.tokens);
-                    planning_saturating_add(cost, work.attention_pairs);
+                // Price the BEST restorable checkpoint this victim holds, not the endpoint alone.
+                // Pricing only `summary.endpoint` gave rebuild cost 0 to any victim whose only
+                // restorable checkpoint is a rewrite. `value_weights_for_victims` sorts ascending and
+                // assigns weight = rank, so cost 0 means the LOWEST weight -- and the eviction charge
+                // is `degradation_units + value_weight` (below), so dropping such a victim was
+                // effectively free. The search then evicted exactly the victims this ranking exists to
+                // protect. Measured on prod 2026-09-26: seven of the eight victims evicted with host
+                // state slots AND host KV free read `endpoint=0 rewrite=1` with frontiers of
+                // 52k-77k tokens. All three checkpoint inventories are the same type
+                // (`CheckpointSummary`), so the rewrite's rebuild work was available and unread.
+                const qwen3_5::CheckpointSummary* best = nullptr;
+                const auto consider = [&best](const qwen3_5::CheckpointSummary& candidate) {
+                    if (best == nullptr ||
+                        candidate.rebuild_work.tokens > best->rebuild_work.tokens) {
+                        best = &candidate;
+                    }
+                };
+                if (summary.endpoint) { consider(*summary.endpoint); }
+                if (summary.rewrite) { consider(*summary.rewrite); }
+                for (const auto& anchor : summary.long_anchors) { consider(anchor); }
+                if (best != nullptr) {
+                    planning_saturating_add(cost, best->rebuild_work.tokens);
+                    planning_saturating_add(cost, best->rebuild_work.attention_pairs);
                 }
             }
             rebuild_cost.push_back(cost);

@@ -78,6 +78,45 @@ for the session that produced it -- read and edit `plan.md`, not those.
   requests. Never offer "wait / let it accumulate" as an option — proceed, and
   keep working.
 
+### Dev time vs prod time — `NINFERDEV`
+
+**The operator declares which mode the host is in by creating the file `/tmp/NINFERDEV`.** Check it with
+`test -e /tmp/NINFERDEV` — present means dev time, absent means prod time. Do not infer the mode from the
+hour, from `ANTHROPIC_BASE_URL`, or from how busy the journal looks.
+
+**Why a file and not an environment variable** (this was tried first, on 2026-09-26): an `export` typed
+into the operator's session shell does not reach the agent's tool calls — each Bash invocation gets a
+fresh shell initialised from the profile, so `env NINFERDEV` came back empty while the operator's own
+shell had it set. A file is visible to every invocation. (`~/.claude/settings.json`'s `env` block *does*
+propagate — that is where `ANTHROPIC_BASE_URL` comes from — so an env var set there would also work; the
+file is simply the lighter switch, and `/tmp` makes it obviously a session-scoped declaration.) The two modes differ in what stopping prod *costs*, and in what the session should be
+doing with its time — they do NOT differ in the safety rules, which hold always (see below).
+
+- **`/tmp/NINFERDEV` exists — dev time.** Prod is not serving the operator: nothing local depends on it, so a GPU
+  window or an e2e swap costs essentially nothing beyond the Bash classifier's round-trip for the
+  duration of the stop. **Run the experiment. Do not defer a run to "save prod time", and never offer
+  batching as a reason to postpone one** — batch only when a run's own validity requires it (a shared
+  build tree, a single freeze covering several suites). This is the mode where the open experiments are
+  the work; a session here that only reads and edits is wasting the cheapest resource it has.
+- **`/tmp/NINFERDEV` absent — prod time.** Prod is serving the operator's sessions. Stopping it interrupts them
+  and breaks soak continuity, so the default action is **read, don't stop**: journal, `/stats`, the
+  request log, the monitor. Collect insights — and note that soak data (net/census/evictions) accrues
+  only while the server is driven with requests, so drive it rather than idling. If a stop is genuinely
+  needed, say so before doing it and treat it as an event, not routine.
+
+**Unchanged in both modes** (a mode switch is not a licence) — these exist because each one has already
+cost an outage:
+- the e2e test server must never bind `:8080`; it defaults to `E2E_PORT=8085`;
+- the swap is ONE blocking foreground command, never split, never detached;
+- never put the string `build/apps/ninfer-serve` in a command line that runs `tools/e2e/e2e-swap.sh`
+  (its `pkill -f` matches the caller and has killed this session three times);
+- after any window or swap, prod is restored and *verified* — `/health` 200, wedge sentinel active;
+- the sentinel is stopped FIRST and re-armed LAST around a window;
+- one journal monitor at a time.
+
+The Bash classifier routes through NInfer in both modes, so a stop still blocks command classification
+while it lasts. In dev time that is the entire cost; in prod time it is the smallest part of it.
+
 ## Reviewing
 - **Reviews run in parallel with e2e, one pass per milestone — never a chain of
   passes with no e2e between them.** Ten consecutive review passes once ran

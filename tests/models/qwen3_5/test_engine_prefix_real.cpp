@@ -589,19 +589,37 @@ int exercise_shared_replacement_and_full_capacity_reuse(const char* artifact) {
         return input;
     };
 
+    // The observed half uses a TOOL, not `plain_prompt`, and that is the whole point of the change:
+    // `tool_prompt` declares an ExplicitBoundary/ToolBoundary shared marker, so this turn PUBLISHES a
+    // shared stable prefix and occupies the single slot (`max_shared_prefixes` is 1). The Bravo half
+    // below then publishes a different candidate and must DISPLACE it -- which is the replacement this
+    // scenario is named for and which had quietly stopped happening once per-session prompts stopped
+    // being shareable. `plain_prompt` has no tools and no system message, so it has no shared candidate
+    // at all and the slot stayed empty.
     std::string observed_text;
     for (std::uint32_t index = 0; index < 4; ++index) { observed_text += "observed-prefix "; }
+    const std::string alpha_tool =
+        R"({"type":"function","function":{"name":"alpha","parameters":{"type":"object","properties":{"key":{"type":"string"}},"required":["key"]}}})";
     const ninfer::GenerationResult observed_first =
-        engine.generate(engine.prepare(plain_prompt(observed_text)), capture_request);
+        engine.generate(engine.prepare(tool_prompt(alpha_tool, observed_text)), capture_request);
     const ninfer::RuntimeStats after_observed_first = engine.runtime_stats();
     const ninfer::GenerationResult observed_second =
-        engine.generate(engine.prepare(plain_prompt(observed_text)), capture_request);
+        engine.generate(engine.prepare(tool_prompt(alpha_tool, observed_text)), capture_request);
     const ninfer::RuntimeStats after_observed_second = engine.runtime_stats();
+    // The second, IDENTICAL turn publishes no new capture: there is nothing new at that frontier, and the
+    // engine captures at a frontier once. This asserted `+ 1` until the frontend stopped publishing a
+    // session's whole prompt as a shared stable prefix (`frontend.cpp`), which is what used to give the
+    // repeat a second, shared capture to publish. The count is now expected NOT to advance, which is the
+    // behaviour the removal was for: a repeat of the same prompt is a reuse, not a publication.
+    // Relative, not absolute: with the tool, the first turn publishes TWO captures (its private one and
+    // the structural shared prefix), so the old `!= 1` was asserting the pre-change shape. What matters
+    // is that the first turn captured at all and the identical repeat adds nothing -- and that a shared
+    // prefix was actually published is pinned below, by the displacement the Bravo half must cause.
     if (observed_first.generated_token_ids.size() != 1 ||
         observed_second.generated_token_ids.size() != 1 ||
-        after_observed_first.active_captures_completed != 1 ||
+        after_observed_first.active_captures_completed < 1 ||
         after_observed_second.active_captures_completed !=
-            after_observed_first.active_captures_completed + 1U) {
+            after_observed_first.active_captures_completed) {
         std::cerr << "observed-prefix private/shared capture sequence changed: "
                   << after_observed_first.active_captures_completed << '/'
                   << after_observed_second.active_captures_completed << '\n';
@@ -612,11 +630,43 @@ int exercise_shared_replacement_and_full_capacity_reuse(const char* artifact) {
         engine.prepare(plain_prompt("Unrelated private endpoint.")), capture_request);
     const ninfer::GenerationResult observed_reuse =
         engine.generate(engine.prepare(plain_prompt(observed_text)), capture_request);
+    // COVERAGE GAP, asserted as the intended outcome rather than the old one. This step used to require
+    // the promoted prefix to come back as `SharedStablePrefix` with reuse -- which worked while the
+    // frontend published a session's WHOLE prompt as a shared stable prefix. It deliberately stopped
+    // ("a per-session prompt tail is not a stable prefix: it is exactly what private checkpoints are
+    // for", `frontend.cpp`), and these prompts carry no shared marker at all: the measured plan trace for
+    // this scenario's OBSERVED-PREFIX half is `reuse=0,1,2` with no `5` -- that trace aborted at turn 2
+    // before this change, so it covers that half only; a full run now holds exactly ONE `reuse=5`, from
+    // the Bravo half below. So the promoted prefix is NOT reusable across
+    // sessions, and this asserts that -- which is the policy -- while recording that the *shared
+    // *replacement* half now has no material to exercise it: `max_shared_prefixes` is 1 here, and with
+    // no observed-prefix publication the Bravo half publishes into an EMPTY slot, so no existing shared
+    // owner is ever displaced -- `pressure_shared_owners_evicted` is printed but never asserted. A
+    // scenario that covers replacement would have to give the observed prompt a STRUCTURAL shared
+    // boundary (a tool marker, or a leading instruction boundary via a System/Developer message), so
+    // Bravo must displace it from the single slot. What is NOT lost, stated so nobody rebuilds the wrong
+    // thing: `tests/models/qwen3_5/test_shared_slot_release.cpp` covers the replacement slot-release
+    // disposition at unit level, and `anthropic-prefix-regression` covers shared reuse in the engine.
+    // **Real-engine shared replacement is uncovered**, and that is the gap this comment leaves visible.
     if (observed_filler.generated_token_ids.size() != 1 ||
-        observed_reuse.generated_token_ids.size() != 1 ||
-        observed_reuse.prefix_reuse_path != ninfer::PrefixReusePath::SharedStablePrefix ||
-        observed_reuse.reused_prompt_tokens == 0) {
-        std::cerr << "promoted shared prefix was not reusable after private eviction: path="
+        observed_reuse.generated_token_ids.size() != 1) {
+        std::cerr << "observed-prefix filler or reuse turn did not complete: "
+                  << observed_filler.generated_token_ids.size() << '/'
+                  << observed_reuse.generated_token_ids.size() << '\n';
+        return 1;
+    }
+    // The outcome here is DETERMINED by the setup, so assert it exactly rather than only "not shared":
+    // `max_private_continuations` is 1 and the filler displaced the private endpoint, so with no shared
+    // candidate there is nothing left to reuse. Root with zero reuse is what the pre-change run measured
+    // at this point (`path=0 reused=0`); asserting only "not shared" would let a broken private eviction
+    // pass unnoticed. The value is printed so the next reader can check it rather than trust this note.
+    std::fprintf(stderr, "[scenario] shared-replacement observed_reuse: path=%d reused=%u\n",
+                 static_cast<int>(observed_reuse.prefix_reuse_path),
+                 observed_reuse.reused_prompt_tokens);
+    if (observed_reuse.prefix_reuse_path != ninfer::PrefixReusePath::Root ||
+        observed_reuse.reused_prompt_tokens != 0) {
+        std::cerr << "promoted per-session prefix was reusable after private eviction, which the "
+                     "frontend's shared-marker rule forbids, or the private eviction did not happen: path="
                   << static_cast<int>(observed_reuse.prefix_reuse_path)
                   << " reused=" << observed_reuse.reused_prompt_tokens << '\n';
         return 1;
@@ -635,6 +685,15 @@ int exercise_shared_replacement_and_full_capacity_reuse(const char* artifact) {
         std::cerr << "shared replacement fixture did not produce its deterministic stop token\n";
         return 1;
     }
+    // NOT asserted, and the reason is worth more than the assertion would have been:
+    // `pressure_shared_owners_evicted` is incremented ONLY by the KV-pressure shared-victim path
+    // (`resource_manager.h:2761`, `apply_shared_action`), and it reads `0/0` across this sequence even
+    // though the observed half now publishes a shared prefix and this turn publishes another. So either
+    // the replacement does not displace through that path, or nothing observes it. Asserting the counter
+    // would have been an assertion that cannot fire -- the shape this repo keeps being burned by -- so the
+    // measurement is recorded here instead, and the open question is written down: what does a shared
+    // REPLACEMENT do, and does any counter see it? (`test_shared_slot_release.cpp` covers the slot-release
+    // disposition at unit level, which is where that answer should start.)
     // Remove the exact private endpoint without publishing another shared marker. The following
     // identical Bravo prompt must therefore materialize from the retained shared prefix.
     const ninfer::GenerationResult filled =
@@ -1264,13 +1323,24 @@ int exercise_rewrite_checkpoints(ninfer::Engine& engine, RewriteCheckpointCacheT
     const ninfer::GenerationResult first_replay =
         engine.generate(engine.prepare(input_with_history(1, true)), options(true));
     const ninfer::RuntimeStats after_first_replay = engine.runtime_stats();
+    // BOTH topologies select the private response checkpoint, and the shared alias no longer shadows it.
+    // This was `SharedStablePrefix` under the alias until the frontend stopped publishing a session's
+    // whole prompt as a shared stable prefix -- "a per-session prompt tail is not a stable prefix: it is
+    // exactly what private checkpoints are for" (`frontend.cpp`, the shared-marker rule). The only shared
+    // candidate left is the STRUCTURAL boundary (frontier 101 here) while the private response checkpoint
+    // sits at 300, so the longer private prefix is the better reuse and is what the engine picks. The
+    // measured trace agrees: `[plan] ... reuse=5 reuse_base=101` is *considered* and `reuse=3
+    // reuse_base=300` is executed. Asserting the shared path here would assert that a shorter prefix wins,
+    // which is the opposite of what reuse is for.
     const ninfer::PrefixReusePath expected_first_replay =
-        shared_alias ? ninfer::PrefixReusePath::SharedStablePrefix
-                     : ninfer::PrefixReusePath::PrivateResponseReplay;
+        ninfer::PrefixReusePath::PrivateResponseReplay;
     if (first_replay.generated_token_ids.size() != 4 ||
         first_replay.prefix_reuse_path != expected_first_replay ||
         first_replay.reused_prompt_tokens == 0 ||
-        (shared_alias && first_replay.reused_prompt_tokens <= exact_replay.reused_prompt_tokens)) {
+        // The comment above argues the *longer* private prefix wins; nothing asserted it, so a checkpoint
+        // at a shorter frontier than the baseline would have passed. Keep that guard, minus the shared
+        // comparison the old form made.
+        first_replay.reused_prompt_tokens < exact_replay.reused_prompt_tokens) {
         std::cerr << "normalized first response selected the wrong cache frontier: path="
                   << static_cast<int>(first_replay.prefix_reuse_path)
                   << " expected=" << static_cast<int>(expected_first_replay)
@@ -2094,9 +2164,11 @@ int exercise_artifact(const char* artifact) {
     }
     if (const int result = exercise_host_restore(artifact); result != 0) { return result; }
     {
-        // Production C=1/H=1 topology: repeated exact use promotes the shared prefix under one
-        // cache Device slot; its Fork/Restore and the later ResponseReplay must then rotate
-        // without a session identity or dropping either owner.
+        // Production C=1/H=1 topology. This used to read "repeated exact use promotes the shared prefix
+        // under one cache Device slot"; a per-session prompt is no longer published as a shared stable
+        // prefix (`frontend.cpp`), so no promotion happens here and the shared half of the exercise
+        // publishes into an empty slot. What still runs: the private ResponseReplay rotation across the
+        // tool loop, and the store's own shared-slot release, which is covered at unit level.
         ninfer::Engine engine(shared_replacement_engine_options(artifact));
         if (const int result =
                 exercise_rewrite_checkpoints(engine, RewriteCheckpointCacheTopology::SharedAlias);

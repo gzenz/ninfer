@@ -130,12 +130,14 @@ ProgramImpl::inspect_capture(const CaptureOffer& offer, const SharedPrefixHandle
         }
         std::fprintf(stderr,
                      "[capture] assess lane=%u placement=%d dev_occ=%u dev_cap=%u host_images=%d "
+                     "shared_group=%d publish_shared=%d "
                      "rewrite_group=%d rewrite_state_live=%d "
                      "checkpoint_valid=%d slot_differs=%d can_recycle=%d replaces_rewrite=%d "
                      "recycles=%d frontier=%u base=%u refs=%d\n",
                      lane, static_cast<int>(assessment.state_placement), state_store->device_occupied(),
                      state_store->device_capacity(),
                      static_cast<int>(host_state_images != nullptr),
+                     static_cast<int>(group.shared), static_cast<int>(publish_shared),
                      static_cast<int>(group.rewrite.has_value()),
                      static_cast<int>(state_live),
                      static_cast<int>(sequence.rewrite_checkpoint.valid),

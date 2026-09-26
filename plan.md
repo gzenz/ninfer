@@ -241,6 +241,62 @@ wedge; when it says `#13`, the accounting underflow.
    runs predate it.) They remain a new open item of their own. The `all` scenario is excluded by the script because it
    aborts on a known golden mismatch.
    **So the branch is unreachable across all 12 capture-building scenarios this target dispatches**
+   **ATTRIBUTED 2026-09-26: the two golden failures PRE-DATE this work.** Run against a build of
+   `ed8d534a` -- the commit before any of it, binary `840c23ddb7c1`, in a `git worktree` so nothing in the
+   working tree moved -- both scenarios fail with the *identical* messages and rc=1
+   (`path=3 expected=5 reused=300`; `capture sequence changed: 1/1`), while `rewrite-checkpoint` passes in
+   the same run. So they are not a regression from the pre-reserve removal or anything else here, and the
+   earlier "not established" wording is replaced by this. What it means: `rewrite-checkpoint-shared` and
+   `shared-replacement` have had **no working coverage since before 2026-09-26**, and they are the only
+   scenarios that exercise those two paths -- so a real defect in shared-prefix replacement would not be
+   caught by this suite. That is now the item, and it is a test defect, not an engine one.
+   **FIXED 2026-09-26 (dev time): both were STALE EXPECTATIONS, not engine defects -- and the engine
+   change they missed was deliberate.** **Not bisected, and said so**: what is proved is that the old
+   assertions are *unsatisfiable* under the frontend rule (proved by reading `frontend.cpp` and
+   `request_plan.cpp`, plus `git show 2f8eea39` showing the removal); the commit that changed the
+   behaviour was not isolated by building either side of it. The rule, with the citation: the frontend stopped publishing a
+   session's whole prompt as a shared stable prefix, and says why in the code -- *"a per-session prompt
+   tail is not a stable prefix: it is exactly what private checkpoints are for"* (`frontend.cpp`, the
+   shared-marker rule). Both scenarios were written against the removed behaviour:
+   * `rewrite-checkpoint-shared` required a `SharedStablePrefix` to shadow the private response
+     checkpoint. It cannot: the only shared candidate left is the structural boundary (frontier 101)
+     while the private checkpoint sits at 300, so the longer private prefix is the better reuse. The
+     trace shows the shared path *considered* (`reuse=5 reuse_base=101`) and the private one executed
+     (`reuse=3 reuse_base=300`). The assertion now expects the private path, with the reasoning recorded
+     where the expectation lives.
+   * `shared-replacement` required a repeated prompt to publish a second, *shared* capture, and later
+     required that a promoted per-session prefix be reusable as `SharedStablePrefix`. Neither is
+     permitted now, and that scenario's prompts carry **no shared marker at all** -- scoped correctly:
+     its OBSERVED-PREFIX half's saved trace is `reuse=0,1,2` with no `5`, and that trace aborted at turn 2
+     before the change, so it covers that half only; a full run now holds exactly ONE `reuse=5`, from the
+     Bravo half. (The first version of this bullet generalized the half's trace to the whole scenario,
+     which the full run refutes.)
+     **Coverage partly RESTORED, and one assertion deliberately not written (2026-09-26).** The observed
+     half was rebuilt on `tool_prompt` instead of `plain_prompt`, because that builder declares an
+     ExplicitBoundary/ToolBoundary shared marker: the observed turn now PUBLISHES a shared prefix, and the
+     scenario's plan trace went from one `reuse=5` to **two** -- shared publication and reuse from that
+     half are exercised again, verified twice with saved logs
+     (`results/golden-attribution/20260926-142815/`). What is STILL uncovered is the *displacement*: an
+     assertion that the single shared slot is evicted when the second candidate is published reads
+     `evicted=0/0`, and the reason is that `pressure_shared_owners_evicted` is incremented only by the
+     KV-pressure shared-victim path (`resource_manager.h:2761`, `apply_shared_action`) -- so it cannot fire
+     for a replacement. Writing that assertion would have been an assertion that cannot fire, so the
+     measurement is recorded instead, with the open question attached: what does a shared REPLACEMENT do,
+     and does any counter see it? `test_shared_slot_release.cpp` is where that answer should start.
+     It now asserts the policy -- `path=Root reused=0`, printed by the scenario and confirmed twice --
+     and its comment names the gap correctly: what is lost is **replacement**, since `max_shared_prefixes`
+     is 1 and Bravo now publishes into an *empty* slot, displacing nobody; `pressure_shared_owners_evicted`
+     is printed but never asserted. Not lost: `test_shared_slot_release.cpp` covers the slot-release
+     disposition at unit level and `anthropic-prefix-regression` covers shared reuse -- so it is
+     real-engine *replacement* that is uncovered, not shared reuse in general.
+   Verified, with the logs saved this time (`results/golden-attribution/20260926-142216/`, run twice):
+   `rewrite-checkpoint-shared` and `shared-replacement` both `rc=0 ... ok` on both runs, with 14 and 10
+   `[plan]` lines respectively and the same counts each time; `rewrite-checkpoint` and `recycling-capture`
+   unchanged. The earlier claim of a passing run rested on an unsaved window, which is a review finding
+   in its own right.
+   **This is the kind of change that can look like silencing a test, so it is stated as a risk:** two
+   assertions were turned around rather than one defect fixed. The defence is the trace and the code
+   comment above, not the passing run.
    (`all` is excluded because it aborts on a known golden mismatch, and `stream-observations` because it
    runs with `context_cache.enabled = false` and so builds no captures; `vision` generates its own image
    via `gradient_ppm()` and needs no fixture). That is all of them, and it is still not "everything the
@@ -570,7 +626,25 @@ wedge; when it says `#13`, the accounting underflow.
    **Not committed yet, deliberately:** these two files (`program_impl.h`, `materialization.cpp`) are
    excluded from the #11(a) commit because they landed mid-review; this is their own milestone and needs
    its own pass.
-7. **#8 — forced-token binding**: fixed (`6f03ec3c`), unverifiable until a run forces tokens.
+7. **#8 — forced-token binding**: fixed (`6f03ec3c`); **still unexercised, and the reason is now narrow.**
+   Four runs (2026-09-26, dev time, via `tools/e2e/forced-token-probe.py` and the swap):
+   * the forced-token path itself DOES run -- two concurrent 3,804-token requests, each exhausting its
+     thinking budget (`thinking_tokens=1048`, `stop_reason=max_tokens`) produced two
+     `[forced] append_forced_tokens rows=1 stride=25 tokens=25 multi_row=0` lines;
+   * `rows` stayed 1 in every shape tried, and the companion line says why in its own terms:
+     `[forced] run_control_batch membership=1 control_ready_lanes=1` -- **only one lane was control-ready
+     at each control boundary**, which by that probe's stated criterion makes the separation *timing, not
+     structure*;
+   * two concurrency shapes were tried: byte-identical requests (which reuse a prefix and therefore cannot
+     step together) and distinct equal-length ones (the `--lane` change in the probe);
+   * the construction that should force coincidence -- short prompt so both prefills finish in one chunk,
+     tiny budget so both exhaust in the same step -- **is blocked by the API**: `thinking.budget_tokens`
+     must be at least 1024 (`anthropic_messages_request.cpp:866`), and a smaller value returns 400.
+   **So the next step is reading the scheduler's admission path, not another run.** If admission is one
+   lane per boundary and control-readiness is a one-shot per-lane event, the two can never coincide and
+   `multi_row=1` is unreachable in this configuration -- which would make #8's per-row bind defensive
+   rather than load-bearing, the same shape as #11(a). That is a question of reach, so it is answerable by
+   reading, and it should be answered before another window is spent here.
 
 ### 3. Next actions, each with its validation
 

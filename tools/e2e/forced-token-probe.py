@@ -18,6 +18,18 @@ This suite creates the condition and reads the probe inside the function:
     bash tools/e2e/e2e-swap.sh
   then: grep '\\[forced\\]' ~/ninfer-serve.log
 
+**What the three swap runs established (2026-09-26 13:53-13:59), so they are not repeated:** the multi-row case has NOT been
+reached by concurrency in this configuration. The server prints `[forced] run_control_batch
+membership=1 control_ready_lanes=1` -- by that line's own criterion the separation is timing, not
+structure, since only one lane was control-ready at each control boundary. Two concurrency shapes were
+tried: two byte-identical 3,804-token requests with budget 1024, and two DISTINCT equal-length ones (the
+byte-identical pair reuses a prefix and cannot step together). The construction that should force
+coincidence -- a short prompt so both prefills finish in one chunk, plus a tiny budget so both exhaust in
+the same step -- is blocked by the API: `thinking.budget_tokens` must be at least 1024
+(`anthropic_messages_request.cpp:866`), and a smaller value is a 400. The next step here is READING the
+scheduler's admission path (one lane per boundary, so a readiness that is a one-shot per-lane event may
+never coincide), not another run of this probe.
+
 `distinct_lanes=1` means the call saw more than one row -- the case the per-row KV bind exists for. A
 run of this suite with one row proves the path executes; a run with two rows is the one that tests the
 fix, and needs two sessions constrained the same way at the same time (send both requests before reading
@@ -32,34 +44,42 @@ import urllib.request
 URL = "http://127.0.0.1:8085/v1/messages"
 PROMPT = ("For every integer from 1 to 400, state whether it is prime and give a one-line "
           "justification for each. Do not skip any number and do not summarise.")
-def body(pad_tokens: int) -> dict:
+def body(pad_tokens: int, lane: int = 0) -> dict:
     """The request. `pad_tokens` of filler are prepended when > 0, which is what makes the lanes overlap:
     with tiny prompts the engine runs them one at a time (`running 1` in the throughput lines), so the
     forced steps never share a step -- and the membership that `append_forced_tokens` is handed, which
     accumulates rows, therefore holds one. Long prompts keep several lanes resident at once."""
     filler = ("The following is filler context, read it but do not act on it. " * max(1, pad_tokens // 12))
-    content = (filler + "\n\n" + PROMPT) if pad_tokens else PROMPT
+    # `lane` makes each request DISTINCT while keeping the prompts the same length. Byte-identical prompts
+    # are the reason the first multi-row attempt saw one row per step: the second request reuses the
+    # first's prefix and the two never advance in lockstep, so each forced step holds a single row. A
+    # single differing digit is one token either way, so the lengths stay equal -- which is what the
+    # multi-row case needs (equal-length lanes stepping together), and what the printed
+    # `prompt_tokens` per request lets the reader check rather than assume.
+    content = (filler + f"\n\n(lane {lane})\n\n" + PROMPT) if pad_tokens else PROMPT
     return {
         "model": "qwen3.8-27b",
         "max_tokens": 2048,
-        "thinking": {"type": "enabled", "budget_tokens": 1024},
+        "thinking": {"type": "enabled", "budget_tokens": BUDGET_TOKENS},
         "messages": [{"role": "user", "content": content}],
     }
 
 
 PAD_TOKENS = 0
+BUDGET_TOKENS = 1024
 
 
 def send(label: str) -> dict:
     request = urllib.request.Request(
-        URL, data=json.dumps(body(PAD_TOKENS)).encode(),
+        URL, data=json.dumps(body(PAD_TOKENS, int(label.split()[-1].split('/')[0]) - 1)).encode(),
         headers={"content-type": "application/json"})
     started = time.time()
     with urllib.request.urlopen(request, timeout=300) as response:
         payload = json.loads(response.read().decode())
     usage = payload.get("usage", {})
     thinking = usage.get("output_tokens_details", {}).get("thinking_tokens")
-    print(f"[probe] {label}: stop_reason={payload.get('stop_reason')} "
+    print(f"[probe] {label}: prompt_tokens={usage.get('input_tokens')} "
+          f"stop_reason={payload.get('stop_reason')} "
           f"thinking_tokens={thinking} output={usage.get('output_tokens')} "
           f"elapsed={time.time() - started:.0f}s", flush=True)
     return payload
@@ -68,9 +88,26 @@ def send(label: str) -> dict:
 def main() -> int:
     import threading
 
-    global PAD_TOKENS
+    global PAD_TOKENS, BUDGET_TOKENS
     if "--pad-tokens" in sys.argv:
         PAD_TOKENS = int(sys.argv[sys.argv.index("--pad-tokens") + 1])
+    # A SHORT prompt would be the construction that makes two lanes control-ready at the same worker
+    # boundary -- with a single prefill chunk the one-boundary admission offset cannot accumulate -- but
+    # the BUDGET half of that idea is unavailable: the API floors `thinking.budget_tokens` at 1024
+    # (`anthropic_messages_request.cpp:866`), so a smaller value is a 400 and cannot force two lanes to
+    # exhaust in the same step. Refused here rather than sent, because a 400 run reads like a failed
+    # experiment and is really an unusable one.
+    if "--budget" in sys.argv:
+        BUDGET_TOKENS = int(sys.argv[sys.argv.index("--budget") + 1])
+        if BUDGET_TOKENS < 1024:
+            print(f"[probe] refusing --budget {BUDGET_TOKENS}: the API requires >= 1024 "
+                  f"(anthropic_messages_request.cpp:866); a smaller value returns HTTP 400 and the run "
+                  f"measures nothing", flush=True)
+            return 2
+    if count > 1 and PAD_TOKENS == 0:
+        print("[probe] warning: --concurrent > 1 without --pad-tokens -- `lane` is ignored when "
+              "pad_tokens is 0, so the requests are byte-identical and cannot step together",
+              flush=True)
 
     # Concurrent, not sequential: `multi_row=1` is the case the per-row KV bind exists for, and it needs
     # two thinking-constrained lanes in flight *at the same time* so they can land in one batch. Both

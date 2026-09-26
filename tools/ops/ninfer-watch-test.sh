@@ -77,32 +77,40 @@ else
   rc=1
 fi
 # --- the request-log leg (tools/ops/ninfer-watch-requests.jq) -----------------
-# Same discipline as the journal fixture: the cases that make the filter WRONG are asserted, including the
-# negatives -- a root-path request must be silent (no reuse was attempted, so nothing is suspicious), and
-# a near-total hit must not alert.
+# The cases that make the filter WRONG are asserted, including the negatives. Two of them are the
+# false alarms that a standalone "prefill > 2s" rule produced on live traffic (92.4% and 89.3% hit,
+# 2.6-3.1 s): at fraction 0.9 the 92.4% one must be silent, and the 89.3% one alerts only because it is
+# just under the fraction -- which is the rule doing its job, not the slow rule misfiring.
 cat >"$work/requests.jsonl" <<JSONL
-{"event":"request_done","request":{"request_id":"low"},"result":{"prompt_tokens":66700,"prefix_cache_hit_tokens":23706,"prefix_reuse_path":"shared_stable_prefix","computed_prefill_tokens":42994},"timings_seconds":{"prefill":0.4}}
-{"event":"request_done","request":{"request_id":"ok"},"result":{"prompt_tokens":65059,"prefix_cache_hit_tokens":63844,"prefix_reuse_path":"shared_stable_prefix","computed_prefill_tokens":1215},"timings_seconds":{"prefill":0.3}}
+{"event":"request_done","request":{"request_id":"sharedonly"},"result":{"prompt_tokens":89215,"prefix_cache_hit_tokens":23706,"prefix_reuse_path":"shared_stable_prefix","computed_prefill_tokens":65509},"timings_seconds":{"prefill":19.2}}
+{"event":"request_done","request":{"request_id":"goodslow"},"result":{"prompt_tokens":87848,"prefix_cache_hit_tokens":81208,"prefix_reuse_path":"shared_stable_prefix","computed_prefill_tokens":6640},"timings_seconds":{"prefill":2.61}}
+{"event":"request_done","request":{"request_id":"justunder"},"result":{"prompt_tokens":82872,"prefix_cache_hit_tokens":74000,"prefix_reuse_path":"shared_stable_prefix","computed_prefill_tokens":8872},"timings_seconds":{"prefill":3.09}}
 {"event":"request_done","request":{"request_id":"rootpath"},"result":{"prompt_tokens":65059,"prefix_cache_hit_tokens":0,"prefix_reuse_path":"root","computed_prefill_tokens":65059},"timings_seconds":{"prefill":14.5}}
-{"event":"request_done","request":{"request_id":"slow"},"result":{"prompt_tokens":65000,"prefix_cache_hit_tokens":64000,"prefix_reuse_path":"private_endpoint","computed_prefill_tokens":1000},"timings_seconds":{"prefill":3.1}}
 JSONL
 jq -rc --argjson fraction 0.9 --argjson max_prefill_s 2.0 -f ninfer-watch-requests.jq <"$work/requests.jsonl" >"$work/reqout"
 printf '%s\n' \
- '[watch] LOW PREFIX USE on reuse: low path=shared_stable_prefix hit=23706/66700 computed=42994 prefill_s=0.4' \
- '[watch] reuse-ok: ok path=shared_stable_prefix hit=63844/65059 computed=1215 prefill_s=0.3' \
- '[watch] SLOW REUSE (prefill 3.1s > 2.0s): slow path=private_endpoint hit=64000/65000 computed=1000 prefill_s=3.1' \
+ '[watch] LOW PREFIX USE on reuse (SLOW): sharedonly path=shared_stable_prefix hit=23706/89215 computed=65509 prefill_s=19.2' \
+ '[watch] reuse-ok: goodslow path=shared_stable_prefix hit=81208/87848 computed=6640 prefill_s=2.61' \
+ '[watch] LOW PREFIX USE on reuse (SLOW): justunder path=shared_stable_prefix hit=74000/82872 computed=8872 prefill_s=3.09' \
  >"$work/reqexpected"
 if diff -u "$work/reqexpected" "$work/reqout" >"$work/reqdiff"; then
-  echo "[watch-test] requests PASS: $(grep -c . "$work/reqout") classifications"
+  echo "[watch-test] requests PASS: $(grep -c . "$work/reqout") of 4 classified"
 else
   echo "[watch-test] requests FAIL:" >&2
   cat "$work/reqdiff" >&2
   rc=1
 fi
 if grep -q 'rootpath' "$work/reqout"; then
-  echo "[watch-test] requests FAIL: a root-path request produced output (nothing was reused, so nothing is suspicious)" >&2
+  echo "[watch-test] requests FAIL: a root-path request produced output (nothing was reused)" >&2
   rc=1
 else
   echo "[watch-test] requests: root path correctly silent"
 fi
+if grep -q 'goodslow' "$work/reqout" && grep -q 'reuse-ok: goodslow' "$work/reqout"; then
+  echo "[watch-test] requests: the 92.4% + 2.6s false alarm is silenced"
+else
+  echo "[watch-test] requests FAIL: the 92.4%/2.6s case must not alert" >&2
+  rc=1
+fi
+
 exit "$rc"

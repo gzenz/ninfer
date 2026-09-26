@@ -1,20 +1,27 @@
 # Request-log filter for tools/ops/ninfer-watch.sh: stdout = alerts, log file = every reuse record.
 #
-# The journal says what the ENGINE did (evictions, recoveries); this says what a CLIENT got. Two conditions
-# are worth an alert, both reported by the operator on 2026-09-26 after seeing requests reuse only the
-# ~23.7k shared prefix and re-prefill >40k:
+# The journal says what the ENGINE did (evictions, recoveries); this says what a CLIENT got. One rule, so
+# that an alert means "reuse did not deliver" and nothing else:
 #
-#   1. LOW PREFIX USE on a reuse: the request took a reuse path, so it should not be re-prefilling much of
-#      its prompt -- yet the cache hit is a small fraction of it.
-#   2. SLOW REUSE: it took a reuse path and still spent more than `max_prefill_s` in prefill. Reuse is
-#      supposed to buy that time back, so a slow reuse means the path did not deliver.
+#   LOW PREFIX USE -- the request took a reuse path, so it should not be re-prefilling much of its prompt,
+#   yet its cache hit is a small fraction of it. The prefill time is reported as an ATTRIBUTE of that
+#   alert, marked SLOW when it exceeds `max_prefill_s`.
 #
-# BOTH THRESHOLDS ARE A FIRST CUT, not measured constants, and they are arguments so they can be tuned
-# from the log rather than recompiled. `fraction` is deliberately high (0.9): the interesting cases are
-# "reused something, re-prefilled a lot", and the operator's two examples were 76% and 36% hit.
+# WHY SLOWNESS IS NOT ITS OWN ALARM (changed 2026-09-26 after measuring, not after reasoning): a standalone
+# "prefill > 2s on a reuse" rule was tried first and it flagged healthy traffic --
 #
-# Every request_done with a non-root path is LOGGED, alert or not, so the thresholds can be set from data
-# -- and so that "no alert" can be told from "no reuse happened at all" (the denominator rule).
+#   hit=81208/87848 (92.4%) prefill_s=2.61   <- alerted, and this is a normal re-prefill
+#   hit=74000/82872 (89.3%) prefill_s=3.09   <- alerted, also normal
+#
+# A few thousand tokens of re-prefill at 2-3 s is throughput, not a symptom. What the rule was reaching for
+# is "reuse FAILED and cost us time", which is the low-use case: gating slow on low-use then leaves a
+# second branch unreachable (the first would already have fired), and a branch that cannot fire is the
+# defect this repo keeps recording. So there is one alert, and slowness is carried inside it.
+#
+# THRESHOLDS: `fraction` 0.9 is a first cut -- the operator's reported cases were 36% and 76% hit -- and it
+# is deliberately high, because "reused something, re-prefilled a lot" is the interesting shape. Both
+# thresholds are arguments so they can be set from the log rather than recompiled. Every request_done with a
+# non-root path is LOGGED either way, so "no alert" can be told from "no reuse happened at all".
 select(.event == "request_done") |
 (.result // {}) as $r |
 ($r.prompt_tokens // 0 | tonumber) as $prompt |
@@ -27,9 +34,7 @@ select(.event == "request_done") |
   as $rec |
 if $path == "root" then empty
 elif ($prompt > 0 and ($hit / $prompt) < $fraction) then
-  "[watch] LOW PREFIX USE on reuse: \($rec)"
-elif $prefill > $max_prefill_s then
-  "[watch] SLOW REUSE (prefill \($prefill)s > \($max_prefill_s)s): \($rec)"
+  "[watch] LOW PREFIX USE on reuse\(if $prefill > $max_prefill_s then " (SLOW)" else "" end): \($rec)"
 else
   "[watch] reuse-ok: \($rec)"
 end

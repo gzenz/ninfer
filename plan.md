@@ -956,6 +956,26 @@ task needs no re-derivation:
      constraint is `host_state_slots`, and the 11 -> 10 -> 9 decrement across these three lines suggests
      the victims held slots of their own (`materialization.cpp:2140`: usage still includes the victim's own
      pages, so every "free" figure here is a lower bound).
+   **DECISIVE, 2026-09-26 18:30:34 (seven lines in one second, prod, the build that carries the eligibility
+   field but not yet the session id): every one read `demotable=1 restorable=1`.** Host STATE SLOTS were
+   free (8/16 falling to 2/16), host KV was nearly empty (1.2-3.6 GB of 30 GiB), and each victim held a
+   RESTORABLE state image (`state_store->complete`: immutable, settled replica, non-zero epoch) with
+   frontiers 42,566 / 44,390 / 73,343 / 73,931 / 68,346 / 77,219 / 51,781. So the innocent explanation is
+   excluded: `restorable` covers the state image, and the other two requirements -- a host slot and host KV
+   room -- were both satisfied, so the demote option existed on every axis the engine checks, and eviction
+   was chosen anyway.
+   **It has a visible cost, which is how the report that prompted it reads.** In the request log of the
+   instance serving that traffic, requests 14 and 21 reused exactly **23,706** tokens -- the SHARED prefix
+   -- and re-prefilled 7,308 and 42,994; 23,706 recurs across that instance, and **no request in it took
+   `private_turn_closure`**, the restore path. Evicting a 73k restorable continuation and re-prefilling
+   ~43k of it is the same event seen from the other end. **Not established as one event:** the join needs a
+   session id on both sides. The eviction line now carries `session=%016llx cont=%u`; the serve-side
+   request log does NOT yet record a matching field, so the two logs still cannot be matched.
+   **So #6 is now a POLICY question with evidence rather than a measurement gap** -- the demote-vs-evict
+   weighting evicted restorable, high-frontier victims while host had room. What would show whether that is
+   wrong is the planner's own accounting (`materialization.selected_degradation_units`, recorded in the
+   request log) set against the observed re-prefill, which is the next comparison rather than another
+   counter.
    * **the instrument is now MUTED for this item.** The print is rate-limited to the first 8 and then every
      512th (`materialization.cpp:2154`), and `checked=8` was the eighth: the next line is at check 512, and
      `demotable_evictions_` is not exported to `/stats` at all (`grep -rl demotable_evictions_ src/` finds

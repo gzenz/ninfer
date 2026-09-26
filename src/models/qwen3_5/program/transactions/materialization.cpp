@@ -2149,15 +2149,38 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
                     const detail::PhysicalResources room = admission_capacity();
                     const bool demotable = usage.host_state_slots < room.host.state_slots &&
                                            usage.host_kv_bytes < room.host.kv_bytes;
+                    // The ELIGIBILITY half, which `demotable` does not express: could this victim have been
+                    // demoted at all? Demotion needs a RESTORABLE state image -- the same predicate #11(b)
+                    // uses (`state_store->complete`, which requires immutable + a settled replica + a
+                    // non-zero epoch). Printed beside `demotable` because the two answer different
+                    // questions and a reader who sees only the first concludes the engine wasted free host
+                    // capacity: `demotable=1 restorable=0` means eviction was the ONLY option here, and
+                    // `demotable=1 restorable=1` is the case that would need the demote-vs-evict weighting
+                    // examined. Neither is a verdict on the policy -- the planner's cost model is not
+                    // modelled by either flag.
+                    // `session=` and `cont=` exist so this line can be JOINED to a served request rather
+                    // than compared with one by magnitude: the 18:13 evictions (frontiers 69k-76k,
+                    // demotable=1) and a user's report that two requests reused only the 23.7k shared
+                    // prefix while re-prefilling 43k are plausibly the same phenomenon, and nothing tied
+                    // them together. `session_key_hash` is what the engine sets on a continuation at
+                    // prefill (`prefill.cpp:256`, from the request's owner). CAVEAT: the serve-side
+                    // request log records no matching field yet, so this is the engine HALF of the join --
+                    // the other half has to be added before the two logs can actually be matched.
+                    const bool state_restorable =
+                        victim.rewrite_state.has_value() && state_store->complete(*victim.rewrite_state);
                     if (demotable) { ++demotable_evictions_; }
                     ++demotable_eviction_checks_;
                     if (demotable_eviction_checks_ <= 8ULL ||
                         demotable_eviction_checks_ % 512ULL == 0ULL) {
                         std::fprintf(stderr,
-                                     "[engine] private victim evicted: demotable=%d frontier=%u "
-                                     "endpoint=%d rewrite=%d anchors=%zu host_state_slots=%u/%llu "
-                                     "host_kv=%zu/%llu checked=%llu demotable_total=%llu\n",
-                                     static_cast<int>(demotable), victim.execution_frontier,
+                                     "[engine] private victim evicted: demotable=%d restorable=%d "
+                                     "session=%016llx cont=%u frontier=%u endpoint=%d rewrite=%d "
+                                     "anchors=%zu host_state_slots=%u/%llu host_kv=%zu/%llu "
+                                     "checked=%llu demotable_total=%llu\n",
+                                     static_cast<int>(demotable),
+                                     static_cast<int>(state_restorable),
+                                     static_cast<unsigned long long>(victim.session_key_hash),
+                                     work.continuation_index, victim.execution_frontier,
                                      static_cast<int>(victim.endpoint_valid),
                                      static_cast<int>(victim.rewrite_checkpoint.valid),
                                      victim.long_anchors.size(), usage.host_state_slots,

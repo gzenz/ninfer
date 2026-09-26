@@ -627,7 +627,7 @@ public:
         rebuild_prefix_index();
 
         CaptureAssessment private_baseline =
-            program.inspect_capture(offer, nullptr, nullptr, std::nullopt, false);
+            program.inspect_capture(offer, nullptr, nullptr, std::nullopt, false, "baseline");
         std::optional<CheckpointRef> private_replacement;
         if (!private_baseline.private_replacement_candidates.empty()) {
             private_replacement =
@@ -638,11 +638,11 @@ public:
                                              std::tuple{rhs.kind, rhs.frontier, rhs.ordinal};
                                   });
             private_baseline =
-                program.inspect_capture(offer, nullptr, nullptr, private_replacement, false);
+                program.inspect_capture(offer, nullptr, nullptr, private_replacement, false, "candidate");
         }
 
         CaptureAssessment candidate =
-            program.inspect_capture(offer, nullptr, nullptr, private_replacement, true);
+            program.inspect_capture(offer, nullptr, nullptr, private_replacement, true, "candidate-shared");
         const SharedPrefixHandle* exact_shared = nullptr;
         if (candidate.publishes_shared) {
             for (const PrefixIndexEntry& index : prefix_index_) {
@@ -718,7 +718,7 @@ public:
                         continue;
                     }
                     CaptureAssessment assessment = program.inspect_capture(
-                        offer, nullptr, &*entry.handle, private_replacement, true);
+                        offer, nullptr, &*entry.handle, private_replacement, true, "shared-replacement");
                     if (!assessment.publishes_shared) { continue; }
                     scenarios.push_back(CaptureScenario{
                         .assessment           = std::move(assessment),
@@ -1205,6 +1205,7 @@ public:
         out.pressure_private_owners_evicted    = context_stats_.pressure_private_owners_evicted;
         out.pressure_shared_owners_degraded    = context_stats_.pressure_shared_owners_degraded;
         out.pressure_shared_owners_evicted     = context_stats_.pressure_shared_owners_evicted;
+        out.pressure_shared_owners_replaced    = program.shared_replacements();
         out.pressure_checkpoints_dropped       = context_stats_.pressure_checkpoints_dropped;
         out.pressure_searches                  = context_stats_.pressure_searches;
         out.pressure_search_budget_exhaustions = context_stats_.pressure_search_budget_exhaustions;

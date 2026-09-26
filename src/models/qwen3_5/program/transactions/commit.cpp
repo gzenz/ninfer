@@ -831,9 +831,20 @@ ReleaseResult ProgramImpl::release_shared_prefix(SharedPrefixHandle&& handle) no
 }
 
 void ProgramImpl::resource_census() const noexcept {
+    // NULL-CHECKED, and that is a fix to a crash this census caused in the code it was written to serve.
+    // `backend_kv_addresses` is null in any configuration without a backend KV (MTP-less or DFlash-less
+    // engines, e.g. `pressure_resume_engine_options`), and calling a non-virtual member through a null
+    // pointer does not throw -- it segfaults. The `try` above cannot catch that.
+    //
+    // Reproduced 2026-09-26 in `feasibility-orphan` under gdb: `KVAddressSpaceStore::census
+    // (this=0x0, label="backend")` reached from `report_recovery_residual` -> `recover_from_oom_locked`.
+    // **The census runs whenever the residual is non-zero -- i.e. exactly when the engine is in #9's
+    // incident state, which is the state the census exists to report.** So this bug did not merely risk a
+    // crash: it would have taken the process down at the moment of the observation, converting the one
+    // event this whole investigation is waiting for into a crash with no diagnosis.
     try {
-        text_kv_addresses->census("text");
-        backend_kv_addresses->census("backend");
+        if (text_kv_addresses) { text_kv_addresses->census("text"); }
+        if (backend_kv_addresses) { backend_kv_addresses->census("backend"); }
     } catch (...) {}
 }
 

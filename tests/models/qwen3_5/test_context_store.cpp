@@ -114,6 +114,47 @@ void test_state_store(ninfer::DeviceContext& device) {
                images.checkpoint_references(*source) == 1,
            "aborted rewrite rotation restores the prior checkpoint identity");
 
+    // #11(b): `complete()` is the StateImage half of invariant #6 -- the KV side walks every required
+    // page and throws, and this expresses "there is a settled replica to restore from". Its first version
+    // returned false for any image with a pending replica, which includes an IN-FLIGHT Host-to-Device
+    // restore (`begin_host_to_device` sets `pending_device_slot`, `transfer_id` and `destination_pinned`
+    // while the host replica is settled) -- a false positive that would have failed pricing for a whole
+    // owner on healthy traffic, and the reason the condition now tests the settled slots instead. This
+    // case pins that: an image mid-restore IS complete, because its host replica is there.
+    const auto demoted = images.reserve_reset(device.stream);
+    expect(demoted.has_value(), "completeness case could reserve an image");
+    if (demoted.has_value()) {
+        images.freeze(*demoted);
+        expect(images.role(*demoted) == store::StateImageRole::CheckpointImmutable,
+               "completeness case froze its image into a checkpoint");
+        auto to_host = images.reserve_device_to_host(*demoted);
+        expect(to_host.has_value(), "completeness case could start a Device-to-Host demotion");
+        if (to_host.has_value()) {
+            images.enqueue_device_to_host(*to_host, device.stream);
+            images.publish_transfer(std::move(*to_host), false);
+            expect(images.complete(*demoted),
+                   "a checkpoint with a settled Host replica is complete");
+            auto to_device = images.begin_host_to_device(*demoted, device.stream);
+            expect(to_device.has_value(),
+                   "completeness case could start a Host-to-Device restore");
+            if (to_device.has_value()) {
+                expect(images.complete(*demoted),
+                       "a checkpoint mid-RESTORE is complete: its Host replica is settled, so an "
+                       "in-flight Device replica must not be read as incompleteness");
+                images.abort_transfer(std::move(*to_device));
+                expect(images.complete(*demoted),
+                       "aborting the restore leaves the checkpoint complete on its Host replica");
+            }
+        }
+        // Release what this case created, or the store's ownership-closure check at the end of this
+        // function fails -- which is exactly what the first version of this case did: two teardown
+        // failures ("rotated state image ownership closes after release" among them) that had nothing to
+        // do with `complete()` and everything to do with a leaked image.
+        expect(images.release(*demoted), "completeness case released the image it created");
+    }
+    expect(!images.complete(store::StateImageHandle{}),
+           "an invalid handle is not a complete checkpoint");
+
     images.freeze(*destination);
     (void)images.recycle_checkpoint_destination(*source);
     (void)images.begin_fork(*destination, *source);

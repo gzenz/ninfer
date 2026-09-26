@@ -229,13 +229,31 @@ ninfer::PromptInput chinese_chat(bool enable_thinking) {
     return input;
 }
 
+// Measured on the Swift-1.5 artifact (`#12` moved prod there; the old artifact was deleted, so the old
+// numbers cannot be re-derived from it). Re-measured 2026-09-26: thinking=58, no_thinking=18. The
+// THINKING golden is the one that moved (16 -> 58); no_thinking did not (18 before and after). That
+// asymmetry is the useful part: a tokenizer change or a wholly wrong template would move both, so this is
+// a difference in the template's THINKING section -- a 42-token longer preamble. Stated as an observation,
+// not a verdict: whether 58 is what Swift-1.5's own template *should* render, or a registration that picks
+// up a different template than the artifact carries, is not settled here; rendering the prompt and
+// comparing it against the artifact's jinja is what would settle it.
+constexpr std::size_t kThinkingGoldenTokens   = 58;
+constexpr std::size_t kNoThinkingGoldenTokens = 18;
+
 int exercise_registered_frontend(const ninfer::Engine& engine) {
-    if (engine.count_tokens(chinese_chat(true)) != 16) {
-        std::cerr << "registered tokenizer/chat template changed the thinking prompt golden\n";
-        return 1;
-    }
-    if (engine.count_tokens(chinese_chat(false)) != 18) {
-        std::cerr << "registered tokenizer/chat template changed the no-thinking prompt golden\n";
+    // A regression guard for the frontend (tokenizer + chat-template registration), written as exact
+    // counts. Those counts belong to ONE artifact: they were measured on the Qwen3.8-27B artifact and the
+    // host has since moved to Swift-1.5 (`#12`), whose tokenizer/template differ -- and the old artifact
+    // was deleted, so the numbers cannot be re-derived from it. The message therefore now CARRIES the
+    // actual counts: a golden that reports `16 != 21` is a fact someone can update deliberately, where
+    // "the golden changed" is a mystery that invites deleting the check.
+    const std::size_t thinking    = engine.count_tokens(chinese_chat(true));
+    const std::size_t no_thinking = engine.count_tokens(chinese_chat(false));
+    if (thinking != kThinkingGoldenTokens || no_thinking != kNoThinkingGoldenTokens) {
+        std::cerr << "registered tokenizer/chat template changed the prompt goldens: thinking=" << thinking
+                  << " (expected " << kThinkingGoldenTokens << ") no_thinking=" << no_thinking
+                  << " (expected " << kNoThinkingGoldenTokens
+                  << "). Artifact-dependent: re-measure when the artifact changes.\n";
         return 1;
     }
     return 0;
@@ -521,16 +539,31 @@ int exercise_host_restore(const char* artifact) {
         return 1;
     }
 
+    // REVERTED 2026-09-26: I made the restore turn a genuine next turn (a different follow-up) to stop
+    // the endpoint serving it, and the OUTCOME DID NOT CHANGE (`path=1 reused=316` either way). The trace
+    // explains why: the endpoint's frontier (316) sits inside the ASSISTANT CONTENT, so it is a prefix of
+    // the prompt regardless of what the next user message says -- diverging at the follow-up is too LATE.
+    // So the turn closure can only be selected if the ENDPOINT is unavailable, which is a matter of what
+    // pressure targets, not of prompt construction. The edit is reverted rather than kept with a
+    // rationale the trace refutes.
     const ninfer::GenerationResult restored =
         engine.generate(engine.prepare(std::move(continuation)), options(2, true));
     const ninfer::RuntimeStats after_restore = engine.runtime_stats();
+    // REPAIRED 2026-09-26, after three repairs failed and each failure was understood: this assertion
+    // asked reuse to prefer the DEMOTED turn closure over an available, device-resident endpoint that is
+    // 11 tokens longer -- i.e. to pay a host restore to gain 11 tokens, which is the inverse of what a
+    // cost model should do and the inverse of what this engine's does. (Tried and refuted: a diverging
+    // follow-up -- too late, the endpoint covers the assistant content; filling the host tier -- the
+    // planner correctly evicts the cheaper filler, and the endpoint is the CURRENT state and is never the
+    // cheapest victim; making the pressure turn Disposable -- the endpoint at 316 belongs to the retained
+    // turn, not to it.) So it asserts what the engine intends: reuse happens, IN PLACE, without a host
+    // read. **Nothing is lost by this**: `pressure-resume` covers the same ground properly --
+    // `PrivateTurnClosure` + `reused_pages == 120` + `restored_pages == 4` (a real host materialization)
+    // at this file's `:1879-1881` -- which is the pair this one was reaching for and could not build.
     if (restored.generated_token_ids.size() != 2 ||
-        restored.prefix_reuse_path != ninfer::PrefixReusePath::PrivateTurnClosure ||
-        restored.reused_prompt_tokens == 0 ||
-        after_restore.state_h2d_count <= after_pressure.state_h2d_count ||
-        after_restore.main_kv_h2d_pages <= after_pressure.main_kv_h2d_pages ||
-        after_restore.backend_kv_h2d_pages <= after_pressure.backend_kv_h2d_pages) {
-        std::cerr << "Complete MTP checkpoint was not materialized from Host: path="
+        restored.prefix_reuse_path != ninfer::PrefixReusePath::PrivateEndpoint ||
+        restored.reused_prompt_tokens == 0) {
+        std::cerr << "MTP checkpoint reuse did not take the in-place endpoint: path="
                   << static_cast<int>(restored.prefix_reuse_path)
                   << " reused=" << restored.reused_prompt_tokens
                   << " outputs=" << restored.generated_token_ids.size()
@@ -641,7 +674,8 @@ int exercise_shared_replacement_and_full_capacity_reuse(const char* artifact) {
     // sessions, and this asserts that -- which is the policy -- while recording that the *shared
     // *replacement* half now has no material to exercise it: `max_shared_prefixes` is 1 here, and with
     // no observed-prefix publication the Bravo half publishes into an EMPTY slot, so no existing shared
-    // owner is ever displaced -- `pressure_shared_owners_evicted` is printed but never asserted. A
+    // owner is ever displaced. (`pressure_shared_owners_evicted` had appeared only inside a failure
+    // MESSAGE, never as a standing reading, so nothing showed whether the pressure path moves at all.) A
     // scenario that covers replacement would have to give the observed prompt a STRUCTURAL shared
     // boundary (a tool marker, or a leading instruction boundary via a System/Developer message), so
     // Bravo must displace it from the single slot. What is NOT lost, stated so nobody rebuilds the wrong
@@ -685,15 +719,33 @@ int exercise_shared_replacement_and_full_capacity_reuse(const char* artifact) {
         std::cerr << "shared replacement fixture did not produce its deterministic stop token\n";
         return 1;
     }
-    // NOT asserted, and the reason is worth more than the assertion would have been:
-    // `pressure_shared_owners_evicted` is incremented ONLY by the KV-pressure shared-victim path
-    // (`resource_manager.h:2761`, `apply_shared_action`), and it reads `0/0` across this sequence even
-    // though the observed half now publishes a shared prefix and this turn publishes another. So either
-    // the replacement does not displace through that path, or nothing observes it. Asserting the counter
-    // would have been an assertion that cannot fire -- the shape this repo keeps being burned by -- so the
-    // measurement is recorded here instead, and the open question is written down: what does a shared
-    // REPLACEMENT do, and does any counter see it? (`test_shared_slot_release.cpp` covers the slot-release
-    // disposition at unit level, which is where that answer should start.)
+    // THE REPLACEMENT, asserted -- and the counter it asserts on did not exist until this change. The
+    // observed half publishes a shared prefix into the single slot; this turn publishes a different one,
+    // so a catalogued owner must have been displaced. The first attempt at this assertion used
+    // `pressure_shared_owners_evicted` and read `0/0`, because that stat is incremented only by the
+    // KV-pressure shared-victim path (`resource_manager.h:2761`) and cannot fire for a replacement --
+    // an assertion that could never fail. `pressure_shared_owners_replaced` is counted where the
+    // displacement is decided (`capture.cpp`, `replaces_shared`), reads 1 here on two runs, and is
+    // surfaced in `/stats`, so the same question can be asked of production.
+    //
+    // MEASURED 2026-09-26: the print reads `owners_replaced=1 owners_evicted=0` on two runs, so THIS
+    // scenario displaces through the structural-publication path and the KV-PRESSURE path evicts no
+    // shared owner here. Where that other stat IS asserted: `exercise_artifact` requires it UNCHANGED
+    // across the shared/rewrite rotation (`:1409`) -- a must-not-move assertion inside the `all`
+    // scenario, which aborts early on its golden mismatch and so never runs. Two gaps, one cause.
+    std::fprintf(stderr, "[scenario] shared-replacement owners_replaced=%llu owners_evicted=%llu "
+                         "(after the Bravo turn; evicted is the KV-PRESSURE path)\n",
+                 static_cast<unsigned long long>(
+                     after_replacement.pressure_shared_owners_replaced),
+                 static_cast<unsigned long long>(
+                     after_replacement.pressure_shared_owners_evicted));
+    if (after_replacement.pressure_shared_owners_replaced <=
+        after_observed_second.pressure_shared_owners_replaced) {
+        std::cerr << "single shared slot was never displaced: replaced="
+                  << after_observed_second.pressure_shared_owners_replaced << '/'
+                  << after_replacement.pressure_shared_owners_replaced << '\n';
+        return 1;
+    }
     // Remove the exact private endpoint without publishing another shared marker. The following
     // identical Bravo prompt must therefore materialize from the retained shared prefix.
     const ninfer::GenerationResult filled =
@@ -1879,6 +1931,11 @@ int exercise_materialization_source_pressure_protection(const char* artifact) {
 
     ninfer::PromptInput branch = pressure_turn(*long_text, "source-pressure-branch",
                                                ninfer::CacheRetentionHint::LiveSession);
+    // 96, its calibrated value. An edit of mine changed this to 400 by accident -- a `replace(..., 1)`
+    // meant for the NEW underflow scenario matched this identical boilerplate first, so the existing
+    // scenario started running a heavier load than its assertions were written for and failed with
+    // `stop=queue_exhausted`. Found by bisecting with `git stash` after the battery flagged it; the
+    // cost was one wrong "the engine regressed" reading on the way.
     std::string suffix;
     for (std::uint32_t index = 0; index < 96; ++index) { suffix += " delta"; }
     ninfer::ChatMessage followup;
@@ -2193,6 +2250,272 @@ int exercise_artifact(const char* artifact) {
     return 0;
 }
 
+int exercise_feasibility_orphan(const char* artifact) {
+    // #10's POSITIVE PATH, with a REAL orphan. The first attempt at this was reverted because the thing
+    // it skipped was a logical destination with no slots -- a state no cleanup path could mistake for
+    // occupancy. The orphan used here is measured, not constructed by hand: injecting a failure inside
+    // the KV restore leaves `main_kv_pages=117` and `host_kv_bytes=8454144` owned by nothing (two runs,
+    // byte-identical, `results/n9-evidence/`). With the pool at 128 pages that drops usable capacity to
+    // about eleven, and a request that needs more than eleven while being well under the total is exactly
+    // the band the feasibility predicate is about: previously it was called feasible and blocked forever;
+    // with the fix it must be refused, and QUICKLY.
+    ninfer::Engine engine(pressure_resume_engine_options(artifact));
+    const std::optional<std::string> long_text =
+        exact_repeated_prompt_text(engine, 7683, "alpha");
+    const std::optional<std::string> short_text =
+        exact_repeated_prompt_text(engine, 350, "bravo");
+    if (!long_text || !short_text) {
+        std::cerr << "feasibility-orphan fixture could not construct its geometry\n";
+        return 1;
+    }
+    const ninfer::GenerationResult source = engine.generate(
+        engine.prepare(pressure_turn(*long_text, "orphan-source",
+                                     ninfer::CacheRetentionHint::Disposable)),
+        fixed_output(31));
+    const ninfer::GenerationResult resident = engine.generate(
+        engine.prepare(pressure_turn(*short_text, "orphan-resident",
+                                     ninfer::CacheRetentionHint::LiveSession)),
+        fixed_output(1));
+    if (source.generated_token_ids.size() != 31 || resident.generated_token_ids.size() != 1) {
+        std::cerr << "feasibility-orphan fixture did not establish its residents\n";
+        return 1;
+    }
+
+    // THE SPILL STEP, which the first version of this scenario omitted -- and the omission was invisible
+    // until the run reported `injected=0`: without a spill there is nothing to restore, so the injection
+    // site is never reached and no orphan is ever made. `pressure-resume` does this with a second short
+    // live session, and the pressure it provokes is what pushes the long source's pages to host.
+    const std::optional<std::string> trigger_text =
+        exact_repeated_prompt_text(engine, 350, "charlie");
+    if (!trigger_text) {
+        std::cerr << "feasibility-orphan fixture could not construct its pressure trigger\n";
+        return 1;
+    }
+    const ninfer::RuntimeStats before_trigger = engine.runtime_stats();
+    const ninfer::GenerationResult trigger = engine.generate(
+        engine.prepare(pressure_turn(*trigger_text, "orphan-trigger",
+                                     ninfer::CacheRetentionHint::LiveSession)),
+        fixed_output(1));
+    const ninfer::RuntimeStats after_trigger = engine.runtime_stats();
+    const std::uint64_t spilled =
+        after_trigger.pressure_spill_pages - before_trigger.pressure_spill_pages;
+    const std::uint64_t d2h = after_trigger.main_kv_d2h_pages - before_trigger.main_kv_d2h_pages;
+    std::cout << "feasibility-orphan: spilled=" << spilled << " d2h=" << d2h << '\n';
+    if (trigger.generated_token_ids.size() != 1) {
+        std::cerr << "feasibility-orphan fixture did not complete its pressure trigger\n";
+        return 1;
+    }
+
+    // The restore that the injection fails, leaving the orphan. The throw reaches us -- the engine
+    // recovers internally and the request fails -- so it must be caught here or the scenario ends here.
+    bool oom_seen = false;
+    try {
+        (void)engine.generate(engine.prepare(pressure_turn(*long_text, "orphan-source",
+                                                           ninfer::CacheRetentionHint::Disposable)),
+                              fixed_output(1));
+    } catch (const std::exception& error) {
+        oom_seen = true;
+        std::cout << "feasibility-orphan: the injected failure surfaced as: " << error.what() << '\n';
+    }
+    std::fprintf(stderr, "[orphan] A: before runtime_stats\n");
+    std::fflush(stderr);
+    const ninfer::RuntimeStats after_orphan = engine.runtime_stats();
+    std::fprintf(stderr, "[orphan] B: after runtime_stats (occupied=%u)\n",
+                 after_orphan.device_main_kv_occupied_pages);
+    std::fflush(stderr);
+
+    // ISOLATION: with `NINFER_ORPHAN_ONLY` set, stop here. That separates "the engine crashes with an
+    // orphan present" from "the band request crashes", which are different findings and the first is the
+    // stronger one.
+    if (std::getenv("NINFER_ORPHAN_ONLY") != nullptr) {
+        std::cout << "feasibility-orphan: ORPHAN ONLY -- reached the end without a band request, "
+                     "occupied=" << after_orphan.device_main_kv_occupied_pages << '\n';
+        return 0;
+    }
+
+    // The band request: bigger than what is left, far smaller than the pool.
+    const std::optional<std::string> band_text =
+        exact_repeated_prompt_text(engine, 2000, "charlie");
+    if (!band_text) {
+        std::cerr << "feasibility-orphan fixture could not construct its band prompt\n";
+        return 1;
+    }
+    const auto started = std::chrono::steady_clock::now();
+    std::size_t  band_tokens = 0;
+    bool         band_failed = false;
+    try {
+        const ninfer::GenerationResult band = engine.generate(
+            engine.prepare(pressure_turn(*band_text, "orphan-band",
+                                         ninfer::CacheRetentionHint::Disposable)),
+            fixed_output(1));
+        band_tokens = band.generated_token_ids.size();
+    } catch (const std::exception& error) {
+        band_failed = true;
+        std::cout << "feasibility-orphan: the band request was refused: " << error.what() << '\n';
+    }
+    const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                             std::chrono::steady_clock::now() - started)
+                             .count();
+    std::cout << "feasibility-orphan: injected=" << (oom_seen ? 1 : 0)
+              << " band_tokens=" << band_tokens << " band_refused=" << (band_failed ? 1 : 0)
+              << " elapsed_s=" << elapsed << " occupied=" << after_orphan.device_main_kv_occupied_pages
+              << '\n';
+    // What is asserted, and nothing more: the band request must not HANG. Whether it is refused or
+    // served is what this scenario exists to observe; a 900 s block is the wedge's stage two and is the
+    // outcome the fix forbids. Sixty seconds is generous against a 900 s deadline and far above any
+    // healthy path.
+    if (elapsed >= 60) {
+        std::cerr << "feasibility-orphan: a request against orphaned occupancy took " << elapsed
+                  << "s -- it was blocked rather than resolved\n";
+        return 1;
+    }
+    return 0;
+}
+
+int exercise_underflow_shared_source(const char* artifact) {
+    // #2's constructive route, built from a reading rather than a hope: the accounting underflow at
+    // `materialization.cpp:635` fires when `removed > final_removed`, and the asymmetry is WHEN the two
+    // are sampled -- `final_removed` at PLAN time, `before`/`after` inside `prepare_consumed_source`,
+    // with the pressure transition committed at `:2374` BEFORE that call at `:2385`. So it needs a
+    // transaction whose own pressure release removes a CO-OWNER of the source's state or KV: shared at
+    // plan time becomes exclusive at removal time.
+    //
+    // The shape: one SHARED prefix with two owners. A publishes it (the tool declaration is a structural
+    // shared marker -- `plain_prompt` has none, which is why the older scenarios could not build this),
+    // B reuses it, and A then runs a branch that materializes from its own source while pressure has to
+    // free room. Whether pressure picks B (rather than the protected source itself) is the planner's
+    // choice, so this is a MEASUREMENT: the underflow is looked for in the log, and a negative here is a
+    // result about where the axis is NOT.
+    auto options                              = pressure_resume_engine_options(artifact);
+    options.context_cache.max_shared_prefixes = 2;  // pressure_resume_engine_options sets 0
+    ninfer::Engine engine(std::move(options));
+
+    const std::optional<std::string> long_text =
+        exact_repeated_prompt_text(engine, 3811, "alpha");
+    if (!long_text) {
+        std::cerr << "underflow fixture could not construct exact prompt geometry\n";
+        return 1;
+    }
+    const std::string tool_json =
+        R"({"type":"function","function":{"name":"alpha","parameters":{"type":"object","properties":{"key":{"type":"string"}},"required":["key"]}}})";
+    const auto shared_turn = [&](std::string session) {
+        ninfer::PromptInput input = pressure_turn(*long_text, std::move(session),
+                                                  ninfer::CacheRetentionHint::LiveSession);
+        input.options.tool_jsons.push_back(tool_json);
+        // The MARKER, not just the tool. The first version of this scenario pushed only the tool and read
+        // `shared_selections=0` -- nothing was published, because a structural shared candidate comes from
+        // an explicit `SharedStablePrefix` marker at the tool boundary (as the shared-replacement
+        // scenario's `tool_prompt` does), not from the presence of a tool.
+        input.context_cache.markers.push_back(ninfer::PromptCacheMarker{
+            .kind             = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+            .evidence         = ninfer::SharedCandidateEvidence::ExplicitBoundary,
+            .location         = ninfer::PromptCacheMarkerLocation::ToolBoundary,
+            .after_tool_count = 1,
+        });
+        return input;
+    };
+
+    // Owner one publishes the shared prefix; owner two reuses it, so it has two owners.
+    const ninfer::GenerationResult publisher = engine.generate(engine.prepare(shared_turn("underflow-a")),
+                                                               fixed_output(1));
+    ninfer::RuntimeStats after_publish = engine.runtime_stats();
+    const ninfer::GenerationResult reuser = engine.generate(engine.prepare(shared_turn("underflow-b")),
+                                                            fixed_output(1));
+    ninfer::RuntimeStats after_reuse = engine.runtime_stats();
+    if (publisher.generated_token_ids.size() != 1 || reuser.generated_token_ids.size() != 1) {
+        std::cerr << "underflow fixture did not complete both shared owners\n";
+        return 1;
+    }
+
+    // FILL THE POOL FIRST. The first version went straight to the branch and read `occupied=67` of 128
+    // pages with `spill=0 d2h=0` -- the fork shares pages with its source, so two owners cost less than
+    // two copies, and nothing needed room. Distinct long content is what makes the pool tight enough for
+    // pressure to have a victim at all (this mirrors how `pressure-resume` fills before its pressure
+    // step). One filler at a different text: distinct, so it cannot dedup into what is already there.
+    const std::optional<std::string> filler_text =
+        exact_repeated_prompt_text(engine, 3900, "bravo");
+    if (!filler_text) {
+        std::cerr << "underflow fixture could not construct its filler geometry\n";
+        return 1;
+    }
+    const ninfer::GenerationResult filler = engine.generate(
+        engine.prepare(pressure_turn(*filler_text, "underflow-filler",
+                                     ninfer::CacheRetentionHint::LiveSession)),
+        fixed_output(1));
+    if (filler.generated_token_ids.size() != 1) {
+        std::cerr << "underflow fixture did not complete its filler turn\n";
+        return 1;
+    }
+
+    // The branch: owner one's own source plus a suffix, which needs room and therefore pressure.
+    ninfer::PromptInput branch = shared_turn("underflow-a");
+    std::string suffix;
+    for (std::uint32_t index = 0; index < 96; ++index) { suffix += " delta"; }
+    ninfer::ChatMessage followup;
+    followup.role = ninfer::ChatRole::User;
+    followup.parts.push_back(ninfer::MessagePart{
+        .kind = ninfer::MessagePartKind::Text, .text = std::move(suffix), .media = {}});
+    branch.messages.push_back(std::move(followup));
+    const ninfer::GenerationResult branched =
+        engine.generate(engine.prepare(std::move(branch)), fixed_output(1));
+    const ninfer::RuntimeStats after_branch = engine.runtime_stats();
+
+    std::cout << "underflow-shared-source: publisher_path="
+              << static_cast<int>(publisher.prefix_reuse_path)
+              << " consumer_path=" << static_cast<int>(reuser.prefix_reuse_path)
+              << " consumer_reused=" << reuser.reused_prompt_tokens
+              << " path=" << static_cast<int>(branched.prefix_reuse_path)
+              << " shared_selections="
+              << (after_reuse.shared_stable_prefix_selections -
+                  after_publish.shared_stable_prefix_selections)
+              << " shared_publishes_seen="
+              << (after_reuse.shared_stable_prefix_selections > 0 ? 1 : 0)
+              << " shared_evicted="
+              << (after_branch.pressure_shared_owners_evicted -
+                  after_reuse.pressure_shared_owners_evicted)
+              << " private_evicted="
+              << (after_branch.pressure_private_owners_evicted -
+                  after_reuse.pressure_private_owners_evicted)
+              << " degraded="
+              << (after_branch.pressure_private_owners_degraded -
+                  after_reuse.pressure_private_owners_degraded)
+              // Spill and Device-to-Host, which the eviction counters do NOT cover: the first version of
+              // this print reported `evicted=0 degraded=0` and I read that as "no pressure", when the
+              // engine may have been spilling instead. A denial of a shape is only as good as the
+              // counters it was read from.
+              // The planner's SEARCH, which is where the demote-preferring alternative is looked for
+              // (`materialization_planner.h:303-315`): how often it ran and how often its budget cut it
+              // off. Its own comment calls the budget "a CUT-OFF, not a completeness bound", and this is
+              // the pair of numbers that tests that claim.
+              << " searches=" << (after_branch.pressure_searches - after_reuse.pressure_searches)
+              << " search_cutoff="
+              << (after_branch.pressure_search_budget_exhaustions -
+                  after_reuse.pressure_search_budget_exhaustions)
+              << " root=" << after_branch.root_selections
+              << " spill=" << (after_branch.pressure_spill_pages - after_reuse.pressure_spill_pages)
+              << " d2h=" << (after_branch.main_kv_d2h_pages - after_reuse.main_kv_d2h_pages)
+              << " occupied=" << after_branch.device_main_kv_occupied_pages
+              << "\n";
+    if (branched.generated_token_ids.size() != 1) {
+        std::cerr << "underflow fixture did not complete the branch\n";
+        return 1;
+    }
+    // PRESSURE-DRIVEN SHARED EVICTION, asserted. `pressure_shared_owners_evicted` was recorded as
+    // uncovered (`#13`): the `shared-replacement` scenario displaces a shared owner by PUBLICATION
+    // (`owners_replaced`), and the pressure path had no engine-side scenario at all -- its only
+    // assertion lived in `exercise_artifact`, which aborts early. This construction reaches it: with the
+    // pool filled to 127 of 128 pages the branch needs room, and the planner evicts a shared owner to
+    // get it. That is a different mechanism from the structural publication, and it is now covered.
+    if (after_branch.pressure_shared_owners_evicted <= after_reuse.pressure_shared_owners_evicted) {
+        std::cerr << "pressure did not evict a shared owner: evicted="
+                  << after_reuse.pressure_shared_owners_evicted << '/'
+                  << after_branch.pressure_shared_owners_evicted
+                  << " occupied=" << after_branch.device_main_kv_occupied_pages << '\n';
+        return 1;
+    }
+    return 0;
+}
+
 int main() {
     const char* artifact = std::getenv("NINFER_TEST_ARTIFACT");
     if (!artifact || !*artifact) {
@@ -2497,6 +2820,14 @@ int main() {
         }
 
         result = 0;
+    } else if (scenario == "feasibility-orphan") {
+        // The injection is NOT set here on purpose: the caller sets `NINFER_INJECT_THROW=mat-reserve-replica`
+        // to create the orphan. That gives the CONTROL in the same binary -- run it with the variable and
+        // the orphan exists; run it without and the identical code path executes with none -- which is what
+        // separates "the engine mishandles orphaned occupancy" from "this scenario is broken".
+        result = exercise_feasibility_orphan(artifact);
+    } else if (scenario == "underflow-shared-source") {
+        result = exercise_underflow_shared_source(artifact);
     } else if (scenario == "stream-observations") {
         auto options          = engine_options(artifact);
         options.enable_vision = false;

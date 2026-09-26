@@ -997,11 +997,15 @@ public:
         return transaction_kind_ != TransactionKind::None;
     }
 
+    // The `site` parameter mirrors the real contract (`inspect_capture`'s call-site tag, which exists for
+    // the diagnostic line only): the mock must match the signature or the whole suite stops compiling,
+    // which is how this was found.
     [[nodiscard]] FakeCaptureAssessment inspect_capture(const FakeCaptureOffer&,
                                                         const FakeSharedPrefixHandle*,
                                                         const FakeSharedPrefixHandle*,
                                                         std::optional<CheckpointRef>,
-                                                        bool permit_shared_publication) const {
+                                                        bool permit_shared_publication,
+                                                        const char* /*site*/) const {
         FakeCaptureAssessment assessment = capture_assessment;
         if (!permit_shared_publication) { assessment.publishes_shared = false; }
         return assessment;
@@ -1135,6 +1139,8 @@ public:
     [[nodiscard]] ProgramResourceRevision resource_revision() const noexcept { return revision_; }
 
     [[nodiscard]] FakePhysicalUsage physical_usage() const noexcept { return usage; }
+    // Added with the shared-replacement counter: `populate_runtime_stats` reads it, so the mock needs it.
+    [[nodiscard]] std::uint64_t shared_replacements() const noexcept { return 0; }
 
     void invalidate_resources() noexcept { advance_revision(); }
 

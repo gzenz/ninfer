@@ -977,6 +977,13 @@ struct RuntimeStats {
     std::uint64_t pressure_private_owners_evicted      = 0;
     std::uint64_t pressure_shared_owners_degraded      = 0;
     std::uint64_t pressure_shared_owners_evicted       = 0;
+    // A shared slot whose catalogued owner was REPLACED by a new publication (`capture.cpp`, where
+    // `replaces_shared` is set and the slot becomes `ReservedReplacement`). It had no counter at all,
+    // which meant a run where shared prefixes were replaced was indistinguishable from one where none
+    // were -- and the one assertion that would have covered replacement in the suite could not be
+    // written for want of it (`pressure_shared_owners_evicted` is the KV-pressure path only, so it
+    // reads 0/0 across a replacement).
+    std::uint64_t pressure_shared_owners_replaced      = 0;
     std::uint64_t pressure_checkpoints_dropped         = 0;
     std::uint64_t pressure_searches                    = 0;
     std::uint64_t pressure_search_budget_exhaustions   = 0;

@@ -1983,49 +1983,8 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
         populate_continuation_summary(state, *result.final_summary);
     };
     const auto evict_private_result = [&](MaterializationVictimResult& result) {
-        // W2/#6: was this eviction forced by a shortage, or chosen while the host tier had room? The
-        // demotion half is counted where it is published (`pressure_private_owners_demoted_kv_only`,
-        // above), so this supplies the numerator the plan asked for: evictions that could have been
-        // demotions. Both conditions are required -- a demotion needs a host state slot AND host KV room
-        // for the pages -- so a non-zero count here is a real "evicted anyway", not a near-miss. Read at
-        // the commit site, per committed victim, never in the planner's candidate search.
-        try {
-            const PhysicalUsageSnapshot usage        = physical_usage();
-            const detail::PhysicalResources capacity = admission_capacity();
-            const bool demotable =
-                usage.host_state_slots < capacity.host.state_slots &&
-                usage.host_kv_bytes < capacity.host.kv_bytes;
-            if (demotable) { ++demotable_evictions_; }
-            // The denominator, and the reason this is not gated by the result: a counter that never
-            // fires is indistinguishable from a gate that can never be true. The first evictions of a
-            // run therefore report the host occupancy and capacity whether or not the condition held, so
-            // a run says "N evictions, M demotable, host was x/y and a/b" instead of just "0". (First
-            // version printed only when the condition held, and its first run said nothing at all.)
-            ++demotable_eviction_checks_;
-            if (demotable_eviction_checks_ <= 8ULL || demotable_eviction_checks_ % 512ULL == 0ULL) {
-                // #6 follow-up: WHICH victim, not just how many. A count of `demotable` evictions
-                // cannot be judged without knowing whether the victim was worth keeping. The planner's
-                // own value weight is not reachable from here (it lives in the search,
-                // `pressure_planner.cpp`), so this prints the one identifier the commit site has.
-                // An earlier version also carried the victim's endpoint frontier and live reference
-                // count; both are structurally zero here -- the summary is emplaced empty
-                // (`materialization.cpp:120`) and filled only on the RETAIN path
-                // (`retain_private_result`, :1973), so an evicted victim never has one. Dropped rather
-                // than printed as zeros that look like data. `owner` is a per-plan ordinal
-                // (`details.pressure_owner_ids`), not a stable identity.
-                std::fprintf(stderr,
-                             "[engine] private victim evicted: demotable=%d plan_owner_ordinal=%u "
-                             "host_state_slots=%u/%llu host_kv=%zu/%llu evictions_checked=%llu "
-                             "demotable_total=%llu\n",
-                             static_cast<int>(demotable), result.owner.value, usage.host_state_slots,
-                             static_cast<unsigned long long>(capacity.host.state_slots),
-                             usage.host_kv_bytes,
-                             static_cast<unsigned long long>(capacity.host.kv_bytes),
-                             static_cast<unsigned long long>(demotable_eviction_checks_),
-                             static_cast<unsigned long long>(demotable_evictions_));
-                std::fflush(stderr);
-            }
-        } catch (...) {}
+        // The #6 measurement lives at the CALL SITE (see `evict_private_result`'s caller), because this
+        // lambda runs after the victim's state has been released and there is nothing left to read.
         result.disposition        = runtime::VictimDisposition::Evicted;
         result.pressure_committed = true;
         result.final_summary.reset();
@@ -2165,6 +2124,38 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
         for (std::size_t position = 0; position < transaction.victim_count; ++position) {
             MaterializationTransaction::PressureWork& work = transaction.pressure[position];
             if (work.option.evicts_continuation) {
+                // #6's attribution, MEASURED HERE because this is the last moment the victim's state is
+                // still populated: `release_materialization_victim` clears it. The first version of this
+                // print read `result.final_summary`, which is emplaced empty and filled only on the RETAIN
+                // path -- so it reported `frontier=0 refs=0` for every eviction and told a reader nothing.
+                // These fields come from the state itself and are the ones a demote-first policy weighs:
+                // how much work the victim represents, and which restorable checkpoints it holds.
+                {
+                    const SequenceState& victim = continuation_states[work.continuation_index];
+                    const PhysicalUsageSnapshot usage    = physical_usage();
+                    const detail::PhysicalResources room = admission_capacity();
+                    const bool demotable = usage.host_state_slots < room.host.state_slots &&
+                                           usage.host_kv_bytes < room.host.kv_bytes;
+                    if (demotable) { ++demotable_evictions_; }
+                    ++demotable_eviction_checks_;
+                    if (demotable_eviction_checks_ <= 8ULL ||
+                        demotable_eviction_checks_ % 512ULL == 0ULL) {
+                        std::fprintf(stderr,
+                                     "[engine] private victim evicted: demotable=%d frontier=%u "
+                                     "endpoint=%d rewrite=%d anchors=%zu host_state_slots=%u/%llu "
+                                     "host_kv=%zu/%llu checked=%llu demotable_total=%llu\n",
+                                     static_cast<int>(demotable), victim.execution_frontier,
+                                     static_cast<int>(victim.endpoint_valid),
+                                     static_cast<int>(victim.rewrite_checkpoint.valid),
+                                     victim.long_anchors.size(), usage.host_state_slots,
+                                     static_cast<unsigned long long>(room.host.state_slots),
+                                     usage.host_kv_bytes,
+                                     static_cast<unsigned long long>(room.host.kv_bytes),
+                                     static_cast<unsigned long long>(demotable_eviction_checks_),
+                                     static_cast<unsigned long long>(demotable_evictions_));
+                        std::fflush(stderr);
+                    }
+                }
                 const PhysicalReleaseResult released =
                     release_materialization_victim(transaction, position);
                 if (released.status != runtime::ConsumeStatus::Consumed ||

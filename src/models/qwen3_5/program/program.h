@@ -890,7 +890,7 @@ public:
     inspect_capture(const CaptureOffer& offer, const SharedPrefixHandle* exact_shared,
                     const SharedPrefixHandle* replacement,
                     std::optional<runtime::CheckpointRef> private_replacement,
-                    bool permit_shared_publication) const;
+                    bool permit_shared_publication, const char* site) const;
     [[nodiscard]] std::vector<runtime::CheckpointRecoveryAlternativeWork>
     checkpoint_recovery_work(const ContinuationHandle& owner,
                              runtime::CheckpointRef checkpoint) const;
@@ -939,6 +939,7 @@ public:
     [[nodiscard]] ReleaseResult release_shared_prefix(SharedPrefixHandle&& shared) noexcept;
     void fail_all_cleanup() noexcept;
     void resource_census() const noexcept;
+    [[nodiscard]] std::uint64_t shared_replacements() const noexcept;
 
     [[nodiscard]] bool isolated_request_feasible(const RequestBasePlan& base) const noexcept;
     [[nodiscard]] runtime::ProgramResourceRevision resource_revision() const noexcept;

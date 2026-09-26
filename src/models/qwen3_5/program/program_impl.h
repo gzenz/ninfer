@@ -522,10 +522,14 @@ public:
     [[nodiscard]] PrefillProgress advance_prefill(SequenceHandle sequence,
                                                   runtime::ExecutionTiming* failed_timing);
     [[nodiscard]] CaptureAssessment
+    // `site` names the CALLER (baseline / candidate / candidate-shared / shared-replacement / reserve).
+    // It exists only for the diagnostic line: this function is called several times for one capture, so a
+    // count of lines is a count of calls, and without the tag the reading cannot say which phase produced
+    // it -- which is exactly how an earlier trace was misread.
     inspect_capture(const CaptureOffer& offer, const SharedPrefixHandle* exact_shared,
                     const SharedPrefixHandle* replacement,
                     std::optional<runtime::CheckpointRef> private_replacement,
-                    bool permit_shared_publication) const;
+                    bool permit_shared_publication, const char* site) const;
     [[nodiscard]] std::vector<runtime::CheckpointRecoveryAlternativeWork>
     checkpoint_recovery_work(const ContinuationHandle& owner,
                              runtime::CheckpointRef checkpoint) const;
@@ -567,6 +571,8 @@ public:
     // #9 diagnostic: what the KV address spaces still hold, per address. Called by the engine's recovery
     // path so a non-zero residual can be attributed to an owner instead of remaining an amount.
     void resource_census() const noexcept;
+    // Shared-prefix replacements observed (see `shared_replacements_`).
+    [[nodiscard]] std::uint64_t shared_replacements() const noexcept { return shared_replacements_; }
     [[nodiscard]] detail::PhysicalResources admission_capacity() const noexcept;
     [[nodiscard]] bool isolated_request_feasible(const RequestBasePlan& base) const noexcept;
 
@@ -896,6 +902,9 @@ private:
     // could only ever read 0 (the branch is unreachable), and a counter that can only read zero is a
     // claim, not an instrument.
     std::uint64_t recycled_checkpoint_drops_             = 0;
+    // A shared catalogued slot replaced by a new capture (`prepare_active_capture`). Counted so the
+    // replacement path is observable at all; read back through `Program::shared_replacements()`.
+    std::uint64_t shared_replacements_                   = 0;
     // #11(b): a checkpoint priced with no settled StateImage replica. Counted with its denominator, never
     // thrown on -- see the comment at the observation site.
     // `mutable`: the observation site is a const pricing walk, which is where the condition has to be

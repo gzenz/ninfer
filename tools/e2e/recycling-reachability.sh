@@ -59,7 +59,11 @@ for scenario in "${SCENARIOS[@]}"; do
   # The denominator, per scenario. Without it a run where the probe never executed -- stale binary,
   # crash at startup, test that never reached a capture -- is indistinguishable from a clean negative,
   # which is exactly the failure mode this whole investigation kept hitting.
-  calls=$(grep -c 'assess lane=' "$log" 2>/dev/null)
+  # The probe's line now carries its call site (`assess site=%s lane=%u`), so this counter must match the
+  # CURRENT format: it was left greping `assess lane=` after that change, which made every scenario report
+  # "NO ASSESSMENTS" and the run's denominator zero -- the script declaring its own evidence worthless
+  # because its counter was stale. Match the prefix that cannot move: `[capture] assess`.
+  calls=$(grep -c '\[capture\] assess' "$log" 2>/dev/null)
   total_calls=$((total_calls + calls))
   if [ "$calls" -eq 0 ] && [ "$hits" -eq 0 ]; then
     echo "[reach] $scenario: NO ASSESSMENTS (rc=$rc) -- the probe did not run; this scenario is"
@@ -102,7 +106,7 @@ for scenario in rewrite-checkpoint-shared shared-replacement; do
   env -u NINFER_CAPTURE_PROBE NINFER_PREFIX_REAL_SCENARIO="$scenario" timeout 600 "$BIN" >"$log" 2>&1
   rc=$?
   if [ "$rc" = 0 ]; then
-    echo "[reach] $scenario: PASSES without the probe -- the golden failure IS caused by the probes"
+    echo "[reach] $scenario: PASSES without the probe (informational only -- the goldens were CORRECTED\n          2026-09-26, so these two pass either way and this phase no longer discriminates anything)"
   else
     echo "[reach] $scenario: fails the same way without the probe (rc=$rc) -- not probe timing;"
     echo "[reach]   whether it pre-dates the diff is still unestablished; read $log"

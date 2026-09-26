@@ -78,6 +78,23 @@ def reply_text(out):
     return "".join(parts)
 
 
+def reply_shape(out):
+    """What KIND of reply came back, which `len(text)` alone cannot say.
+
+    `len=0` was recorded as an unexplained reproducible observation ("S2 r2 replies empty") because the
+    record kept only the concatenated TEXT. A turn whose reply is a tool call has no text and therefore
+    measures zero, so "empty reply" and "tool-only reply" were indistinguishable -- and one of them is an
+    engine finding while the other is this harness counting the wrong thing. The shape is what separates
+    them: the content-block kinds, the tool-call count and the stop reason.
+    """
+    blocks = out.get("content", []) or []
+    return {
+        "block_kinds": [b.get("type") for b in blocks],
+        "tool_calls": sum(1 for b in blocks if b.get("type") == "tool_use"),
+        "stop_reason": out.get("stop_reason"),
+    }
+
+
 def filler(rng, tokens):
     return _suite.filler(rng, tokens)
 
@@ -122,7 +139,9 @@ class CanarySession(threading.Thread):
         out = post_messages(self.args, payload)
         text = reply_text(out)
         self.messages.append({"role": "assistant", "content": text or "(empty)"})
-        return text
+        # The SHAPE comes back with the text: `verdict` needs it to tell an empty reply from a
+        # tool-only one, which the text alone cannot express.
+        return text, reply_shape(out)
 
     def run(self):
         # Staggered arrival: session i starts i*STAGGER after the previous one, then joins at the
@@ -136,17 +155,17 @@ class CanarySession(threading.Thread):
             body = document(self.rng, self.args.seed, self.canary)
             first = (f"{body}\n\nYour canary code is {self.canary}. "
                      f"Reply with only the canary code, nothing else.")
-            text = self.ask(first)
-            self.results.append(self.verdict("r1", text))
+            text, shape = self.ask(first)
+            self.results.append(self.verdict("r1", text, shape))
             for r in range(2, self.args.rounds + 1):
                 self.barrier.wait(timeout=900)
-                text = self.ask("Again: reply with only your canary code.")
-                self.results.append(self.verdict(f"r{r}", text))
+                text, shape = self.ask("Again: reply with only your canary code.")
+                self.results.append(self.verdict(f"r{r}", text, shape))
         except Exception as exc:  # noqa: BLE001 - reported, not raised
             self.errors += 1
             self.results.append({"session": self.name, "round": "?", "error": str(exc)})
 
-    def verdict(self, rnd, text):
+    def verdict(self, rnd, text, shape):
         own = self.canary in text
         foreign = [c for c in _ALL_CANARIES if c != self.canary and c in text]
         # A *partial* foreign match: another session's canary prefix appears without the full
@@ -166,12 +185,14 @@ class CanarySession(threading.Thread):
                    if c != self.canary and c not in text and len(c) > 14 and c[:14] in text]
         record = {"session": self.name, "round": rnd, "own": own,
                   "foreign": foreign, "foreign_partial": partial, "len": len(text),
-                  "text": text[:400]}
+                  "text": text[:400], **(shape or {})}
         # Print as we go: a capped run still shows which turn stalled. The body hash lets the
         # serve-side provenance log be matched to what this client actually received.
         body_hash = hashlib.sha256(text.encode()).hexdigest()[:16]
+        shape = shape or {}
         print(f"  {self.name} {rnd}: own={own} foreign={foreign} partial={partial} "
-              f"len={len(text)} sha={body_hash} :: {text[:60]!r}", flush=True)
+              f"len={len(text)} kinds={shape['block_kinds']} tools={shape['tool_calls']} "
+              f"stop={shape['stop_reason']} sha={body_hash} :: {text[:60]!r}", flush=True)
         record["sha"] = body_hash
         return record
 

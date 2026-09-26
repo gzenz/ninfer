@@ -35,7 +35,7 @@ CaptureAssessment
 ProgramImpl::inspect_capture(const CaptureOffer& offer, const SharedPrefixHandle* exact_shared,
                              const SharedPrefixHandle* replacement,
                              std::optional<runtime::CheckpointRef> private_replacement,
-                             bool permit_shared_publication) const {
+                             bool permit_shared_publication, const char* site) const {
     if (!valid_capture_offer(offer)) { throw std::logic_error("capture offer is stale"); }
     if (exact_shared != nullptr && replacement != nullptr) {
         throw std::invalid_argument("capture cannot deduplicate and replace simultaneously");
@@ -129,12 +129,13 @@ ProgramImpl::inspect_capture(const CaptureOffer& offer, const SharedPrefixHandle
             std::abort();
         }
         std::fprintf(stderr,
-                     "[capture] assess lane=%u placement=%d dev_occ=%u dev_cap=%u host_images=%d "
+                     "[capture] assess site=%s lane=%u placement=%d dev_occ=%u dev_cap=%u host_images=%d "
                      "shared_group=%d publish_shared=%d "
                      "rewrite_group=%d rewrite_state_live=%d "
                      "checkpoint_valid=%d slot_differs=%d can_recycle=%d replaces_rewrite=%d "
                      "recycles=%d frontier=%u base=%u refs=%d\n",
-                     lane, static_cast<int>(assessment.state_placement), state_store->device_occupied(),
+                     site != nullptr ? site : "?", lane, static_cast<int>(assessment.state_placement),
+                     state_store->device_occupied(),
                      state_store->device_capacity(),
                      static_cast<int>(host_state_images != nullptr),
                      static_cast<int>(group.shared), static_cast<int>(publish_shared),
@@ -439,7 +440,7 @@ runtime::ContextTransactionReserveStatus ProgramImpl::reserve_active_capture_imp
         return runtime::ContextTransactionReserveStatus::Aborted;
     }
     const CaptureAssessment assessment = inspect_capture(
-        offer, exact_shared, replacement, private_replacement, permit_shared_publication);
+        offer, exact_shared, replacement, private_replacement, permit_shared_publication, "reserve");
     if (!assessment.publishes_private && !assessment.publishes_shared) {
         skip_capture(std::move(offer));
         return runtime::ContextTransactionReserveStatus::Aborted;
@@ -553,6 +554,9 @@ runtime::ContextTransactionReserveStatus ProgramImpl::reserve_active_capture_imp
                 transaction.replaces_shared        = true;
                 transaction.replacement_generation = shared_prefix_slots[index].generation;
                 shared_prefix_slots[index].role    = SharedPrefixSlotRole::ReservedReplacement;
+                // Counted HERE, at the decision, because this is the only place that knows a catalogued
+                // shared owner is being displaced. Nothing else reported it -- see the field's comment.
+                ++shared_replacements_;
             } else {
                 for (std::uint32_t index = 0; index < shared_prefix_capacity; ++index) {
                     if (shared_prefix_slots[index].role == SharedPrefixSlotRole::Free) {

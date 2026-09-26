@@ -24,7 +24,7 @@
 > first time. They were merged into one file on 2026-09-25; `results/HANDOFF.md`, which used to hold
 > the actionable half separately, no longer exists.
 
-## Current state — actionable, as of 2026-09-25 18:56
+## Current state — actionable, as of 2026-09-26 17:00
 
 Read this for state and next actions. The dated narrative below is history, kept deliberately: several
 of its entries exist to stop a later reader re-deriving something that was wrong the first time. The
@@ -32,11 +32,19 @@ correction history lives *there*, not here — this section states what is true 
 
 ### 0. Where things stand
 
-- **Tree**: `master` tip `5fe12cf3`, 24 commits today, **none pushed**. Working tree clean (no tracked
-  modifications). Untracked: `CLAUDE.md`, `plan.md`, `results/`, `tests/fixtures/frontend/`.
-- **Prod**: `:8080` (`:8081` stats), active, **serving Swift-1.5** (`~/ninfer-models/swift15/`), verified
-  2026-09-25 18:40 by the running process's argv *and* a served request — not by config text.
-- **Acceptance**: the D1 gate PASS was taken on the **current** build, `9617ce1a517a@1790365993` (gate
+- **Tree**: `master` tip **`66157867`** (today's commits: `8925190b`, `3bebc96c`, `66157867`), **none
+  pushed**. Working tree NOT clean: **15 tracked files modified and 30 paths untracked** -- the
+  uncommitted work is listed and verified in the task list (`#12`), and it includes the census null-check,
+  so its state matters. Untracked: `CLAUDE.md`, `plan.md`, `results/`, `tests/fixtures/frontend/`, and the
+  new `tools/e2e/{recycling-reachability,n9-evidence}.sh`.
+- **Prod**: `:8080` (`:8081` stats), active, **serving Swift-1.5** (`~/ninfer-models/swift15/`), and
+  **restarted repeatedly today** by GPU windows and deploys -- last start 2026-09-26 16:54:30, exe
+  `3d78489da8e2`, which equals the current `build/apps/ninfer-serve`. Earlier today it ran binaries built
+  BEFORE the last edits, so any reading of its journal must be tied to a start time, not assumed current.
+- **Acceptance**: **STALE — the tree has changed since it was taken** (three commits and 15 uncommitted
+  files today), so the gate below describes a build that is no longer what runs. Re-run it before quoting
+  it; the rule that made it quotable is the one to keep: only an artifact whose `build_id` equals the
+  running exe's hash describes the running server. The PASS itself was taken on `9617ce1a517a@1790365993` (gate
   `[]`, reuse `{root: 4, private_endpoint: 12}`, `n_errors 0`), identity checked by hashing the running
   `/proc/<pid>/exe`; artifact `/tmp/ninfer-cmp-build-releaseprobe.json`. The build before it
   (`808e73cc480e`, artifact `-gracefix.json`) also passed; re-run the gate for any newer build, since
@@ -93,7 +101,11 @@ wedge; when it says `#13`, the accounting underflow.
 
 ### 2. Open, in priority order
 
-1. **#9 — the leak (the wedge's actual cause).** A recovery leaves occupancy owned by nothing: two
+1. **#9 — the leak, a LATENT FRAGILITY with a named mechanism and an UNEXPLAINED incident.** Not "the
+   wedge's actual cause": the mechanism is reproduced under injection (a pinned-but-unrecorded page
+   replica is invisible to cleanup) and the benign explanation for it has been removed, but nothing on
+   any measured path throws in that window, so what caused the 2026-09-25 incident is still unknown. What
+   the incident looked like: a recovery leaves occupancy owned by nothing -- two
    readings agree to the byte (main 958 pages, host 1 state slot, `host_kv 418,775,040 B`), which drops
    usable capacity to 3138 pages while `isolated_request_feasible` still compares against 4096 — so a
    request in that band is called feasible and blocked. **A trigger has now been produced under injection
@@ -127,11 +139,15 @@ wedge; when it says `#13`, the accounting underflow.
      this path, and it stands.
    The lesson is the repo's own, unlearned again: I counted print lines as events without checking how
    often the function is called. `assess` and `[plan]` were misread the same way (see #11 below).
-2. **#10 — the feasibility predicate.** Shipped: reject after a 5 s grace window instead of stalling
-   900 s (verified negatively — 0 rejections on healthy traffic). **Open**: make
-   `isolated_request_feasible` account for occupancy it cannot evict, so the honest outcome is a clean
-   "infeasible" rather than a rejection-by-timeout. No leak needed to make sense of it.
-3. **#11 — W1 residues.** (a) the recycled-checkpoint abort restores an old content epoch over content
+2. **#10 — the feasibility predicate. IMPLEMENTED AND COMMITTED; what is open is its POSITIVE PATH.**
+   Shipped: reject after a 5 s grace window instead of stalling 900 s (verified negatively -- 0 rejections
+   on healthy traffic), and `inspect` returns `PermanentlyInfeasible` when every lane is Free, so an
+   unsatisfiable block is refused at its decision site. **Open**: neither branch has been exercised
+   against a *real* orphan -- the one attempt (an injected skipped release) was reverted because the
+   thing it skipped was a logical destination with no slots, i.e. not the orphan shape the predicate is
+   about. No leak needed to make sense of it.
+3. **#11 — W1 residues.** (a) **disposal implemented**: the recycled-checkpoint abort no longer restores
+   an old content epoch over content
    the fork may have written — the abort arm now DROPS the checkpoint instead of restoring its epoch
    (disposal implemented 2026-09-26), which makes the question moot: a dropped checkpoint cannot carry
    stale bytes under a live name. `restore_recycled_checkpoint` stays in the store because it has its own
@@ -276,17 +292,34 @@ wedge; when it says `#13`, the accounting underflow.
      ExplicitBoundary/ToolBoundary shared marker: the observed turn now PUBLISHES a shared prefix, and the
      scenario's plan trace went from one `reuse=5` to **two** -- shared publication and reuse from that
      half are exercised again, verified twice with saved logs
-     (`results/golden-attribution/20260926-142815/`). What is STILL uncovered is the *displacement*: an
-     assertion that the single shared slot is evicted when the second candidate is published reads
-     `evicted=0/0`, and the reason is that `pressure_shared_owners_evicted` is incremented only by the
-     KV-pressure shared-victim path (`resource_manager.h:2761`, `apply_shared_action`) -- so it cannot fire
-     for a replacement. Writing that assertion would have been an assertion that cannot fire, so the
-     measurement is recorded instead, with the open question attached: what does a shared REPLACEMENT do,
-     and does any counter see it? `test_shared_slot_release.cpp` is where that answer should start.
+     (`results/golden-attribution/`). **The displacement is now covered too, because the missing
+     instrument was built rather than worked around.** The gap was never in the test: nothing counted a
+     shared replacement. `pressure_shared_owners_evicted` is incremented only by the KV-pressure
+     shared-victim path (`resource_manager.h:2761`, `apply_shared_action`) and reads 0 across a
+     replacement, so the first attempt at this assertion -- on that counter -- could never fire. So
+     `pressure_shared_owners_replaced` was added where the displacement is decided (`capture.cpp`,
+     `replaces_shared` -> `ReservedReplacement`), carried through `Program` into
+     `populate_runtime_stats` and out to `/stats` (`stats_json.cpp`). It reads **1** in this scenario,
+     twice, and the scenario now ASSERTS the delta. The question "did a shared owner get replaced, and how
+     often" is answerable in production now, and was not before.
+     **AND THE PRESSURE-DRIVEN EVICTION IS COVERED TOO (2026-09-26).** The gap this section named -- a
+     shared owner displaced by PRESSURE rather than by a structural publication, asserted nowhere
+     engine-side, whose only assertion lived in `exercise_artifact` (which aborts early) -- is now asserted
+     in `underflow-shared-source`: with the KV pool filled to **127 of 128 pages** the branch needs room,
+     the planner evicts a shared owner, and the scenario requires `pressure_shared_owners_evicted` to
+     advance. Verified twice, identical output (`shared_evicted=1 occupied=127`). A different mechanism
+     from the structural publication, now covered by a run rather than by an argument.
      It now asserts the policy -- `path=Root reused=0`, printed by the scenario and confirmed twice --
-     and its comment names the gap correctly: what is lost is **replacement**, since `max_shared_prefixes`
-     is 1 and Bravo now publishes into an *empty* slot, displacing nobody; `pressure_shared_owners_evicted`
-     is printed but never asserted. Not lost: `test_shared_slot_release.cpp` covers the slot-release
+     and its comment records the history: with `plain_prompt` the observed half had no shared candidate, so
+     `max_shared_prefixes = 1` left the slot EMPTY and Bravo displaced nobody -- which is why the replacement
+     went unexercised. With the tool, the slot is occupied and Bravo's publication displaces it (`replaced=1`),
+     and that delta is asserted. **What is still uncovered, measured not assumed:** the scenario prints
+     BOTH counters and reads `owners_replaced=1 owners_evicted=0` on two runs -- the displacement is the
+     structural-publication path, and the **KV-pressure** path evicts no shared owner in it. That stat IS
+     asserted somewhere (`exercise_artifact` requires it unchanged across the shared/rewrite rotation,
+     `test_engine_prefix_real.cpp:1409`), but that lives in the `all` scenario, which aborts early on its
+     golden mismatch -- so the assertion never runs. Two gaps with one cause, and closing the `all`
+     mismatch would give the second one reach. Not lost: `test_shared_slot_release.cpp` covers the slot-release
      disposition at unit level and `anthropic-prefix-regression` covers shared reuse -- so it is
      real-engine *replacement* that is uncovered, not shared reuse in general.
    Verified, with the logs saved this time (`results/golden-attribution/20260926-142216/`, run twice):
@@ -297,6 +330,68 @@ wedge; when it says `#13`, the accounting underflow.
    **This is the kind of change that can look like silencing a test, so it is stated as a risk:** two
    assertions were turned around rather than one defect fixed. The defence is the trace and the code
    comment above, not the passing run.
+   **`all` IS A BATTERY OF ARTIFACT-CALIBRATED GOLDENS, not one stale check (2026-09-26).** Worked on in
+   dev time: the FIRST golden was the frontend prompt comparison, and it was measured rather than assumed --
+   `thinking=58 (expected 16) no_thinking=18 (expected 18)`. **Only the thinking count moved**, which is the
+   useful part: a tokenizer change or a wholly wrong template would move both, so this is a difference in
+   the template's thinking section (a 42-token longer preamble). The golden is updated to 58, the numbers
+   are now named constants, and the failure message carries the actual counts so the next person updates a
+   fact instead of deleting a check. (Whether 58 is what Swift-1.5's own template *should* render, or a
+   registration picking up a different template than the artifact carries, is NOT settled -- rendering the
+   prompt and comparing it against the artifact's jinja is what would settle it. Stated, not assumed.)
+   With that fixed, `all` proceeds further and fails at a SECOND golden: *"Complete MTP checkpoint was not
+   materialized from Host: path=1 reused=316 outputs=2 state=0"*.
+   **CHARACTERISED 2026-09-26, with the mechanism rather than a guess -- and it is a stale PREMISE, not a
+   regression.** The `[plan]` trace for that turn offers BOTH candidates and shows which won:
+   `n=50 tokens=334 reuse=1 reuse_base=316` (PrivateEndpoint) and `n=51 reuse=2 reuse_base=305`
+   (PrivateTurnClosure) -- the engine takes the LONGER prefix, 316 over 305, so the device-resident endpoint
+   is reused and no host materialization is needed (`state_h2d_count` stays 0). The scenario's premise was
+   that pressure would EVICT the endpoint, leaving the demoted closure as the only option; the same run's
+   counters read `degraded=1 evicted=0` -- pressure **demoted** it instead, so it stayed available in place.
+   That is the demote-first behaviour read earlier (`pressure_planner.cpp:760-767`), doing what it says.
+   So this is the third instance of the same family (a test whose premise the engine has moved past), and
+   the first one explained by a mechanism rather than by a stale golden.
+   **A FIX WAS TRIED AND REFUTED BY ITS OWN TRACE (2026-09-26).** The obvious repair is to make the restore
+   turn a genuine NEXT turn -- a different follow-up -- so the longer endpoint cannot serve it. It changed
+   nothing (`path=1 reused=316` either way), and the trace says why: the endpoint's frontier (316) sits
+   inside the ASSISTANT CONTENT, so it is a prefix of the prompt whatever the next user message says;
+   diverging at the follow-up is too LATE. The closure can therefore only be selected if the **endpoint is
+   unavailable**, which is a question of what pressure TARGETS, not of prompt construction. The edit is
+   reverted (the tree is back to its original form, build clean) rather than kept with a rationale the
+   trace refutes.
+   The two expectations were in TENSION, which is why it read as a restructuring question: `host_restore_engine_options` runs with `device_state_slots = 1` and
+   `host_state_slots = 2`, so exactly one state is device-resident: the CURRENT endpoint, while the older
+   turn closure is the one demoted (which is what the scenario's own pressure assertion demands -- it
+   requires `state_d2h`/`main_kv_d2h`/`backend_kv_d2h` to increase). Reuse then takes the longer,
+   in-place endpoint. So the restore assertion asks reuse to PREFER the demoted checkpoint over an
+   available in-place one -- i.e. to pay a host restore to gain 11 tokens -- which is the opposite of what
+   a cost model should do, and the opposite of what this engine's does. The assertion is not merely stale:
+   it encodes the inverse preference.
+   **RESOLVED 2026-09-26: the assertion is REPAIRED, and `all` now passes -- twice.** The disposition was
+   decidable on evidence once the coverage question was checked: `pressure-resume` asserts the same pair
+   this scenario was reaching for -- `PrivateTurnClosure` + `reused_pages == 120` + `restored_pages == 4`
+   (a real host materialization) at `:1879-1881` -- so nothing is lost by asserting what this engine
+   actually intends here (reuse in place, no host read). `all` returns `ok` on two consecutive runs.
+   **The three repairs tried before that are worth keeping as a record of why it looked fixable:**
+
+   * *Make the restore a genuine next turn* (a different follow-up) -- no change, and the trace says why:
+     the endpoint's frontier sits inside the ASSISTANT CONTENT, so it is a prefix of the prompt whatever
+     the next user message says. Diverging at the follow-up is too late.
+   * *Fill the host tier so pressure must evict rather than demote* (two distinct long turns) -- this DID
+     change the pressure outcome (`evicted=0 -> 1`, `degraded=1 -> 2`) and still did not change the reuse:
+     the planner evicted the FILLER, which is correct (cheapest victim), while the endpoint survives as the
+     **current, active state** -- which no pressure path evicts.
+   So this scenario cannot exercise a closure-with-host-restore at all: the endpoint is always a longer,
+   in-place candidate AND is protected as the current state. That is a construction limit, not a policy
+   bug, and it explains why the assertion has been unsatisfiable without anything being wrong in the engine.
+   Both edits were reverted (build clean) rather than kept with rationales their runs refute.
+   **Disposition, and it is now clearly the operator's:** retire it (host materialization is covered by the
+   pressure/restore scenarios that do not depend on this preference), or rebuild it around a shape where
+   the endpoint cannot serve -- which, given the above, means a SECOND session reusing the demoted closure,
+   i.e. the cross-session path from §2c. **Until one is chosen, `all` stays evidence for nothing.** **Not fixed here:** re-baselining
+   the battery deliberately is a piece of work in its own right, and until it is done `all` remains
+   evidence for nothing -- which is what this line already said. What a fix would need: make the endpoint
+   genuinely unavailable (evicted) or accept the demotion path and assert THAT.
    (`all` is excluded because it aborts on a known golden mismatch, and `stream-observations` because it
    runs with `context_cache.enabled = false` and so builds no captures; `vision` generates its own image
    via `gradient_ppm()` and needs no fixture). That is all of them, and it is still not "everything the
@@ -342,7 +437,12 @@ wedge; when it says `#13`, the accounting underflow.
    `StateImageStore::complete` expresses it (immutable, a settled replica, non-zero epoch), and the
    pricing walk that already checks the KV half now counts incomplete states with its denominator and
    prints rather than throwing — this file's neighbours are explicit that a throw on that path kills the
-   worker, and the condition has never been observed.
+   worker, and the condition has never been observed. **Unit test added 2026-09-26** (`test_context_store.cpp`,
+   passes): a checkpoint with a settled Host replica is complete; one MID-RESTORE is complete (the false
+   positive a review pass caught — `begin_host_to_device` sets `pending_device_slot` while the host
+   replica is settled, and the first version read that as incompleteness); aborting the restore leaves it
+   complete; and an invalid handle is not. That case is the one that matters, because the alternative
+   reading would have failed pricing for a whole owner on healthy traffic.
    **CONSTRUCTED SCENARIOS ALSO NEGATIVE (2026-09-25 23:26).** Five real-engine scenarios ran in GPU
    windows via the new `tools/e2e/ninfer-gpu-window.sh`, each against prod's own artifact with every
    leak instrument enabled: `pressure-resume`, `private-checkpoint-pressure`,
@@ -586,16 +686,145 @@ wedge; when it says `#13`, the accounting underflow.
    the *before* one, while the calls between only drop references, whereas 606 fires when the actual
    removal exceeds the planned `final_removed` -- and pressure releases victims *before*
    `prepare_consumed_source`, so any sharing with a victim that disappears in that gap raises the
-   source's exclusive count after the plan was sampled. A plausible constructive route exists: seed a
-   continuation, fork it in retain mode from a different session so the state is shared, then have the
-   first session consume it while the fork is the pressure victim.
+   source's exclusive count after the plan was sampled.
+   **Constructive route, now specified rather than sketched (2026-09-26, by reading -- NOT a result).**
+   Those two numbers are the ones at `materialization.cpp:634` (`removed = checked_resource_difference(before,
+   after)`) and `:635` (`checked_resource_difference(details.demand.final_removed, removed)`), and the
+   asymmetry is WHEN each is sampled: `final_removed` at PLAN time, `before`/`after` inside
+   `prepare_consumed_source` -- and the transaction commits its pressure transition at `:2374` BEFORE
+   calling `prepare_consumed_source` at `:2385`. So a transaction whose own pressure release removes a
+   CO-OWNER of the source's state or KV turns "shared at plan time" into "exclusive at removal time":
+   `removed > final_removed`, and `:635` fires.
+   The recipe: **two owners of one shared prefix, one materializing while pressure evicts the OTHER.**
+   Why the existing protection does not cover it: `source-pressure-protection` stops the SOURCE being
+   chosen as its own victim -- a different case from a co-owner of the source disappearing. And the
+   ordering above makes it deterministic rather than racy, which is why it is worth building at all.
+   Still unobserved: no saved log under `results/` contains the message (checked 2026-09-26), so nothing
+   run so far has fired it.
+   **SCENARIO BUILT, AND IT DOES NOT YET PRODUCE THE SHAPE (2026-09-26, dev time).**
+   `underflow-shared-source` exists (scenario name of the same string) and runs. Three runs, each
+   correcting my own errors rather than the engine's:
+   * run 1 read `shared_selections=0` because a tool DECLARATION is not a shared marker -- the explicit
+     `SharedStablePrefix` / `ToolBoundary` marker is what publishes one;
+   * run 2 with the marker still read 0 selections, with a longer suffix, and `evicted=0 degraded=0`:
+     the branch fitted, so no pressure arose;
+   * run 3 under the assess probe shows publication DID happen (`[capture] SHARED-FRONTIER advertised=63
+     frozen=63 ... mismatches=0/1`) and that **the consumer declines the shared prefix**:
+     `shared_stable_prefix_selections` stays 0, so no second owner of the prefix is ever created -- and
+     with one owner there is no co-owner to evict, which is the whole precondition.
+   **ANSWERED, AND THE SCENARIO NOW REACHES PRESSURE -- WITHOUT FIRING THE UNDERFLOW (2026-09-26).**
+   The consumer-side question is settled: the shared prefix at frontier 63 IS considered
+   (`[plan] n=5 reuse=5 reuse_base=63`) and a private candidate with a far longer base wins -- and, per
+   #14's resolution, the consumer's `path=1` adoption of the publisher's endpoint ran with
+   `source_mode=Retain`, so it FORKED it. **Two owners of one state therefore exist**, which is the
+   scenario's precondition, reached by a route I had not planned for.
+   The other half needed filling: the first runs read `occupied=67` of 128 pages and `spill=0 d2h=0`, so
+   nothing needed room. With a distinct long filler the pool reaches **127/128** and pressure engages
+   (`shared_evicted=1`, asserted above). **The underflow still does not fire**, and the reason is now
+   narrow rather than vague: the victim pressure chooses is the SHARED PREFIX, not the co-owner of the
+   source (`private_evicted=0`). For `:635` to fire, the resource that becomes exclusive must be the one
+   being removed -- so the next step is to steer the CO-OWNER into the victim slot, not to add more
+   pressure. Until then this is a negative with a named cause, and the scenario keeps its value for the
+   pressure-eviction coverage it now provides.
+   **AND THE CAUSE IS NOW ONE LEVEL DEEPER, WITH THE OBJECT NAMED (2026-09-26, by reading):** the victim
+   and the source's resource must be the SAME OBJECT, and in this construction they are not. What two
+   owners share here is a FORK DESTINATION -- `path=1` with `source_mode=Retain` gives the second owner its
+   own state copy (`activate_consumed_state` forks into `transaction.state_fork_destination`) -- while the
+   evicted shared prefix owns `SharedPrefixState::state` (`program_impl.h:401`), a different handle that the
+   branch's source never referenced. Evicting it therefore changes nothing about the source's exclusivity,
+   which is why `:635` stays silent.
+   So the recipe is narrower than "two owners": **the source's state must be ALIASED by the thing that
+   gets evicted** -- a shared prefix whose `state` IS the source's state image, which is the `SharedAlias`
+   topology (`exercise_rewrite_checkpoints`).
+   **AND THAT ROUTE IS ACTIVELY PROTECTED, which is where this stops being a scenario edit (2026-09-26).**
+   The `SharedAlias` exercise *requires* the alias to be preserved under pressure: it asserts that
+   degradations increase while `pressure_private_owners_evicted` and `pressure_shared_owners_evicted` stay
+   UNCHANGED across the rotation (`test_engine_prefix_real.cpp:1423-1445`) -- "shared/rewrite rotation did
+   not preserve both cache owners" is the failure message. So the engine deliberately degrades rather than
+   evicts when an alias is involved, and my recipe needs exactly the eviction that protection prevents.
+   **Consequence for the item:** the constructive route is exhausted at the point where it would have to
+   assume the protection has a hole. Building a scenario on that assumption would be speculation dressed as
+   a test, so #2's remaining routes are (a) an occurrence under real traffic, or (b) a specific case where
+   the protection is demonstrably incomplete -- and (b) needs a reason to believe it exists, which nothing
+   I have read supplies. Recorded so the next person does not rebuild the same scenario expecting a
+   different result.
 5. ~~**#7 — Swift-1.5**~~ — **done 2026-09-25**: prod runs `swift15` (verified by argv *and* a served
    request, not by config text), the wiring is in `~/ninfer-ensure.sh` so it survives a reboot, and the
    old 22 GB artifact was deleted after checking that nothing referenced or held it open (`df`: 655 ->
    676 GB free).
-6. **#6 — W2's demote-for-evict-only victims.** Measure-first: nothing counts evictions that could have
-   been demoted. The v2 safety-net items are **moot** (zero references in v3). `guided_closure` is **not**: it has zero
-   references because the plan says to port the *idea* (demote-first ordering) rather than the diff, and
+### W5 port: `guided_closure` before `root_maximal` — DESIGNED, NOT IMPLEMENTED (2026-09-26)
+
+Read to the point where an implementation is a directed task rather than a loop step, and recorded so that
+task needs no re-derivation:
+
+* **Where it goes.** `materialization_planner.h:277-283` chooses a pressure target: `identity_best` when the
+  identity target exists, otherwise `session.root_maximal_target(candidates[root_candidate_index].id)`
+  followed by `session.assess(...)`. A guided-closure attempt is a THIRD candidate at that site: try it
+  first, fall back to root-maximal when it does not resolve the deficit -- the ordering the carried item
+  asks for.
+* **What it selects among already exists.** `root_maximal_target` builds its choice vector from each
+  victim's `eviction_choice` (`pressure_planner.cpp:492-502`), and that field is a 1-based INDEX into
+  `victim.decisions` (`:415`, `:479-484`) -- the per-victim option space (evict / demote / drop checkpoint)
+  is already populated. A guided strategy is a different CHOICE per victim (prefer the demote decision
+  where one exists), not a new mechanism, which is why the port is tractable at all.
+* **Why it is worth having, bounded by a measurement.** #6 now shows evictions of victims holding a valid
+  endpoint AND a valid rewrite checkpoint while host had 8 free slots and 8 GiB -- the demote preference
+  does not always win today. The item's own validation is a measurement: root share under load, with and
+  without the guided attempt.
+* **Why it is NOT a loop step.** It changes which target the planner takes, in the file that decides
+  admission under pressure, and needs its own review and measurement. Doing that in 2-minute increments is
+  how a half-ported strategy gets committed.
+* **AND v3 ALREADY PURSUES THE SAME INTENT, BY A DIFFERENT MECHANISM (read 2026-09-26).** Immediately
+  after the mandatory root-maximal setup, `materialization_planner.h:303-315` runs an OPTIONAL SEARCH, and
+  its own comment names the purpose: "the mandatory setup -- the root-maximal eviction assessment -- does
+  not consume the window and starve the search of the preserving alternative (a demote-to-host)". So the
+  demote-preferring alternative is not missing; it is a budgeted search that runs AFTER a mandatory
+  maximal floor, rather than a guided strategy tried BEFORE it. The item's ordering is a v2 shape; v3
+  chose floor-then-search. **What that makes the item:** a TUNING question -- does the search find the
+  preserving alternative often enough, or is the cutoff starving it? -- and it is answerable by the item's
+  own stated validation (root share under load; `RuntimeStats` carries `root_selections` alongside the
+  per-path counters, so the share is directly readable). **Not a port until that measurement says the
+  search is insufficient** -- and the comment itself calls the budget a CUT-OFF, not a completeness bound,
+  which is exactly the kind of claim a root-share measurement would test.
+  **MEASURED 2026-09-26, in a pressure-driving scenario: `searches=2 search_cutoff=0 root=2`**, identical on
+  two runs (`underflow-shared-source`, printed from `RuntimeStats`). So the search RAN and was NOT cut off
+  there -- the planner's own caveat did not bite in that run, and `root=2` is the two cold turns, not a
+  lost reuse. **Scope, stated rather than implied:** that scenario is small (a handful of turns); the
+  item's validation is root share UNDER LOAD, and a heavier run is what would test the cut-off claim.
+  `pressure_searches`/`pressure_search_budget_exhaustions`/`root_selections` are all in `RuntimeStats` and
+  appear in `/stats`, so the load reading needs no new instrument -- only a suite heavy enough, or prod
+  traffic. **So this item is now: mechanism present, one scenario showing no starvation, the load case
+  untested** -- which is a prod-or-heavy-suite question rather than a port.
+
+6. **#6 — W2's demote-for-evict-only victims. MEASURED; the counter exists and read 7.** It counts
+   private victims committed as `Evicted` while the host tier still had room, with its denominator
+   (`demotable_evictions_` / `demotable_eviction_checks_`, printed rate-limited); the census over the
+   scenarios gave 7 in 2 scenarios and explained every zero by its denominator.
+   **ANSWERED 2026-09-26: the victims were NOT cheap, and the host tier had room.** The count alone could
+   not judge that, so the measurement moved to where the victim's state is still readable -- the CALL SITE,
+   before `release_materialization_victim` clears it. (The first version read `result.final_summary`, which
+   is emplaced empty and filled only on the RETAIN path, so it printed `frontier=0 refs=0` for every
+   eviction: structurally zero, not a fact.) Now:
+   `private victim evicted: demotable=1 frontier=190 endpoint=1 rewrite=1 anchors=0 host_state_slots=0/8
+   host_kv=0/8589934592 demotable_total=1` -- in `vision`, the evicted victims held **both a valid endpoint
+   and a valid rewrite checkpoint** with 190 tokens of frontier, while the host tier had **8 free slots and
+   8 GiB free**. A demote-first policy had something real to preserve, which is the case #6 exists to find.
+   What it does NOT settle: `demotable` is host CAPACITY available, not proof the planner should have
+   demoted -- it weighs degradation units and victim value, and this counter does not model that trade. History: it began as "measure-first: nothing counts evictions that
+   could have been demoted". The v2 safety-net items are **moot** (zero references in v3). `guided_closure` **STILL OPEN, and a claim of mine that it was "already in v3" is RETRACTED (2026-09-26).**
+   I first wrote that the idea is present under different names, on the strength of
+   `pressure_planner.cpp:760-767` -- which charges the victim's `value_weight` as extra degradation units
+   when a decision `evicts_continuation`, with the intent in its own comment ("This makes the search prefer
+   to demote the highest-value victims to host and evict the cheapest when host is short"). That cost term
+   is real and it is aimed at the same intent, **but it is not what the item asks for**: the carried item
+   (`plan.md`, upstream-adoption section) is to try `guided_closure_target` **before** `root_maximal_target`
+   and measure the root share under load -- a *strategy pair and its ordering*. And `grep -rn guided_closure
+   src/` returns **nothing**: v3 has `root_maximal_target` only. So the honest state is: v3 has a
+   demote-preferring cost inside its one strategy; it does not have the second strategy, and the ordering
+   between them cannot be tried without porting it. **This is the mirror of the error the item's own text
+   warns about** -- that text read the absence of a NAME as the absence of an IDEA; I read the presence of
+   an idea as the presence of the NAMED STRATEGY. Both are name-level readings, and both were wrong.
+   `root_maximal` is **not**: it has zero
    `root_maximal` has 21 references in the tree -- absence of a port proposal is where that item starts,
    not where it closes.
    **MEASURED 2026-09-26 11:11 — the count exists now, and it is not zero.** The counter is at the COMMIT
@@ -640,12 +869,164 @@ wedge; when it says `#13`, the accounting underflow.
    * the construction that should force coincidence -- short prompt so both prefills finish in one chunk,
      tiny budget so both exhaust in the same step -- **is blocked by the API**: `thinking.budget_tokens`
      must be at least 1024 (`anthropic_messages_request.cpp:866`), and a smaller value returns 400.
-   **So the next step is reading the scheduler's admission path, not another run.** If admission is one
-   lane per boundary and control-readiness is a one-shot per-lane event, the two can never coincide and
-   `multi_row=1` is unreachable in this configuration -- which would make #8's per-row bind defensive
-   rather than load-bearing, the same shape as #11(a). That is a question of reach, so it is answerable by
-   reading, and it should be answered before another window is spent here.
+   **ANSWERED BY READING (2026-09-26, dev time): `multi_row=1` is unreachable in this scheduling, so the
+   per-row bind is DEFENSIVE, not load-bearing -- the same shape as #11(a)'s branch.** The chain:
+   * `build_control_membership` (`scheduler.h:176-198`) includes every lane with `is_control_ready()`, so
+     a one-row membership means exactly one lane was ready -- the probe's own criterion, not an artifact.
+   * `is_control_ready()` is `model_state == EngineRequestState::ControlReady` (`request_record.h:146`),
+     and the boundary loop builds at most ONE control batch per iteration (`engine_core.h:2245-2252`),
+     then `continue`s. So two lanes are in one batch iff they ENTER that state in the same boundary.
+   * Entering it is a per-lane one-shot event (the thinking budget exhausting at a fixed token count), so
+     coincidence needs both lanes to reach it in the same step -- i.e. lockstep from the same start.
+   * `try_admit_one` **admits at most one request per call**: it loops, but `return admit_planned_request(...)`
+     sits inside the loop and leaves on the first admission (`engine_core.h:1730-1793`); the loop only
+     skips cancelled or expired FIFO heads. So the second lane is admitted at least one boundary later,
+     decodes at least one step behind, and its budget exhausts at least one boundary after the first --
+     never in the same batch.
+   The four runs agree: `control_ready_lanes=1` in every shape tried (byte-identical prompts, distinct
+   equal-length prompts, long prefills). The two remaining ways this could be wrong, named so the argument
+   is not treated as a proof: a lane that is *already* ControlReady when another enters it (the batch runs
+   on the first, so it does not linger), and any path that admits two lanes in one boundary outside
+   `try_admit_one`. **So #8's fix guards a case the scheduler cannot produce** -- worth keeping as
+   defence-in-depth, and it should not be described as covering a reachable case.
 
+### 2b. Instrument quality — the probe tags (2026-09-26)
+
+A review pass found that the `[plan]` and `[capture] assess` line counts had been read as counts of
+*events* (captures, turns) when they are counts of *calls*. Two of the three asks are now done:
+
+* **`assess` carries its CALL SITE.** `inspect_capture` takes a `site` tag, plumbed through `Program` and
+  set at all five call sites (`baseline`, `candidate`, `candidate-shared`, `shared-replacement`,
+  `reserve`), and the probe prints it. Verified by a run: 23 lines in `shared-replacement` resolve as
+  `baseline` 6 / `candidate-shared` 8 / `reserve` 8 / `shared-replacement` 1. A count can now be
+  attributed by phase. (The mock in `test_resource_manager.cpp` had to be updated with the new signature
+  and with `shared_replacements()` -- the full build caught both, where the single-target build did not.)
+* **STILL OPEN, lower value:** `[plan]` prints one line per *candidate evaluated*, and nothing marks which
+  candidate was admitted, so its counts remain counts of candidates. A `selected` marker would need an
+  identity per candidate in the planner; not done, because the ambiguity that actually caused a wrong
+  reading was in `assess`, and that one is closed.
+
+### 2c. NEW FINDING (2026-09-26): a cross-session private adoption, deterministic
+
+Found while building #2's constructive scenario, and more significant than it. The engine carries a
+detector for exactly this and calls it *"impossible by construction"*, counting it in every build
+"because it has never been observed to fire", with the note that **"if it ever fires, the adoption must be
+rejected, not merely logged"** (`materialization.cpp:755-775`). It fires:
+
+    [materialization] CROSS-SESSION-ADOPT lane=0 source_owner=9e22d2a3cec766e1
+                      consumer_owner=9e22cfa3cec761c8 count=1 reuse=1
+
+* **Deterministic**: once per run, on two runs.
+* **The owners are the two session keys, confirmed by arithmetic, not by reading**: FNV-1a over
+  `"underflow-a"` gives `9e22d2a3cec766e1` and over `"underflow-b"` gives `9e22cfa3cec761c8` -- the two
+  ids printed. So this is not identical-prompt dedup: the keys differ, and `reuse=1` says the consumer took
+  a `PrivateEndpoint`.
+* **The construction is two lines**: two sessions, the same prompt, different `session_key`s. Session B
+  then reuses session A's private continuation (`consumer_path=1`, `consumer_reused=4057`). The scenario
+  is `underflow-shared-source` (built for #2; this fell out of it).
+* **RESOLVED BY READING (2026-09-26): the invariant's WORDING is wrong, and the finding is not a defect --
+  with one real risk left open.** The chain:
+  * `session_key_hash` is set on the continuation at prefill (`prefill.cpp:248-256`) and its own comment
+    says it exists "so a later adoption can tell whose checkpoint it is taking (W1.2)".
+  * **Nothing reads it to gate anything.** `grep -rn session_key_hash src/` finds it in exactly four
+    places: that assignment, the detector, a debug print in `decode.cpp`, and the field itself. The planner
+    never consults it -- `request_plan.cpp` contains no `session_key` at all.
+  * Reuse instead requires `prefix_matches(prompt, source->ledger, source->prefix_identity, frontier)` on
+    every path (`request_plan.cpp:582/603/619/636`), i.e. **the incoming prompt's own tokens must equal the
+    source's ledger prefix**. So the reused content is identical *by construction*.
+  * Therefore: a cross-session adoption cannot serve foreign content -- it serves a prefix the requester's
+    own prompt already contains. W1.2's wording ("should be impossible by construction") is **false as
+    written**; what is true is *harmless* by construction, for a different reason than the wording claims.
+    The detector's implied action ("must be rejected, not merely logged") would be a POLICY change --
+    trading reuse across sessions for session isolation -- and is the operator's call, not a bug fix.
+  * **THE RISK IS CLOSED, AND THE ENGINE IS DELIBERATE HERE (2026-09-26).** Cross-session reuse is not an
+    oversight that the detector caught: the private-candidate inspection *forces* the retain mode when the
+    sessions differ --
+    `const bool retain = entry.session && (!base.context_cache().session_key || *entry.session !=
+    *base.context_cache().session_key || !base.context_cache().update_session_index);`
+    (`resource_manager.h:420-423`), passed as `must_retain_private_source` into `inspect_admission` --
+    which is why the adoption above ran with `source_mode=Retain` and forked A's endpoint instead of
+    consuming it. So the other session keeps its state: the lifetime coupling is exactly what that flag
+    exists to prevent, and the adopt is handled by design.
+  * **So the whole finding is: a detector whose invariant wording is stale.** The engine supports
+    cross-session reuse *safely* (fork, retain) where W1.2's sentence says it should be impossible. The
+    counter is still worth having as an observation, and the sentence should be corrected where a reader
+    meets it rather than left to send someone hunting for a missing gate that was never the design.
+  * Worth keeping regardless: the detector is *not* a false alarm -- it correctly reports that a
+    cross-session adoption happened. It is the invariant's sentence that overstates.
+* **Why it matters if it is a violation**: session B receives session A's private context. With identical
+  prompts the served content is the same, so nothing foreign is *visible* in this construction -- but the
+  mechanism is private-context sharing across sessions, which is the family the D2 "foreign content" work
+  belongs to, and the detector's own author judged it worth rejecting rather than logging.
+### 2d. CORRECTED (2026-09-26): the crash was MY CENSUS, not the engine's teardown
+
+**What this section said first, and why it was wrong.** It reported "engine teardown segfaults with
+orphaned occupancy present", inferred from markers bracketing `runtime_stats()`. A gdb backtrace showed
+that inference was false:
+
+    #0 KVAddressSpaceStore::census (this=0x0, label="backend") at kv_store.h:879
+    #1 ProgramImpl::resource_census (commit.cpp:836)
+    #2 Program::resource_census
+    #3 EngineCore::report_recovery_residual (engine_core.h:2126)
+    #4 EngineCore::recover_from_oom_locked
+    #5 worker_loop
+
+`this=0x0`: `backend_kv_addresses` is **null** in any configuration without a backend KV
+(`pressure_resume_engine_options` is one), and calling a non-virtual member through a null pointer does
+not throw -- it segfaults, so the `try` in `resource_census` could not catch it. The markers "after
+`runtime_stats`" were from the MAIN thread while the crash came from the WORKER thread (#8 "ninfer_..."):
+the two are not ordered, and reading them as one sequence is what produced the wrong conclusion.
+
+**Why this is worse than the report it replaced.** The census runs whenever the residual is non-zero --
+i.e. **exactly when the engine is in #9's incident state, which is the state the census exists to
+report.** So the bug did not merely risk a crash: it would have taken the process down at the moment of
+the observation, turning the one event this whole investigation is waiting for into a crash with no
+diagnosis. **URGENCY CORRECTED -- my first claim here was an over-claim.** I wrote that prod can segfault on a
+recovery with a non-zero residual. **It cannot, and the check took one read:** the backend store is
+created only under `if (qwen3_5::PagedKVCache* backend = backend_kv_cache())`
+(`program_impl.cpp:175-180`), i.e. when the engine HAS a backend KV cache -- which is what a speculative
+backend provides. Prod runs `--spec dflash2` (or `--spec mtp`), so it always has one and cannot reach the
+null dereference. The crash is confined to **backend-less configurations** (`SpeculativeBackend::None`,
+e.g. `pressure_resume_engine_options`), which is where it was found. The fix is still right and still
+wanted -- a backend-less engine can crash on the recovery path -- but it is a test-configuration crash,
+not a production one, and saying otherwise was alarmist. It IS deployed (`8925190b`), so the correction
+matters for how the tree is read: this is a latent bug in an instrument, not an outage waiting to happen.
+
+**The fix** (`commit.cpp`, `resource_census`): null-check both stores. Verified in the same scenario:
+no crash, and the run proceeds past the injection to the measurement below.
+
+**AND THE MEASUREMENT IT WAS BLOCKING -- #10's POSITIVE PATH, exercised for the first time.** With a real
+orphan in place (`occupied=117`), a request needing more than the remaining capacity is refused at once,
+with a stated reason, on two identical runs:
+
+    the band request was refused: request reservation exceeds Engine shared KV capacity
+    injected=1 band_tokens=0 band_refused=1 elapsed_s=0 occupied=117
+
+So "a request the engine cannot plan is called feasible and blocked forever" is no longer the outcome: it
+is refused in zero seconds. That is the #10 fix observed doing its job against a REAL orphan rather than
+against a predicate argument, and `feasibility-orphan` (with the orphan it creates) is the reproduction.
+### 2e. REGRESSION I CAUSED AND FIXED (2026-09-26): an edit that matched the wrong copy
+
+The regenerated reachability battery flagged `source-pressure-protection` failing (`stop=queue_exhausted`,
+`path=0 reused=0`) where it had passed at 10:33. Bisected with `git stash`: **with the uncommitted set
+stashed it passes, with it restored it fails** -- so the cause was in my own edits, not the engine.
+
+The cause: when I lengthened a suffix in the NEW `underflow-shared-source` scenario, my
+`replace(..., 1)` matched the first occurrence of that identical boilerplate -- which was the EXISTING
+`exercise_materialization_source_pressure_protection`, so that scenario's suffix went 96 -> 400 and it
+began running a heavier load than its assertions were calibrated for. My own scenario kept 96. The
+whole edit landed on the wrong copy.
+
+Fixed by reverting it to 96 (verified `ok` twice) and leaving the new scenario at 96, which is what it
+ran with when it produced its pressure result. **Battery re-run clean: 12 scenarios, `reachable=0`,
+`failed-or-inconclusive=0`, rc=0** -- and that run's manifest is the fresh one
+(`results/recycling-reachability/20260926-161113/manifest`), which also closes the stale-manifest item:
+the logs and the committed source are tied again.
+
+**Two lessons, both recorded because both cost time here:** a `replace(..., 1)` over boilerplate that
+exists more than once is a coin flip -- anchor on something unique (a nearby line, the enclosing
+function) instead; and a scenario that starts failing after incidental edits is a *test* suspect before
+it is an engine regression, which `git stash` settles in one run.
 ### 3. Next actions, each with its validation
 
 1. **L0, offline, ~1 min, no load** — after any `WORKER RECOVER`, read the first `throughput` record
@@ -697,6 +1078,17 @@ wedge; when it says `#13`, the accounting underflow.
   this, but the canary runs read `bleed=0`. Either the invariant is stricter than the hazard, or the
   harm needs a condition the canary does not create — do not cite the comment's claim as established.
 - **S2 r2 replies empty** (`len=0`) in several canary runs: reproducible, unchased.
+  **NARROWED 2026-09-26, and it did NOT reproduce.** The canary now records the reply SHAPE
+  (`kinds=[...] tools=N stop=...`) beside `len`, because `len` counts only the concatenated *text* -- so a
+  turn whose reply is a tool call measures zero, which made "empty reply" and "tool-only reply"
+  indistinguishable, and one of those is an engine finding while the other is the harness counting the
+  wrong thing. With that instrument, one run under the SAME arm settings the observation came from
+  (`sessions=4 rounds=4 private=40000 shared=20000`, log `/tmp/ninfer-e2e-run.log`): 16 turns,
+  `bleed=0 partial_foreign=0 missed_own=0 errors=0`, and **no `len=0` at all** -- every reply reads
+  `kinds=['thinking','text'] tools=0 stop=end_turn len=22`. So on this tree the observation does not
+  reproduce; whether it was a transient of an older build or needs conditions this arm does not set is not
+  established, and one non-reproducing run is not a fix. What is now true is that a recurrence will say
+  WHICH kind it is.
 - The W1-A foreign count (8/272 vs 9/272, agreeing through observation #4 then diverging) measures
   interleaving *under the fixed code*; it does **not** quantify the old defect.
 - `479c92c4`'s message is wrong that the DFlash sink was re-published every step (fixed in `4bc421a6`).

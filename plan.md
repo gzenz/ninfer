@@ -24,7 +24,8 @@
 > first time. They were merged into one file on 2026-09-25; `results/HANDOFF.md`, which used to hold
 > the actionable half separately, no longer exists.
 
-## Current state — actionable, as of 2026-09-26 17:00
+## Current state — actionable (undated on purpose: a timestamp inside a file edited after it is stale by
+construction; the dated bullets below carry the times)
 
 Read this for state and next actions. The dated narrative below is history, kept deliberately: several
 of its entries exist to stop a later reader re-deriving something that was wrong the first time. The
@@ -41,13 +42,14 @@ correction history lives *there*, not here — this section states what is true 
   **NOTHING NEWER THAN `a8d9e895` IS NAMED HERE, and that is a rule rather than an omission:** a file
   committed into a series cannot correctly name the commit that contains it -- any edit to this file makes
   a new commit, so "X is the tip" is false the instant it is written. The tail is therefore a range,
-  `git log --oneline a8d9e895..HEAD`, and everything in it is documentation-only. The phrase "the tip" was
+  `git log --oneline a8d9e895..HEAD` -- and the invariant that tail is documentation-only is a CHECK, not a
+  claim: `git diff --stat a8d9e895 HEAD -- . ':!plan.md' ':!CLAUDE.md'` must be empty. The phrase "the tip" was
   written here four times and went stale four times, the last time inside the sentence forbidding it.
 - **Push state:** `fork/master` (`e919931a`) is an ancestor of `a8d9e895`, so the push fast-forwards.
   (While this work was in progress the fork's `master` moved by one commit -- an edit to `README.md`, not
   other work; the local tracking ref was stale, so the ranges computed before that were computed against
   it.)
-  What those revisions got wrong, corrected: the tracked tree is CLEAN once this commit lands (they listed
+  What those revisions got wrong, corrected: the tracked tree is clean, which is `git status --porcelain --untracked-files=no | wc -l` -> 0 (they listed
   five modified files); `5aff7b3c` still RESOLVES as an object (`git cat-file -t 5aff7b3c` -> `commit`;
   `--amend` leaves it until gc), so "a hash that no longer resolves" was false; and the evidence binary was
   built from a DIRTY tree -- `171507`'s manifest says `git_dirty_paths=31` -- so "the tree it was built
@@ -58,7 +60,11 @@ correction history lives *there*, not here — this section states what is true 
   pass 3 returned "not yet, close" with three documentation blockers (a `CLAUDE.md` instruction that kills
   the shell that follows it, §0 stale after the merge, and a false tree-identity claim) plus five smaller
   ones, **all closed in the commit after `a8d9e895`** -- not in the repair commit, which is where passes 1
-  and 2's findings live. Pass 4 is the convergence test and its verdict is recorded below when it returns.
+  and 2's findings live. Pass 4 returned **not converged**: one blocker -- §0 named a commit as "the tip" and went stale the moment
+  it was committed -- plus non-blocking findings, all closed in the commit after `44a61c5a`. **The verdict of
+  a pass on a commit LATER than the one this file sits in is NOT recorded here:** a file cannot record the
+  review of the commit that contains it, which is the same self-reference that produced the "tip" staleness
+  four times. Read the pass's own report.
 
   **Blocker 1 was MY REFUSAL, and the refusal was wrong.** The first pass asked for `765f305f`'s subject to
   be reworded "since its change was later removed as dead"; I refused, arguing the fix was alive at HEAD
@@ -936,11 +942,27 @@ task needs no re-derivation:
    `frontier=75778 endpoint=0 rewrite=1 host_state_slots=10/16 host_kv=9078571008/…` and
    `frontier=65078 endpoint=1 rewrite=0 host_state_slots=9/16 host_kv=7684227072/…`. So on prod the
    victims being evicted hold **65k-76k-token frontiers** and an endpoint or rewrite checkpoint, while the
-   host tier had **5-7 free state slots and ~23 GB of free host KV**. This is the case #6 exists to find,
-   and unlike the earlier `vision` reading (frontier 190, which is under one prefill chunk, and which the
-   second review pass correctly called out as overstated) the frontier here is two orders of magnitude
-   larger. `demotable` still means only "host had room at the decision" -- the trade against degradation
-   units is not modelled -- but the victims are not throwaways. It counts
+   host tier had **5-7 free state slots and ~23 GB of free host KV**. Unlike the earlier `vision` reading
+   (frontier 190, under one prefill chunk, which the second pass correctly called overstated) the frontier
+   here is two orders of magnitude larger. `demotable` still means only "host had room at the decision" --
+   the trade against degradation units is not modelled -- but these victims are not throwaways.
+   **Three qualifications the pass after this entry supplied, and they change its reading:**
+   * **"the host tier was not full" is true only of the last five seconds.** The five evictions immediately
+     before it (17:54:15 -> 18:13:04; frontiers 32, 42, 21856, 24042, 24839) were all `demotable=0` with
+     `host_state_slots=16/16`. The tier was FULL four seconds earlier, so this is not a story about a tier
+     sitting idle while work is destroyed -- it is about the moment the tier freed up.
+   * **the host-KV bytes were never the binding resource**: 9.09 of 30 GiB used. The tier that ran out was
+     state SLOTS. A reading of "host_kv unused" is therefore about the wrong resource; the nearest
+     constraint is `host_state_slots`, and the 11 -> 10 -> 9 decrement across these three lines suggests
+     the victims held slots of their own (`materialization.cpp:2140`: usage still includes the victim's own
+     pages, so every "free" figure here is a lower bound).
+   * **the instrument is now MUTED for this item.** The print is rate-limited to the first 8 and then every
+     512th (`materialization.cpp:2154`), and `checked=8` was the eighth: the next line is at check 512, and
+     `demotable_evictions_` is not exported to `/stats` at all (`grep -rl demotable_evictions_ src/` finds
+     only `program_impl.h` and `materialization.cpp`). So the watcher's silence on #6 from here means "not
+     printed", NOT "not recurring". Un-mute it (export the counters, or change the limit) before reading
+     anything into the absence -- and "first live prod evidence" means first since this field existed, in
+     this build (17:35), not first ever. It counts
    private victims committed as `Evicted` while the host tier still had room, with its denominator
    (`demotable_evictions_` / `demotable_eviction_checks_`, printed rate-limited); the census over the
    scenarios gave 7 in 2 scenarios and explained every zero by its denominator.

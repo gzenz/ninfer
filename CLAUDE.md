@@ -21,10 +21,15 @@ for the session that produced it -- read and edit `plan.md`, not those.
 
 ## Monitoring
 - Keep a journal monitor armed during a soak/prod. It expires at 30 min —
-  re-arm on expiry and after any stop.
-- Pattern (full, not crash-only):
-  `CUDA error|cudaError|bad_alloc|terminate called|Assertion|Segmentation|core dumped|Killed [0-9]|WORKER RECOVER|WORKER CRASH|host-arena|single_alloc|admission stalled|admission rejected|subtraction underflow|post-recovery residual|non-strict release REFUSED|recycled-checkpoint|checkpoint StateImage INCOMPLETE`
-  on `journalctl -u ninfer.service -f -q --output=short-iso`.
+  re-arm on expiry and after any stop. **Arm `tools/ops/ninfer-watch.sh`; its alert set is
+  `tools/ops/ninfer-watch.awk`, and that file is the only specification of it.** A second copy of the
+  set in this file drifted from the real one -- this pattern was missing `WORKER OOM` and
+  `private victim evicted: demotable=1`, so a session arming the raw pattern below missed the line the
+  watcher's own section calls the wedge signature, while claiming to be arming the same thing.
+- Fallback, if the script cannot be used at all -- and it is a FALLBACK, not the definition:
+  `CUDA error|cudaError|bad_alloc|terminate called|Assertion|Segmentation|core dumped|Killed [0-9]|WORKER OOM|WORKER RECOVER|WORKER CRASH|host-arena|single_alloc|admission stalled|admission rejected|subtraction underflow|post-recovery residual|non-strict release REFUSED|recycled-checkpoint|checkpoint StateImage INCOMPLETE|private victim evicted: demotable=1`
+  on `journalctl -u ninfer.service -f -q -n 0 --output=short-iso` (`-n 0` because `-f` replays its last
+  10 lines, so a re-arm re-reports the previous run's tail).
 
   (That sentence used to say "the last four were added 2026-09-25"; the pattern has grown since, so the
   count no longer identifies them and the tokens are named individually below instead.) `admission stalled` / `admission rejected` are the two

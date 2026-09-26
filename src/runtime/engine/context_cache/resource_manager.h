@@ -1206,6 +1206,8 @@ public:
         out.pressure_shared_owners_degraded    = context_stats_.pressure_shared_owners_degraded;
         out.pressure_shared_owners_evicted     = context_stats_.pressure_shared_owners_evicted;
         out.pressure_shared_owners_replaced    = program.shared_replacements();
+        out.pressure_private_evictions_demotable = program.demotable_evictions();
+        out.pressure_private_eviction_checks    = program.demotable_eviction_checks();
         out.pressure_checkpoints_dropped       = context_stats_.pressure_checkpoints_dropped;
         out.pressure_searches                  = context_stats_.pressure_searches;
         out.pressure_search_budget_exhaustions = context_stats_.pressure_search_budget_exhaustions;

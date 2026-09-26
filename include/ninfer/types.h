@@ -984,6 +984,12 @@ struct RuntimeStats {
     // written for want of it (`pressure_shared_owners_evicted` is the KV-pressure path only, so it
     // reads 0/0 across a replacement).
     std::uint64_t pressure_shared_owners_replaced      = 0;
+    // #6: private victims evicted while the host tier had room AT THE DECISION (`demotable`), with its
+    // denominator. Capacity only -- it is NOT a statement that the victim could have been demoted
+    // (that needs a complete, immutable, settled StateImage), and the print at the eviction site is
+    // rate-limited to 8 then every 512th, so these are the only un-muted reading of the item.
+    std::uint64_t pressure_private_evictions_demotable = 0;
+    std::uint64_t pressure_private_eviction_checks    = 0;
     std::uint64_t pressure_checkpoints_dropped         = 0;
     std::uint64_t pressure_searches                    = 0;
     std::uint64_t pressure_search_budget_exhaustions   = 0;

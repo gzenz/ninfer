@@ -105,6 +105,8 @@ std::string format_stats_json(const ninfer::RuntimeStats& s, const ninfer::Memor
         {"shared_owners_degraded", s.pressure_shared_owners_degraded},
         {"shared_owners_evicted", s.pressure_shared_owners_evicted},
         {"shared_owners_replaced", s.pressure_shared_owners_replaced},
+        {"private_evictions_demotable", s.pressure_private_evictions_demotable},
+        {"private_eviction_checks", s.pressure_private_eviction_checks},
         {"checkpoints_dropped", s.pressure_checkpoints_dropped},
         {"searches", s.pressure_searches},
         {"search_budget_exhaustions", s.pressure_search_budget_exhaustions},

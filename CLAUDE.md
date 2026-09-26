@@ -233,13 +233,15 @@ while it lasts. In dev time that is the entire cost; in prod time it is the smal
 
 ## Observability
 - Journal: `journalctl -u ninfer.service --since "..." --no-pager`.
-- Stats: `curl -s http://127.0.0.1:8080/stats` → host-KV census (per-tier
+- Stats: `curl -s http://127.0.0.1:8081/stats` → host-KV census (per-tier
   {entries,bytes}: dead/live/idle/active), host-KV unit bytes, `pressure.*`,
   `scheduler.*`.
 - **The eviction line is**
   `[engine] private victim evicted: demotable=%d frontier=%u endpoint=%d rewrite=%d anchors=%zu
   host_state_slots=%u/%llu host_kv=%zu/%llu checked=%llu demotable_total=%llu`
-  (`materialization.cpp:2157`), rate-limited to the first 8 and then every 512th. **Corrected 2026-09-26:**
+  (`materialization.cpp:2157`), rate-limited to the first 8 and then every 512th. **Port corrected 2026-09-26:** this line said `:8080/stats`, which serves NOTHING on that path
+  (`http=000 bytes=0`) -- the stats endpoint is `:8081`, and querying the wrong port cost a diagnosis of
+  a working counter (`plan.md` §0 had it right: ':8080 (:8081 stats)'). **Earlier correction:**
   the two sentences that stood here -- "eviction lines carry `tier=` (dead/live/idle/active)" and "the
   reaper logs `[host-state-pool] reap=stale`" -- name instruments that **cannot emit anything**:
   `grep -rn 'host-state-pool' src/` and `grep -rn 'reap=' src/` are both empty, and `tier=` occurs in

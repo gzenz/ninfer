@@ -573,6 +573,12 @@ public:
     void resource_census() const noexcept;
     // Shared-prefix replacements observed (see `shared_replacements_`).
     [[nodiscard]] std::uint64_t shared_replacements() const noexcept { return shared_replacements_; }
+    // #6's numerator and denominator. Exported because the journal print is rate-limited: after the
+    // first 8 evictions the only way to see the counter move is here.
+    [[nodiscard]] std::uint64_t demotable_evictions() const noexcept { return demotable_evictions_; }
+    [[nodiscard]] std::uint64_t demotable_eviction_checks() const noexcept {
+        return demotable_eviction_checks_;
+    }
     [[nodiscard]] detail::PhysicalResources admission_capacity() const noexcept;
     [[nodiscard]] bool isolated_request_feasible(const RequestBasePlan& base) const noexcept;
 

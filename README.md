@@ -1,3 +1,7 @@
+Note: The current version does NOT work with concurrent sessions, it'll mix up the caches.
+
+If you want to use this with concurrent version I suggest using the old V2 version: https://github.com/gzenz/ninfer/tree/docs/prune-plan
+
 # NInfer (YaRN)
 
 This is a fork of [Ninfer](https://github.com/gzenz/ninfer), an inference engine designed to be optimized for Qwen3.x models and an RTX 5090. This project adds YaRN context extension and other enhancements:

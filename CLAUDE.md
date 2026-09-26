@@ -60,6 +60,14 @@ a superseded duplicate kept only for the session that produced it.
   `terminate called`, `Assertion`, `Segmentation`, `core dumped` (the C++ runtime, libc, the kernel).
   `CUDA error|cudaError` DOES appear in `src/` and is not in that class. Four tokens that matched nothing
   (`WEDGE`, `planner-no-plan`, `relief-shared`, `host-state-pool`) were carried here for weeks.
+- **The watcher follows TWO units: `ninfer.service` and `ninfer-wedge-sentinel.service`.** The wedge is
+  announced by the SENTINEL (`WEDGE (A/B): engine idle with work pending Ns -- restarting ninfer`), so
+  watching one unit means the event that explains a dead prod is invisible -- observed 2026-09-26: a live
+  wedge at ~19:51:54, the sentinel's restart at 19:54:37, and the monitor reporting only a bare
+  `health 200 -> 000` with no cause. **`WEDGE` is therefore a live token**, and the note below that it
+  "matches nothing in `src/`" is true and beside the point: it is a sentinel output, not an engine string,
+  so the `grep src/` validation rule does not cover a token emitted by a helper script. That rule is what
+  removed it, and tonight is what that cost.
 - One monitor at a time (duplicates double-notify). After stopping one, kill any orphaned `journalctl` —
   by **`pkill -f 'journalctl -u ninfe[r]'`**, bracketed, because an unbracketed `-f` pattern matches the
   calling shell's own command line (see the traps below).

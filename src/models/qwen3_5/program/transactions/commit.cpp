@@ -660,6 +660,18 @@ FinishResult ProgramImpl::finish(SequenceHandle sequence) noexcept {
             state.reserved_state.reset();
         }
         if (state.rewrite_state && *state.rewrite_state == state.state.read) {
+            // NINFER_CAPTURE_PROBE: name the site that clears a live rewrite checkpoint during commit.
+            // This branch only runs when the checkpoint ALIASES the active state (so the refusal to
+            // clear is `checkpoint_references == 0`), and a sequence can lose the checkpoint that
+            // #11(a)'s recycling branch needs here -- one turn before the capture that would use it.
+            if (std::getenv("NINFER_CAPTURE_PROBE") != nullptr) {
+                const std::uint32_t refs = state_store->checkpoint_references(*state.rewrite_state);
+                if (refs != 0) {
+                    std::fprintf(stderr, "[commit] clears rewrite_state refs=%u frontier=%u lane=%u\n",
+                                 refs, state.rewrite_checkpoint.frontier, state.lane);
+                    std::fflush(stderr);
+                }
+            }
             if (state_store->checkpoint_references(*state.rewrite_state) == 0) { return out; }
             state_store->release_checkpoint_reference(*state.rewrite_state);
             state.rewrite_state.reset();

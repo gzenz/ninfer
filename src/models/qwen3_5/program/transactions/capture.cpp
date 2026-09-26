@@ -110,6 +110,44 @@ ProgramImpl::inspect_capture(const CaptureOffer& offer, const SharedPrefixHandle
     assessment.recycles_private_state =
         replaces_rewrite && *sequence.rewrite_state != sequence.state.write &&
         state_store->can_recycle_checkpoint_destination(*sequence.rewrite_state);
+    // Per-capture probe (NINFER_CAPTURE_PROBE): the five conditions above, read where they are computed
+    // rather than only at the one transfer-submitted site the abort probe reaches. Designing the
+    // scenario for #11(a) needs to know WHICH condition fails on each turn, and the previous design
+    // pass had only a single-hit reading to go on. Cheap, env-gated, and it needs no injector.
+    if (std::getenv("NINFER_CAPTURE_PROBE") != nullptr) {
+        const bool state_live =
+            sequence.rewrite_state.has_value() && state_store->valid(*sequence.rewrite_state);
+        // Reachability assert for #11(a), the plan's next action: if `recycles_private_state` can never
+        // be true, this fires zero times across every real-engine scenario, and the recycling branch is
+        // dead code rather than a latent hazard. Deliberately an abort, not a print: a print can be read
+        // as "did not happen" when the probe was skipped, which is the mistake that produced two wrong
+        // conclusions in this file's neighbourhood today.
+        if (assessment.recycles_private_state) {
+            std::fprintf(stderr, "[capture] ASSERT recycles_private_state is REACHABLE lane=%u\n",
+                         lane);
+            std::fflush(stderr);
+            std::abort();
+        }
+        std::fprintf(stderr,
+                     "[capture] assess lane=%u rewrite_group=%d rewrite_state_live=%d "
+                     "checkpoint_valid=%d slot_differs=%d can_recycle=%d replaces_rewrite=%d "
+                     "recycles=%d frontier=%u base=%u refs=%d\n",
+                     lane, static_cast<int>(group.rewrite.has_value()), static_cast<int>(state_live),
+                     static_cast<int>(sequence.rewrite_checkpoint.valid),
+                     static_cast<int>(state_live &&
+                                      *sequence.rewrite_state != sequence.state.write),
+                     static_cast<int>(state_live &&
+                                      state_store->can_recycle_checkpoint_destination(
+                                          *sequence.rewrite_state)),
+                     static_cast<int>(replaces_rewrite),
+                     static_cast<int>(assessment.recycles_private_state), group.frontier,
+                     sequence.rewrite_checkpoint.frontier,
+                     static_cast<int>(state_live
+                                          ? state_store->checkpoint_references(
+                                                *sequence.rewrite_state)
+                                          : -1));
+        std::fflush(stderr);
+    }
     detail::PhysicalResources added;
     detail::PhysicalResources active_removed;
     std::optional<KVActiveSnapshotShape> text_snapshot_shape;
@@ -552,10 +590,29 @@ ProgramImpl::install_private_capture(SequenceState& sequence, const CaptureGroup
     detail::PhysicalResources removed;
     if (group.rewrite) {
         if (sequence.rewrite_state && *sequence.rewrite_state != checkpoint) {
+            if (std::getenv("NINFER_CAPTURE_PROBE") != nullptr) {
+                std::fprintf(stderr,
+                             "[capture] install replaces an existing rewrite_state "
+                             "frontier=%u new_frontier=%u refs=%d\n",
+                             sequence.rewrite_checkpoint.frontier, group.frontier,
+                             static_cast<int>(
+                                 state_store->checkpoint_references(*sequence.rewrite_state)));
+                std::fflush(stderr);
+            }
             removed = checked_resource_sum(removed,
                                            release_checkpoint_reference(*sequence.rewrite_state));
         }
         state_store->retain_checkpoint_reference(checkpoint);
+        if (std::getenv("NINFER_CAPTURE_PROBE") != nullptr) {
+            std::fprintf(stderr,
+                         "[capture] install rewrite_state=set refs=%d residency=%d aliases_write=%d "
+                         "aliases_read=%d frontier=%u\n",
+                         static_cast<int>(state_store->checkpoint_references(checkpoint)),
+                         static_cast<int>(state_store->residency(checkpoint)),
+                         static_cast<int>(checkpoint == sequence.state.write),
+                         static_cast<int>(checkpoint == sequence.state.read), group.frontier);
+            std::fflush(stderr);
+        }
         sequence.rewrite_state      = checkpoint;
         sequence.rewrite_checkpoint = RewriteCheckpoint{
             .valid        = true,
@@ -1424,7 +1481,7 @@ ProgramImpl::progress_active_capture_transaction(runtime::CancellationFlagView c
         // `abort_active_capture`, *after* that function's state restoration had already released the
         // rewrite checkpoint -- so it reported `rewrite_state_live=0` for a value it had destroyed the
         // ability to observe, and three windows were spent on a reading that could not vary. Here the
-        // four conditions `recycles_private_state` is built from (capture.cpp:110-112) are measured as
+        // five conditions `recycles_private_state` is built from (capture.cpp:110-112) are measured as
         // the abort will find them.
         if (std::getenv("NINFER_ABORT_PROBE") != nullptr &&
             transaction.lane < max_concurrency &&

@@ -734,6 +734,42 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
             selected_state_requires_fork(*source, plan->reuse, plan->rewrite_disposition,
                                          plan->selected_checkpoint, plan->reuse_base);
     }
+    // Probe (NINFER_CAPTURE_PROBE): WHY `preserve_rewrite` came out the way it did. `preserve_rewrite`
+    // is `rewrite_disposition == RetainExisting` (`prefill.cpp:526`), and RetainExisting is off whenever
+    // `can_retain_rewrite` is false -- which silently reduces the turn to a consume-and-clear, erasing
+    // the precondition #11(a) needs. Printed alongside the fork decision, because a Move consume also
+    // clears the checkpoint at commit (`commit.cpp:662`: rewrite_state aliasing state.read is dropped at :676-678),
+    // so "retained" is not sufficient on its own: the consume must FORK.
+    if (std::getenv("NINFER_CAPTURE_PROBE") != nullptr) {
+        // `n` and `tokens` exist to attribute a plan line to a turn. The scenario prints its own turn
+        // lines on stdout, which is block-buffered when piped while these probes are fflush'd on
+        // stderr, so line ORDER between the two streams is not evidence -- and the first reading of
+        // this trace was sequenced by position. `tokens` is the incoming prompt's length, which
+        // distinguishes the turns directly.
+        static std::uint64_t plan_probe_seq = 0;
+        std::fprintf(stderr,
+                     "[plan] n=%llu tokens=%zu reuse=%d reuse_base=%u desired=%d desired_frontier=%u "
+                     "src=%d ckpt_valid=%d ckpt_frontier=%u ckpt_refs=%d can_retain=%d disposition=%d "
+                     "fork_required=%d source_mode=%d\n",
+                     static_cast<unsigned long long>(++plan_probe_seq), prompt.token_ids.size(),
+                     static_cast<int>(plan->reuse), plan->reuse_base,
+                     static_cast<int>(desired.has_value()),
+                     desired ? desired->frontier : 0U, static_cast<int>(source != nullptr),
+                     static_cast<int>(source != nullptr && source->rewrite_checkpoint.valid),
+                     source != nullptr ? source->rewrite_checkpoint.frontier : 0U,
+                     // `valid()` is not decoration: `checkpoint_references` calls `require()`, which
+                     // throws on a stale handle -- and the neighbouring `can_retain_rewrite_checkpoint`
+                     // checks `valid()` precisely because a stale handle is possible here. Without this
+                     // guard, setting the probe variable could turn a probe into a planning exception.
+                     static_cast<int>(source != nullptr && source->rewrite_state &&
+                                              state_store->valid(*source->rewrite_state)
+                                          ? state_store->checkpoint_references(*source->rewrite_state)
+                                          : -1),
+                     static_cast<int>(can_retain_rewrite),
+                     static_cast<int>(plan->rewrite_disposition),
+                     static_cast<int>(plan->state_fork_required), static_cast<int>(plan->source_mode));
+        std::fflush(stderr);
+    }
     if (source != nullptr && is_rewrite_checkpoint_restore(plan->reuse) &&
         plan->source_mode == runtime::PrivateSourceMode::ConsumeToActive) {
         std::vector<StateImageHandle> optional_states;

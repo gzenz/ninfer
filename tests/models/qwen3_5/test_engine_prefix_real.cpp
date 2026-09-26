@@ -2161,27 +2161,175 @@ int main() {
         ninfer::Engine engine(std::move(options));
         result = exercise_rewrite_checkpoints(engine, RewriteCheckpointCacheTopology::PrivateOnly);
     } else if (scenario == "recycling-capture") {
-        // Same shape as `rewrite-checkpoint`, on a MASKED-DRAFT backend, because that is what the
-        // recycling branch of `abort_active_capture` needs (#11(a)): `recycles_private_state` is set only
-        // when a rewrite capture group exists, a live `rewrite_state` carries `rewrite_checkpoint.valid`,
-        // that checkpoint's slot differs from the state's write slot, and the store agrees it can recycle
-        // it as a fork destination (capture.cpp:110-112) -- i.e. a SECOND turn-closure capture while a
-        // first rewrite checkpoint is still held. On dflash2 the fork's `copy_dflash_local` writes into
-        // that recycled slot, which is what makes the abort's `restore_recycled_checkpoint` re-assert an
-        // old content epoch over bytes the fork just wrote; with MTP and no transfer, nothing is written
-        // before the last cancellation check and the mixture cannot arise.
+        // POSITIVE CONTROL for the claim in plan.md §2 item 3 that `recycles_private_state` is
+        // unreachable, i.e. that #11(a)'s recycling branch is dead. It is not a vehicle that reaches the
+        // branch, and it no longer delegates to `exercise_rewrite_checkpoints` (the earlier version did,
+        // and the comment describing that survived the rewrite; corrected 2026-09-26).
         //
-        // Drive it with NINFER_INJECT_THROW=capture-submitted (harmful-controls build) to abort *after*
-        // the transfer is submitted. The observable is `[capture] recycled-checkpoint restored on abort`,
-        // a counter that has never fired. Without the injection the scenario still runs and asserts what
-        // `exercise_rewrite_checkpoints` always asserts -- it just never reaches the abort.
+        // `recycles_private_state` is set only when a rewrite capture group exists AND a live
+        // `rewrite_state` carries `rewrite_checkpoint.valid` AND that checkpoint's slot differs from the
+        // state's write slot AND the store agrees it can recycle it as a fork destination
+        // (`capture.cpp:110-112`). The two halves are mutually exclusive: the planner strips
+        // `group.rewrite` unless the disposition is `ReplaceAtCommittedFrontier`
+        // (`request_plan.cpp:808-813`), and every `Replace` activation branch clears the checkpoint --
+        // including the shared/long-anchor route, at `prefill.cpp:383-384`.
+        //
+        // So the scenario walks the shapes most likely to refute that, and the probe does the judging:
+        // with NINFER_CAPTURE_PROBE=1, `inspect_capture` aborts the moment `recycles_private_state` is
+        // true. The scenario itself asserts only that both turns ran and no capture aborted; a pass is
+        // not evidence of correct reuse behaviour, which is recorded in plan.md rather than implied here.
+        // `tools/e2e/recycling-reachability.sh` runs this and eleven other scenarios that way.
         auto options                              = engine_options(artifact);
         options.speculative.backend               = ninfer::SpeculativeBackend::DFlash2;
         options.speculative.draft_tokens          = 7;  // prod's --draft-tokens
-        options.context_cache.device_state_slots  = 2;
-        options.context_cache.max_shared_prefixes = 0;
+        options.max_context                       = 1024;
+        options.kv_capacity                       = ninfer::KvCapacityPolicy::explicit_capacity(1024);
+        options.prefill_chunk                     = 256;
+        // The host tier is what makes a capture take the HostSnapshot (transfer) placement, and the
+        // transfer-enqueue branch is where the recycling hazard lives: with device forks only, the
+        // `capture-submitted` site is reached once in the whole run and no checkpoint is ever live
+        // there. Device state capacity is 2 slots, not 1: one slot proved tight enough to push the
+        // rewrite checkpoint into the HOST replica, and `can_recycle_checkpoint_destination`
+        // (`state_store.h:336-343`) requires a device slot and no host slot, so a checkpoint in host
+        // cannot be recycled however the rest of the conditions fall.
+        options.context_cache.device_state_slots          = 2;
+        options.context_cache.host_state_slots            = 2;
+        options.context_cache.host_kv_capacity_bytes      = 256ULL << 20;
+        options.context_cache.max_private_continuations   = 2;
+        // Shared prefixes are enabled so turn 2 can be served by the shared path rather than by its own
+        // rewrite checkpoint -- the one route the planner could take without the disposition having to
+        // be `RetainExisting`. (An earlier comment here claimed that route leaves `rewrite_state`
+        // untouched and cited `prefill.cpp:729`; both were wrong, and the run showed it -- the
+        // `preserving_source` branch that serves the shared path clears the handle at `:383-384`.)
+        options.context_cache.max_shared_prefixes         = 4;
+        options.context_cache.max_long_anchors_per_continuation = 0;
         ninfer::Engine engine(std::move(options));
-        result = exercise_rewrite_checkpoints(engine, RewriteCheckpointCacheTopology::PrivateOnly);
+
+        // A DIAGNOSTIC scenario: it asserts nothing about reuse and ends by reporting what it measured
+        // (`captures`/`aborts` per turn), because the question it exists to answer is whether the
+        // recycling branch is reachable at all -- read with NINFER_CAPTURE_PROBE=1, which aborts if
+        // `recycles_private_state` is ever true. Its premise is that #11(a)'s precondition looks
+        // unreachable by construction (see plan.md §2 item 3 for the argument and its line references);
+        // this scenario is the positive control for that claim, and it deliberately walks the shapes most
+        // likely to refute it: a turn-closure capture that publishes a private rewrite checkpoint, then a
+        // second turn with a NEW closure served by the SHARED prefix, which is the one route the planner
+        // could take without the disposition having to be `RetainExisting`.
+        //
+        // Several comments here were rewritten on 2026-09-26 after a review pass showed the originals
+        // reasoned from a misread of `prefill.cpp` (the branch at `:729` is the invalid-path `throw`, not
+        // the long-anchor/shared branch, and `SharedStablePrefix` reaches a checkpoint-clearing path
+        // -- the unconditional reset at `prefill.cpp:383-384`). The earlier version of this scenario ran
+        // both turns with reuse OFF and claimed the capturing turn needed that; the trace refuted it.
+        auto text_message = [](ninfer::ChatRole role, std::string text) {
+            ninfer::ChatMessage message;
+            message.role = role;
+            message.parts.push_back(ninfer::MessagePart{
+                .kind = ninfer::MessagePartKind::Text, .text = std::move(text), .media = {}});
+            return message;
+        };
+        auto assistant_call = [&](std::string reasoning, std::string id, std::string key) {
+            ninfer::ChatMessage message = text_message(ninfer::ChatRole::Assistant, "");
+            message.reasoning_content   = std::move(reasoning);
+            message.tool_calls.push_back(ninfer::ToolCall{
+                .id = std::move(id), .name = "lookup", .arguments_json = "{\"key\":\"" + key + "\"}"});
+            return message;
+        };
+        // `question` is a parameter, not a constant, so the capturing turn can diverge from turn 1
+        // *before* the private checkpoint's frontier. Keeping turn 1's question makes turn 2's prompt a
+        // superset of turn 1's, `prefix_matches` still matches the private checkpoint at 300, that
+        // checkpoint wins the selection on length over the shared prefix at 101, and the executed path
+        // is the rewrite-restore (`path=3`). Diverging moves the executed path to the shared one
+        // (`path=5`) -- which was worth measuring, and which still does not keep the checkpoint alive.
+        auto input_with_history = [&](int completed, bool preserve_thinking,
+                                      const char* question =
+                                          "Use the lookup results to determine the deterministic "
+                                          "checkpoint value.") {
+            ninfer::PromptInput input;
+            input.messages.push_back(text_message(ninfer::ChatRole::User, question));
+            if (completed >= 1) {
+                input.messages.push_back(
+                    assistant_call("The first lookup should be alpha.", "call_alpha", "alpha"));
+                ninfer::ChatMessage tool =
+                    text_message(ninfer::ChatRole::Tool, "{\"value\":17,\"next\":\"beta\"}");
+                tool.tool_call_id = "call_alpha";
+                input.messages.push_back(std::move(tool));
+            }
+            input.options.preserve_thinking = preserve_thinking;
+            input.options.tool_jsons.push_back(
+                R"({"type":"function","function":{"name":"lookup","parameters":{"type":"object","properties":{"key":{"type":"string"}},"required":["key"]}}})");
+            return input;
+        };
+        // Mirror the exercise's own turn shapes, because those provably capture in this harness (the
+        // injection fires twice inside it); a reduced shape of my own captured NOTHING --
+        // `captures=0` after both turns -- so the first version of this scenario could not reach the
+        // injection site at all, which its own counter is what revealed.
+        auto request_options = [](bool reuse) {
+            ninfer::RequestOptions request;
+            request.execution.requested_output_tokens = 4;
+            request.execution.sampling.temperature    = 0.0F;
+            request.execution.allow_prefix_reuse      = reuse;
+            request.stop.include_model_defaults       = false;
+            return request;
+        };
+        auto turn = [&](const char* label, int completed, bool preserve, bool reuse,
+                        const char* question = nullptr) {
+            const ninfer::GenerationResult generated =
+                engine.generate(engine.prepare(question ? input_with_history(completed, preserve,
+                                                                            question)
+                                                    : input_with_history(completed, preserve)),
+                                request_options(reuse));
+            const ninfer::RuntimeStats stats = engine.runtime_stats();
+            std::cout << "recycling-capture " << label
+                      << ": path=" << static_cast<int>(generated.prefix_reuse_path)
+                      << " outputs=" << generated.generated_token_ids.size()
+                      << " captures=" << stats.active_captures_completed
+                      << " aborts=" << stats.active_captures_aborted << '\n';
+            return generated;
+        };
+
+        // Turn shape, and what the runs before this one got wrong. `recycles_private_state` needs five
+        // things at one capture, and two of them pull in opposite directions:
+        //
+        //   * `group.rewrite` must survive the planner, which happens ONLY when
+        //     `rewrite_disposition == ReplaceAtCommittedFrontier` (`request_plan.cpp:808-813`) -- i.e.
+        //     when the incoming closure is NEWER than the retained checkpoint's frontier.
+        //   * `sequence.rewrite_state`/`rewrite_checkpoint` must survive the prefill -- and they never
+        //     do, on any branch, once the disposition is `Replace`: `preserve_rewrite` is false
+        //     (`prefill.cpp:526-527`), Root clears the `valid` flag (`:580-581`), the
+        //     `preserving_source` branch that `SharedStablePrefix` and `PrivateLongAnchor` both take
+        //     clears the handle unconditionally (`:383-384`, branch at `:302`), and `PrivateEndpoint`
+        //     and the rewrite-restore clear it too (`:643-647`, `:699-702`). The `else` at `:729` is a
+        //     `throw` for an invalid reuse path.
+        //
+        // So the two requirements are mutually exclusive: this scenario is the positive control for
+        // that, not a vehicle that reaches the branch. It walks the shapes most likely to REFUTE the
+        // claim -- turn 1 publishes a private rewrite checkpoint, turn 2 arrives with a new closure
+        // served by the shared prefix -- and the abort in `inspect_capture` (NINFER_CAPTURE_PROBE=1)
+        // fires if the claim is wrong. Across 12 scenarios and 161 assessments it never fired, and a
+        // live `rewrite_state` never appeared at a capture at all. See plan.md §2 item 3 for the counts
+        // and `results/recycling-reachability/20260926-103341/` for the logs; the numbers are kept there
+        // and not here, because this comment went stale against them twice.
+        const ninfer::GenerationResult first =
+            turn("turn 1 (publishes the checkpoint)", 0, true, true);
+        // A DIFFERENT question, so the prompt diverges before frontier 300 and the shared prefix at
+        // 101 is the only source that matches.
+        const ninfer::GenerationResult second =
+            turn("turn 2 (diverges, shared reuse, new closure)", 1, true, true,
+                 "Answer a different question: summarise the second lookup in one short clause.");
+        // What this asserts, and nothing more: both turns produced output and no capture aborted. It is
+        // a DIAGNOSTIC scenario -- its real output is the probe trace (NINFER_CAPTURE_PROBE=1, which
+        // aborts if the recycling branch turns out to be reachable), and a pass here says only that the
+        // shapes ran. Said explicitly because the previous version ended in an unconditional
+        // `result = 0` and would have passed with every turn broken.
+        const ninfer::RuntimeStats final_stats = engine.runtime_stats();
+        if (first.generated_token_ids.empty() || second.generated_token_ids.empty() ||
+            final_stats.active_captures_aborted != 0) {
+            std::cerr << "recycling-capture: a turn produced no output, or a capture aborted\n";
+            return 1;
+        }
+        std::cout << "recycling-capture: diagnostic only -- the assertion is that both turns ran; the "
+                     "finding is in the probe trace\n";
+        result = 0;
     } else if (scenario == "stream-observations") {
         auto options          = engine_options(artifact);
         options.enable_vision = false;

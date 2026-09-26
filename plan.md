@@ -929,7 +929,18 @@ task needs no re-derivation:
   traffic. **So this item is now: mechanism present, one scenario showing no starvation, the load case
   untested** -- which is a prod-or-heavy-suite question rather than a port.
 
-6. **#6 — W2's demote-for-evict-only victims. MEASURED; the counter exists and read 7.** It counts
+6. **#6 — W2's demote-for-evict-only victims. MEASURED; the counter exists and read 7.**
+   **LIVE PROD EVIDENCE, and the first of it (2026-09-26 18:13:09, three lines in one second, on real
+   traffic):** the watcher alerts on `demotable=1` precisely for this item, and it fired with
+   `frontier=69475 endpoint=1 rewrite=0 host_state_slots=11/16 host_kv=9089187840/32212254720`,
+   `frontier=75778 endpoint=0 rewrite=1 host_state_slots=10/16 host_kv=9078571008/…` and
+   `frontier=65078 endpoint=1 rewrite=0 host_state_slots=9/16 host_kv=7684227072/…`. So on prod the
+   victims being evicted hold **65k-76k-token frontiers** and an endpoint or rewrite checkpoint, while the
+   host tier had **5-7 free state slots and ~23 GB of free host KV**. This is the case #6 exists to find,
+   and unlike the earlier `vision` reading (frontier 190, which is under one prefill chunk, and which the
+   second review pass correctly called out as overstated) the frontier here is two orders of magnitude
+   larger. `demotable` still means only "host had room at the decision" -- the trade against degradation
+   units is not modelled -- but the victims are not throwaways. It counts
    private victims committed as `Evicted` while the host tier still had room, with its denominator
    (`demotable_evictions_` / `demotable_eviction_checks_`, printed rate-limited); the census over the
    scenarios gave 7 in 2 scenarios and explained every zero by its denominator.

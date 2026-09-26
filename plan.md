@@ -1237,6 +1237,53 @@ Mooncake `main`; local copies in `/tmp/kvres/`).
   **supersede rather than accumulate** when a new entry fully contains an older one (llama.cpp's `alloc`) --
   which is the host-KV "no dedup/supersede" note in §2 #6's family.
 
+### 2g. Demote vs evict: the field is UNANIMOUS, so #6 is a DEFECT, not a policy call (2026-09-26)
+
+Researched after the eight `demotable=1 restorable=1` evictions of 52k-77k-token victims with host room.
+Sources read at the branch heads listed in §2f.
+
+**In every engine surveyed, "demote or drop" is not judged at eviction time.** It is decided by (a) whether
+a host copy exists or can be made and the host has room, (b) an admission filter applied at WRITE time (a
+hit count), or (c) an explicit client priority. **No engine drops a victim that can be demoted while the
+host tier has free space**, unless that filter or priority said so.
+
+* vLLM drops on the GPU path because its CPU tier is WRITE-THROUGH -- a host copy already exists, so the
+  eviction drops only the GPU copy. `store_threshold` (default 0 = off) is the only admission gate.
+* SGLang states the rule in code (`UnifiedTreeCore.evict_device_leaf`, `unified_tree_core.py:1591-1624`):
+  "demote if backuped, delete if write-through; for an unbacked write-back node, back up and then demote."
+  It drops only when there is no host copy, or the host backup itself fails under host pressure
+  (`dropped_tokens reason="host_pressure"`).
+* TensorRT-LLM offloads on eviction whenever `pri >= secondaryOffloadMinPriority` (default 30) and the
+  secondary tier has a free block -- and with the default priority of 35, **every reusable block is
+  offloaded when host has space**.
+* **llama.cpp, the closest analogue (local, single-user), ALWAYS demotes**: on slot reassignment it saves
+  the slot state to the RAM prompt cache first, and its cache supersedes entries fully contained in a newer
+  one.
+
+**So `demotable=1` (host slot free, host KV free, restorable state image) and still dropped is a departure
+from the whole field -- it is a defect to root-cause, not a trade-off to weigh.** The previous framing in
+this file ("the operator's call") was wrong.
+
+Two warnings for whatever we build, both from the same sources:
+* **a hit-count gate would starve exactly our case.** vLLM's `store_threshold` and SGLang's
+  `write_through_selective` admit a chunk only after N lookups -- and in an agent session a private
+  continuation is reused EXACTLY ONCE, on the next turn, so `hit_count >= 2` rejects precisely the entries
+  we want (marked INFERENCE by the agent, and it is right).
+* **losing an internal state caps the match frontier forever**, leaving the KV below it unservable
+  (SGLang's mamba comment) -- the same hazard as losing a NInfer state image.
+
+Failure modes measured by research systems, worth knowing before choosing: write-through POLLUTION
+(Marconi measured only 0.4% of SSM states reused at block 32), write-back stalling allocation and
+degenerating to drops under host pressure, swap contention with foreground compute (InferCept budgets
+swaps per iteration), and head-first loss breaking contiguous-prefix lookup (vLLM reverses its free order
+to avoid it). **No production engine prices recompute cost**; the research systems that do are Marconi
+(`recency + alpha * flops_saved/bytes`, for HYBRID attention+SSM models -- our case) and Pensieve
+(`Cost/idle`). Mooncake's paper found plain LRU beat LFU and length-aware on its trace.
+
+**Next step, and it is a code question, not a measurement:** root-cause WHY the eviction path chose drop
+when a demote was available on every axis we check. The D2H cost of a 52-77k demotion, whether eight in a
+second need a per-iteration budget, and any TTL/pinning value are measurements to take AFTER that.
+
 ### 2e. REGRESSION I CAUSED AND FIXED (2026-09-26): an edit that matched the wrong copy
 
 The regenerated reachability battery flagged `source-pressure-protection` failing (`stop=queue_exhausted`,

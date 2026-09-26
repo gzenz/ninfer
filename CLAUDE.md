@@ -11,88 +11,58 @@ Current state lives in `plan.md` at the repo root -- read its **Current state**
 section (actionable: what is fixed and its evidence, what is not, the next
 instruments with their validation, the open-claims list), which is kept current;
 the dated narrative follows it in the same file, and the still-live items of the
-old upstream-adoption plan are carried at its end.
+old upstream-adoption plan are carried at its end. **Correction history belongs
+there, not in this file** -- these are the rules.
 
-Since 2026-09-25 that is the **single record**. Two files it used to be split
-across are gone as sources of truth: `results/HANDOFF.md` (the actionable half)
-was merged into `plan.md` and deleted, and
-`~/.claude/plans/ticklish-sniffing-wadler.md` is a superseded duplicate kept only
-for the session that produced it -- read and edit `plan.md`, not those.
+Since 2026-09-25 `plan.md` is the **single record**: `results/HANDOFF.md` was
+merged into it and deleted, and `~/.claude/plans/ticklish-sniffing-wadler.md` is
+a superseded duplicate kept only for the session that produced it.
 
 ## Monitoring
-- Keep a journal monitor armed during a soak/prod. It expires at 30 min —
-  re-arm on expiry and after any stop. **Arm `tools/ops/ninfer-watch.sh`; its alert set is
-  `tools/ops/ninfer-watch.awk`, and that file is the only specification of it.** A second copy of the
-  set in this file drifted from the real one -- this pattern was missing `WORKER OOM` and
-  `private victim evicted: demotable=1`, so a session arming the raw pattern below missed the line the
-  watcher's own section calls the wedge signature, while claiming to be arming the same thing.
-- Fallback, if the script cannot be used at all -- and it is a FALLBACK, not the definition:
+- Keep a monitor armed during a soak/prod. It expires at 30 min — re-arm on expiry and after any stop.
+- **Arm `tools/ops/ninfer-watch.sh`.** It is the monitor: it carries state (a regex cannot express the
+  rules below), polls `/health` and reports transitions, and splits one pass over the journal into an
+  alert stream and a full-fidelity log at `~/ninfer-watch/latest.log`. **Its alert set is
+  `tools/ops/ninfer-watch.awk`, and that file is the only specification of it** — do not maintain a second
+  copy here, because one already drifted: the pattern that used to be written in this file was missing
+  `WORKER OOM` and `private victim evicted: demotable=1`, so following it armed a monitor blind to both.
+- Fallback only if the script cannot be used at all — `grep -E` on
+  `journalctl -u ninfer.service -f -q -n 0 --output=short-iso` (`-n 0`: `-f` otherwise replays its last 10
+  lines, so every re-arm re-reports the previous run's tail):
   `CUDA error|cudaError|bad_alloc|terminate called|Assertion|Segmentation|core dumped|Killed [0-9]|WORKER OOM|WORKER RECOVER|WORKER CRASH|host-arena|single_alloc|admission stalled|admission rejected|subtraction underflow|post-recovery residual|non-strict release REFUSED|recycled-checkpoint|checkpoint StateImage INCOMPLETE|private victim evicted: demotable=1`
-  on `journalctl -u ninfer.service -f -q -n 0 --output=short-iso` (`-n 0` because `-f` replays its last
-  10 lines, so a re-arm re-reports the previous run's tail).
-
-  (That sentence used to say "the last four were added 2026-09-25"; the pattern has grown since, so the
-  count no longer identifies them and the tokens are named individually below instead.) `admission stalled` / `admission rejected` are the two
-  admission-path outcomes `5fe12cf3` introduced (a head blocked with an empty active set: reported
-  during its 5 s grace window, then rejected with `Overloaded`); without them the condition is
-  invisible to this monitor, which is the whole reason the wedge looked like a silent outage.
-  `subtraction underflow` names the diagnosis instead of relying on the `WORKER RECOVER` prefix, and
-  `post-recovery residual` is the leak test: the line prints occupancy right after a recovery, and
-  **its expected value is all-zero** -- a non-zero residual there is unowned occupancy, i.e. the cause
-  of the wedge (tasks #9), visible at the moment it happens rather than hours later in `/stats`.
-
-  **The zero case proves nothing (corrected 2026-09-26).** `fail_all_locked` also runs on the
-  **shutdown** path (`engine_core.h:2170-2196`), so every clean prod stop logs this line for an empty
-  engine. On 2026-09-26 I read 19 of those zero lines as "19 recoveries, residual zero" and wrote it
-  into plan.md; every one was a shutdown, with `server stopped` before it and `WORKER RECOVER` = 0 in
-  the whole journal. **A residual line is evidence when it is NON-ZERO**, whatever produced it; an all-zero
-  one is the noise of a restart, and with GPU windows in use there is one per
-  window. (The rule was first written as "only when a `WORKER RECOVER`/`WORKER CRASH` precedes it", which
-  both missed the `WORKER OOM` path -- the OOM catch prints `WORKER OOM: … - recovering`, then the same
-  recovery, then the residual -- and would have discarded a non-zero `(fail-all)` line. The line carries
-  its own discriminator, `(recover)` or `(fail-all)`; the amount is what a reader needs.)
-
-  `checkpoint StateImage INCOMPLETE` is #11(b)'s alerting line: checkpoint pricing found a state image
-  that is not a restorable checkpoint (invalid, not immutable, no settled replica, or zero epoch). It is rate-limited on its own count, so the FIRST occurrence prints whatever
-  the traffic volume; the companion line `checkpoint StateImage priced: incomplete=0 (... denominator=...)`
-  prints on a separate schedule and exists so that "priced, none incomplete" can be told from "never
-  priced". If the denominator line is absent from a long journal, pricing is not running -- do not read
-  its silence as a healthy zero.
-
-  **Corrected 2026-09-26, and the correction was made by grep rather than by taste.** Four tokens this
-  pattern used to carry match *nothing* in `src/` -- `WEDGE`, `planner-no-plan`, `relief-shared`,
-  `host-state-pool` -- so they could never fire, and a pattern that cannot fire reads exactly like a
-  quiet system. Three live instruments were missing and are now here: `WORKER CRASH` (the fatal path,
-  distinct from `WORKER RECOVER`), `non-strict release REFUSED` (a release that did not free its address
-  or state image: the leak's shape), and `recycled-checkpoint` (the abort branch over a reused
-  checkpoint, #11a).
-
-  When adding or removing a token: check it with `grep -rl '<token>' src/`. Most tokens are strings the
-  engine prints, so they should match a source file; some are journal-level signatures and match none --
-  `Killed [0-9]` (the kernel's OOM killer), `terminate called`, `Assertion`, `Segmentation` and
-  `core dumped` (the C++ runtime, libc and the kernel; all five are absent from `src/`, and all five can
-  fire -- `terminate called` appears in the #9 reproduction logs). `CUDA error|cudaError` is the driver's
-  and does appear in `src/` (30 files for the alternation; `cudaError` alone is 29), so it is NOT in that class: the corrected claim here used to list
-  it among the ones that match nothing, which a `grep -rl cudaError src/` refutes. An engine instrument
-  that prints to the journal belongs here; a token nothing can ever emit does not.
-- **The pattern is now a program: `tools/ops/ninfer-watch.sh`** (filter `tools/ops/ninfer-watch.awk`,
-  contract tested by `tools/ops/ninfer-watch-test.sh`, whose fixture is the specification):
-  * a `post-recovery residual` line **alerts when it is non-zero, whatever its prefix**, and an all-zero
-    one is log-only -- `fail_all_locked` also runs on the shutdown path, which is how 19 null readings got
-    mistaken for 19 healthy recoveries. (An earlier version armed on `WORKER RECOVER`/`WORKER CRASH` and
-    alerted only when armed: that dropped a non-zero residual after `WORKER OOM` -- the wedge signature --
-    and a non-zero `(fail-all)` line. `WORKER OOM` is now in the alert set explicitly.)
-  * `private victim evicted: demotable=1` is an **alert** even though it is not an error: it is #6's
-    evidence (an eviction taken while the host tier had room), and a crash-only pattern drops it.
-  It also **polls `/health` and reports transitions**, because the 2026-09-25 wedge had the unit `active`,
-  an empty scheduler, and nothing in the journal to grep. The token list above is its alert set; the
-  insight lines whose *absence* is the signal -- `checkpoint StateImage priced`, `fail-all cleanup`, and
-  every `private victim evicted` -- go to the log file only (`~/ninfer-watch/latest.log`), so the alert
-  stream stays signal and the log still proves the instrument ran.
-- One monitor at a time (duplicates double-notify). After stopping one,
-  `pkill -f 'journalctl -u ninfe[r]'` any orphaned process (bracketed so the pattern cannot match its own
-  command line -- the unbracketed form is the very trap described below, and it was left standing here for
-  a day after that description was added).
+- What the tokens mean, and the two rules a flat pattern cannot carry:
+  * **`post-recovery residual` — a residual line is evidence when it is NON-ZERO, whatever its prefix.**
+    The amount is the signal and the line carries its own discriminator, `(recover)` or `(fail-all)`; an
+    all-zero one is restart noise. `fail_all_locked` runs on the **shutdown** path too
+    (`engine_core.h:2170-2196`), so every clean stop logs one for an empty engine — which is how 19 zero
+    lines were once read as "19 recoveries, residual zero" when every one was a stop. Arming on a preceding
+    `WORKER RECOVER`/`WORKER CRASH` instead is *also* wrong: it drops a non-zero residual after
+    `WORKER OOM`, which is the wedge signature (`WORKER OOM: … - recovering`, then the same recovery, then
+    the residual).
+  * **`private victim evicted: demotable=1` is an alert although it is not an error** — it is #6's evidence
+    (an eviction taken while the host tier had room), and a crash-only pattern drops it.
+  * `admission stalled` / `admission rejected` are the two admission-path outcomes `5fe12cf3` introduced (a
+    head blocked with an empty active set: reported during its 5 s grace window, then rejected with
+    `Overloaded`). Without them the condition is invisible, which is why the wedge looked like a silent
+    outage. `subtraction underflow` names the diagnosis instead of relying on the `WORKER RECOVER` prefix;
+    `WORKER CRASH` is the fatal path, distinct from `WORKER RECOVER`; `non-strict release REFUSED` is a
+    release that did not free its address or state image (the leak's shape); `recycled-checkpoint` is the
+    abort branch over a reused checkpoint (#11a).
+  * `checkpoint StateImage INCOMPLETE` is #11(b)'s alerting line: pricing found a state image that is not a
+    restorable checkpoint (invalid, not immutable, no settled replica, or zero epoch). Its companion
+    `checkpoint StateImage priced: incomplete=0 (… denominator=…)` prints on a separate schedule so that
+    "priced, none incomplete" can be told from "never priced" — **if the denominator line is absent from a
+    long journal, pricing is not running; do not read its silence as a healthy zero.** The same logic
+    applies to every counter here: absence is not zero.
+- **A token that cannot fire reads exactly like a quiet system.** Before adding or removing one, check it
+  with `grep -rl '<token>' src/`. Most are strings the engine prints and must match a source file; a few are
+  journal-level signatures that match none and still fire — `Killed [0-9]` (the kernel's OOM killer),
+  `terminate called`, `Assertion`, `Segmentation`, `core dumped` (the C++ runtime, libc, the kernel).
+  `CUDA error|cudaError` DOES appear in `src/` and is not in that class. Four tokens that matched nothing
+  (`WEDGE`, `planner-no-plan`, `relief-shared`, `host-state-pool`) were carried here for weeks.
+- One monitor at a time (duplicates double-notify). After stopping one, kill any orphaned `journalctl` —
+  by **`pkill -f 'journalctl -u ninfe[r]'`**, bracketed, because an unbracketed `-f` pattern matches the
+  calling shell's own command line (see the traps below).
 
 ## Working
 - All development, commits, builds, and tests happen on this host (Strix,
@@ -108,13 +78,13 @@ for the session that produced it -- read and edit `plan.md`, not those.
 `test -e /tmp/NINFERDEV` — present means dev time, absent means prod time. Do not infer the mode from the
 hour, from `ANTHROPIC_BASE_URL`, or from how busy the journal looks.
 
-**Why a file and not an environment variable** (this was tried first, on 2026-09-26): an `export` typed
-into the operator's session shell does not reach the agent's tool calls — each Bash invocation gets a
-fresh shell initialised from the profile, so `env NINFERDEV` came back empty while the operator's own
-shell had it set. A file is visible to every invocation. (`~/.claude/settings.json`'s `env` block *does*
-propagate — that is where `ANTHROPIC_BASE_URL` comes from — so an env var set there would also work; the
-file is simply the lighter switch, and `/tmp` makes it obviously a session-scoped declaration.) The two modes differ in what stopping prod *costs*, and in what the session should be
-doing with its time — they do NOT differ in the safety rules, which hold always (see below).
+**Why a file and not an environment variable:** an `export` typed into the operator's session shell does
+not reach the agent's tool calls — each Bash invocation gets a fresh shell initialised from the profile, so
+`env NINFERDEV` comes back empty while the operator's own shell has it set. A file is visible to every
+invocation. (`~/.claude/settings.json`'s `env` block *does* propagate — that is where `ANTHROPIC_BASE_URL`
+comes from — so an env var set there would also work; the file is the lighter switch.) The two modes differ
+in what stopping prod *costs* and in what the session should do with its time — they do NOT differ in the
+safety rules, which hold always (see below).
 
 - **`/tmp/NINFERDEV` exists — dev time.** Prod is not serving the operator: nothing local depends on it, so a GPU
   window or an e2e swap costs essentially nothing beyond the Bash classifier's round-trip for the
@@ -132,16 +102,13 @@ doing with its time — they do NOT differ in the safety rules, which hold alway
 cost an outage:
 - the e2e test server must never bind `:8080`; it defaults to `E2E_PORT=8085`;
 - the swap is ONE blocking foreground command, never split, never detached;
-- never put the string `build/apps/ninfer-serve` in a command line that runs `tools/e2e/e2e-swap.sh`
-  (its `pkill -f` matches the caller and has killed this session three times);
-- **and that rule is about `-f`, not about that string.** Any `pkill -f`/`pgrep -f` pattern written into a
-  Bash tool call matches the *calling shell's own command line*, including text that is only a regex:
-  `pkill -f 'journalctl -u ninfer'` killed its own shell on 2026-09-26 and returned **exit 144** with no
-  output, which reads like a failed kill rather than a self-kill. Bracket one character (`ninfe[r]`) so the
-  pattern cannot match its own text, or put the pattern in a script and call the script. **And bracketing
-  only helps if the unbracketed text appears nowhere ELSE on that command line** -- a call that both ran
-  `journalctl -u ninfer` and bracketed-pgrep'd for it matched its own shell anyway, because the plain form
-  was still in the command. Two invocations, or a script, when both are needed;
+- `pkill -f` / `pgrep -f` patterns match the **calling shell's own command line**, including text that is
+  only a regex. `pkill -f 'journalctl -u ninfer'` killed its own shell (exit 144, no output — which reads
+  like a failed kill, not a self-kill); the same trap killed this session three times via the string
+  `build/apps/ninfer-serve` in an e2e-swap command line. Bracket one character (`ninfe[r]`) or put the
+  pattern in a script — **and note that bracketing only helps if the unbracketed text appears nowhere else
+  on that command line**: a call that both ran `journalctl -u ninfer` and bracketed-pgrep'd for it still
+  matched its own shell;
 - after any window or swap, prod is restored and *verified* — `/health` 200, wedge sentinel active;
 - the sentinel is stopped FIRST and re-armed LAST around a window;
 - one journal monitor at a time.
@@ -183,7 +150,9 @@ while it lasts. In dev time that is the entire cost; in prod time it is the smal
   of logs. A claim is a result only when a run produced it; state the run.
 - **Every finding gets triaged**: an actionable code defect is fixed; a
   claim/comment or documentation defect is corrected *in place*, where a reader
-  meets it — a note in a triage section does not unstate a wrong claim.
+  meets it — a note in a triage section does not unstate a wrong claim. Grep the
+  whole tree for other copies first: a stale claim usually has duplicates, and
+  the one a reviewer quotes is rarely the only one.
 - **Validate the instrument before believing its output.** Run the same
   configuration twice and require the two runs to agree; if they do not, the
   probe measures something other than what you think. Most false conclusions in
@@ -199,7 +168,7 @@ while it lasts. In dev time that is the entire cost; in prod time it is the smal
 - E2E swap = ONE blocking foreground command, ~8 min session freeze:
   `E2E_TIMEOUT=420 bash ~/ninfer-e2e/e2e-swap.sh`. Never split it, never detach.
 - **Where this session's own model traffic goes is not fixed — check it, don't assume:**
-  `env ANTHROPIC_BASE_URL`. Right now it is OpenRouter, and the operator moves it back to
+  `env ANTHROPIC_BASE_URL`. It is OpenRouter at the time of writing, and the operator moves it back to
   local NInfer when they judge the server stable enough, so the tooling must be correct in
   both states rather than tuned to one.
 - **The e2e server must NOT bind :8080, in either state.** :8080 is prod, and prod serves
@@ -207,8 +176,7 @@ while it lasts. In dev time that is the entire cost; in prod time it is the smal
   (this one included whenever `ANTHROPIC_BASE_URL` points at 127.0.0.1:8080). A test
   server there answers requests the suite never issued — tainting every cache and timing
   number with an unknown workload, and 400ing them on the test profile's smaller context.
-  If this session *is* local, a swap also takes the session down for its duration, which is
-  the freeze already documented below.
+  If this session *is* local, a swap also takes the session down for its duration.
   The swap defaults its test server to `E2E_PORT=8085` (`PROD_PORT=8080` stays prod's) and
   forwards `--port` to the suite; `~/.config/ninfer.conf` pins prod to 8080, so anything on
   8085 is the test server by construction. Two checks enforce it: nothing may listen on
@@ -223,7 +191,10 @@ while it lasts. In dev time that is the entire cost; in prod time it is the smal
   reuse, queue and counter numbers, which belong on the isolated port.
 - The Bash classifier routes through NInfer; it may block swap/restart during
   prefills or thrash. Don't hammer retries — the user runs it with `! <cmd>`.
-- Build: `cmake --build build -j --target ninfer-serve`.
+- Build: `cmake --build build -j --target ninfer-serve`. After restarting prod on a build, verify by the
+  **running exe's hash**, not the build directory's: `sha256sum /proc/$(systemctl show -p MainPID --value
+  ninfer.service)/exe` must equal `sha256sum build/apps/ninfer-serve`. A build-directory hash changes on
+  every relink and proves nothing on its own.
 - **A wedged engine is NOT fixed by `~/ninfer-ensure.sh`.** That script is idempotent and
   reports "already running with desired config" whenever the unit is *active* — and a wedge
   is internal to the engine, not a unit failure (observed 2026-09-25: unit active,
@@ -233,27 +204,26 @@ while it lasts. In dev time that is the entire cost; in prod time it is the smal
 
 ## Observability
 - Journal: `journalctl -u ninfer.service --since "..." --no-pager`.
-- Stats: `curl -s http://127.0.0.1:8081/stats` → host-KV census (per-tier
+- Stats: **`curl -s http://127.0.0.1:8081/stats`** → host-KV census (per-tier
   {entries,bytes}: dead/live/idle/active), host-KV unit bytes, `pressure.*`,
-  `scheduler.*`.
+  `scheduler.*`. **The stats endpoint is `:8081`; `:8080/stats` serves nothing at all**
+  (`http=000 bytes=0`) — querying the wrong port there once made a working counter look dead.
+- `/stats` is where a counter that the journal has stopped printing can still be read. Two for #6:
+  `pressure_private_evictions_demotable` and its denominator `pressure_private_eviction_checks` — needed
+  because the eviction print below is rate-limited to the first 8 and then every 512th, so its silence
+  after the 8th means "not printed", not "not recurring".
 - **The eviction line is**
   `[engine] private victim evicted: demotable=%d frontier=%u endpoint=%d rewrite=%d anchors=%zu
   host_state_slots=%u/%llu host_kv=%zu/%llu checked=%llu demotable_total=%llu`
-  (`materialization.cpp:2157`), rate-limited to the first 8 and then every 512th. **Port corrected 2026-09-26:** this line said `:8080/stats`, which serves NOTHING on that path
-  (`http=000 bytes=0`) -- the stats endpoint is `:8081`, and querying the wrong port cost a diagnosis of
-  a working counter (`plan.md` §0 had it right: ':8080 (:8081 stats)'). **Earlier correction:**
-  the two sentences that stood here -- "eviction lines carry `tier=` (dead/live/idle/active)" and "the
-  reaper logs `[host-state-pool] reap=stale`" -- name instruments that **cannot emit anything**:
-  `grep -rn 'host-state-pool' src/` and `grep -rn 'reap=' src/` are both empty, and `tier=` occurs in
-  `src/` only inside `frontier=`. They are pre-v3 strings, and they are the same defect this file warns
-  about for monitor tokens. The per-tier `{dead,live,idle,active}` census is real, but it is in `/stats`
-  (the line above), not in the journal. `tools/ops/ninfer-watch.sh` reads the journal for the rest.
-- **Evidence logs are gitignored on purpose (`*.log`, `.gitignore:45`) and are NOT tracked.** What is
-  committed is the MANIFEST beside them: it names the binary's sha256, the artifact, `git-head`, and -- for
-  runs made by `tools/e2e/prefix-real-evidence.sh` -- each log's own sha256 and rc. So a claim cites
-  `results/<run>/manifest` in the repo and the log locally. Two consequences worth stating: a log that was
-  never written down is not evidence (the defect the 2026-09-26 review found), and force-adding a log past
-  the ignore rule is a mistake -- made that same day, and undone.
+  (`materialization.cpp:2157`). `demotable` is a **capacity** test at the decision — `host_state_slots` and
+  `host_kv_bytes` both under capacity — and NOT a statement that the victim could have been demoted (that
+  needs a complete, immutable, settled StateImage) nor that the planner chose eviction for value reasons.
+  The per-tier `{dead,live,idle,active}` census is in `/stats`, not in the journal.
+- **Evidence logs are gitignored on purpose (`*.log`, `.gitignore:45`) and are NOT tracked.** Never
+  `git add -f` one. What is committed is the MANIFEST beside them: binary sha256, artifact, `git-head`, and
+  -- for runs made by `tools/e2e/prefix-real-evidence.sh` -- each log's own sha256 and rc. A claim cites
+  `results/<run>/manifest` in the repo and the log locally; a log that was never written down is not
+  evidence.
 
 ## Commits
 - User-directed. Conventional Commit subjects (`fix(scope):`, `feat(scope):`,
@@ -261,7 +231,10 @@ while it lasts. In dev time that is the entire cost; in prod time it is the smal
 - Run brutal-honesty-review agent on commit.
   1. Triage findings: actionable code defect vs documentation/PR-body item. Fix real defects; document inherent limits
   (e.g. a path untestable without mock infra this suite lacks) in the PR body.
-  2. Re-run the  brutal-honesty-review  agent on the new state. Convergence = a fresh pass finds ZERO actionable
+  2. Re-run the  brutal-honesty-review  agent on the new state. Convergence = a fresh pass finds ZERO actionable
   defects. Fixing the findings is NOT convergence; a clean review pass is. Never self-attest "looks clean" from a
   manual skim — re-run the agent.
   3. Repeat until converged, then push.
+- **A commit message cannot be corrected after a push, so a hash or a run path it cites must resolve for
+  every reader.** Cite ids that exist on the remote, never a pre-rewrite id; put the mapping in `plan.md`
+  if history was rewritten.

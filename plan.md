@@ -1202,6 +1202,41 @@ with a stated reason, on two identical runs:
 So "a request the engine cannot plan is called feasible and blocked forever" is no longer the outcome: it
 is refused in zero seconds. That is the #10 fix observed doing its job against a REAL orphan rather than
 against a predicate argument, and `feasibility-orphan` (with the orphan it creates) is the reproduction.
+### 2f. What other engines do (2026-09-26, sourced) — how reuse is keyed, and demote vs evict
+
+Asked because Claude Code sends no session id and cannot be patched, and because prod showed a request
+reusing only 23,706 of 66,700 tokens. Researched rather than re-derived, from branch heads read that day
+(vLLM `379e9a1e`, SGLang `cdbea5dc`, TensorRT-LLM `b88149e5`, llama.cpp `2145525a`, LMCache `dev`,
+Mooncake `main`; local copies in `/tmp/kvres/`).
+
+* **No engine needs a client session id for reuse to be correct.** The key is the exact token prefix,
+  chained per block or page, plus content extras (LoRA id, multimodal hash, extra token ids). Client fields
+  exist but are opt-in and are about something else: `cache_salt` ISOLATES caches (vLLM, SGLang,
+  TensorRT-LLM), `RetentionPriority`/`priority`/soft-pin change how long an entry SURVIVES, llama.cpp's
+  `id_slot` pins a request to a slot. **So NInfer's `session_key` -- which reads 0 for every `/v1/messages`
+  request -- is that class of field, and using it as an identity key was a category error.** `ledger` +
+  `prefix_identity` + `prefix_matches` is already equivalent to vLLM's chained hash, and stricter: the exact
+  comparison is authoritative.
+* **The instrument the 23.7k observation needs is a SPLIT, not a counter** (SGLang does this at
+  `components/mamba.py:165-186`): report (a) the longest exact common prefix against ANY stored ledger,
+  whether or not state survives there, (b) the deepest restorable GDN checkpoint at or below it, and
+  (c) the first differing token index. If (a) is also ~23k the PROMPT diverged -- an earlier turn
+  re-rendered differently, thinking-strip being the obvious candidate -- and no engine in that list would do
+  better; if (a) is ~60k while (b) is 23k, it is placement or retention and it is ours. **Hypothesis, not a
+  finding:** the agent marked the split as its own inference and did not check it against our logs.
+* **What they do under pressure:** a refcount/lock protects state in use; among unreferenced state, LRU,
+  with leaves and tails before shared ancestors (vLLM frees a request's tail first). Demote-on-evict exists
+  and is simple where it exists -- TensorRT-LLM offloads instead of evicting when priority >= 30 and host
+  has room; SGLang HiCache `write_back`; LMCache "eviction-aware lazy offload". Others write through
+  eagerly (vLLM `CHUNK_LEVEL`, SGLang `write_through[_selective]`), which makes GPU eviction a drop of a
+  copy that already exists on host. **Nobody prices recompute cost explicitly** except length-aware
+  variants (SGLang T-LRU, arXiv 2510.15152; Mooncake's LengthAwareCache).
+* Two more things worth copying, both aimed at problems this file already records: **checkpoint where the
+  next turn attaches** (llama.cpp puts recurrent state at user-message starts and shortly before the prompt
+  end; SGLang saves a state at the branching point during the prefill that discovered it), and
+  **supersede rather than accumulate** when a new entry fully contains an older one (llama.cpp's `alloc`) --
+  which is the host-KV "no dedup/supersede" note in §2 #6's family.
+
 ### 2e. REGRESSION I CAUSED AND FIXED (2026-09-26): an edit that matched the wrong copy
 
 The regenerated reachability battery flagged `source-pressure-protection` failing (`stop=queue_exhausted`,

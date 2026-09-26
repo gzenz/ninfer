@@ -37,6 +37,14 @@ function alert(line) { print line; fflush(); keep(line) }
 # appears means the instrument stopped running, not that the count is zero.
 /checkpoint StateImage priced|fail-all cleanup|private victim evicted/ { keep($0); next }
 
+# A KILLED OR RESTARTED UNIT, which is what took prod down on 2026-09-26 and which NOTHING here matched:
+# the `Killed [0-9]` token below is written for the KERNEL's "Killed process" message, and that message
+# never appears in a unit-scoped journal (WSL2 publishes no kernel log to the guest at all). What does
+# appear is systemd's own line, `Main process exited, code=killed, status=9/KILL`, plus
+# `Failed with result 'signal'` and `Scheduled restart job`. Those are the reachable signatures, so they
+# are the ones to alert on.
+/Main process exited|Failed with result|Scheduled restart job|Stopped ninfer.service|Started ninfer.service/ { alert($0); next }
+
 # Fatal and near-fatal: the process, the driver, the kernel, and the engine's own fatal path.
 /CUDA error|cudaError|bad_alloc|terminate called|Assertion|Segmentation|core dumped|Killed [0-9]/ { alert($0); next }
 

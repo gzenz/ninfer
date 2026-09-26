@@ -54,11 +54,33 @@ exe_sha=$(sha256sum "/proc/${mainpid}/exe" 2>/dev/null | awk '{print $1}')
 # gap -- it re-shows what was already reported and still misses everything older. Each arm writes its own
 # timestamped log, so a gap shows up as an interval no log covers rather than as silence inside one.
 JOURNAL_CMD="${JOURNAL_CMD:-journalctl -u $UNIT -f -q -n 0 --output=short-iso}"
+# The request log is a SECOND instrument, not a duplicate of the journal: the journal says what the engine
+# did (evictions, recoveries), this says what a client got (reuse, prefill time). Both thresholds are a
+# first cut and are settable, so they can be tuned from the log rather than recompiled.
+REQUEST_LOG="${REQUEST_LOG:-$HOME/ninfer-requests.jsonl}"
+WATCH_REUSE_MIN_FRACTION="${WATCH_REUSE_MIN_FRACTION:-0.9}"
+WATCH_REUSE_MAX_PREFILL_S="${WATCH_REUSE_MAX_PREFILL_S:-2.0}"
 AWK_FILTER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/ninfer-watch.awk"
+JQ_FILTER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/ninfer-watch-requests.jq"
 
 journal() {
   # shellcheck disable=SC2086
   $JOURNAL_CMD 2>/dev/null | gawk -v logpath="$LOG" -f "$AWK_FILTER"
+}
+
+requests() {
+  # Alerts to stdout (they become notifications); every reuse record to the log, so "no alert" can be told
+  # from "no reuse happened" and the thresholds can be set from data.
+  tail -F -n 0 "$REQUEST_LOG" 2>/dev/null |
+    jq -rc --argjson fraction "$WATCH_REUSE_MIN_FRACTION" \
+           --argjson max_prefill_s "$WATCH_REUSE_MAX_PREFILL_S" \
+           -f "$JQ_FILTER" 2>/dev/null |
+    while IFS= read -r line; do
+      case "$line" in
+        "[watch] LOW PREFIX USE"*|"[watch] SLOW REUSE"*) echo "$line"; printf '%s\n' "$line" >>"$LOG" ;;
+        *) printf '%s\n' "$line" >>"$LOG" ;;
+      esac
+    done
 }
 
 health() {
@@ -77,5 +99,6 @@ health() {
 
 journal &
 health &
+[ -r "$REQUEST_LOG" ] && requests &
 trap 'kill $(jobs -p) 2>/dev/null' INT TERM HUP EXIT
 wait

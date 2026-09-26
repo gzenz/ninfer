@@ -13,10 +13,8 @@
 #   * `demotable=1` -> ALERT, `demotable=0` -> log only (#6's evidence is not an error).
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
-
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
-
 cat >"$work/journal" <<'EOF'
 2026-09-26T17:14:55+02:00 Strix bash[1]: [engine] post-recovery residual (fail-all): main_kv_pages=0 backend_kv_pages=0 device_state_slots=0 host_state_slots=0 host_kv_bytes=0
 2026-09-26T17:15:00+02:00 Strix bash[1]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=1)
@@ -34,10 +32,10 @@ cat >"$work/journal" <<'EOF'
 2026-09-26T17:15:12+02:00 Strix bash[1]: [engine] post-recovery residual (fail-all): main_kv_pages=117 backend_kv_pages=0 device_state_slots=0 host_state_slots=0 host_kv_bytes=8450000
 2026-09-26T17:15:13+02:00 Strix bash[1]: [engine] WORKER OOM: out of memory - recovering
 2026-09-26T17:15:14+02:00 Strix bash[1]: [engine] post-recovery residual (recover): main_kv_pages=958 backend_kv_pages=0 device_state_slots=0 host_state_slots=1 host_kv_bytes=0
+2026-09-26T18:39:12+02:00 Strix systemd[1]: ninfer.service: Main process exited, code=killed, status=9/KILL
+2026-09-26T18:39:16+02:00 Strix systemd[1]: ninfer.service: Scheduled restart job, restart counter is at 1.
 EOF
-
 gawk -v logpath="$work/log" -f ninfer-watch.awk <"$work/journal" >"$work/alerts"
-
 cat >"$work/expected" <<'EOF'
 2026-09-26T17:15:02+02:00 Strix bash[1]: [engine] WORKER RECOVER: subtraction underflow
 2026-09-26T17:15:04+02:00 Strix bash[1]: [engine] private victim evicted: demotable=1 frontier=190 endpoint=1 rewrite=1 anchors=0 host_state_slots=0/8 host_kv=0/8589934592 checked=4 demotable_total=2
@@ -49,8 +47,9 @@ cat >"$work/expected" <<'EOF'
 2026-09-26T17:15:12+02:00 Strix bash[1]: [engine] post-recovery residual (fail-all): main_kv_pages=117 backend_kv_pages=0 device_state_slots=0 host_state_slots=0 host_kv_bytes=8450000
 2026-09-26T17:15:13+02:00 Strix bash[1]: [engine] WORKER OOM: out of memory - recovering
 2026-09-26T17:15:14+02:00 Strix bash[1]: [engine] post-recovery residual (recover): main_kv_pages=958 backend_kv_pages=0 device_state_slots=0 host_state_slots=1 host_kv_bytes=0
+2026-09-26T18:39:12+02:00 Strix systemd[1]: ninfer.service: Main process exited, code=killed, status=9/KILL
+2026-09-26T18:39:16+02:00 Strix systemd[1]: ninfer.service: Scheduled restart job, restart counter is at 1.
 EOF
-
 total=$(wc -l <"$work/journal")
 rc=0
 if diff -u "$work/expected" "$work/alerts" >"$work/diff"; then
@@ -60,7 +59,6 @@ else
   cat "$work/diff" >&2
   rc=1
 fi
-
 # The log must carry the insight lines the alert stream deliberately drops, or "log-only" means "lost".
 for t in 'checkpoint StateImage priced' 'demotable=0' 'fail-all cleanup' 'post-recovery residual (fail-all): main_kv_pages=0'; do
   if grep -q -- "$t" "$work/log"; then
@@ -70,7 +68,6 @@ for t in 'checkpoint StateImage priced' 'demotable=0' 'fail-all cleanup' 'post-r
     rc=1
   fi
 done
-
 # And the denominator: the filter must not have swallowed the whole stream.
 n=$(wc -l <"$work/log")
 if [ "$n" -ge 10 ]; then
@@ -79,5 +76,33 @@ else
   echo "[watch-test] log lines=$n of $total -- too few, the filter dropped lines it should keep" >&2
   rc=1
 fi
-
+# --- the request-log leg (tools/ops/ninfer-watch-requests.jq) -----------------
+# Same discipline as the journal fixture: the cases that make the filter WRONG are asserted, including the
+# negatives -- a root-path request must be silent (no reuse was attempted, so nothing is suspicious), and
+# a near-total hit must not alert.
+cat >"$work/requests.jsonl" <<JSONL
+{"event":"request_done","request":{"request_id":"low"},"result":{"prompt_tokens":66700,"prefix_cache_hit_tokens":23706,"prefix_reuse_path":"shared_stable_prefix","computed_prefill_tokens":42994},"timings_seconds":{"prefill":0.4}}
+{"event":"request_done","request":{"request_id":"ok"},"result":{"prompt_tokens":65059,"prefix_cache_hit_tokens":63844,"prefix_reuse_path":"shared_stable_prefix","computed_prefill_tokens":1215},"timings_seconds":{"prefill":0.3}}
+{"event":"request_done","request":{"request_id":"rootpath"},"result":{"prompt_tokens":65059,"prefix_cache_hit_tokens":0,"prefix_reuse_path":"root","computed_prefill_tokens":65059},"timings_seconds":{"prefill":14.5}}
+{"event":"request_done","request":{"request_id":"slow"},"result":{"prompt_tokens":65000,"prefix_cache_hit_tokens":64000,"prefix_reuse_path":"private_endpoint","computed_prefill_tokens":1000},"timings_seconds":{"prefill":3.1}}
+JSONL
+jq -rc --argjson fraction 0.9 --argjson max_prefill_s 2.0 -f ninfer-watch-requests.jq <"$work/requests.jsonl" >"$work/reqout"
+printf '%s\n' \
+ '[watch] LOW PREFIX USE on reuse: low path=shared_stable_prefix hit=23706/66700 computed=42994 prefill_s=0.4' \
+ '[watch] reuse-ok: ok path=shared_stable_prefix hit=63844/65059 computed=1215 prefill_s=0.3' \
+ '[watch] SLOW REUSE (prefill 3.1s > 2.0s): slow path=private_endpoint hit=64000/65000 computed=1000 prefill_s=3.1' \
+ >"$work/reqexpected"
+if diff -u "$work/reqexpected" "$work/reqout" >"$work/reqdiff"; then
+  echo "[watch-test] requests PASS: $(grep -c . "$work/reqout") classifications"
+else
+  echo "[watch-test] requests FAIL:" >&2
+  cat "$work/reqdiff" >&2
+  rc=1
+fi
+if grep -q 'rootpath' "$work/reqout"; then
+  echo "[watch-test] requests FAIL: a root-path request produced output (nothing was reused, so nothing is suspicious)" >&2
+  rc=1
+else
+  echo "[watch-test] requests: root path correctly silent"
+fi
 exit "$rc"

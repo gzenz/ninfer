@@ -220,6 +220,17 @@ public:
         return require(handle).source_pins;
     }
 
+    // Does THIS handle hold a slot in each tier? A pool total cannot answer "was this victim already
+    // demoted", which is what separates a genuinely premature eviction from one where the host tier merely
+    // had room -- and `demotable` is a pool comparison taken BEFORE release, so it counts the victim's own
+    // space as free.
+    [[nodiscard]] bool holds_host_slot(StateImageHandle handle) const noexcept {
+        return valid(handle) && objects_[handle.index_].host_slot.has_value();
+    }
+    [[nodiscard]] bool holds_device_slot(StateImageHandle handle) const noexcept {
+        return valid(handle) && objects_[handle.index_].device_slot.has_value();
+    }
+
     [[nodiscard]] std::uint32_t checkpoint_references(StateImageHandle handle) const {
         return require(handle).checkpoint_references;
     }

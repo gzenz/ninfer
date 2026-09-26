@@ -2168,6 +2168,22 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
                     // the other half has to be added before the two logs can actually be matched.
                     const bool state_restorable =
                         victim.rewrite_state.has_value() && state_store->complete(*victim.rewrite_state);
+                    // THIS victim's own tier occupancy. `demotable` above is a pool comparison taken
+                    // BEFORE `release_materialization_victim`, so it counts the victim's own slot and pages
+                    // as free room: `demotable=1` on a victim that itself holds a host slot is weaker
+                    // evidence than it reads. These numbers say whether that was the case, instead of
+                    // leaving it to be inferred from a pool total.
+                    std::uint32_t victim_host_slots   = 0;
+                    std::uint32_t victim_device_slots = 0;
+                    const auto tally_slots = [&](StateImageHandle handle) {
+                        if (!state_store->valid(handle)) { return; }
+                        if (state_store->holds_host_slot(handle)) { ++victim_host_slots; }
+                        if (state_store->holds_device_slot(handle)) { ++victim_device_slots; }
+                    };
+                    tally_slots(victim.state.write);
+                    if (!victim.state.read_has_external_owner()) { tally_slots(victim.state.read); }
+                    if (victim.rewrite_state) { tally_slots(*victim.rewrite_state); }
+                    for (const auto& anchor_state : victim.long_anchors) { tally_slots(anchor_state.state); }
                     if (demotable) { ++demotable_evictions_; }
                     ++demotable_eviction_checks_;
                     if (demotable_eviction_checks_ <= 8ULL ||
@@ -2175,7 +2191,7 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
                         std::fprintf(stderr,
                                      "[engine] private victim evicted: demotable=%d restorable=%d "
                                      "session=%016llx cont=%u frontier=%u endpoint=%d rewrite=%d "
-                                     "anchors=%zu host_state_slots=%u/%llu host_kv=%zu/%llu "
+                                     "anchors=%zu victim_host_slots=%u victim_dev_slots=%u host_state_slots=%u/%llu host_kv=%zu/%llu "
                                      "checked=%llu demotable_total=%llu\n",
                                      static_cast<int>(demotable),
                                      static_cast<int>(state_restorable),
@@ -2183,7 +2199,8 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
                                      work.continuation_index, victim.execution_frontier,
                                      static_cast<int>(victim.endpoint_valid),
                                      static_cast<int>(victim.rewrite_checkpoint.valid),
-                                     victim.long_anchors.size(), usage.host_state_slots,
+                                     victim.long_anchors.size(), victim_host_slots, victim_device_slots,
+                                     usage.host_state_slots,
                                      static_cast<unsigned long long>(room.host.state_slots),
                                      usage.host_kv_bytes,
                                      static_cast<unsigned long long>(room.host.kv_bytes),

@@ -94,6 +94,15 @@ private:
     bool owns_        = true;
 };
 
+// Pin `bytes` of host memory (cudaMallocHost) and release it. Exported because the elastic pinned pool's
+// production chunk source needs exactly these, and a second pinning path with its own error reporting is
+// how two instruments end up disagreeing about the same failure.
+//
+// `pin_host_memory` returns nullptr instead of throwing: a failed pin is a REFUSAL TO GROW for the pool, a
+// policy outcome it counts and carries on from, not an exception that unwinds a request.
+[[nodiscard]] void* pin_host_memory(std::size_t bytes) noexcept;
+void free_host_memory(void* base) noexcept;
+
 class PinnedHostBuffer {
 public:
     explicit PinnedHostBuffer(std::size_t size_bytes);

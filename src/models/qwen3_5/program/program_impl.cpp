@@ -126,14 +126,38 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         decoder->text_kv.execution_tables().logical_page_capacity());
     state_images =
         std::make_unique<qwen3_5::StateImageDevicePool>(backing, plan.persistent.state_images);
+    // THE SHARED PINNED BUDGET, created before its consumers. `host_state_slots` is now an INITIAL
+    // RESERVATION rather than a capacity, and there is no fixed ceiling: growth is bounded by the host's own
+    // RAM minus a reserve, evaluated at each attempt (HostMemoryBudget), with the pinning primitives reused
+    // from arena.cu so there is one pinning path and one place that reports its errors.
+    host_memory_budget = std::make_unique<ninfer::HostMemoryBudget>(ninfer::HostMemoryBudgetConfig{
+        plan.context_cache.host_pinned_reserve_bytes, plan.context_cache.host_pinned_max_bytes,
+        /*shmem_cap_bytes=*/0U});
+    pinned_host_pool = std::make_unique<ninfer::PinnedHostPool>(
+        ninfer::PinnedHostPool::Config{plan.context_cache.host_pinned_chunk_bytes, /*alignment=*/256U,
+                                       /*initial_bytes=*/0U, plan.context_cache.host_pinned_max_bytes},
+        [](std::size_t bytes) { return ninfer::pin_host_memory(bytes); },
+        [](void* base) { ninfer::free_host_memory(base); });
+    pinned_host_pool->set_growth_policy([this](std::size_t bytes) {
+        host_memory_budget->set_pinned_bytes(pinned_host_pool->capacity_bytes());
+        return host_memory_budget->allow(bytes);
+    });
+
     if (plan.context_cache.host_state_slots != 0) {
         const std::uint64_t host_state_bytes =
             static_cast<std::uint64_t>(state_images->host_layout().image_bytes) *
             plan.context_cache.host_state_slots;
         StartupPhaseScope host_state_phase(startup_observer, StartupPhase::HostStatePin,
                                            StartupProgressUnit::Bytes, host_state_bytes);
-        host_state_images = std::make_unique<qwen3_5::HostStatePool>(
-            state_images->host_layout(), plan.context_cache.host_state_slots);
+        host_state_images =
+            std::make_unique<qwen3_5::HostStatePool>(state_images->host_layout(), *pinned_host_pool);
+        // The configured count is an initial reservation. The pool CAN grow past it, but nothing on the
+        // demote path does so today: feasibility is priced against `admission_capacity()`, which is the
+        // CURRENT slot count, so any demote that passes already has a free slot and the grow branch in
+        // `allocate_growing()` cannot run. The configured count is therefore still the effective ceiling for
+        // demotion -- growth becomes reachable only if a caller plans against growable headroom, and the
+        // planner pre-grow that did that was deliberately removed (it pre-grew inside the search).
+        (void)host_state_images->reserve_slots(plan.context_cache.host_state_slots);
         host_state_phase.complete(host_state_bytes, host_state_bytes);
     }
     const std::uint64_t logical_state_capacity =
@@ -197,8 +221,12 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         StartupPhaseScope host_kv_phase(
             startup_observer, StartupPhase::HostKvPin, StartupProgressUnit::Bytes,
             static_cast<std::uint64_t>(plan.context_cache.host_kv_capacity_bytes));
+        // The arena now draws on the SHARED pinned budget: `host_kv_capacity_bytes` is its initial span and
+        // it grows on demand, so host KV and host state slots are finally one pile rather than two fixed,
+        // mutually-blind allocations.
         host_kv_arena = std::make_unique<HostKVArena>(
-            plan.context_cache.host_kv_capacity_bytes,
+            *pinned_host_pool, plan.context_cache.host_kv_capacity_bytes,
+            plan.context_cache.host_pinned_chunk_bytes,
             std::span<const HostKVPageLayout>(layouts.data(), layouts.size()));
         host_kv_phase.complete(
             static_cast<std::uint64_t>(plan.context_cache.host_kv_capacity_bytes),
@@ -562,6 +590,17 @@ MemorySummary ProgramImpl::memory_summary() const noexcept {
     out.kv_payload_bytes             = kv_payload_bytes;
     if (host_state_images) {
         out.host_state_capacity_slots = host_state_images->capacity();
+        if (pinned_host_pool) {
+            out.host_pinned_capacity_bytes = pinned_host_pool->capacity_bytes();
+            out.host_pinned_free_bytes     = pinned_host_pool->free_bytes();
+            out.host_pinned_chunks         = static_cast<std::uint32_t>(pinned_host_pool->chunk_count());
+            out.host_pinned_grows          = pinned_host_pool->growth_count();
+        }
+        if (host_memory_budget) { out.host_pinned_grow_refusals = host_memory_budget->refusals(); }
+        if (host_kv_arena) {
+            out.host_kv_grows         = host_kv_arena->growth_count();
+            out.host_kv_grow_refusals = host_kv_arena->growth_refusals();
+        }
         out.host_state_occupied_slots = host_state_images->occupied();
     }
     if (host_kv_arena) {

@@ -1197,6 +1197,19 @@ function renderKvBars(latest){
   } else {
     h+='<div class="empty">host KV cache disabled</div>';
   }
+  h+='<div style="font-size:12px;color:var(--muted);  // THE SHARED PINNED POOL (2026-09-26). Host KV and host state slots now come out of ONE elastic pile, so
+  // this panel says whether it is working: `grows` moving means the engine took room on demand instead of
+  // failing the plan; `refusals` moving means it wanted room and could not have it; and the demotable
+  // ratio says whether demotion is winning over eviction.
+  const poolCap=mem.host_pinned_capacity_bytes||0,poolFree=mem.host_pinned_free_bytes||0;
+  const poolUsed=Math.max(0,poolCap-poolFree);
+  const poolPct=poolCap?poolUsed/poolCap*100:0;
+  if(poolCap>0){
+    h+='<div style="font-size:12px;color:var(--muted);margin:6px 0 2px">pinned pool: '+gb(poolUsed)+' / '+gb(poolCap)+' ('+poolPct.toFixed(0)+'%) · chunks '+(mem.host_pinned_chunks||0)+'</div>';
+    h+=bar([{pct:poolPct,color:C.kv[2],label:'used'},{pct:100-poolPct,color:'#30363d',label:'free'}]);
+    h+='<div style="font-size:12px;color:var(--muted);margin:2px 0 2px">growth: state '+(mem.host_pinned_grows||0)+' · kv '+(mem.host_kv_grows||0)+' · refusals '+(mem.host_pinned_grow_refusals||0)+'/'+(mem.host_kv_grow_refusals||0)+'</div>';
+    h+='<div style="font-size:12px;color:var(--muted);margin:2px 0 2px">demotable evictions '+(pstats.private_evictions_demotable||0)+' / '+(pstats.private_eviction_checks||0)+' checked · maximal fallback '+(pstats.maximal_fallback_selections||0)+'</div>';
+  }
   h+='<div style="font-size:12px;color:var(--muted);margin:6px 0 2px">pressure (cum): evict '+evict+' · demote '+demoted+' · spill '+spill+' · ckpt_drop '+ckptDrop+'</div>';
   $('kvbars').innerHTML=h;
 }

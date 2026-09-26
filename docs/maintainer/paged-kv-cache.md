@@ -182,8 +182,12 @@ MTP 的额外 pages 只覆盖每条 active row 在一个 speculative round 中�
 
 ### 3.5 Host capacity
 
-Main 与 selected backend 的 Host replicas共用一个 startup-fixed pinned `HostKVArena`，但每个 allocation
-携带自己的 typed page layout。Host capacity 按实际 packed bytes 和 allocator extent geometry计费；
+Main 与 selected backend 的 Host replicas 共用一个 pinned `HostKVArena`。**2026-09-26 起 Host KV arena 与 host
+state-image slots 已合并到同一个按需增长的共享 pinned pool**（`PinnedHostPool` + `HostMemoryBudget`）：arena
+以 span 为单位从该 pool 取 extent，增长时只追加 chunk、不移动任何已有地址。注意仍然成立的是**可规划的上限**：
+planner 按 `admission_capacity()`（当前既有的容量）定价，所以通过 feasibility 的 demote 一定有现成空间、
+不会触发增长——`--host-state-slots` 与 arena 的初始大小依旧是 planner 的规划上限，弹性余量真实但尚未被规划消费。
+每个 allocation 携带自己的 typed page layout。Host capacity 按实际 packed bytes 和 allocator extent geometry 计费；
 它不扩大 Device active entitlement 或单 sequence context ceiling。
 
 ---

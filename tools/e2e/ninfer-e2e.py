@@ -433,12 +433,41 @@ V3_LOG_PATTERNS = {
     "cuda_error": "CUDA error",
     "tool_markup_leak": "tool markup returned as text",
     "pressure_expansion_fail": "prepared pressure expansion exceeds the target arena",
+    # The v3 request-error string. It has to be a PATTERN to be counted at all: mapping it in
+    # LEGACY_V3_SOURCES pointed at a key the dict never had, so `missing_source_result` was permanently 0 and
+    # phase 12's "PASS: zero 'private source result is missing' errors" could not fail. The review of
+    # 2026-09-26 proved that by feeding the string in twice and getting 0 both times.
+    "missing_source_result": "private source result is missing",
+}
+
+
+# THE LEGACY COUNTER NAMES THE PHASES READ, and why they are DERIVED rather than read. This suite was
+# vendored speaking the PRE-v3 counter vocabulary: every name below appears in ZERO files under `src/` in
+# this engine, so reading it raised KeyError and killed the phase -- phases 4, 12 and 13 each died that way
+# on 2026-09-26, which is why the 14-phase acceptance could not run at all.
+#
+# Each name is therefore mapped to a signal this engine DOES emit. A `None` means there is no v3 equivalent;
+# those stay 0 and the phase's own "the counter may not fire" branch applies -- but they are listed in
+# `no_v3_source` so a permanent zero is visible as "unmeasurable" and cannot be read as a pass, which is the
+# mistake this repo keeps paying for (an instrument that cannot fire reads exactly like a quiet system).
+LEGACY_V3_SOURCES = {
+    "admit_session": None,          # phase 4 falls back to checking cold re-prefills, by its own design
+    # `missing_source_result` is NOT listed here: it is a native V3_LOG_PATTERNS key now, and mapping it
+    # re-assigned it from `d.get(<raw string>)`, i.e. 0 -- overwriting the correct count.
+    "state_lease_orphan": "refused_release_orphan",   # refused release whose blocker is NOT a still-owned image
+    "state_lease_leak": "refused_release_any",        # every refusal, legitimate retention included
+    "relief_demote": None,          # no per-demotion stderr line in v3; the disposition is in the request log
+    "spill_before_loss": None,
+    "state_relinquish": None,
 }
 
 
 def parse_serve_log(path, skip_lines=0):
     d = {k: 0 for k in V3_LOG_PATTERNS}
     d["legacy_metrics_available"] = False
+    refused_any = 0
+    refused_orphan = 0
+    refused_unclassified = 0
     try:
         with open(path, "r", errors="replace") as f:
             for _ in range(skip_lines):
@@ -447,8 +476,40 @@ def parse_serve_log(path, skip_lines=0):
                 for key, pat in V3_LOG_PATTERNS.items():
                     if pat in line:
                         d[key] += 1
+                if "non-strict release REFUSED" in line:
+                    refused_any += 1
+                    # A refusal whose blocker is a still-owned image (a checkpoint reference or a fork pin)
+                    # is BY DESIGN: the slot is owned and nothing was stranded. Only the other shapes are the
+                    # leak, so counting every refusal would fail this phase on correct behaviour.
+                    # Only the three shapes the store can classify as unowned count as orphans. The other
+                    # FOURTEEN emission sites pass no blocker and print `blocker=unclassified`, so they are
+                    # counted separately -- silently folding them in would call an unclassified refusal a leak,
+                    # and dropping them entirely would hide #11a's abort-recycled-checkpoint instrument.
+                    if "blocker=unclassified" in line:
+                        refused_unclassified += 1
+                    elif "pending-replica" in line or "blocker=none" in line:
+                        refused_orphan += 1
     except OSError:
         pass
+    d["refused_release_any"] = refused_any
+    d["refused_release_orphan"] = refused_orphan
+    d["refused_release_unclassified"] = refused_unclassified
+    for name, source in LEGACY_V3_SOURCES.items():
+        d[name] = d.get(source, 0) if source is not None else 0
+    # EVERY OTHER NAME THE PHASES READ, defaulted to 0 and DECLARED unmeasurable. These describe mechanisms
+    # whose v3 signal I could not establish (entitlement re-planning, queued-KV relief, spill-checkpoint
+    # backstops, ...); inventing a pattern for them would FABRICATE the acceptance rather than adapt it.
+    # Defaulting them (a) removes the KeyError class that killed phases 4, 12 and 13, and (b) puts them in
+    # `no_v3_source`, which the phases now report as INFO -- an unmeasurable check is visible instead of
+    # reading as a pass. The list is the union of `logN["..."]` accesses in this file, obtained with:
+    #   grep -oE 'log[0-9]+\["[a-z_]+"\]' tools/e2e/ninfer-e2e.py | sed 's/.*\["//;s/"\]//' | sort -u
+    unmeasurable = {name for name, src in LEGACY_V3_SOURCES.items() if src is None}
+    for name in ("checkpoint_demoted", "checkpoint_restored", "entitlement_mismatch", "kv_occupancy_block",
+                 "queued_kv_deadline", "queued_kv_relief", "rewrite_prefix_hit", "spill_ckpt_ok",
+                 "state_replan"):
+        d.setdefault(name, 0)
+        unmeasurable.add(name)
+    d["no_v3_source"] = sorted(unmeasurable)
     return d
 
 
@@ -1185,6 +1246,10 @@ def phase_12(args):
         all_verdicts.append(("state-lease", f"WARN: only {captured} checkpoint captures (expected >= 4) — state pressure may not have been reached"))
     else:
         all_verdicts.append(("state-lease", f"PASS: {captured} checkpoint captures (rewrite-recycle precondition)"))
+    if log12.get("no_v3_source"):
+        all_verdicts.append(("state-lease",
+            "INFO: no v3 signal for " + ", ".join(log12["no_v3_source"]) +
+            " -- those checks cannot fire on this engine; the suite's vocabulary predates v3"))
     if restored == 0 and demoted == 0 and log12["relief_demote"] == 0:
         all_verdicts.append(("state-lease", "WARN: no checkpoint demote/restore/relief observed — state pool never pressurized (H2D-restore path may be unexercised)"))
     else:
@@ -1256,6 +1321,10 @@ def phase_13(args):
         all_verdicts.append(("state-saturation", f"PASS: device state pool saturated ({occ}/{cap} at phase end)"))
     else:
         all_verdicts.append(("state-saturation", f"WARN: device state pool not saturated ({occ}/{cap} at phase end)"))
+    if log13.get("no_v3_source"):
+        all_verdicts.append(("state-saturation",
+            "INFO: no v3 signal for " + ", ".join(log13["no_v3_source"]) +
+            " -- those checks cannot fire on this engine; the suite's vocabulary predates v3"))
     if log13["relief_demote"] > 0:
         all_verdicts.append(("state-saturation", f"PASS: relief freed device state slots {log13['relief_demote']}x (dual drops: {log13['relief_dual_drop']})"))
     else:

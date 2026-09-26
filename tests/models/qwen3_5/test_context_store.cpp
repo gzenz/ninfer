@@ -9,6 +9,7 @@
 
 #include <array>
 #include <cstdint>
+#include <cstdlib>
 #include <exception>
 #include <iostream>
 #include <new>
@@ -63,7 +64,15 @@ void test_state_store(ninfer::DeviceContext& device) {
     const q36::StateImageDeviceLayout layout = q36::plan_state_image_device_pool(builder, spec);
     ninfer::DeviceArena arena(builder.finish(256));
     q36::StateImageDevicePool physical({arena.base(), arena.capacity()}, layout);
-    q36::HostStatePool host(layout.host, 2);
+    // The host slots come from the SHARED pinned budget now; the two slots this test needs are an initial
+    // reservation. A CPU-only chunk source keeps this test's pool bookkeeping independent of whether the
+    // machine has a GPU -- the test itself still needs one for the device pool.
+    ninfer::PinnedHostPool host_pool(
+        ninfer::PinnedHostPool::Config{/*chunk_bytes=*/layout.host.image_bytes * 2U, /*alignment=*/256U},
+        [](std::size_t bytes) { return std::malloc(bytes); },
+        [](void* base) { std::free(base); });
+    q36::HostStatePool host(layout.host, host_pool);
+    expect(host.reserve_slots(2) == 2U, "host slots reserved from the shared pool");
     store::StateImageStore images(
         physical, &host, static_cast<std::uint32_t>(physical.slot_count()) + host.capacity());
 
@@ -230,7 +239,12 @@ void test_kv_store(ninfer::DeviceContext& device) {
     const ninfer::HostKVPageLayout host_layout =
         ninfer::plan_host_kv_page_layout(physical_pages.geometry());
     const std::array host_layouts{host_layout};
-    ninfer::HostKVArena host_arena(host_layout.page_stride * 8, host_layouts);
+    ninfer::PinnedHostPool kv_pool(  // CPU-only source: this suite checks allocation, not pinning
+        ninfer::PinnedHostPool::Config{host_layout.page_stride * 8U, 256U},
+        [](std::size_t bytes) { return std::malloc(bytes); },
+        [](void* base) { std::free(base); });
+    ninfer::HostKVArena host_arena(kv_pool, host_layout.page_stride * 8, host_layout.page_stride * 8,
+                                   host_layouts);
     store::LogicalKVPageStore pages(physical_pages, physical_pages.capacity_pages() + 8U);
     store::HostKVExtentStore extents(host_arena, 8);
     store::KVAddressSpaceStore addresses(pages, physical_tables, 4, 4);

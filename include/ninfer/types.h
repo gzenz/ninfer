@@ -25,6 +25,14 @@ inline constexpr std::size_t kMaximumPromptMediaBytes    = 256ULL << 20;
 inline constexpr std::size_t kDefaultMediaCacheBytes     = 1ULL << 30;
 inline constexpr std::size_t kDefaultMediaLiveBytes      = 2ULL << 30;
 inline constexpr std::uint32_t kDefaultHostStateSlots    = 8;
+// 8 GiB held back from pinned memory, as a FIRST CUT -- the number that justifies it is
+// `~/ninfer-e2e/ab-runner.sh`'s gate, which treats MemAvailable >= 38 GiB as "memory released" on this
+// 53 GB host, implying ~15 GiB is needed for weight staging, the media cache and the OS.
+inline constexpr std::size_t kDefaultHostPinnedReserveBytes = 8ULL << 30U;
+// One growth step. A state image is ~187 MiB, so 1 GiB lets several share a chunk while keeping the first
+// pin modest.
+inline constexpr std::size_t kDefaultHostPinnedChunkBytes   = 1ULL << 30U;
+
 inline constexpr std::size_t kDefaultHostKvCapacityBytes = 8ULL << 30;
 
 enum class KvCacheStorage : std::uint8_t {
@@ -132,7 +140,21 @@ struct ContextCacheOptions {
     bool enabled = true;
     // Extra Device checkpoint StateImage slots H. Total Device StateImage capacity is C + H.
     std::optional<std::uint32_t> device_state_slots;
-    // Host StateImages and Host KV bytes are independently configured pinned-memory capacities.
+    // THE ELASTIC PINNED BUDGET (2026-09-26). `host_state_slots` and `host_kv_capacity_bytes` are the
+    // consumers' INITIAL SIZES: they draw on ONE shared pile of pinned host RAM that can grow past them,
+    // bounded by the host's own RAM rather than by a flag. These three bound that growth.
+    // **They are still the limits the planner plans against.** Growth is reachable only from execution
+    // paths, and every demote option is priced against the capacity that exists NOW
+    // (`admission_capacity()`), so a plan that passes feasibility already has room and nothing asks the
+    // pool to grow. Setting a larger `--host-state-slots` is still how you plan for more host checkpoints;
+    // the headroom is real and unspent, not a replacement for the flag.
+    //   reserve : RAM pinned memory may never eat into. THE SAFETY PROPERTY -- see HostMemoryBudget.
+    //   max     : 0 = no fixed ceiling; else a hard cap on the pile.
+    //   chunk   : the size of one growth step.
+    std::size_t host_pinned_reserve_bytes = kDefaultHostPinnedReserveBytes;
+    std::size_t host_pinned_max_bytes     = 0U;
+    std::size_t host_pinned_chunk_bytes   = kDefaultHostPinnedChunkBytes;
+    // (Was: "Host StateImages and Host KV bytes are independently configured pinned-memory capacities.")
     std::uint32_t host_state_slots     = kDefaultHostStateSlots;
     std::size_t host_kv_capacity_bytes = kDefaultHostKvCapacityBytes;
     // Bounded private/shared logical catalogs and per-continuation long-anchor count.
@@ -866,6 +888,21 @@ struct MemorySummary {
     std::uint32_t host_state_capacity_slots       = 0;
     std::uint32_t host_state_occupied_slots       = 0;
     std::size_t host_kv_capacity_bytes            = 0;
+    // THE SHARED PINNED POOL (2026-09-26). `host_state_capacity_slots` above is now LIVE (it follows the
+    // pool), and these say how much the pool holds, how much is unallocated, and whether it has had to grow.
+    // `grows == 0` with demotable evictions still happening is the instrument check: it means the growth
+    // path never fired, which is indistinguishable from a machine that never needed it.
+    std::size_t   host_pinned_capacity_bytes = 0;
+    std::size_t   host_pinned_free_bytes     = 0;
+    std::uint32_t host_pinned_chunks         = 0;
+    std::uint64_t host_pinned_grows          = 0;
+    std::uint64_t host_pinned_grow_refusals  = 0;
+    // KV's own growth, so a host-KV span added on demand is visible and not only inferable from total
+    // capacity. With these three -- grew, could not grow, and the existing `maximal_fallback_selections`
+    // (evicted everything) -- the three outcomes a full host tier can produce are DISTINGUISHABLE, which
+    // they were not: a failed seal and claim contention used to look identical in the fallback counter.
+    std::uint64_t host_kv_grows              = 0;
+    std::uint64_t host_kv_grow_refusals      = 0;
     std::size_t host_kv_occupied_bytes            = 0;
 };
 

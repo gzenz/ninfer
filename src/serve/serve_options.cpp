@@ -237,6 +237,25 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             }
             options.context_cache.host_kv_capacity_bytes = static_cast<std::size_t>(mib << 20);
             context_capacity_explicit                    = true;
+        } else if (arg == "--host-ram-reserve-mib") {
+            const std::uint64_t mib = parse_u64(require_value("--host-ram-reserve-mib"), "host-ram-reserve-mib");
+            if (mib > std::numeric_limits<std::size_t>::max() / (1ULL << 20)) {
+                throw std::invalid_argument("--host-ram-reserve-mib is out of range");
+            }
+            options.context_cache.host_pinned_reserve_bytes = static_cast<std::size_t>(mib << 20);
+        } else if (arg == "--host-pinned-max-mib") {
+            // 0 keeps its natural meaning: no fixed ceiling.
+            const std::uint64_t mib = parse_u64(require_value("--host-pinned-max-mib"), "host-pinned-max-mib");
+            if (mib > std::numeric_limits<std::size_t>::max() / (1ULL << 20)) {
+                throw std::invalid_argument("--host-pinned-max-mib is out of range");
+            }
+            options.context_cache.host_pinned_max_bytes = static_cast<std::size_t>(mib << 20);
+        } else if (arg == "--host-chunk-mib") {
+            const std::uint64_t mib = parse_u64(require_value("--host-chunk-mib"), "host-chunk-mib");
+            if (mib == 0U || mib > std::numeric_limits<std::size_t>::max() / (1ULL << 20)) {
+                throw std::invalid_argument("--host-chunk-mib must be a positive, in-range value");
+            }
+            options.context_cache.host_pinned_chunk_bytes = static_cast<std::size_t>(mib << 20);
         } else if (arg == "--max-private-continuations") {
             options.context_cache.max_private_continuations =
                 static_cast<std::uint32_t>(parse_nonnegative_int(

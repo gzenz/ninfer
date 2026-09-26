@@ -2,6 +2,8 @@
 #include "models/qwen3_5/program/internal.h"
 
 #include "core/arena.h"
+#include "core/host_memory_budget.h"
+#include "core/pinned_host_pool.h"
 #include "core/gdn_replay_records.h"
 #include "core/host_kv_arena.h"
 #include "ninfer/ops/gdn_replay.h"
@@ -629,6 +631,11 @@ public:
     std::size_t text_host_kv_page_stride    = 0;
     std::size_t backend_host_kv_page_stride = 0;
     std::unique_ptr<qwen3_5::StateImageDevicePool> state_images;
+    // THE SHARED PINNED BUDGET. Declared BEFORE the consumers so it outlives them, and used by both the
+    // host state slots and (next) the host KV arena: one pile of pinned RAM split on demand, which is what
+    // the two fixed, mutually-blind allocations were not.
+    std::unique_ptr<ninfer::HostMemoryBudget> host_memory_budget;
+    std::unique_ptr<ninfer::PinnedHostPool>   pinned_host_pool;
     std::unique_ptr<qwen3_5::HostStatePool> host_state_images;
     std::unique_ptr<StateImageStore> state_store;
     std::optional<GdnReplayRecords> replay_records;
@@ -1096,6 +1103,11 @@ private:
     owner_exclusive_resources(const SharedPrefixState& shared) const;
     [[nodiscard]] detail::PhysicalResources physical_occupancy() const noexcept;
     [[nodiscard]] bool physical_peak_fits(detail::PhysicalResources peak) const noexcept;
+
+    // Give idle pinned host memory back. Gated on the TRANSFER STREAM being idle: a chunk can look free while
+    // a D2H/H2D copy onto it is still in flight, and unpinning then is a use-after-free. Never trims below
+    // `retain_bytes`, so a demote that just succeeded cannot immediately lose its room and thrash.
+    void maintain_host_memory(std::size_t retain_bytes) noexcept;
     [[nodiscard]] StateImageHandle
     selected_state(const SequenceState& sequence, ReusePath reuse,
                    std::optional<runtime::CheckpointRef> checkpoint) const;

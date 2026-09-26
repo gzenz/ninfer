@@ -2301,6 +2301,19 @@ bool ProgramImpl::compose_pressure_candidate(
             }
             requested_bytes += bytes;
         }
+        // NO PRE-GROW HERE, and this is a deliberate reversal of the first version of this change. This
+        // function is called for EVERY node the planner assesses (`pressure_planner.cpp` ~1013/1023), so
+        // pinning from inside it meant cudaMallocHost of at least one chunk -- measured at ~1 s per GiB on
+        // the engine thread -- plus a /proc/meminfo read, repeatedly, for candidates that are never selected,
+        // inside a search whose p95 is 400 ms. **Planning must be free of side effects.** The room is taken
+        // when the SELECTED plan executes instead (`host_kv_store::prepare` grows the arena and extends its
+        // own tables together), which is where the cost belongs.
+        //
+        // The cost of the reversal, stated rather than hidden: feasibility now counts PINNED capacity only, so
+        // a plan that would be affordable by growing reads as blocked and the caller may evict where a demote
+        // was possible -- the very failure this change exists to fix. That is the conservative direction, and
+        // removing it properly needs the planner to see capacity PLUS the growth policy's answer without
+        // acting on it (a pure query), which is not this change.
         if (host_kv_extents == nullptr ||
             !host_kv_extents->can_allocate_after_page_releases(
                 host_releases, host_last_reference_releases, host_requests)) {
@@ -2586,6 +2599,7 @@ detail::PhysicalResources ProgramImpl::admission_capacity() const noexcept {
             },
     };
 }
+
 
 bool ProgramImpl::isolated_request_feasible(const RequestBasePlan& base) const noexcept {
     if (base.impl_ == nullptr) { return false; }

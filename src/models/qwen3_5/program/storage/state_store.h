@@ -97,18 +97,25 @@ public:
     StateImageStore(qwen3_5::StateImageDevicePool& device, qwen3_5::HostStatePool* host,
                     std::uint32_t logical_capacity)
         : device_(&device), host_(host), objects_(logical_capacity),
-          free_objects_(logical_capacity),
+          free_objects_(),
           free_device_slots_(static_cast<std::size_t>(device.slot_count())),
-          free_object_count_(logical_capacity),
           free_device_count_(static_cast<std::uint32_t>(device.slot_count())) {
+        // The check covers the INITIAL reservation; the table then FOLLOWS the host pool, because the pool is
+        // elastic now and every host-resident image needs its own object entry -- without that the table, not
+        // the pool, is the ceiling, and the elasticity buys nothing (`ensure_host_object_capacity`).
         if (logical_capacity == 0 || device.slot_count() <= 0 ||
             logical_capacity < static_cast<std::uint32_t>(device.slot_count()) ||
             (host != nullptr && logical_capacity < static_cast<std::uint32_t>(device.slot_count()) +
                                                        host->capacity())) {
             throw std::invalid_argument("StateImageStore capacity is inconsistent");
         }
+        // A STACK, maintained with push_back/pop_back throughout. It used to be a pre-sized vector written by
+        // index (`free_objects_[free_object_count_++] = ...`), which is only valid while the vector is never
+        // resized -- and this table now grows. (The same pattern in HostStatePool produced a double
+        // allocation when its container became dynamic; that is why this is converted rather than extended.)
+        free_objects_.reserve(logical_capacity);
         for (std::uint32_t index = 0; index < logical_capacity; ++index) {
-            free_objects_[index] = logical_capacity - 1U - index;
+            free_objects_.push_back(logical_capacity - 1U - index);
         }
         for (std::uint32_t index = 0; index < free_device_slots_.size(); ++index) {
             free_device_slots_[index] =
@@ -126,7 +133,7 @@ public:
     }
 
     [[nodiscard]] std::uint32_t occupied() const noexcept {
-        return capacity() - free_object_count_;
+        return capacity() - static_cast<std::uint32_t>(free_objects_.size());
     }
 
     [[nodiscard]] std::uint32_t device_occupied() const noexcept {
@@ -520,7 +527,10 @@ public:
             object.source_pins == std::numeric_limits<std::uint32_t>::max()) {
             return std::nullopt;
         }
-        std::optional<qwen3_5::HostStateSlotHandle> target = host_->allocate();
+        // GROWING, and only here: this is the demote path, the one place that should be able to take room
+        // the KV arena is not using rather than failing and letting the caller evict restorable state
+        // (2026-09-26). Every pure path keeps the pure `allocate()`.
+        std::optional<qwen3_5::HostStateSlotHandle> target = host_->allocate_growing();
         if (!target) { return std::nullopt; }
         const std::uint64_t transfer = next_transfer();
         object.pending_host_slot     = *target;
@@ -707,7 +717,7 @@ public:
         object.role          = StateImageRole::Free;
         object.content_epoch = 0;
         if (++object.generation == 0) { ++object.generation; }
-        free_objects_[free_object_count_++] = handle.index_;
+        free_objects_.push_back(handle.index_);
         return true;
     }
 
@@ -789,13 +799,26 @@ private:
                object.transfer_id != 0;
     }
 
+    // Grow the handle table so it covers the host pool's CURRENT capacity. Called before an object is handed
+    // out, never while a reference to an Object is held (the vector may reallocate).
+    void ensure_host_object_capacity() noexcept {
+        if (host_ == nullptr) { return; }
+        const std::size_t required = static_cast<std::size_t>(device_->slot_count()) + host_->capacity();
+        while (objects_.size() < required) {
+            objects_.push_back(Object{});
+            free_objects_.push_back(static_cast<std::uint32_t>(objects_.size() - 1U));
+        }
+    }
+
     [[nodiscard]] std::optional<StateImageHandle> allocate(StateImageRole role,
                                                            bool with_device) noexcept {
-        if (free_object_count_ == 0 || role == StateImageRole::Free ||
+        ensure_host_object_capacity();
+        if (free_objects_.empty() || role == StateImageRole::Free ||
             (with_device && free_device_count_ == 0)) {
             return std::nullopt;
         }
-        const std::uint32_t index = free_objects_[--free_object_count_];
+        const std::uint32_t index = free_objects_.back();
+        free_objects_.pop_back();
         Object& object            = objects_[index];
         object                    = Object{.generation = object.generation, .role = role};
         if (with_device) { object.device_slot = free_device_slots_[--free_device_count_]; }
@@ -856,7 +879,6 @@ private:
     std::vector<Object> objects_;
     std::vector<std::uint32_t> free_objects_;
     std::vector<std::int32_t> free_device_slots_;
-    std::uint32_t free_object_count_  = 0;
     std::uint32_t free_device_count_  = 0;
     std::uint64_t next_content_epoch_ = 0;
     std::uint64_t next_transfer_id_   = 0;

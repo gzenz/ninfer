@@ -788,6 +788,9 @@ ProgramImpl::release_shared_prefix_state_strict(std::uint32_t index,
         slot.role = SharedPrefixSlotRole::Free;
         if (++slot.generation == 0) { ++slot.generation; }
         if (host_kv_extents) { (void)host_kv_extents->release_unreferenced(); }
+        // NOW is the natural moment to give idle pinned memory back: a release just finished, so something
+        // may have gone idle, and `maintain_host_memory` refuses to act while transfers are in flight.
+        maintain_host_memory(context_cache.host_pinned_chunk_bytes);
         return removed;
     } catch (...) { std::terminate(); }
 }

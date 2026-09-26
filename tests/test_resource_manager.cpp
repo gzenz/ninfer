@@ -660,6 +660,12 @@ public:
         return base.isolated_feasible;
     }
 
+    // #6's counters, read by the stats assembly (`resource_manager.h`). The fake returns zeroes: this suite
+    // is host-only and asserts the plumbing, not the eviction policy -- but it must COMPILE, and it did not
+    // from the moment those two lines were added, because only the serve binary was built at the time.
+    [[nodiscard]] std::uint64_t demotable_evictions() const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t demotable_eviction_checks() const noexcept { return 0U; }
+
     [[nodiscard]] std::optional<FakeAdmissionCandidate>
     inspect_admission(const FakePreparedPrompt& prompt, const FakeRequestBasePlan& base, LaneId,
                       const FakeContinuationHandle* source,

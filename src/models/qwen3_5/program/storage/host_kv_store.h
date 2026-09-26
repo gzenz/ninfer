@@ -53,15 +53,20 @@ class HostKVExtentStore {
 public:
     HostKVExtentStore(HostKVArena& arena, std::uint32_t descriptor_capacity)
         : arena_(&arena), extents_(descriptor_capacity), free_(descriptor_capacity),
-          free_count_(descriptor_capacity), memberships_(descriptor_capacity),
-          free_memberships_(descriptor_capacity), free_membership_count_(descriptor_capacity),
+          memberships_(descriptor_capacity),
           release_marks_(descriptor_capacity), extent_marks_(descriptor_capacity) {
         if (descriptor_capacity == 0) {
             throw std::invalid_argument("Host KV extent descriptor capacity is zero");
         }
+        // The two free lists are STACKS (push_back/pop_back). They used to be pre-sized and written by
+        // index, which is only valid while the vector never resizes -- and these tables now grow with the
+        // arena (`reserve_capacity`), so the indexed form would write past the end exactly as
+        // `HostStatePool`'s did before a test caught it handing out a slot twice.
+        free_.reserve(descriptor_capacity);
+        free_memberships_.reserve(descriptor_capacity);
         for (std::uint32_t index = 0; index < descriptor_capacity; ++index) {
-            free_[index]             = descriptor_capacity - 1U - index;
-            free_memberships_[index] = descriptor_capacity - 1U - index;
+            free_.push_back(descriptor_capacity - 1U - index);
+            free_memberships_.push_back(descriptor_capacity - 1U - index);
         }
         affected_extents_.reserve(descriptor_capacity);
         extent_scan_scratch_.reserve(descriptor_capacity);
@@ -78,7 +83,52 @@ public:
         return static_cast<std::uint32_t>(extents_.size());
     }
 
-    [[nodiscard]] std::uint32_t occupied() const noexcept { return capacity() - free_count_; }
+    // Grow the tables to cover the arena's CURRENT capacity. Called wherever the arena may have grown: a
+    // growth that extended the arena and not this store would either throw in `partition_extent` or hand out
+    // pages the store cannot describe.
+    [[nodiscard]] bool ensure_capacity_for(const HostKVArena& arena) noexcept {
+        const std::size_t needed = arena.descriptor_hint_for(arena.capacity_bytes());
+        if (needed <= extents_.size()) { return true; }
+        const std::size_t missing = needed - extents_.size();
+        if (missing > std::numeric_limits<std::uint32_t>::max()) { return false; }
+        return reserve_capacity(static_cast<std::uint32_t>(missing));
+    }
+
+    // Grow the tables so the arena can hold more host memory than the capacity it started with. Every table
+    // is index-addressed, so appending is safe; the marks resize to 0, which reads as "not marked" because
+    // `release_stamp_` starts at 1 and is never 0. The two free lists are stacks and are APPENDED TO.
+    //
+    // Without this, growth shows up as `partition_extent`'s hard throw ("Host KV partition descriptor
+    // capacity is exhausted") -- a failure inside the address-space teardown path, at the worst moment.
+    [[nodiscard]] bool reserve_capacity(std::uint32_t additional_extents) noexcept {
+        if (additional_extents == 0U) { return true; }
+        const std::size_t target = extents_.size() + additional_extents;
+        if (target > std::numeric_limits<std::uint32_t>::max()) { return false; }
+        try {
+            const auto begin = static_cast<std::uint32_t>(extents_.size());
+            extents_.resize(target);
+            memberships_.resize(target);
+            release_marks_.resize(target, 0U);
+            extent_marks_.resize(target, 0U);
+            free_.reserve(target);
+            free_memberships_.reserve(target);
+            affected_extents_.reserve(target);
+            extent_scan_scratch_.reserve(target);
+            partition_runs_.reserve(target);
+            suballocation_scratch_.reserve(target);
+            for (auto index = begin; index < static_cast<std::uint32_t>(target); ++index) {
+                free_.push_back(index);
+                free_memberships_.push_back(index);
+            }
+        } catch (...) {
+            return false;  // a failed reserve leaves the tables usable, just not larger
+        }
+        return true;
+    }
+
+    [[nodiscard]] std::uint32_t occupied() const noexcept {
+        return capacity() - static_cast<std::uint32_t>(free_.size());
+    }
 
     [[nodiscard]] const HostKVPageLayout& page_layout(const LogicalKVPageStore& pages) const {
         const HostKVPageLayout* layout = arena_->layout_for(pages.physical_pool().geometry());
@@ -90,7 +140,7 @@ public:
 
     [[nodiscard]] std::optional<HostKVExtentReservation>
     prepare(LogicalKVPageStore& pages, std::span<const LogicalKVPageHandle> membership) {
-        if (membership.empty() || free_count_ == 0 || membership.size() > free_membership_count_) {
+        if (membership.empty() || free_.empty() || membership.size() > free_memberships_.size()) {
             return std::nullopt;
         }
         for (const LogicalKVPageHandle page : membership) {
@@ -98,11 +148,23 @@ public:
         }
 
         const HostKVPageLayout& layout = page_layout(pages);
+        // GROWING, and only here: this is the KV demote path, the one place that should be able to take room
+        // the state pool is not using rather than failing and letting the caller evict. The arena and this
+        // store's tables grow TOGETHER -- that pairing is the whole reason this is one method and not two
+        // calls at the call site.
         std::optional<HostKVAllocation> allocation =
             arena_->allocate(layout, static_cast<std::uint32_t>(membership.size()));
-        if (!allocation) { return std::nullopt; }
+        if (!allocation) {
+            if (!arena_->grow_for(static_cast<std::uint32_t>(membership.size()), layout.page_stride) ||
+                !ensure_capacity_for(*arena_)) {
+                return std::nullopt;
+            }
+            allocation = arena_->allocate(layout, static_cast<std::uint32_t>(membership.size()));
+            if (!allocation) { return std::nullopt; }
+        }
 
-        const std::uint32_t descriptor = free_[--free_count_];
+        const std::uint32_t descriptor = free_.back();
+        free_.pop_back();
         Extent& extent                 = extents_[descriptor];
         if (extent.state != ExtentState::Free) { std::terminate(); }
         extent.state      = ExtentState::Reserved;
@@ -464,8 +526,10 @@ private:
     }
 
     [[nodiscard]] std::uint32_t take_membership() noexcept {
-        if (free_membership_count_ == 0) { return kInvalidIndex; }
-        return free_memberships_[--free_membership_count_];
+        if (free_memberships_.empty()) { return kInvalidIndex; }
+        const std::uint32_t node = free_memberships_.back();
+        free_memberships_.pop_back();
+        return node;
     }
 
     void begin_release_marks() const noexcept {
@@ -577,7 +641,7 @@ private:
         }
         if (!any_release) { return 0; }
         const std::uint32_t additional_extents = retained_runs == 0 ? 0U : retained_runs - 1U;
-        if (additional_extents > free_count_) {
+        if (additional_extents > free_.size()) {
             throw std::logic_error("Host KV partition descriptor capacity is exhausted");
         }
         const std::size_t stride = page_layout(*pages).page_stride;
@@ -610,14 +674,21 @@ private:
                     const std::uint32_t next = entry.next;
                     if (!pages->detach_host_replica(entry.page, old)) { std::terminate(); }
                     entry                                       = {};
-                    free_memberships_[free_membership_count_++] = release_node;
+                    free_memberships_.push_back(release_node);
                     release_node                                = next;
                 }
                 if (release_node != kInvalidIndex || !allocation.release()) { std::terminate(); }
                 continue;
             }
 
-            const std::uint32_t target_index = !original_assigned ? index : free_[--free_count_];
+            // The pop happens ONLY when the free list was read. (An earlier conversion of this line had the
+            // condition negated: it popped when the list had NOT been read -- discarding a free descriptor --
+            // and leaked one when it had.)
+            std::uint32_t target_index = index;
+            if (original_assigned) {
+                target_index = free_.back();
+                free_.pop_back();
+            }
             Extent& target                   = extents_[target_index];
             if (target_index != index && target.state != ExtentState::Free) { std::terminate(); }
             original_assigned = true;
@@ -658,7 +729,7 @@ private:
             original.head        = kInvalidIndex;
             original.tail        = kInvalidIndex;
             original.page_count  = 0;
-            free_[free_count_++] = index;
+            free_.push_back(index);
         }
         return released_bytes;
     }
@@ -669,7 +740,7 @@ private:
             if (node == kInvalidIndex) { std::terminate(); }
             const std::uint32_t next                    = memberships_[node].next;
             memberships_[node]                          = {};
-            free_memberships_[free_membership_count_++] = node;
+            free_memberships_.push_back(node);
             node                                        = next;
         }
         if (node != kInvalidIndex) { std::terminate(); }
@@ -680,7 +751,7 @@ private:
         extent.tail       = kInvalidIndex;
         extent.page_count = 0;
         increment_generation(extent.generation);
-        free_[free_count_++] = index;
+        free_.push_back(index);
     }
 
     static void consume(HostKVExtentReservation& reservation) noexcept {
@@ -691,10 +762,8 @@ private:
     HostKVArena* arena_ = nullptr;
     std::vector<Extent> extents_;
     std::vector<std::uint32_t> free_;
-    std::uint32_t free_count_ = 0;
     std::vector<Membership> memberships_;
     std::vector<std::uint32_t> free_memberships_;
-    std::uint32_t free_membership_count_ = 0;
     mutable std::vector<std::uint32_t> release_marks_;
     mutable std::vector<std::uint32_t> extent_marks_;
     mutable std::vector<std::uint32_t> affected_extents_;

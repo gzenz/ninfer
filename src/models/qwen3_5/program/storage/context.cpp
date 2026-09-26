@@ -512,6 +512,13 @@ bool ProgramImpl::physical_peak_fits(detail::PhysicalResources peak) const noexc
                     limits.device.backend_kv_pages) &&
            fits_u32(occupied.host.state_slots, peak.host.state_slots, limits.host.state_slots) &&
            fits_size(occupied.host.kv_bytes, peak.host.kv_bytes, limits.host.kv_bytes);
+    // NO cross-dimension sum check, and that is deliberate: it existed in the first version of this change
+    // and was DEAD CODE. Both consumers do share one pool, but each axis is checked against a capacity its
+    // own consumer already owns, so `o_s+p_s <= L_s && o_k+p_k <= L_k` implies the weighted sum -- the extra
+    // check could never fail, and its stated rationale ("a proof can pass and the allocation then throw")
+    // was false. Removed rather than kept as reassurance. What WOULD be a real check is comparing the peak
+    // against pool capacity PLUS growable room, which needs the growth policy's answer at planning time; that
+    // is not this change.
 }
 
 StateImageHandle
@@ -1723,6 +1730,29 @@ void ProgramImpl::note_nonstrict_release_refusal(const char* what, const char* b
                                        : "unclassified (this call site holds no state store to ask)",
                      static_cast<unsigned long long>(nonstrict_release_refusals_));
         std::fflush(stderr);
+    }
+}
+
+void ProgramImpl::maintain_host_memory(std::size_t retain_bytes) noexcept {
+    if (pinned_host_pool == nullptr) { return; }
+    // THE STREAM GATE, and it is the whole reason this is a separate step: a chunk can hold no live
+    // allocation while a D2H/H2D copy onto it is still in flight, and unpinning then is a use-after-free.
+    // Conservative: skip this round rather than wait for the stream.
+    if (device.transfer_stream != nullptr && cudaStreamQuery(device.transfer_stream) != cudaSuccess) {
+        return;
+    }
+    // Give back trailing idle slots first; their pool extents then become free, which is what lets a chunk
+    // go idle. Order matters: the pool can only unpin a chunk that holds NOTHING.
+    // The FLOOR is the configured slot count: trimming below it would lower the limit the planner demotes
+    // against. Nothing restores that room at planning time -- this change deliberately made growth
+    // UNREACHABLE from the planner (an earlier version pre-grew inside the search), so neither axis has a
+    // planning-time pre-grow to raise the limit again. The floor is what keeps `admission_capacity()` honest.
+    if (host_state_images != nullptr) {
+        (void)host_state_images->trim_idle_slots(context_cache.host_state_slots);
+    }
+    // Then unpin idle chunks, keeping `retain_bytes` of room so a demote that just succeeded cannot
+    // immediately lose its room and force the next one to grow again -- growth/shrink thrash.
+    while (pinned_host_pool->free_bytes() > retain_bytes && pinned_host_pool->shrink_idle()) {
     }
 }
 

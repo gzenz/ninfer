@@ -141,10 +141,20 @@ void test_host_roundtrip(bool dflash, ninfer::DeviceContext& device, bool dflash
     fill_slot(pool, 0, dflash ? 0x19 : 0x25);
     pool.zero_slot(1, device.stream);
 
-    q36::HostStatePool host(planned.layout.host, 1);
+    // A GPU-free chunk source: what is under test is the pool's bookkeeping, and a pool whose growth can
+    // only be exercised on a machine with a GPU is a growth path that is rarely exercised. `chunk_bytes` is
+    // set to ONE IMAGE so the second slot has to pin a second chunk -- that is what makes the
+    // address-stability assertion below a real test of growth rather than of packing.
+    ninfer::PinnedHostPool host_pool(
+        ninfer::PinnedHostPool::Config{/*chunk_bytes=*/planned.layout.host.image_bytes, /*alignment=*/256U},
+        [](std::size_t bytes) { return std::malloc(bytes); },
+        [](void* base) { std::free(base); });
+    q36::HostStatePool host(planned.layout.host, host_pool);
+    expect(host.reserve_slots(1) == 1U, "HostStatePool reserves its configured initial slot");
     const auto handle = host.allocate();
-    expect(handle.has_value(), "HostStatePool allocates its fixed slot");
-    expect(!host.allocate().has_value(), "HostStatePool reports capacity exhaustion");
+    expect(handle.has_value(), "HostStatePool allocates its reserved slot");
+    expect(!host.allocate().has_value(),
+           "the PURE allocate reports capacity exhaustion (it never grows)");
     expect(host.occupied() == 1, "HostStatePool occupied count after allocation");
 
     pool.copy_to_host(0, host.writable_view(*handle), device.stream);
@@ -167,6 +177,37 @@ void test_host_roundtrip(bool dflash, ninfer::DeviceContext& device, bool dflash
            "HostStatePool reuse advances generation");
     expect(!host.release(stale), "HostStatePool rejects stale release");
     expect(host.release(*reused), "HostStatePool releases the reused slot");
+
+    // GROWTH, and the property the whole elastic design rests on: adding a slot must NOT move an existing
+    // one, because views into these bytes are held across in-flight H2D/D2H copies.
+    const auto held = host.allocate();
+    expect(held.has_value(), "a slot to hold across a growth");
+    const std::byte* const address_before = host.writable_view(*held).data;
+    // Relative, not absolute: the INITIAL reservation is itself a growth, so a fixed expected count would
+    // encode how the test happens to be set up rather than what this line is testing.
+    const std::uint64_t growth_before = host.growth_count();
+    expect(host.capacity() == 1U, "capacity is one slot before the growth");
+    const auto grown = host.allocate_growing();
+    expect(grown.has_value(), "allocate_growing adds a slot when none is free");
+    expect(host.capacity() == 2U, "capacity followed the growth");
+    expect(host.growth_count() == growth_before + 1U,
+           "the growth is counted (a silent capacity change is not)");
+    expect(host.writable_view(*held).data == address_before,
+           "the existing slot's address did NOT move -- the pool grew by pinning another chunk");
+    expect(host.writable_view(*grown).data != nullptr, "the new slot has an address");
+    expect(host.writable_view(*grown).data != address_before, "and it is a different one");
+    expect(host.release(*held) && host.release(*grown), "both slots release");
+
+    // THE TRIM FLOOR, which the review of 2026-09-26 found missing: the first version trimmed every idle
+    // trailing slot, and `capacity()` feeds `admission_capacity()`, which the planner treats as the host
+    // state limit -- so trimming to zero would leave no room to demote INTO, which is the 16/16 incident
+    // made worse.
+    const std::uint32_t floor = host.capacity();
+    expect(host.reserve_slots(3) == 3U, "three more slots for the trim fixture");
+    expect(host.capacity() == floor + 3U, "capacity grew");
+    expect(host.trim_idle_slots(floor) == 3U, "trim gives back exactly what is above the floor");
+    expect(host.capacity() == floor, "capacity is back AT the floor, never below it");
+    expect(host.trim_idle_slots(floor) == 0U, "and a second trim has nothing to give back");
 }
 
 } // namespace

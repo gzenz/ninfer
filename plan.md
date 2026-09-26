@@ -193,6 +193,30 @@ current ids.
 | **checkpoint state↔epoch binding** — W1's plan form: the state's content epoch recorded where each checkpoint is installed, compared at selection | `ff6ea1f4` | measured `recorded=16 live=16 mismatches=0/1 unrecorded=3`; selections with no record count as unrecorded rather than as agreement |
 | **idle-block grace + unsatisfiable refusal** | `6380bbdc` | see #10: the first version could not fire (a review caught it); now unit-tested, with the test failing against the shipped form |
 | **N1 "nondeterminism"** | — | withdrawn: three instrument errors, not an engine defect |
+| **elastic pinned host budget** — one `PinnedHostPool` + `HostMemoryBudget`, drawn on by host KV (through spans) and host state slots | the unpushed commit whose subject is `feat(engine): one elastic pinned host budget, shared by host KV and host state slots` (id at push time: see §1b) | `pinned_host_pool` 90 / `host_memory_budget` 29 checks; `kv_cache` multi-span now carries THREE added cases: one per user of the span-keyed helper (`can_allocate_after_suballocation_releases`, `plan_after_releases`, and the REAL free list via `insert_free_extent`) (**mutation-checked, two runs each, ONE MUTANT PER CASE**: `m1` fails only the split case, `m2`/`m3`/`m4` only their own; unmutated gives `failures=0`. `m2`, `m3` and `m4` each passed the whole suite before their case existed); e2e phase 11 PASS on the repaired build (`spill=1053 h2d=1538`, 0 cold-starts, log `/tmp/ninfer-e2e-run-1790455115.log`; **no binary sha256 recorded — the "mtime 22:37:46" that stood here describes a binary that has since been relinked**), 11-14 = 11 PASS/6 WARN/1 FAIL (that 11/6/1 is phases 11-14; 12-14 alone are 8 PASS), where the state-pool checks WARNed rather than passed (see §4). **Its reachability limit is §3 item 6 — this is NOT a fix for eviction, and the first version of the commit message claimed it was** |
+
+### 1b. Commit id map for the elastic-pool change (history was rebuilt)
+
+The commit was REWRITTEN six times while unpushed, and the last two rewrites landed on the wrong base: after
+`7238c552` was committed (the CLAUDE.md rule, briefly its own commit) HEAD was that commit, and `git commit
+--amend` amends HEAD -- so the third and fourth passes' repairs went onto `7238c552` instead of onto the
+feature commit. The result was a history that still carried `66ce0707`, the exact tree the third pass
+refused, with its refused message intact: pushing it would have published the uncorrected text this whole
+exercise exists to prevent. Rebuilt as `887521e8` -> one squashed `feat(engine)` commit -> the `docs(claude)`
+commit. A message citing a pre-rewrite id resolves for nobody after a push, so the map, oldest first:
+
+| id | what it was |
+|---|---|
+| `27c8a142` | the original commit, before any review repair |
+| `0e1ecfc4` | + the first pass's repairs (two span fixes, dead-check deletion, shim fix) |
+| `1227a212` | + the corrected message and the `plan.md` records |
+| `0df37d6c` | + the README corrections |
+| `66ce0707` | + the second pass's repairs; the state the THIRD pass reviewed and refused |
+| `7238c552` | the CLAUDE.md convergence rule, briefly its own commit before the amends absorbed it |
+| `3afc6109`, `bb732dea` | the third and fourth passes' repairs, amended onto `7238c552` in error |
+| the squashed `feat(engine)` commit | everything above with the corrected message; **its own id cannot appear here -- a commit cannot cite itself -- and is appended by the first commit after the push** |
+
+**Cite the subject line, or the id that is on the remote after the push, never a row above it.**
 
 ### 2. Open, in priority order
 
@@ -1372,9 +1396,41 @@ it is an engine regression, which `git stash` settles in one run.
    `forty-heavy`'s rc=1 is the harness's own over-budget 400s on its last rounds, not an engine error.
 5. **Re-run the gate before quoting an acceptance** for any tree that has since changed — only an
    artifact whose own `build_id` re-hashes equal to the binary describes it.
+6. **Make host growth REACHABLE from planning** — the step that would make the elastic pool address
+   anything. The pool can grow (see §1b for the commit) but no path asks it to: `physical_peak_fits` prices
+   `host.state_slots` against `admission_capacity()`, which is the slot count that exists NOW, so every
+   demote passing feasibility already has a free slot and `allocate_growing()`'s grow branch cannot run.
+   **The evidence it matters:** the day has **60** `private victim evicted` lines, of which **44 carry a
+   `restorable=` field**: 29 `demotable=1 restorable=1`, 8 `demotable=0 restorable=1`, 6
+   `demotable=0 restorable=0`, 1 `demotable=1 restorable=0`; the other **16 are in an older format with no
+   `restorable=`** (5 `demotable=0` at 16/16, 11 `demotable=1`). The 8 `demotable=0 restorable=1` sit at
+   `host_state_slots=16/16` with `host_kv` 2.9-11.6 GB *of 32.2* — the one shape a shared pile addresses,
+   since the room existed in the other dimension. (The 29 `demotable=1` had room by the instrument's own
+   definition: a POLICY defect, and the reason the commit message's original 16/16 story was wrong.) **An
+   earlier version of this item said "of the day's 44 lines" as though that were the whole day, which is how
+   a denominator slips: the grep is `journalctl -u ninfer.service --since 2026-09-26 --until 2026-09-27 -o cat | grep -c 'private victim evicted'`
+   and it returns 60.** **Validation:** the same 8-line shape must
+   stop appearing, and `host_pinned_grows`/`host_kv_grows` must be non-zero **on the state axis under real
+   traffic**, which they never have been. **Two designs, and the choice is the work:** (a) pre-grow ONCE at
+   admission, before the search, so the planner reads a capacity that includes the new bytes — planning
+   stays side-effect-free per candidate, but it pins on every admission and changes prod behaviour
+   materially; (b) leave growth execution-only and accept that the configured counts are the limits. The
+   in-search pre-grow that was tried and removed (~1 s/GiB pinning plus a /proc/meminfo read per assessed
+   node, inside a 400 ms p95 search) is neither. **Risk:** pricing a demote against headroom that then
+   fails to pin converts a clean eviction into the `bad_alloc` → worker-recovery path the plan's §Risks 1
+   names, so the growth must be taken BEFORE the plan is priced, not during execution.
 
 ### 4. Open claims — do not quote these as settled
 
+- **`planner-latency` FAILS, and it is unattributed.** The suite counts materialization rows whose
+  `stop_reason` is `expansion_capacity`/`target_budget` and fails on any non-zero count. This build:
+  `budget_stops=39, n=95`; before the planner pre-grow was removed: `47, n=80` — different numbers, same
+  verdict, so the removal neither caused nor cured it. The pre-change prod binary DOES show the same stop
+  reason in its own traffic, but as a RATE, which the gate is not: over 17:36-20:07 on 2026-09-26 prod
+  logged **744 materialization rows, 22 budget stops** (18 `expansion_capacity` + 4 `target_budget`, 3.0%),
+  on a workload nothing like the suite's. **The 7-of-11 (or 6-of-10) instance ratio quoted earlier had no
+  reproducible denominator and is withdrawn.** The control that settles it — this phase against a
+  pre-change binary — has not been run.
 - Every e2e timing taken before 2026-09-25 evening ran with all `MAT_*` probes on (the start script
   exported empty names, and `getenv` is non-NULL for an empty string), so those numbers are conservative
   against prod but not comparable with post-fix ones.

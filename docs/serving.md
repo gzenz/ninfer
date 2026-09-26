@@ -826,8 +826,14 @@ Frequency penalty is `0` for all registered presets. Process flags override regi
 request fields override process flags, and `--greedy` finally forces temperature `0`.
 
 For `C=--max-concurrency` and `H=--device-state-slots`, total Device StateImage capacity is `C+H`:
-`C` slots guarantee active requests and `H` is a global checkpoint pool. Host State and Host KV are
-independent startup-fixed pinned-memory capacities; Host KV is shared by Main and the selected
+`C` slots guarantee active requests and `H` is a global checkpoint pool. Host State and Host KV are both
+drawn from ONE shared elastic pinned-memory budget (`PinnedHostPool` + `HostMemoryBudget`, 2026-09-26),
+split on demand and bounded by the host's own RAM minus a reserve. **The growth is not yet reachable from
+the planner**: `admission_capacity()` reports the capacity that exists NOW, and every demote option is
+priced against it, so a plan that passes feasibility already has room and nothing asks the pool to grow.
+`--host-state-slots` and the KV arena's initial size therefore still bound what the planner will plan,
+and the elastic headroom is real but unspent until a caller plans against it -- do not read this
+paragraph as "the limits are gone". Host KV is shared by Main and the selected
 Backend pool and is consumed in physical page extents. `--no-prefix-reuse` selects root-only Engine
 mode and cannot be combined with any of the seven explicit context-cache capacity flags, including
 zero-valued flags.

@@ -31,6 +31,16 @@ ninfer_add_test(ninfer_gdn_replay_records_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_gdn_replay_records.cpp"
   LIBRARIES ninfer_core)
 
+# No GPU needed: the pool's chunk source is injected, so its growth and shrink paths are exercised on any
+# host (see tests/test_pinned_host_pool.cpp).
+ninfer_add_test(ninfer_pinned_host_pool_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_pinned_host_pool.cpp"
+  LIBRARIES ninfer_core)
+
+ninfer_add_test(ninfer_host_memory_budget_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_host_memory_budget.cpp"
+  LIBRARIES ninfer_core)
+
 set_tests_properties(
   ninfer_device_test
   ninfer_decode_graph_test

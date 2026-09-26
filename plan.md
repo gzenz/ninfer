@@ -1284,6 +1284,27 @@ to avoid it). **No production engine prices recompute cost**; the research syste
 when a demote was available on every axis we check. The D2H cost of a 52-77k demotion, whether eight in a
 second need a per-iteration budget, and any TTL/pinning value are measurements to take AFTER that.
 
+### 2h. CLOSED (2026-09-26): the shutdown `non-strict release REFUSED` is by design, NOT a leak
+
+`non-strict release REFUSED (state-rewrite)` fired on every graceful prod stop, and its message asserted "a
+leak of the #9 shape". That assertion was never established: `StateImageStore::can_release` refuses for five
+different reasons, and three of them mean the state image is still OWNED. The classifier added for this
+(`d8ccab41`) answered it on its first live occurrence, at the 19:38 shutdown:
+
+    [engine] non-strict release REFUSED (state-rewrite, blocker=checkpoint-references (still owned)):
+    the caller dropped its handle and the store did not free the image. count=1
+
+**So: a checkpoint still references the state image, the release was premature, the slot is owned, and
+nothing was stranded.** The all-zero `post-recovery residual` printed in the same second agrees rather than
+contradicts. **#9 is not reopened by this surface, and the refusal alone must not be read as a leak** -- what
+would be a leak is `blocker=pending-replica`, or the post-gate case where the gate passed and the HOST
+release failed; both now print their own label. The other twelve call sites hold no state store to ask and
+say "unclassified" rather than guessing.
+
+Worth keeping as the counter-example to the rest of this file: an instrument that names a leak shape for a
+condition it has not classified sent this investigation after a leak that a second instrument in the same
+second said was not there. The fix was not a better probe but a honest label.
+
 ### 2e. REGRESSION I CAUSED AND FIXED (2026-09-26): an edit that matched the wrong copy
 
 The regenerated reachability battery flagged `source-pressure-protection` failing (`stop=queue_exhausted`,

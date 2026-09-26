@@ -977,6 +977,23 @@ void ProgramImpl::prepare_materialization(MaterializationTransaction& transactio
             if (source_reservation) {
                 pages.physical_pool().resize_reservation(reservation, missing);
             }
+            // Capacity up front so the two recordings below cannot allocate, and therefore cannot
+            // throw. THIS IS THE #9 FIX, and it is a fix of ordering, not of the reservation:
+            // `reserve_device_replica` pins the logical page (`pending_device_replica` +
+            // `destination_pinned`), and a pinned page can neither release its reference nor be dropped.
+            // The existing abort walks the *recorded* restores, so a replica that is pinned but not yet
+            // recorded is invisible to every cleanup path -- the sequence's KV release then refuses, the
+            // address stays `occupied` with its pages resident, and the recovery leaves 117 device pages
+            // and 8.45 MB of host KV owned by nothing. Before this, `restores.push_back` (a vector
+            // growth) was a real throw source inside that window; reserving the capacity first removes
+            // it, so the recording cannot fail and the window cannot be entered by an allocation fault.
+            //
+            // What remains open, stated rather than implied: a throw *inside* `reserve_device_replica`
+            // after it has materialized the physical page would still leave an unrecorded pin. That is
+            // unproven here -- it needs a fault site inside `kv_store.h`, not in this file -- and no fix
+            // is claimed for it.
+            restores.reserve(restores.size() + mapped);
+            destinations.reserve(destinations.size() + mapped);
             for (std::uint32_t page = 0; page < mapped; ++page) {
                 const LogicalKVPageHandle logical = addresses.logical_page(address, page);
                 if (pages.device_resident(logical)) { continue; }
@@ -992,15 +1009,23 @@ void ProgramImpl::prepare_materialization(MaterializationTransaction& transactio
                     .extent_page = replica.page_offset,
                 });
                 destinations.push_back(destination);
+                // Fault injection (NINFER_INJECT_THROW=mat-reserve-replica): a failure with the device
+                // page replica reserved and RECORDED but not yet published. Recorded is the point: the
+                // existing abort (`abort_materialization_transfers`, materialization.cpp:1519-1537)
+                // already walks `text_restores`/`backend_restores` and calls `abort_device_replica` for
+                // each, so a recorded replica is cleaned up correctly -- verified, residual zero. What it
+                // cannot see is a replica reserved and NOT yet recorded, which is where this leak lived
+                // (see the comment on the capacity reservation above).
+                if (ninfer::harmful_inject_throw("mat-reserve-replica")) { throw std::bad_alloc(); }
+
             }
         };
     DeviceKVPageReservation& text_restore_reservation =
         text_prefix_fork ? *transaction.text_source_restore_reservation
                          : text_kv_addresses->page_reservation(*transaction.text_activation);
     prepare_kv_restores(*text_kv_addresses, *text_kv_pages, text_address,
-                        transaction.text_activation_frontier, text_prefix_fork,
-                        text_restore_reservation, transaction.text_restores,
-                        transaction.text_restore_destinations);
+                        transaction.text_activation_frontier, text_prefix_fork, text_restore_reservation,
+                        transaction.text_restores, transaction.text_restore_destinations);
     if (backend_address) {
         DeviceKVPageReservation& backend_restore_reservation =
             backend_prefix_fork
@@ -1934,6 +1959,38 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
         populate_continuation_summary(state, *result.final_summary);
     };
     const auto evict_private_result = [&](MaterializationVictimResult& result) {
+        // W2/#6: was this eviction forced by a shortage, or chosen while the host tier had room? The
+        // demotion half is counted where it is published (`pressure_private_owners_demoted_kv_only`,
+        // above), so this supplies the numerator the plan asked for: evictions that could have been
+        // demotions. Both conditions are required -- a demotion needs a host state slot AND host KV room
+        // for the pages -- so a non-zero count here is a real "evicted anyway", not a near-miss. Read at
+        // the commit site, per committed victim, never in the planner's candidate search.
+        try {
+            const PhysicalUsageSnapshot usage        = physical_usage();
+            const detail::PhysicalResources capacity = admission_capacity();
+            const bool demotable =
+                usage.host_state_slots < capacity.host.state_slots &&
+                usage.host_kv_bytes < capacity.host.kv_bytes;
+            if (demotable) { ++demotable_evictions_; }
+            // The denominator, and the reason this is not gated by the result: a counter that never
+            // fires is indistinguishable from a gate that can never be true. The first evictions of a
+            // run therefore report the host occupancy and capacity whether or not the condition held, so
+            // a run says "N evictions, M demotable, host was x/y and a/b" instead of just "0". (First
+            // version printed only when the condition held, and its first run said nothing at all.)
+            ++demotable_eviction_checks_;
+            if (demotable_eviction_checks_ <= 8ULL || demotable_eviction_checks_ % 512ULL == 0ULL) {
+                std::fprintf(stderr,
+                             "[engine] private victim evicted: demotable=%d host_state_slots=%u/%llu "
+                             "host_kv=%zu/%llu evictions_checked=%llu demotable_total=%llu\n",
+                             static_cast<int>(demotable), usage.host_state_slots,
+                             static_cast<unsigned long long>(capacity.host.state_slots),
+                             usage.host_kv_bytes,
+                             static_cast<unsigned long long>(capacity.host.kv_bytes),
+                             static_cast<unsigned long long>(demotable_eviction_checks_),
+                             static_cast<unsigned long long>(demotable_evictions_));
+                std::fflush(stderr);
+            }
+        } catch (...) {}
         result.disposition        = runtime::VictimDisposition::Evicted;
         result.pressure_committed = true;
         result.final_summary.reset();

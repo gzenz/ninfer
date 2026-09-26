@@ -938,6 +938,7 @@ public:
     [[nodiscard]] ReleaseResult release_continuation(ContinuationHandle&& continuation) noexcept;
     [[nodiscard]] ReleaseResult release_shared_prefix(SharedPrefixHandle&& shared) noexcept;
     void fail_all_cleanup() noexcept;
+    void resource_census() const noexcept;
 
     [[nodiscard]] bool isolated_request_feasible(const RequestBasePlan& base) const noexcept;
     [[nodiscard]] runtime::ProgramResourceRevision resource_revision() const noexcept;

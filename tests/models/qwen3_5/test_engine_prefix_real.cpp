@@ -2330,6 +2330,69 @@ int main() {
         std::cout << "recycling-capture: diagnostic only -- the assertion is that both turns ran; the "
                      "finding is in the probe trace\n";
         result = 0;
+    } else if (scenario == "capture-host-snapshot") {
+        // #9: coverage for the abort's host-snapshot release -- `capture.cpp:826`,
+        // `abort-snapshot-destination`, a NON-STRICT release whose refusal is exactly the leak's shape
+        // (the handle is dropped, its host state slot and host KV are not freed). Without this scenario
+        // that branch has NO coverage: `HostSnapshot` placement is chosen only when the device state
+        // pool is FULL and a host tier exists (`capture.cpp:218-233`), and every capture in the
+        // 2026-09-26 injection run took `placement=0` (DeviceFork) because no scenario both filled the
+        // pool and had a host tier -- three had the host tier and never filled the pool, the rest had
+        // `host_state_slots = 0`.
+        //
+        // So: ONE device state slot, occupied by another session that stays resident, with a host tier
+        // to snapshot into. The capturing turn's own capture must then find the pool full.
+        //
+        // Read it with NINFER_CAPTURE_PROBE=1 -- the capture's `assess` line should read `placement=1`
+        // (`DeviceFork` is 0, `HostSnapshot` is 1); if it says 0 the precondition was not built and the
+        // run is evidence of nothing. To test the abort path, add NINFER_INJECT_THROW=capture-submitted
+        // (harmful-controls build) and look for `non-strict release REFUSED (abort-snapshot-destination)`
+        // or a non-zero `post-recovery residual`: either one is the leak, named.
+        auto options                                    = engine_options(artifact);
+        options.speculative.backend                     = ninfer::SpeculativeBackend::DFlash2;
+        options.speculative.draft_tokens                = 7;
+        options.max_context                             = 1024;
+        options.kv_capacity                             = ninfer::KvCapacityPolicy::explicit_capacity(1024);
+        options.prefill_chunk                           = 256;
+        options.max_concurrency                         = 2;
+        options.context_cache.device_state_slots        = 1;
+        options.context_cache.host_state_slots          = 2;
+        options.context_cache.host_kv_capacity_bytes    = 256ULL << 20;
+        options.context_cache.max_private_continuations = 2;
+        options.context_cache.max_shared_prefixes       = 0;
+        options.context_cache.max_long_anchors_per_continuation = 0;
+        ninfer::Engine engine(std::move(options));
+
+        // The occupant is SUBMITTED, not generated: a turn that runs to completion has its state
+        // demoted to host by the tiering, which frees the device slot -- and the first version of this
+        // scenario did exactly that and still read `placement=0`, i.e. it measured an unfilled pool.
+        // Held in flight, its device state is live while the capturing turn runs.
+        auto occupant = engine.submit(
+            engine.prepare(
+                session_turn("hs-occupant", "Give one deterministic token for the occupant.")),
+            fixed_output(24));
+        // The capturing turn. Thinking is left ON because the rewrite capture group comes from the
+        // chat template's closure boundary (`chat_template.cpp:402`), and `session_turn` disables it.
+        ninfer::PromptInput capturing_input =
+            session_turn("hs-capture", "Describe deterministic scheduling in one paragraph.");
+        capturing_input.options.enable_thinking = true;
+        const ninfer::GenerationResult capturing =
+            engine.generate(engine.prepare(std::move(capturing_input)), fixed_output(4));
+        const ninfer::GenerationResult occupant_result = occupant.wait();
+
+        const ninfer::RuntimeStats stats = engine.runtime_stats();
+        std::cout << "capture-host-snapshot occupant_tokens=" << occupant_result.generated_token_ids.size()
+                  << " capture_tokens=" << capturing.generated_token_ids.size()
+                  << " path=" << static_cast<int>(capturing.prefix_reuse_path)
+                  << " captures=" << stats.active_captures_completed
+                  << " aborts=" << stats.active_captures_aborted
+                  << " (expect the capture's assess line to read placement=1; placement=0 means the "
+                     "device pool was not full and this run proves nothing)\n";
+        if (occupant_result.generated_token_ids.empty() || capturing.generated_token_ids.empty()) {
+            std::cerr << "capture-host-snapshot: a turn produced no output\n";
+            return 1;
+        }
+        result = 0;
     } else if (scenario == "stream-observations") {
         auto options          = engine_options(artifact);
         options.enable_vision = false;

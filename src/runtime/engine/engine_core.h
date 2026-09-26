@@ -2114,6 +2114,17 @@ private:
                          what, usage.device_main_kv_pages, usage.device_backend_kv_pages,
                          usage.device_state_slots, usage.host_state_slots, usage.host_kv_bytes);
             std::fflush(stderr);
+            // #9: the amount is printed above; this names the owner -- but ONLY when there is something
+            // to name. The census walks the KV stores, and this function also runs on the shutdown path
+            // (`fail-all`), where the stores may already be torn down: called unconditionally it
+            // segfaulted every scenario at teardown, which is how this guard was learned (the `try`
+            // below cannot catch a segfault, and the crash also swallowed the scenarios' own `ok` line,
+            // because stdout was never flushed). A zero residual needs no owner.
+            if (usage.device_main_kv_pages != 0 || usage.device_backend_kv_pages != 0 ||
+                usage.device_state_slots != 0 || usage.host_state_slots != 0 ||
+                usage.host_kv_bytes != 0) {
+                instance_.program->resource_census();
+            }
         } catch (...) {}
     }
 

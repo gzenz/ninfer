@@ -129,10 +129,15 @@ ProgramImpl::inspect_capture(const CaptureOffer& offer, const SharedPrefixHandle
             std::abort();
         }
         std::fprintf(stderr,
-                     "[capture] assess lane=%u rewrite_group=%d rewrite_state_live=%d "
+                     "[capture] assess lane=%u placement=%d dev_occ=%u dev_cap=%u host_images=%d "
+                     "rewrite_group=%d rewrite_state_live=%d "
                      "checkpoint_valid=%d slot_differs=%d can_recycle=%d replaces_rewrite=%d "
                      "recycles=%d frontier=%u base=%u refs=%d\n",
-                     lane, static_cast<int>(group.rewrite.has_value()), static_cast<int>(state_live),
+                     lane, static_cast<int>(assessment.state_placement), state_store->device_occupied(),
+                     state_store->device_capacity(),
+                     static_cast<int>(host_state_images != nullptr),
+                     static_cast<int>(group.rewrite.has_value()),
+                     static_cast<int>(state_live),
                      static_cast<int>(sequence.rewrite_checkpoint.valid),
                      static_cast<int>(state_live &&
                                       *sequence.rewrite_state != sequence.state.write),
@@ -230,6 +235,20 @@ ProgramImpl::inspect_capture(const CaptureOffer& offer, const SharedPrefixHandle
         // identity.  This preserves both logical checkpoints without assigning fixed slot roles.
         assessment.state_placement = qwen3_5::CaptureStatePlacement::HostSnapshot;
         added.host.state_slots     = 1;
+    }
+    if (std::getenv("NINFER_CAPTURE_PROBE") != nullptr) {
+        // Printed AT the decision, because the earlier probe cannot see these: `replaced_shared` is
+        // declared below it. The first three runs of the host-snapshot scenario read `placement=0` with
+        // `dev_occ == dev_cap`, which is only possible if a replacement frees a slot -- so read the
+        // value the decision actually uses instead of inferring it.
+        std::fprintf(stderr,
+                     "[capture] placement-decision lane=%u placement=%d occupied=%u capacity=%u "
+                     "replaced_shared_slots=%u after_preparation=%u host_images=%d\n",
+                     lane, static_cast<int>(assessment.state_placement), state_store->device_occupied(),
+                     state_store->device_capacity(), replaced_shared.device.state_slots,
+                     device_state_after_preparation,
+                     static_cast<int>(host_state_images != nullptr));
+        std::fflush(stderr);
     }
     const detail::PhysicalResources replaced =
         checked_resource_sum(replaced_private, replaced_shared);
@@ -1468,6 +1487,18 @@ ProgramImpl::progress_active_capture_transaction(runtime::CancellationFlagView c
             abort_active_capture(transaction);
             transaction.published = true;
             throw;
+        }
+        // Fault injection (NINFER_INJECT_THROW=capture-submitted-host): the same instant as
+        // `capture-submitted`, restricted to a HOST-SNAPSHOT capture -- the only placement that reaches
+        // `abort_active_capture`'s `abort-snapshot-destination` release, a NON-STRICT release whose
+        // refusal is exactly the #9 leak's shape (the handle is dropped while its host state slot and
+        // host KV stay allocated). `capture-submitted` cannot target it: in the host-snapshot scenario
+        // the occupying lane's earlier DeviceFork captures consume the injections first -- observed
+        // 2026-09-26, where the plain site fired on lane 0 (the occupant) and the host-snapshot capture
+        // on lane 1 was never aborted.
+        if (transaction.state_placement == qwen3_5::CaptureStatePlacement::HostSnapshot &&
+            ninfer::harmful_inject_throw("capture-submitted-host")) {
+            throw std::bad_alloc();
         }
         // Fault injection (NINFER_INJECT_THROW=capture-submitted, harmful-controls build). Placed AFTER
         // the enqueue succeeded, so `transfer_submitted` is true and the fork's copy into the recycled

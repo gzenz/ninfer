@@ -469,6 +469,7 @@ ReleaseResult Program::release_shared_prefix(SharedPrefixHandle&& shared) noexce
 }
 
 void Program::fail_all_cleanup() noexcept { impl_->fail_all_cleanup(); }
+void Program::resource_census() const noexcept { impl_->resource_census(); }
 
 bool Program::isolated_request_feasible(const RequestBasePlan& base) const noexcept {
     return impl_->isolated_request_feasible(base);

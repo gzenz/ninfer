@@ -830,6 +830,13 @@ ReleaseResult ProgramImpl::release_shared_prefix(SharedPrefixHandle&& handle) no
     return out;
 }
 
+void ProgramImpl::resource_census() const noexcept {
+    try {
+        text_kv_addresses->census("text");
+        backend_kv_addresses->census("backend");
+    } catch (...) {}
+}
+
 void ProgramImpl::fail_all_cleanup() noexcept {
     pending_transaction_.reset();
     if (auto* transaction = std::get_if<ActiveCaptureTransaction>(&context_transaction_)) {

@@ -564,6 +564,9 @@ public:
     [[nodiscard]] ReleaseResult release_continuation(ContinuationHandle&& continuation) noexcept;
     [[nodiscard]] ReleaseResult release_shared_prefix(SharedPrefixHandle&& shared) noexcept;
     void fail_all_cleanup() noexcept;
+    // #9 diagnostic: what the KV address spaces still hold, per address. Called by the engine's recovery
+    // path so a non-zero residual can be attributed to an owner instead of remaining an amount.
+    void resource_census() const noexcept;
     [[nodiscard]] detail::PhysicalResources admission_capacity() const noexcept;
     [[nodiscard]] bool isolated_request_feasible(const RequestBasePlan& base) const noexcept;
 
@@ -895,6 +898,16 @@ private:
     // shape of #9's: the books drop the handle, the pages stay. Counted and named here rather than
     // guessed at; no behaviour change.
     std::uint64_t nonstrict_release_refusals_            = 0;
+    // W2/#6, measure-first: a private victim committed as `Evicted` while the host tier still had a free
+    // state slot AND host KV room -- i.e. one that could have been demoted instead of destroyed. The
+    // demotion half is already counted where it happens (`operations.pressure_private_owners_demoted_kv_only`),
+    // so this is the missing numerator of "evicted for lack of host room" versus "evicted anyway". It is
+    // deliberately at the COMMIT site (`evict_private_result`) and not in the planner: the planner's two
+    // disposition assignments run per candidate evaluated, so counting there would count search steps.
+    std::uint64_t demotable_evictions_                   = 0;
+    // Every eviction the check above ran for -- the denominator. Without it a zero numerator cannot be
+    // told from a gate that never had a chance to be true.
+    std::uint64_t demotable_eviction_checks_             = 0;
     std::uint64_t state_epoch_checks_                    = 0;
     std::uint64_t state_epoch_mismatches_                = 0;
     std::uint64_t state_epoch_unrecorded_                = 0;

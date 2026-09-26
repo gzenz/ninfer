@@ -859,7 +859,37 @@ public:
         return static_cast<std::uint32_t>(addresses_.size());
     }
 
-    [[nodiscard]] std::uint32_t occupied() const noexcept { return capacity() - free_count_; }
+    // Diagnostic census (#9): `occupied()` says HOW MANY addresses are live; this says WHICH, and what
+    // each still holds -- mapped pages, pages reserved in the device pool, and how many of its pages are
+    // device- and host-resident. It exists because a recovery left 117 device pages and 8.45 MB of host
+    // KV owned by nothing, and the aggregate residual line could say how much but not by whom. Read-only,
+    // allocation-free, and called only on the recovery path.
+    void census(const char* label) const noexcept {
+        for (std::size_t index = 0; index < addresses_.size(); ++index) {
+            const Address& address = addresses_[index];
+            const bool live = address.occupied || address.active || address.row.has_value() ||
+                              address.reservation.valid() || address.page_count != 0;
+            if (!live) { continue; }
+            std::uint32_t device_resident = 0;
+            std::uint32_t host_resident   = 0;
+            try {
+                for (std::uint32_t page = 0; page < address.page_count; ++page) {
+                    const LogicalKVPageHandle logical = membership(address, page);
+                    if (pages_->device_resident(logical)) { ++device_resident; }
+                    if (pages_->host_resident(logical)) { ++host_resident; }
+                }
+            } catch (...) {}
+            std::fprintf(stderr,
+                         "[census] %s address=%zu active=%d occupied=%d row=%d reserved_pages=%u "
+                         "page_count=%u device_resident=%u host_resident=%u frontier=%u\n",
+                         label, index, static_cast<int>(address.active),
+                         static_cast<int>(address.occupied), static_cast<int>(address.row.has_value()),
+                         address.reservation.pages(), address.page_count, device_resident,
+                         host_resident, address.committed_frontier);
+        }
+    }
+
+
 
     [[nodiscard]] std::optional<KVAddressSpaceHandle> create_active(std::uint32_t entitlement,
                                                                     std::int32_t execution_row) {

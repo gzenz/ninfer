@@ -335,6 +335,95 @@ wedge; when it says `#13`, the accounting underflow.
    because `std::runtime_error` is not recoverable -- the engine's recovery handle is `std::bad_alloc`,
    and the two paths differ exactly where the incident did.
 
+   **#9 REPRODUCED 2026-09-26 11:41, TWICE WITH IDENTICAL NUMBERS.** New injection site
+   `mat-reserve-replica` in `materialization.cpp`, placed in the gap between
+   `pages.reserve_device_replica(logical, reservation)` and the two statements that record it
+   (`restores.push_back`, `destinations.push_back`). Run on `pressure-resume`:
+   `WORKER OOM: std::bad_alloc - recovering mat=4` ->
+   `non-strict release REFUSED (kv-text): the handle is dropped and its pages or state slot are not
+   freed -- a leak of the #9 shape, count=1` -> **`post-recovery residual (recover): main_kv_pages=117
+   backend_kv_pages=0 device_state_slots=0 host_state_slots=0 host_kv_bytes=8454144`**. Two runs, same
+   four numbers to the byte, same refusal count.
+   **The mechanism, which is the incident's:** a page replica is reserved in the pool and only *then*
+   recorded as owned by the transaction. A failure in that window leaves the reservation owned by
+   nothing; the recovery path's non-strict release of the sequence's text KV then **refuses** (its pages
+   are still held), drops the handle anyway, and the pages and host KV stay allocated with no owner and
+   no path that can find them. That is exactly the shape of the 2026-09-25 wedge's first stage -- 958
+   pages and one host state slot, identical 3 s and 7 min after the recovery -- and it is now
+   reproducible on demand instead of awaited.
+   **Two other scenarios with the same injection stayed clean** (`private-checkpoint-pressure`,
+   `source-pressure-protection`: residual all zero), so this is not "every recovery leaks" -- it is a
+   specific reserve-then-record window that only `pressure-resume`'s restore path enters.
+   **#9: CAUSE FOUND, CENSUS NAMES THE SURVIVOR, FIX IMPLEMENTED AND VERIFIED 2026-09-26 12:07.**
+   * **The survivor, named by the census** (new `KVAddressSpaceStore::census`, called from
+     `report_recovery_residual` when the residual is non-zero):
+     `[census] text address=1 active=0 occupied=1 row=0 reserved_pages=0 page_count=120
+     device_resident=116 host_resident=4 frontier=7676`. A KV address still `occupied` with its pages
+     resident, but inactive, holding no execution row and no reservation -- 116 device pages and
+     4 host pages (4 x 2 MiB = the 8.45 MB), owned by nothing.
+   * **The mechanism.** `reserve_device_replica` pins the logical page (`pending_device_replica` +
+     `destination_pinned`, `kv_store.h:459-471`); a pinned page can neither release its reference nor be
+     dropped. The pre-existing abort (`abort_materialization_transfers`, `materialization.cpp:1519-1537`)
+     walks the *recorded* restores and aborts them correctly -- so a replica that is pinned but **not yet
+     recorded** is invisible to every cleanup path. The sequence's KV release then refuses
+     (`non-strict release REFUSED (kv-text)`), and the address stays occupied.
+   * **The defect**: `restores.push_back` -- a vector growth -- was a real throw source inside that
+     window. Injected failure there reproduced the whole thing, twice, byte-identical.
+   * **The fix**: reserve the recording vectors' capacity before the loop, so the recording cannot
+     allocate and the window cannot be entered by an allocation fault. **Verified**: the same injection
+     that produced 117 pages and 8.45 MB now leaves `post-recovery residual ... all zero`, twice.
+   * **The method, recorded because it cost two wrong attempts**: my first two fixes (a guard in
+     `release_materialization_staging`, then one at the call site) changed *nothing* -- byte-identical
+     residual. The kill-switch control showed the guard was not the mechanism, and that is what pointed
+     at the recording order instead. A fix that cannot be shown to change the failure is not a fix.
+   * **A regression I caused and fixed in the same pass**: the census called unconditionally from
+     `report_recovery_residual` segfaulted every scenario at teardown (that path runs on shutdown, when
+     the stores are torn down, and a `try` cannot catch a segfault -- it also swallowed the scenarios'
+     own `ok` line, since stdout was never flushed). It now runs only when there is a non-zero residual
+     to name. All four affected scenarios pass again, `rc=0` with `ok`.
+   * **Still open, stated plainly**: (1) a throw *inside* `reserve_device_replica` after it materializes
+     the physical page would still leave an unrecorded pin -- unproven, and no fix is claimed; (2) that
+     prod's 2026-09-25 incident entered *this* window is not established, since the reproduction was
+     injected -- what is established is that the window exists and leaks.
+   **What is NOT yet established, and the next instrument.** The reservation object is RAII --
+   `~DeviceKVPageReservation() { release(); }` (`paged_kv_cache.cpp:165`) -- and the transaction's
+   activation *does* get reset on the failure path (`release_materialization_staging` resets both
+   restore reservations and both activations, `materialization.cpp:416-419`). So the pages that
+   survive are **not owned by the object the injection sits next to**, and the 8.45 MB of host KV is a
+   second survivor on a different axis. Which object still holds them is therefore an open question,
+   and a fix written now would be a guess -- the exact error this repo keeps paying for. The next
+   instrument is a **census at recovery time**: at the moment `post-recovery residual` prints, also
+   list the pool objects that still hold pages or host extents (owner tag + count), so the fix targets
+   the object that is actually left, not the one that is merely nearby. That is a print in
+   `report_recovery_residual`'s neighbourhood plus the pool's accessors, one window to run.
+   **What the reproduction does establish:** (1) the trigger is a failure inside this reserve-then-record
+   window -- a real `bad_alloc` there is exactly what the incident's recovery was preceded by; (2) the
+   failure makes a non-strict release refuse (`kv-text`, count=1) and leaves 117 device pages and
+   8.45 MB host KV with no owner; (3) it is deterministic -- two runs, byte-identical -- so it is a test
+   case, not a flake. And it is the first time #9 has been reproduced at all: every load attempt and
+   every constructed scenario before it was negative.
+   **Also corrected here: the earlier claim that no capture ever took `HostSnapshot` was an artifact.**
+   The `assess` probe printed `assessment.state_placement` *before the decision assigns it*, so it read
+   the default `0` in every run. A probe at the decision site shows the truth: the new
+   `capture-host-snapshot` scenario reaches `placement=1` (`occupied=3 capacity=3 host_images=1`), and
+   injecting into it (`capture-submitted-host`, a site that exists only on that path) gives a clean
+   recovery -- residual all zero, no refusal. So the host-snapshot abort is exercised and clean; the
+   leak is not there.
+   **CAPTURE-PATH INJECTION RUN 2026-09-26 11:23 — two forced recoveries, both clean, and the one
+   untouched candidate is now named.** Five host-tier scenarios run with
+   `NINFER_INJECT_THROW=capture-submitted` and the placement added to the `assess` probe. The injection
+   fired in two (`anthropic-prefix-regression`, `recycling-capture`): `WORKER OOM: std::bad_alloc -
+   recovering`, then `post-recovery residual (recover)` **all-zero on every axis**, with
+   `fail-all cleanup: catalogued=0 released-refused=0 skipped=0` in all five. So a forced failure
+   mid-capture leaves nothing behind -- a second site ruled out, on a different path from `mat-consume`.
+   **What was NOT reached, and it is the item that matters:** every capture in every scenario took
+   `placement=0` (DeviceFork); `hostsnapshot=0` in all five. `HostSnapshot` is chosen only when the
+   device state pool is full **and** a host tier exists (`capture.cpp:218-233`), and no scenario in the
+   suite does both -- three have a host tier and never fill the pool, the rest have
+   `host_state_slots = 0`. So `abort-snapshot-destination` (`capture.cpp:826`), a *non-strict* release
+   whose refusal is exactly the leak's shape, **has no coverage anywhere in this suite**. The next step
+   is therefore a scenario whose device pool is full at a capture (`device_state_slots` small,
+   `host_state_slots > 0`, enough resident continuations to occupy it), not another injection site.
    **Next injection sites, in order:** the capture commit path (force an abort after the fork/transfer
    started -- serves #11(a) and the `recycled-checkpoint restored` counter, never fired); then an eviction
    path for the non-strict releases. The injector makes each one an env var, not a rebuild.

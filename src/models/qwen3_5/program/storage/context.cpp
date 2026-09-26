@@ -1427,21 +1427,26 @@ void ProgramImpl::release_sequence_state(SequenceState& sequence) noexcept {
     } catch (...) {}
 
     const auto releasable = [&](StateImageHandle handle) { return state_store->valid(handle); };
-    if (releasable(sequence.state.write) && !state_store->release(sequence.state.write)) {
-        note_nonstrict_release_refusal("state-write");
-    }
+    // Ask the store WHY, before releasing: a false at the gate means the image is still owned (by a
+    // checkpoint or a fork pin); a false with the gate passed means the HOST release failed, which is the
+    // shape that can strand a slot. Querying before the attempt is what makes those two distinguishable.
+    const auto release_or_note = [&](const char* what, StateImageHandle handle) {
+        const auto blocker = state_store->release_blocker(handle);
+        if (!state_store->release(handle)) {
+            note_nonstrict_release_refusal(what, state_store->release_blocker_name(blocker));
+        }
+    };
+    if (releasable(sequence.state.write)) { release_or_note("state-write", sequence.state.write); }
     if (!sequence.state.read_has_external_owner() && sequence.state.read != sequence.state.write &&
         releasable(sequence.state.read)) {
-        if (!state_store->release(sequence.state.read)) { note_nonstrict_release_refusal("state-read"); }
+        release_or_note("state-read", sequence.state.read);
     }
     if (sequence.rewrite_state) {
         const StateImageHandle handle = *sequence.rewrite_state;
         const bool duplicates_binding =
             handle == sequence.state.write ||
             (!sequence.state.read_has_external_owner() && handle == sequence.state.read);
-        if (!duplicates_binding && releasable(handle) && !state_store->release(handle)) {
-            note_nonstrict_release_refusal("state-rewrite");
-        }
+        if (!duplicates_binding && releasable(handle)) { release_or_note("state-rewrite", handle); }
     }
     for (std::size_t index = 0; index < sequence.long_anchors.size(); ++index) {
         const StateImageHandle handle = sequence.long_anchors[index].state;
@@ -1704,12 +1709,19 @@ void ProgramImpl::release_sequence_kv_strict(SequenceState& sequence) noexcept {
     release_kv_row_binding(sequence.lane);
 }
 
-void ProgramImpl::note_nonstrict_release_refusal(const char* what) noexcept {
+void ProgramImpl::note_nonstrict_release_refusal(const char* what, const char* blocker) noexcept {
     if (++nonstrict_release_refusals_ <= 8ULL || nonstrict_release_refusals_ % 512ULL == 0ULL) {
+        // It used to read "a leak of the #9 shape" for every refusal. That word was wrong for three of the
+        // five blockers: with a checkpoint reference or a fork pin holding the image, the slot is OWNED,
+        // so the release was premature and nothing was stranded. Naming the blocker is what separates a
+        // by-design refusal from the two shapes that can actually strand a slot.
         std::fprintf(stderr,
-                     "[engine] non-strict release REFUSED (%s): the handle is dropped and its pages or "
-                     "state slot are not freed -- a leak of the #9 shape, count=%llu\n",
-                     what, static_cast<unsigned long long>(nonstrict_release_refusals_));
+                     "[engine] non-strict release REFUSED (%s, blocker=%s): the caller dropped its handle "
+                     "and the store did not free the image. count=%llu\n",
+                     what,
+                     blocker != nullptr ? blocker
+                                       : "unclassified (this call site holds no state store to ask)",
+                     static_cast<unsigned long long>(nonstrict_release_refusals_));
         std::fflush(stderr);
     }
 }

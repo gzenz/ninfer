@@ -700,11 +700,46 @@ public:
         return true;
     }
 
-    [[nodiscard]] bool can_release(StateImageHandle handle) const noexcept {
-        if (!valid(handle)) { return false; }
+    // WHY a release would be refused, named, so a caller can say which condition held instead of
+    // asserting a leak shape it has not classified. Three of these mean the state image is still OWNED
+    // (a checkpoint references it, or a fork pins it): the release was premature, and the slot is not
+    // unowned. `PendingReplica` and the post-gate `host-release-failed` case are the shapes that could
+    // actually strand a slot.
+    enum class ReleaseBlocker : std::uint8_t {
+        None,
+        InvalidHandle,
+        CheckpointReferences,
+        SourcePins,
+        DestinationPinned,
+        PendingReplica,
+    };
+
+    [[nodiscard]] ReleaseBlocker release_blocker(StateImageHandle handle) const noexcept {
+        if (!valid(handle)) { return ReleaseBlocker::InvalidHandle; }
         const Object& object = objects_[handle.index_];
-        return object.checkpoint_references == 0 && object.source_pins == 0 &&
-               !object.destination_pinned && !has_pending_replica(object);
+        if (object.checkpoint_references != 0) { return ReleaseBlocker::CheckpointReferences; }
+        if (object.source_pins != 0) { return ReleaseBlocker::SourcePins; }
+        if (object.destination_pinned) { return ReleaseBlocker::DestinationPinned; }
+        if (has_pending_replica(object)) { return ReleaseBlocker::PendingReplica; }
+        return ReleaseBlocker::None;
+    }
+
+    [[nodiscard]] const char* release_blocker_name(ReleaseBlocker blocker) const noexcept {
+        switch (blocker) {
+            case ReleaseBlocker::None:                return "none -- the gate passed, so the HOST release failed and the slot was NOT freed";
+            case ReleaseBlocker::InvalidHandle:       return "invalid-handle";
+            case ReleaseBlocker::CheckpointReferences: return "checkpoint-references (still owned)";
+            case ReleaseBlocker::SourcePins:          return "source-pins (still owned)";
+            case ReleaseBlocker::DestinationPinned:   return "destination-pinned (still owned)";
+            case ReleaseBlocker::PendingReplica:      return "pending-replica (may be unowned)";
+        }
+        return "unknown";
+    }
+
+    // Implemented IN TERMS OF the blocker so the two cannot drift apart -- a second copy of this
+    // predicate is how a classifier ends up disagreeing with the thing it classifies.
+    [[nodiscard]] bool can_release(StateImageHandle handle) const noexcept {
+        return release_blocker(handle) == ReleaseBlocker::None;
     }
 
     [[nodiscard]] bool

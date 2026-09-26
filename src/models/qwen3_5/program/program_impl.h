@@ -1313,7 +1313,9 @@ private:
     void release_kv_row_binding(std::uint32_t lane) noexcept;
     // Report a non-strict release that refused (see `nonstrict_release_refusals_`). Rate-limited: the
     // condition can persist for a whole cleanup.
-    void note_nonstrict_release_refusal(const char* what) noexcept;
+    // `blocker` is optional because only the sites that hold a STATE store can classify: the KV release sites
+// in materialization/capture do not, and passing nullptr says so rather than guessing ("unclassified").
+void note_nonstrict_release_refusal(const char* what, const char* blocker = nullptr) noexcept;
     // Publish this lane's own DFlash prefill-sink controls (lane, source/destination slots, backend
     // row) into the single device ingress the sink reads. Must be called at every prefill step, not
     // only at materialization: other lanes' decode rounds overwrite that ingress.

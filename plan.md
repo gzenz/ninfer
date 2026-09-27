@@ -1423,8 +1423,31 @@ it is an engine regression, which `git stash` settles in one run.
    `forty-heavy`'s rc=1 is the harness's own over-budget 400s on its last rounds, not an engine error.
 5. **Re-run the gate before quoting an acceptance** for any tree that has since changed — only an
    artifact whose own `build_id` re-hashes equal to the binary describes it.
-6. **Make host growth REACHABLE from planning — IMPLEMENTED (`d629061c`), then CORRECTED (`cefa1b03`); effect
-   still UNOBSERVED.** **The first version was WRONG in a way no run could see**: `reserve_slots(count)`
+6. **Make host growth REACHABLE from planning — IMPLEMENTED (`d629061c`), CORRECTED (`cefa1b03`), and now
+   OBSERVED FIRING ON PROD (2026-09-27).** **What the soak shows, from two independent instruments that
+   agree** (`results/prefix-real-evidence/20260927-100527/`: the journal lines, the `/stats` read, and a
+   manifest whose binary hash equals the running exe's):
+   `[engine] host state pool PRE-GROWN before planning: slots=17 occupied=16 grew=1 refused=0` then
+   `slots=18 occupied=17 grew=2 refused=0`, with `/stats` at `state=16/18 attempts=2 grew=2 refused=0`.
+   The pool reached 16/16 under a 16-session load on prod, and the pre-grow grew it **by exactly ONE
+   slot each time -- 16 -> 17 -> 18, not the 33/67 the doubling bug would have produced**, which is the
+   fix confirmed in the real engine rather than only in the unit test. **This is also the first live
+   growth of the elastic pool that is not the startup reservation** -- the reading retracted on
+   2026-09-26 was startup state, and §1c recorded that no growth had ever been observed under traffic.
+   **And it did NOT convert the one eviction this workload produced -- for a reason worth stating, because
+   it bounds the mechanism.** The workload ended with exactly one eviction, and its line shows the binding
+   axis was the OTHER one:
+   `demotable=1 restorable=1 cont=4 frontier=192708 victim_host_slots=3 host_state_slots=17/18
+   host_kv=31971999744/32212254720` -- host KV at **99.3%** while the state pool had a free slot, i.e. the
+   INVERSE of the 8-line shape (`demotable=0 restorable=1`, state 16/16 with 20+ GB of KV free) this change
+   exists to address. So this is not the pre-grow failing; it is a workload whose constraint is host KV bytes,
+   which growing STATE SLOTS cannot relieve. The counters agree with that reading: `degraded=64 demoted=18
+   demoted_kv=42 evicted=1` -- the engine demoted 60 times and evicted once.
+   **So what remains unobserved is narrower than before:** the pre-grow's firing is measured, its size is
+   measured, and one eviction is now explained; what is still not measured is the case it was built for --
+   a pre-grow turning an eviction into a demote -- which needs the 8-line shape, i.e. real agentic traffic
+   with the state pool full and host KV free.
+   Earlier framing follows. **The first version was WRONG in a way no run could see**: `reserve_slots(count)`
    ADDS, so the caller's `capacity + 1` DOUBLED the pool (16 -> 33 -> 67 -> 135, ~3 GiB pinned
    synchronously) instead of growing it by one — found by the review of that commit, which ran the call
    against the real pool and reproduced it twice. It shipped unexercised, which is exactly the gap: with

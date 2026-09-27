@@ -1082,6 +1082,17 @@ task needs no re-derivation:
    `NINFER_SEARCH_MS`), and see whether `adoptable > 0` with `chosen = 0` appears in the same regime -- which
    would show the preserving plan EXISTS and the 400 ms cap was starving it, making the defect the budget
    rather than capacity. Nothing here says the fix is wrong; it says the fix's effect is still unmeasured.
+   **THE SAME CONTROL IS NOW RUNNING ON REAL TRAFFIC (2026-09-27, operator-authorized).** A systemd drop-in
+   `/etc/systemd/system/ninfer.service.d/zz-search-ms-experiment.conf` sets `Environment=NINFER_SEARCH_MS=2000`
+   on `ninfer.service`, verified present in the running process's `/proc/<pid>/environ`; prod runs the same
+   binary (`6197549f`) with health 200 and the sentinel active. **THIS IS TEMPORARY AND TRACKED AS TASK #21:
+   remove the drop-in, daemon-reload, restart, and confirm the variable is gone from the process.**
+   Why it is worth the interruption: on real traffic the eviction candidate at 12:54:45 (the one
+   device-resident victim with `victim_room=1`, host KV 19% used) sat in a request whose search was
+   `budget_exhausted=True` at 400 ms with `adoptable=0`, while its immediate neighbours found 461 and 466
+   adoptable preserving plans. So "infeasible for that victim" and "the 400 ms cap cut it off" are still
+   distinguishable only by this run -- the synthetic 5x window weakened the starvation hypothesis, but a real
+   request is the shape the question is actually about.
    **THE 5x-BUDGET CONTROL RAN (2026-09-27, off-prod window: test server on :8085, `CTX=prod4` = prod's slot
    shape, prod's artifact and spec, `NINFER_SEARCH_MS=2000`, verified present in the running server's
    `/proc/<pid>/environ`; prod restored after, health 200 + sentinel active).** Result, against the

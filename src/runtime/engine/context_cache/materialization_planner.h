@@ -996,6 +996,12 @@ private:
         std::uint64_t affected_selected_hits    = 0;
         std::uint64_t newest_affected_hit_epoch = 0;
         std::uint32_t owner_evictions           = 0;
+        // #6: evictions of victims that held a RESTORABLE checkpoint -- the exact quantity the operator's
+        // ruling names, and the ONLY one that outranks cost in `key()`. Kept separate from
+        // `owner_evictions` because a victim with no checkpoint to lose costs nothing here, and from
+        // `checkpoint_drops` because that counts every drop, restorable or not: a blanket ordering on
+        // either one regressed `replacement private long anchor was not reusable` when it was tried.
+        std::uint32_t restorable_evictions      = 0;
         std::uint32_t checkpoint_drops          = 0;
         std::uint32_t copy_operations           = 0;
         std::uint64_t transferred_bytes         = 0;
@@ -1007,7 +1013,23 @@ private:
         std::uint32_t target_ordinal            = 0;
 
         [[nodiscard]] auto key() const noexcept {
+            // #6: PRESERVATION DOMINATES COST, and the ordering here is the whole of that decision.
+            //
+            // `checkpoint_drops` and `owner_evictions` used to sit FOURTH and FIFTH, behind `total_ns`, so
+            // a plan that was merely cheaper won over one that kept a restorable checkpoint: the fold
+            // prices a demote (host bytes + transfers) against an eviction (free), and cost decided before
+            // the destruction count was ever consulted. The operator's ruling is that evicting a victim
+            // holding a restorable checkpoint while the host has room is a DEFECT, not a trade, so the two
+            // counts now come first: among feasible plans, fewer dropped checkpoints wins, then fewer
+            // evictions, and only then cost.
+            //
+            // `restorable_evictions` is FIRST and everything else is where it was: the ruling names
+            // evictions of victims HOLDING A RESTORABLE CHECKPOINT, and nothing wider. An earlier version
+            // of this change promoted `checkpoint_drops` and `owner_evictions` too and regressed
+            // `replacement private long anchor was not reusable` -- preserving a checkpoint the scenario
+            // needs dropped (a non-restorable one) is not what the ruling asks for.
             return std::tuple{
+                restorable_evictions,
                 total_ns,
                 affected_selected_hits,
                 newest_affected_hit_epoch,
@@ -1334,6 +1356,21 @@ private:
         cost.candidate_ordinal       = candidate.stable_ordinal;
         cost.target_ordinal          = assessment.stable_target_ordinal;
         cost.checkpoint_drops        = assessment.dropped_checkpoints;
+
+        // #6: count evictions of victims that HELD a recoverable checkpoint -- the quantity the ruling
+        // names. An owner appears in `checkpoint_impacts` only when it had a checkpoint whose recovery
+        // recipe is supported, so its presence is the "restorable" half; the eviction itself supplies the
+        // other half. Victims with nothing to lose are not counted, which is what keeps this from
+        // outranking cost for throwaway evictions.
+        for (const PressureOwnerOutcome& outcome : assessment.owner_outcomes) {
+            if (outcome.disposition != VictimDisposition::Evicted) { continue; }
+            const bool had_recoverable_checkpoint = std::any_of(
+                assessment.checkpoint_impacts.begin(), assessment.checkpoint_impacts.end(),
+                [&](const PressureCheckpointRecoveryImpact& impact) {
+                    return impact.owner == outcome.owner;
+                });
+            if (had_recoverable_checkpoint) { ++cost.restorable_evictions; }
+        }
 
         for (const PressureOwnerOutcome& outcome : assessment.owner_outcomes) {
             const MaterializationOwnerPolicy* policy =

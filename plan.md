@@ -942,7 +942,8 @@ exit at the precondition or the H2D check. It needs a small scenario parameter (
    nothing and its flat H2D would read as a clean zero -- the silent-instrument failure this file keeps
    recording. A negative stays a possible result: if the adopter had restored main/backend WITHOUT the state
    image, that would have said the state axis is not on this path.
-### W5 port: `guided_closure` before `root_maximal` — DESIGNED, NOT IMPLEMENTED (2026-09-26)
+### W5 port: `guided_closure` before `root_maximal` — **NOT A PORT, on the evidence available (2026-09-27);
+the residual is a heavier measurement, not an implementation**
 
 Read to the point where an implementation is a directed task rather than a loop step, and recorded so that
 task needs no re-derivation:
@@ -973,8 +974,9 @@ task needs no re-derivation:
   chose floor-then-search. **What that makes the item:** a TUNING question -- does the search find the
   preserving alternative often enough, or is the cutoff starving it? -- and it is answerable by the item's
   own stated validation (root share under load; `RuntimeStats` carries `root_selections` alongside the
-  per-path counters, so the share is directly readable). **Not a port until that measurement says the
-  search is insufficient** -- and the comment itself calls the budget a CUT-OFF, not a completeness bound,
+  per-path counters, so the share is directly readable). **It is not a port: under load the search ran 43 times, was cut off 40, and the
+  demote-preferring outcome was STILL chosen 60 times to one eviction (the numbers below), so the
+  measurement does not say the search is insufficient** -- and the comment itself calls the budget a CUT-OFF, not a completeness bound,
   which is exactly the kind of claim a root-share measurement would test.
   **MEASURED 2026-09-26, in a pressure-driving scenario: `searches=2 search_cutoff=0 root=2`**, identical on
   two runs (`underflow-shared-source`, printed from `RuntimeStats`). So the search RAN and was NOT cut off

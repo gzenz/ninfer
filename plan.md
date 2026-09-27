@@ -1131,9 +1131,19 @@ task needs no re-derivation:
    correlation and no measurement, at the price of the operator's requests. Removed rather than extended, and
    the drop-in is gone (`/proc/<pid>/environ` has no `NINFER_SEARCH_MS`, task #21 closed). The NEW process is
    itself the control: recoveries should stop.
-   **This is also evidence about the cut-off's value**, which the W5 section asked for: the 400 ms bound is
-   not arbitrary tuning if five times it correlates with capacity failures -- the bound appears to be
-   protecting admission latency, not merely saving planning work.
+   **RETRACTED WITHIN MINUTES: the correlation was the WORKLOAD, not the override, and it inverted.** The
+   same reason fired again at 13:12:08 in the NEW process with the override REMOVED, and the rates are:
+   before-override 0 in 33 min, with-override 3 in 11 min, **after-removal 1 in 2.5 min -- the HIGHEST rate
+   of the three.** So the override did not cause these recoveries; the load ramped up and the earlier window
+   was quiet. What tracks them is queued concurrency: `running 1-2, waiting 8-10` at the time, i.e. many
+   captures competing for prepared State capacity while the pool is full.
+   **What this retracts:** the inference below that the 400 ms cut-off "protects admission latency". It
+   rested entirely on that correlation and there is now no evidence for it; the cut-off's justification is
+   back to what the W5 section says (a bound, measured to bite), and nothing more.
+   **And the pattern worth naming, since it is the second time today:** a two-window comparison over a
+   workload that is CHANGING underneath is not a control. Twice I have drawn a causal reading from one
+   (the override here, the pre-grow's capacity earlier) and twice the retraction came from a third window.
+   Compare RATES over windows whose load is known comparable, or say the comparison is confounded.
    **FIRST REAL-TRAFFIC EVENT AFTER THE OVERRIDE (2026-09-27 13:05, and it is NOT about the override):** one
    `WORKER RECOVER: selected capture has no prepared logical State capacity`, two `HTTP 500`s (req#25,
    req#26), and **zero non-zero residuals** -- the fail-all released everything

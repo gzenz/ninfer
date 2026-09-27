@@ -1707,6 +1707,26 @@ it is an engine regression, which `git stash` settles in one run.
    `forty-heavy`'s rc=1 is the harness's own over-budget 400s on its last rounds, not an engine error.
 5. **Re-run the gate before quoting an acceptance** for any tree that has since changed — only an
    artifact whose own `build_id` re-hashes equal to the binary describes it.
+6. **WHY A SLOTS PARAMETER STILL EXISTS — ANSWERED (2026-09-27), and the answer was a half-wired change.**
+   The operator asked, correctly: "the plan was to make this dynamic". The POOL is dynamic (it grew 16 -> 31
+   under their workload, one slot per pre-grow firing). What was NOT dynamic were its two CONSUMERS, and only
+   one had been fixed:
+   * `admission_capacity()` -- the planner prices plans against the capacity that exists NOW. Mitigated by
+     the pre-grow (this item).
+   * **the capture path** -- it asked for a logical destination with a PURE reservation
+     (`reserve_logical_destination` -> `allocate`), which fails the moment the object table has no free entry.
+     The pool could grow and nothing asked it to, so `--host-state-slots` was a CEILING in practice while
+     the demote path had used `allocate_growing()` all along. This is what produced
+     `selected capture has no prepared logical State capacity` -> worker recovery -> HTTP 500, repeatedly
+     under concurrency.
+   FIXED (`89440c88`): `reserve_logical_destination_growing()` reserves one more slot when the pure form fails
+   -- pinning it and leaving it FREE, so the table (sized `device slots + host capacity`) gains an entry -- and
+   retries. Fail-closed on the budget, so a refusal returns nullopt and the caller is unchanged: the scenario
+   battery is `rc=0` and behaviour-neutral.
+   **The parameter's remaining role, stated plainly:** an initial size and the trim FLOOR -- not a ceiling.
+   **What would settle the fix:** the recovery rate over a window comparable to the ~0.7/min measured before
+   it. Live after the 13:19:17 restart: exe `d7e6f53f`, symbol present, 0 recoveries and 0 500s since -- a
+   few minutes of a possibly lighter workload, which is NOT a control (see the retraction above).
 6. **Make host growth REACHABLE from planning — IMPLEMENTED (`d629061c`), CORRECTED (`cefa1b03`), and now
    OBSERVED FIRING ON PROD (2026-09-27).** **What the soak shows, from two independent instruments that
    agree** (`results/prefix-real-evidence/20260927-100527/`: the journal lines, the `/stats` read, and a

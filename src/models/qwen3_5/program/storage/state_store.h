@@ -103,6 +103,12 @@ public:
         // The check covers the INITIAL reservation; the table then FOLLOWS the host pool, because the pool is
         // elastic now and every host-resident image needs its own object entry -- without that the table, not
         // the pool, is the ceiling, and the elasticity buys nothing (`ensure_host_object_capacity`).
+        // **AND THE POOL MUST BE GROWN BY WHOEVER NEEDS AN ENTRY (2026-09-27).** Following the pool is only
+        // half: a caller that needs a logical destination when the table is full has to make room. The
+        // demote path always did (`allocate_growing`); the capture path did not, and threw instead, which is
+        // what kept `--host-state-slots` load-bearing and cost an in-flight request per recovery under
+        // concurrency. See `reserve_logical_destination_growing` -- the operator's "no fixed slots" needs
+        // both halves, and for a week it had one.
         if (logical_capacity == 0 || device.slot_count() <= 0 ||
             logical_capacity < static_cast<std::uint32_t>(device.slot_count()) ||
             (host != nullptr && logical_capacity < static_cast<std::uint32_t>(device.slot_count()) +

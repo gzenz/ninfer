@@ -453,10 +453,19 @@ public:
             }
             mark_target(assessment.stable_target_ordinal, kTargetDiscovered | kTargetAssessed);
             ++targets_evaluated;
+            // Counted HERE, once, for both paths: an assessment that is physically feasible and whose cost
+            // destroys no restorable checkpoint is a plan that would have preserved one, whether or not the
+            // search adopts it. Paired with the chosen plan's own count in the diagnostics, this is what
+            // separates "the ordering let one through" from "nothing feasible preserved".
+            const bool assessment_feasible =
+                assessment.physical_status == MaterializationPhysicalStatus::Feasible;
             planning_saturating_add(projection_work, assessment.projection_work);
             const FoldedCost cost =
                 fold_assessment(candidates[expected_candidate], assessment, pressure.owner_policy,
                                 pressure.checkpoint_policy, machine_cost);
+            if (assessment_feasible && cost.restorable_evictions == 0) {
+                ++feasible_preserving_alternatives_;
+            }
             std::optional<LogicalGoal> goal;
             if (assessment.physical_status == MaterializationPhysicalStatus::Feasible) {
                 goal = logical_goal(assessment.candidate, assessment.source_mode,
@@ -937,7 +946,11 @@ public:
 
         MaterializationDiagnostics diagnostics = make_diagnostics(
             incumbent.cost, targets_evaluated, projection_work, planning_started, search_elapsed_ns,
-            stop_reason, budget_exhausted, incumbent.degradation_units, incumbent.root_maximal);
+            stop_reason, budget_exhausted, incumbent.degradation_units, incumbent.root_maximal,
+            feasible_preserving_alternatives_);
+        // #6's decisive pair is `feasible_preserving_alternatives` (set above) against
+        // `chosen_restorable_evictions` (the incumbent's own count, filled by make_diagnostics). Both
+        // non-zero in one record means a preserving plan was available and a destroying one was taken.
 
         diagnostics.initial_predicted_total_ns = initial_cost_ns;
         diagnostics.first_improvement_ns       = first_improvement_ns;
@@ -1507,7 +1520,8 @@ private:
                      std::uint64_t projection_work, Clock::time_point planning_started,
                      std::uint64_t search_elapsed_ns, MaterializationStopReason reason,
                      bool budget_exhausted, std::uint32_t degradation_units,
-                     bool maximal_fallback) noexcept {
+                     bool maximal_fallback,
+                     std::uint64_t feasible_preserving_alternatives = 0) noexcept {
         return MaterializationDiagnostics{
             .predicted_now_ns           = cost.now_ns,
             .predicted_future_loss_ns   = cost.future_loss_ns,
@@ -1519,14 +1533,21 @@ private:
             .stop_reason                = reason,
             .budget_exhausted           = budget_exhausted,
             .selected_degradation_units = degradation_units,
-            .selected_maximal_fallback  = maximal_fallback,
-            .initial_predicted_total_ns = cost.total_ns,
+            .selected_maximal_fallback        = maximal_fallback,
+            .feasible_preserving_alternatives = feasible_preserving_alternatives,
+            .chosen_restorable_evictions      = cost.restorable_evictions,
+            .initial_predicted_total_ns       = cost.total_ns,
         };
     }
 
     std::vector<QueueEntry> queue_;
     std::vector<PendingEntry> pending_;
     std::vector<FoldedCost> identity_costs_;
+    // #6 (2026-09-27): how many targets this planning run assessed FEASIBLE whose cost evicted no
+    // restorable victim -- i.e. how many plans existed that would have preserved one. Counted in
+    // `assess_target` because BOTH paths (the seeded candidate and the search) mark feasibility there, so
+    // one site covers both; see the diagnostics field of the same name.
+    std::uint64_t feasible_preserving_alternatives_ = 0;
     BoundedTargetLedger target_ledger_;
     std::vector<CombinedImpact> impact_scratch_;
     ContextPortfolioValue portfolio_value_;

@@ -808,6 +808,16 @@ struct MaterializationDiagnostics {
     bool budget_exhausted                    = false;
     std::uint32_t selected_degradation_units = 0;
     bool selected_maximal_fallback           = false;
+    // #6 (2026-09-27): THE DECISIVE PAIR, and each half alone is ambiguous.
+    //   `feasible_preserving_alternatives` -- how many targets the search assessed FEASIBLE whose cost
+    //      evicted no restorable victim. >0 means a plan that would have preserved one was available.
+    //   `chosen_restorable_evictions` -- the ADOPTED plan's count of evictions of victims that held a
+    //      recoverable checkpoint (FoldedCost::restorable_evictions, the field the key now ranks first).
+    // Both >0 in the same record is #6 surviving: a preserving plan existed and a destroying one was taken.
+    // `chosen_restorable_evictions > 0` with the other 0 is the honest other case -- nothing feasible
+    // preserved, which is what the three post-fix prod evictions looked like (host KV 94% full).
+    std::uint64_t feasible_preserving_alternatives = 0;
+    std::uint64_t chosen_restorable_evictions      = 0;
 
     std::uint64_t initial_predicted_total_ns = 0;
     std::optional<std::uint64_t> first_improvement_ns;

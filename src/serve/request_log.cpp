@@ -307,6 +307,12 @@ Json materialization_json(const ninfer::MaterializationDiagnostics& diagnostics)
         {"budget_exhausted", diagnostics.budget_exhausted},
         {"selected_degradation_units", diagnostics.selected_degradation_units},
         {"selected_maximal_fallback", diagnostics.selected_maximal_fallback},
+        // #6 (2026-09-27): the decisive pair. Both non-zero in one request means a plan that preserved a
+        // restorable checkpoint was assessed FEASIBLE and a plan that destroyed one was taken anyway --
+        // the defect surviving. `chosen_restorable_evictions > 0` with the other at 0 is the honest other
+        // case: nothing feasible preserved, which is what the KV-saturated prod evictions looked like.
+        {"feasible_preserving_alternatives", diagnostics.feasible_preserving_alternatives},
+        {"chosen_restorable_evictions", diagnostics.chosen_restorable_evictions},
         {"initial_predicted_total_ns", diagnostics.initial_predicted_total_ns},
         {"first_improvement_ns", diagnostics.first_improvement_ns
                                      ? Json(*diagnostics.first_improvement_ns)

@@ -743,7 +743,11 @@ void ProgramImpl::prepare_active_capture(ActiveCaptureTransaction& transaction) 
         if (transaction.recycles_private_state || host_state_images == nullptr) {
             throw std::logic_error("Host capture placement has no valid backing");
         }
-        std::optional<StateImageHandle> destination = state_store->reserve_logical_destination();
+        // GROWING (2026-09-27): the pure form threw here whenever the pool was full, which is what made
+        // `--host-state-slots` load-bearing and cost an in-flight request per recovery under concurrency.
+        // The pool is elastic; this is the capture path finally using that.
+        std::optional<StateImageHandle> destination =
+            state_store->reserve_logical_destination_growing();
         if (!destination) {
             throw std::logic_error("selected capture has no prepared logical State capacity");
         }

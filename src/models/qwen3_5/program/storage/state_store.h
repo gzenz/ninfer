@@ -156,6 +156,27 @@ public:
         return allocate(StateImageRole::ReservedDestination, false);
     }
 
+    // THE GROWING FORM, and it is the half that was missing from "no fixed slots".
+    //
+    // `reserve_logical_destination` is PURE and fails when the object table has no free entry, which is
+    // exactly when `--host-state-slots` was still load-bearing: the capture path threw
+    // `selected capture has no prepared logical State capacity`, the worker recovered, and the in-flight
+    // request 500ed -- repeatedly under the operator's concurrent workload (2026-09-27: three in eleven
+    // minutes, then three more after the search-budget override was removed, so the recoveries track queued
+    // concurrency and NOT that override).
+    //
+    // The pool can already grow -- the demote path has used `host_->allocate_growing()` all along -- and the
+    // ONLY reason a logical destination needed pre-existing capacity is that nobody asked. `reserve_slots`
+    // pins one more slot and leaves it FREE, so the object table (sized `device slots + host capacity`)
+    // gains an entry and the reservation can proceed; the pool's budget is fail-closed, so a refusal here
+    // simply returns nullopt and the caller behaves exactly as before.
+    [[nodiscard]] std::optional<StateImageHandle> reserve_logical_destination_growing() noexcept {
+        std::optional<StateImageHandle> handle = reserve_logical_destination();
+        if (handle || host_ == nullptr) { return handle; }
+        (void)host_->reserve_slots(1U);
+        return reserve_logical_destination();
+    }
+
     [[nodiscard]] std::optional<StateImageHandle> reserve_reset(cudaStream_t stream = nullptr) {
         std::optional<StateImageHandle> handle = allocate(StateImageRole::ActiveMutable, true);
         if (!handle) { return std::nullopt; }

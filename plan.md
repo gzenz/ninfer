@@ -1771,7 +1771,45 @@ it is an engine regression, which `git stash` settles in one run.
    eligibility test; neither asks whether a demote could actually be CONSTRUCTED for THIS victim.
    `can_demote_to_host` asks exactly that (the demote path's own seven preconditions, non-mutating), which
    is what turns this from "possibly a defect" into "a defect, with the state the plan was looking at".
-   **AND THE TWO INSTRUMENTS DISAGREE IN A WAY THAT LOCATES THE DEFECT (2026-09-27, 55 records this run).**
+   **⚠ RESOLVED BY CODE ANALYSIS, AND SEVERAL OF MY OWN CONCLUSIONS ABOVE ARE WRONG (2026-09-27).** A
+   subagent traced both behaviours from the code and corrected five premises of the brief it was given. The
+   corrections, in the order they matter:
+   1. **The cause of the evictions is the PUBLICATION CELL, not memory and not ranking.** A plan obtains its
+      publication cell in exactly three ways (`resource_manager.h:2130-2191`): the candidate's own consumed
+      private source, a **Vacant** catalog cell, or **a victim it evicts**. A fully-preserving target -- zero
+      evictions -- therefore has NO cell, and is unadoptable AND uncountable (the counter sits behind the same
+      `goal`). Executed plans enforce the same rule, so this is not a planner artifact: a planner-side
+      relaxation alone produces the abort that killed the `preserving_root_target` attempt.
+   2. **The catalog is a FIXED 18 cells** (`--max-private-continuations 18`, `resource_manager.h:254`, never
+      resized in that file). Measured `live_private=18` = its capacity at the time of the evictions, so the
+      catalog was FULL: **eviction-to-publish is structural** under concurrent sessions, not incidental.
+      `demote_possible=1`, `host_state_slots=31/32` and `host_kv=4.55/32.2 GB` are all irrelevant to it --
+      the resource sought is a catalog cell, which a demote does not free.
+   3. **`demote_possible` mirrors the EXECUTION path, not the planner's demote generator** (`pressure.cpp:778-806`
+      has four further conditions, incl. `residual.device.state_slots != 0`). It therefore CANNOT rule out
+      non-generation, and my inference "not no option generated -- the demote path's preconditions are met" is
+      unsupported by it. The instrument answers a question one layer below the one being asked.
+   4. **There is NO disagreement between the two selections, and my diagnosis of it was a misreading.**
+      `shared-prefix reuse chosen` fires PER CANDIDATE CONSTRUCTED, including losers: at 14:19:37 it printed
+      four times while the request reported `private_endpoint` at 45815. The report path already follows the
+      winner -- confirmed against data (winner's reuse equals the reported hit in all 8 observable
+      selections). The word "chosen" in that label is what manufactured the defect I then wrote up.
+   5. **`best_private_frontier` cannot support the reading it was used for**: it is a max over ALL
+      `continuation_states` with no session and no prompt-length check, and in 11 of 19 prints it EXCEEDS the
+      request's own prompt, so the continuation it names cannot be a prefix of that prompt. `longer_private_exists=1`
+      was largely meaningless.
+   **And the `FoldedCost::key()` reorder's inertness is now EXPLAINED rather than mysterious:** with
+   `restorable_evictions` first, an adoptable zero-eviction plan beats a one-eviction plan unconditionally --
+   but in those records the zero-eviction plan never reached the comparison, because it had no publication
+   cell. No key reorder can change that. **The real fix is upstream and is a capacity/policy change on the
+   catalog cell** (make a cell obtainable without destroying restorable state, on the same elastic pattern
+   already applied to the logical destination table, or raise `max_private_continuations`), not a ranking
+   change and not the pool floor.
+   **Still open, and named by the analysis:** whether the final relief step was generated-and-goal-less,
+   assessed-and-lost (impossible by the key), or never reached inside the ~4096-target arena. One line
+   decides it: count `add_state` early-returns by reason, and count assessed targets by `goal.has_value()`.
+   **The text below is what I concluded BEFORE this analysis and is kept only to show what it replaced:**
+   **(Superseded:)**
    `demote_possible=1` on two of six real evictions (device-resident, restorable, with room -- 14:22:29 and
    14:22:47), while `adoptable_preserving_alternatives=0` on EVERY eviction record, and the defect pair is 0
    across all 55. Both instruments describe the same bursts, so the preserving option was **CONSTRUCTIBLE BUT

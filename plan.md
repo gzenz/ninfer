@@ -1053,6 +1053,13 @@ task needs no re-derivation:
    is the KV-infeasible case the 94%-full readings predicted, now MEASURED rather than inferred, and it
    means the operator's ruling was not violated in those instances: the host had no room usable by THAT
    victim, which is what the per-victim room field expresses and the pool-level `demotable=1` obscured.
+   **THE CAVEAT THAT MUST TRAVEL WITH IT, or `0` gets over-read as "impossible":** the counter counts
+   targets that were ASSESSED. A preserving plan the search never GENERATED because its budget ran out --
+   40 of 43 searches exhausted it under load, measured in the W5 section -- is invisible to it. So `0` reads
+   precisely as "none of the assessed plans preserved one", not "no preserving plan could exist". What
+   separates the two is a second count, of preserving options GENERATED but left unassessed at the cut-off;
+   that does not exist, so infeasibility here is supported by the KV-94% and per-victim-room readings and
+   not by this counter alone. Stated because the difference is the whole question.
    **What would still be the defect:** a request reporting `adoptable_preserving_alternatives > 0` together
    with `chosen_restorable_evictions > 0` -- a preserving plan available and a destroying one taken. None
    has appeared so far; the soak continues and the monitor reports the first one if it does.

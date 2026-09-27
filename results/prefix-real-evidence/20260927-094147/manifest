@@ -1,0 +1,14 @@
+binary=./build/tests/ninfer_qwen3_5_prefix_real_test
+binary_sha256=d1d13c79ddfa261b44913ce0d3a05184e66fb2838af60be170d14f2dbbe57a6a
+binary_mtime=2026-09-27T09:41:47+02:00
+artifact=/home/zenz/ninfer-models/swift15/qwen3_8_27b_nvfp4swift15.ninfer
+artifact_sha256=683f5086a0e24e9b7c5caad256d373e13eff4e0491564f5b8c2acde33e52a11e
+git_head=956edfa819203fac51a3cf9156cda28bdf45f8df
+git_head_tree=6096cff00a215577d025b3292cf174d9d46b87db
+tree_diff_sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+scenario=all (NINFER_PREFIX_REAL_SCENARIO)
+started=2026-09-27T09:44:49+02:00   # hand-written; the run began before this manifest was written
+all-fixed rc=0 log_sha256=53f61c2602932f35c783d5f5267cf937f9c02086df0bebf171a50f871b40288e
+# Regression check for the pre-grow fix (cefa1b03): zero PRE-GROWN lines, and the engine output is
+# byte-identical to the pre-change baseline 20260926-232403/all-1.log apart from the window's own
+# timeout banner. Not produced by tools/e2e/prefix-real-evidence.sh.

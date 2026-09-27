@@ -1019,6 +1019,27 @@ task needs no re-derivation:
    with the identity deficit, which is not this target's residual -- produces an option whose numbers do
    not hold, and the failure surfaces only at execution. This is the "half-ported strategy" the W5 section
    warns about, caught by the run rather than by review.
+   **FIRST POST-FIX MEASUREMENT (2026-09-27, prod, the 16-session workload that produced the pre-fix
+   eviction this morning): ONE restorable victim was STILL evicted, and the line says why it is not
+   evidence against the ordering:** `demotable=1 restorable=1 cont=11 frontier=158628 endpoint=1 rewrite=1
+   victim_host_slots=1 victim_dev_slots=2 host_state_slots=17/18 host_kv=30269767680/32212254720` -- the
+   STATE axis had a free slot, but host KV was at **94.0% with ~1.9 GB free**, and the victim holds device
+   KV (`victim_dev_slots=2`) on a 158k frontier. `demotable=1` is a POOL-level test (`31 < 32`); it says
+   nothing about whether THIS victim's pages fit the remaining 1.9 GB. So the planner had no preserving
+   plan to prefer, and evicting was correct -- the ordering cannot help when the binding axis is host KV.
+   Counts are also unchanged pre- vs post-fix (checks=1, demotable=1, evicted=1 in both), so **this
+   workload does not exercise the fix either way**.
+   **THE DECISIVE INSTRUMENT, not yet built:** a counter for "a restorable victim was evicted while a
+   FEASIBLE preserving alternative existed" -- i.e. the plan lost on the ordering, rather than on
+   feasibility. `private_owners_evicted` cannot tell those apart, and neither can the eviction line. It
+   belongs where the choice is made (the fold / the planner), must be exposed in `/stats`, and the
+   verification is: post-fix, that counter stays 0 while evictions continue (the fix works, evictions are
+   capacity-bound) -- or it moves, which is the defect surviving and needs a different fix.
+   **A host-only control for the ordering itself now EXISTS** (`bdd43e6e`,
+   `tests/test_materialization_preservation.cpp`, mutation-checked): `FoldedCost` moved to namespace scope
+   so the test compares the very struct the planner compares, seven properties including that a PLAIN
+   eviction count does not dominate cost (the version that regressed a scenario).
+   ------------------------------------------------------------
    **AND THE MECHANISM IS NOW IDENTIFIED, in one place (`materialization_planner.h:1011-1024`):** the
    incumbent comparison is a LEXICOGRAPHIC KEY, and `owner_evictions` is the FOURTH element -- behind
    `total_ns`, `affected_selected_hits` and `newest_affected_hit_epoch`. So a plan that is merely CHEAPER

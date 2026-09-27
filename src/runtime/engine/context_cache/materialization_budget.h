@@ -9,6 +9,77 @@
 #include <limits>
 
 namespace ninfer::runtime {
+// #6: THE INCUMBENT COST KEY, at namespace scope so a host-only test can compare two of them and assert
+// the ordering directly. It was private to the planner, which is why nothing tested it -- and the ordering
+// it encodes IS the operator's ruling ("evicting a victim that holds a restorable checkpoint while the host
+// has room is a defect"): `restorable_evictions` is the FIRST element, ahead of `total_ns`, so among
+// feasible plans fewer evictions of victims that held a recoverable checkpoint wins and cost decides among
+// equals. A test asserting this on a COPY of the ordering would drift the first time either changed, so the
+// planner compares this very struct.
+struct FoldedCost {
+    std::uint64_t now_ns                    = 0;
+    std::uint64_t future_loss_ns            = 0;
+    std::uint64_t total_ns                  = 0;
+    std::uint64_t lower_bound_ns            = 0;
+    std::uint64_t affected_selected_hits    = 0;
+    std::uint64_t newest_affected_hit_epoch = 0;
+    std::uint32_t owner_evictions           = 0;
+    // #6: evictions of victims that held a RESTORABLE checkpoint -- the exact quantity the operator's
+    // ruling names, and the ONLY one that outranks cost in `key()`. Kept separate from
+    // `owner_evictions` because a victim with no checkpoint to lose costs nothing here, and from
+    // `checkpoint_drops` because that counts every drop, restorable or not: a blanket ordering on
+    // either one regressed `replacement private long anchor was not reusable` when it was tried.
+    std::uint32_t restorable_evictions      = 0;
+    std::uint32_t checkpoint_drops          = 0;
+    std::uint32_t copy_operations           = 0;
+    std::uint64_t transferred_bytes         = 0;
+    std::uint64_t remaining_text_prefill    = 0;
+    std::uint64_t remaining_vision_prefill  = 0;
+    std::uint32_t reused_prompt_tokens      = 0;
+    bool current_session_binding            = false;
+    std::uint32_t candidate_ordinal         = 0;
+    std::uint32_t target_ordinal            = 0;
+
+    [[nodiscard]] auto key() const noexcept {
+        // #6: PRESERVATION DOMINATES COST, and the ordering here is the whole of that decision.
+        //
+        // `checkpoint_drops` and `owner_evictions` used to sit FOURTH and FIFTH, behind `total_ns`, so
+        // a plan that was merely cheaper won over one that kept a restorable checkpoint: the fold
+        // prices a demote (host bytes + transfers) against an eviction (free), and cost decided before
+        // the destruction count was ever consulted. The operator's ruling is that evicting a victim
+        // holding a restorable checkpoint while the host has room is a DEFECT, not a trade, so the two
+        // counts now come first: among feasible plans, fewer dropped checkpoints wins, then fewer
+        // evictions, and only then cost.
+        //
+        // `restorable_evictions` is FIRST and everything else is where it was: the ruling names
+        // evictions of victims HOLDING A RESTORABLE CHECKPOINT, and nothing wider. An earlier version
+        // of this change promoted `checkpoint_drops` and `owner_evictions` too and regressed
+        // `replacement private long anchor was not reusable` -- preserving a checkpoint the scenario
+        // needs dropped (a non-restorable one) is not what the ruling asks for.
+        return std::tuple{
+            restorable_evictions,
+            total_ns,
+            affected_selected_hits,
+            newest_affected_hit_epoch,
+            owner_evictions,
+            checkpoint_drops,
+            copy_operations,
+            transferred_bytes,
+            remaining_text_prefill,
+            remaining_vision_prefill,
+            std::numeric_limits<std::uint32_t>::max() - reused_prompt_tokens,
+            current_session_binding ? 0U : 1U,
+            candidate_ordinal,
+            target_ordinal,
+        };
+    }
+
+    [[nodiscard]] bool less(const FoldedCost& other) const noexcept {
+        return key() < other.key();
+    }
+};
+
+
 
 template <class Clock = std::chrono::steady_clock>
 [[nodiscard]] std::uint64_t planning_now_ns() noexcept {

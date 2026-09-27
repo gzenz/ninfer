@@ -1053,6 +1053,18 @@ task needs no re-derivation:
    is the KV-infeasible case the 94%-full readings predicted, now MEASURED rather than inferred, and it
    means the operator's ruling was not violated in those instances: the host had no room usable by THAT
    victim, which is what the per-victim room field expresses and the pool-level `demotable=1` obscured.
+   **⚠ CORRECTED WITHIN THE HOUR: THE `0` DOES NOT ESTABLISH "CAPACITY-BOUND".** I read the three eviction
+   records' own fields next, and every one of them shows the search TRUNCATED:
+   `line=23998 budget_exhausted=True stop=assessment targets_evaluated=508 search_ms=399.9`,
+   `24009 ... 574 ... 400.4`, `24020 ... 559 ... 399.8`. The search hit its 400 ms cap mid-ASSESSMENT in all
+   three, so `adoptable_preserving_alternatives=0` may mean "a preserving plan was never reached", not "none
+   existed". **That is precisely the caveat below, and it applies to all three readings** -- the caveat is not
+   a footnote here, it is the live case. So #6's honest state is: the eviction happened while the search was
+   still working, and this instrument cannot yet say whether a preserving plan existed. **The experiment that
+   settles it:** re-run the same pressure workload with the search budget raised (the planner reads
+   `NINFER_SEARCH_MS`), and see whether `adoptable > 0` with `chosen = 0` appears in the same regime -- which
+   would show the preserving plan EXISTS and the 400 ms cap was starving it, making the defect the budget
+   rather than capacity. Nothing here says the fix is wrong; it says the fix's effect is still unmeasured.
    **AND THE INSTRUMENT IS VALIDATED, which is what makes the `0` mean something.** Across the 14 records
    carrying the pair since the deploy: `adoptable > 0` in **11** of them (12, 21, 31, 43, 43, 69, 110, 122,
    182 ...), each with `chosen = 0`; `chosen = 1` in **2**, each with `adoptable = 0`; and

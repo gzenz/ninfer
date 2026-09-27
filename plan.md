@@ -999,6 +999,12 @@ task needs no re-derivation:
   What it does support is that the cut-off is not a completeness bound (the code's own word) and that a
   root-share comparison needs a heavier, more agentic workload than a synthetic burst: the 8-line shape's
   own traffic. Recorded so the next reader does not re-run this to learn the same two numbers.
+  **A SECOND MEASUREMENT OF THE SAME CUT-OFF (2026-09-27, the 5x-budget window in §2 item 6):** with
+  `NINFER_SEARCH_MS=2000` the budget was STILL exhausted in 20 of 24 records, after 1861-3346 targets
+  assessed against 508-574 at the default 400 ms -- so the cut-off is not an artifact of a short window,
+  it bites at five times the budget too, and raising the budget buys assessment depth without removing
+  the bound. That is the measurement the W5 residual asked for, at the one budget where it could be made
+  cheaply; an agentic workload at 400 ms remains the unrun arm.
   traffic. **So this item is now: mechanism present, one scenario showing no starvation, the load case
   untested** -- which is a prod-or-heavy-suite question rather than a port.
 

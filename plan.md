@@ -1724,6 +1724,26 @@ it is an engine regression, which `git stash` settles in one run.
    retries. Fail-closed on the budget, so a refusal returns nullopt and the caller is unchanged: the scenario
    battery is `rc=0` and behaviour-neutral.
    **The parameter's remaining role, stated plainly:** an initial size and the trim FLOOR -- not a ceiling.
+   **THE DECISIVE PAIR HAS A GAP, AND IT INVALIDATES PART OF WHAT I CONCLUDED FROM IT (2026-09-27 14:04).**
+   A burst of SEVEN evictions at 14:04:28 -- every one `demotable=1 restorable=1`, `victim_room=1`, frontiers
+   54k-91k, with the state pool NOT full (8/16 occupied, so 8 slots free) and host KV at 2.03 GB of 32.2
+   falling to 0 -- has NO matching request record. The two records either side of it both read
+   `chosen_restorable_evictions=0`.
+   **Why:** `feasible_preserving_alternatives` / `chosen_restorable_evictions` are filled in the
+   MATERIALIZATION planner's fold. v3 has a SECOND planner -- `SharedCapturePlanner` -- which also evicts
+   victims, and its decisions do not flow into that pair. So the counter instruments one eviction path and
+   not the other.
+   **What that invalidates:** the claim, repeated in this item, that "every eviction sits in a request where
+   no adoptable preserving plan existed". It covered the records the pair can see, NOT all evictions -- and
+   the strongest defect instance yet (both axes with room, all victims `victim_room=1`, 54k-91k frontiers) is
+   exactly one the counter never saw. The earlier readings are still true OF THOSE RECORDS; they were never
+   true of every eviction, and I stated them as though they were.
+   **The burst itself is the best evidence #6 has had:** the pool was NOT full and host KV had room, yet
+   seven restorable victims were destroyed -- so neither axis justifies it, and `demotable=1 restorable=1
+   victim_room=1` is exactly the shape the operator's ruling calls a defect.
+   **The next step:** extend the instrumentation to the capture path (or instrument the eviction site with
+   the same availability question the reuse instrument asks), so "was a preserving alternative available"
+   is answered on BOTH paths rather than one.
    **THE 2s EXPERIMENT ANSWERED IT, BY SHOWING THE BUDGET IS NOT THE BINDING CONSTRAINT (2026-09-27 13:32-13:37,
    operator-authorized).** With `NINFER_SEARCH_MS=2000` live in the process, the searches do NOT run to 2 s:
 

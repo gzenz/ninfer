@@ -546,6 +546,34 @@ public:
                 .destination = *destination_object.device_slot};
     }
 
+    // WOULD A DEMOTE OF THIS IMAGE BE CONSTRUCTIBLE? Non-mutating, and it mirrors
+    // `reserve_device_to_host`'s preconditions exactly WITHOUT taking a host slot -- the seven checks below
+    // are the same seven, in the same order.
+    //
+    // WHY IT EXISTS (2026-09-27): the eviction line reports `demotable=1` from a POOL-level comparison
+    // (`host_state_slots < capacity && host_kv_bytes < capacity`), which cannot say whether THIS victim
+    // could have been demoted. On prod that left bursts unclassifiable -- thirteen restorable victims
+    // evicted with the state pool 8/16 FREE and host KV at 2.03 GB of 32.2, and no way to tell "a demote
+    // was possible and the plan still evicted" from "no demote was possible at all". That distinction is
+    // the operator's ruling, so it needs an instrument rather than an inference.
+    //
+    // The last precondition is deliberately reported as "a host slot exists NOW": whether the pool may GROW
+    // one is the budget's decision, not this predicate's, and conflating the two would make the answer a
+    // guess. `reserve_device_to_host` does grow -- that is the one place it is allowed to -- so a `false`
+    // here means the demote needs a growth whose approval is unknowable from here, and `true` means it can
+    // proceed without one.
+    [[nodiscard]] bool can_demote_to_host(StateImageHandle source) const noexcept {
+        if (host_ == nullptr || !valid(source)) { return false; }
+        const Object& object = objects_[source.index_];
+        if (object.generation != source.generation_ ||
+            object.role != StateImageRole::CheckpointImmutable || !object.device_slot ||
+            object.host_slot || has_pending_replica(object) ||
+            object.source_pins == std::numeric_limits<std::uint32_t>::max()) {
+            return false;
+        }
+        return host_->capacity() > host_->occupied();
+    }
+
     [[nodiscard]] std::optional<StateImageTransfer>
     reserve_device_to_host(StateImageHandle source) {
         Object& object = require(source);

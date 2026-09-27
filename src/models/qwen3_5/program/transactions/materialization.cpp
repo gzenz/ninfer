@@ -2206,6 +2206,14 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
                     // implied: no per-sequence host-KV byte figure is reachable at this site (the tally
                     // below covers state slots only), so a per-victim KV test would have to be invented,
                     // and an invented number is worse than a labelled pool one.
+                    // WOULD A DEMOTE OF THIS VICTIM HAVE BEEN CONSTRUCTIBLE? The pool-level `demotable`
+                    // above cannot say -- it compares pool totals, so it reports room a victim's own
+                    // footprint may not fit, and it says nothing about the state's eligibility. This asks
+                    // the demote path's own seven preconditions (state_store::can_demote_to_host), which is
+                    // what separates "the plan evicted something it could have preserved" from "no demote
+                    // was possible". Non-mutating: it takes no host slot.
+                    const bool demote_possible =
+                        state_store->can_demote_to_host(victim.state.write);
                     const bool victim_room =
                         usage.host_state_slots + victim_host_slots <= room.host.state_slots &&
                         usage.host_kv_bytes < room.host.kv_bytes;
@@ -2218,7 +2226,7 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
                                      "[engine] private victim evicted: demotable=%d restorable=%d "
                                      "session=%016llx cont=%u frontier=%u endpoint=%d rewrite=%d "
                                      "anchors=%zu victim_host_slots=%u victim_dev_slots=%u host_state_slots=%u/%llu host_kv=%zu/%llu "
-                                     "victim_room=%d checked=%llu demotable_total=%llu\n",
+                                     "victim_room=%d demote_possible=%d checked=%llu demotable_total=%llu\n",
                                      static_cast<int>(demotable),
                                      static_cast<int>(state_restorable),
                                      static_cast<unsigned long long>(victim.session_key_hash),
@@ -2231,6 +2239,7 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
                                      usage.host_kv_bytes,
                                      static_cast<unsigned long long>(room.host.kv_bytes),
                                      static_cast<int>(victim_room),
+                                     static_cast<int>(demote_possible),
                                      static_cast<unsigned long long>(demotable_eviction_checks_),
                                      static_cast<unsigned long long>(demotable_evictions_));
                         std::fflush(stderr);

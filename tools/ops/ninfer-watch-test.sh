@@ -22,11 +22,16 @@ cat >"$work/journal" <<'EOF'
 2026-09-26T17:15:02+02:00 Strix bash[1]: [engine] WORKER RECOVER: subtraction underflow
 2026-09-26T17:15:03+02:00 Strix bash[1]: [engine] post-recovery residual (recover): main_kv_pages=0 backend_kv_pages=0 device_state_slots=0 host_state_slots=0 host_kv_bytes=0
 2026-09-26T17:15:04+02:00 Strix bash[1]: [engine] private victim evicted: demotable=1 frontier=190 endpoint=1 rewrite=1 anchors=0 host_state_slots=0/8 host_kv=0/8589934592 checked=4 demotable_total=2
+2026-09-26T17:15:04+02:00 Strix bash[1]: [engine] catalog cell blocked reuse: occupied=2/2 candidates=1 best_blocked_reuse=45815 chosen_reuse=0 probes=108544 losses=1
 2026-09-26T17:15:05+02:00 Strix bash[1]: [engine] WORKER RECOVER: some other diagnosis
 2026-09-26T17:15:06+02:00 Strix bash[1]: [engine] post-recovery residual (recover): main_kv_pages=117 backend_kv_pages=0 device_state_slots=0 host_state_slots=0 host_kv_bytes=8450000
 2026-09-26T17:15:07+02:00 Strix bash[1]: [engine] admission stalled head=3 lanes_free=4
 2026-09-26T17:15:08+02:00 Strix bash[1]: [engine] fail-all cleanup: shared catalogued=0 released-refused=0 skipped=0
 2026-09-26T17:15:09+02:00 Strix bash[1]: [engine] some entirely unrelated line that no token matches
+2026-09-26T17:15:09+02:00 Strix bash[1]: [engine] catalog cell at-risk: occupied=4/4 at_risk=1 evictable_owners=3 owners_enumerated=3 veto_goals=1 veto_other=0 veto_reuse=0 counted=0 probes=45533 seen=1
+2026-09-26T17:15:09+02:00 Strix bash[1]: [engine] a probe count is a DENOMINATOR and never the event, so this stays silent too
+2026-09-26T17:15:09+02:00 Strix bash[1]: [engine] catalog cell blocked reuse is absent from a run where no reuse was lost, and this line stands for that absence
+2026-09-26T17:15:09+02:00 Strix bash[1]: [engine] a probe count is a DENOMINATOR and must not alert, so this shape stays silent
 2026-09-26T17:15:10+02:00 Strix bash[1]: [engine] WORKER OOM: std::bad_alloc - recovering
 2026-09-26T17:15:11+02:00 Strix bash[1]: [engine] post-recovery residual (recover): main_kv_pages=958 backend_kv_pages=0 device_state_slots=0 host_state_slots=1 host_kv_bytes=0
 2026-09-26T17:15:12+02:00 Strix bash[1]: [engine] post-recovery residual (fail-all): main_kv_pages=117 backend_kv_pages=0 device_state_slots=0 host_state_slots=0 host_kv_bytes=8450000
@@ -40,6 +45,7 @@ gawk -v logpath="$work/log" -f ninfer-watch.awk <"$work/journal" >"$work/alerts"
 cat >"$work/expected" <<'EOF'
 2026-09-26T17:15:02+02:00 Strix bash[1]: [engine] WORKER RECOVER: subtraction underflow
 2026-09-26T17:15:04+02:00 Strix bash[1]: [engine] private victim evicted: demotable=1 frontier=190 endpoint=1 rewrite=1 anchors=0 host_state_slots=0/8 host_kv=0/8589934592 checked=4 demotable_total=2
+2026-09-26T17:15:04+02:00 Strix bash[1]: [engine] catalog cell blocked reuse: occupied=2/2 candidates=1 best_blocked_reuse=45815 chosen_reuse=0 probes=108544 losses=1
 2026-09-26T17:15:05+02:00 Strix bash[1]: [engine] WORKER RECOVER: some other diagnosis
 2026-09-26T17:15:06+02:00 Strix bash[1]: [engine] post-recovery residual (recover): main_kv_pages=117 backend_kv_pages=0 device_state_slots=0 host_state_slots=0 host_kv_bytes=8450000
 2026-09-26T17:15:07+02:00 Strix bash[1]: [engine] admission stalled head=3 lanes_free=4
@@ -62,7 +68,7 @@ else
   rc=1
 fi
 # The log must carry the insight lines the alert stream deliberately drops, or "log-only" means "lost".
-for t in 'checkpoint StateImage priced' 'demotable=0' 'fail-all cleanup' 'post-recovery residual (fail-all): main_kv_pages=0'; do
+for t in 'checkpoint StateImage priced' 'demotable=0' 'fail-all cleanup' 'post-recovery residual (fail-all): main_kv_pages=0' 'catalog cell at-risk'; do
   if grep -q -- "$t" "$work/log"; then
     echo "[watch-test] log keeps: $t"
   else

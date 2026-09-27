@@ -191,6 +191,8 @@ current ids.
 | **checkpoint state↔epoch binding** — W1's plan form: the state's content epoch recorded where each checkpoint is installed, compared at selection | `ff6ea1f4` | measured `recorded=16 live=16 mismatches=0/1 unrecorded=3`; selections with no record count as unrecorded rather than as agreement |
 | **idle-block grace + unsatisfiable refusal** | `6380bbdc` | see #10: the first version could not fire (a review caught it); now unit-tested, with the test failing against the shipped form |
 | **N1 "nondeterminism"** | — | withdrawn: three instrument errors, not an engine defect |
+| **the private catalog: LOST REUSE is now visible, and the capacity is raised** — `memory.private_catalog_{capacity,occupied}_cells` (as of the stats publication, 5 s on prod), `pressure.publication_cell_losses` with its denominator `pressure.publication_cell_probes`, and `[engine] catalog cell blocked reuse: occupied=%u/%u candidates=%u best_blocked_reuse=%u chosen_reuse=%u probes=%llu losses=%llu` in the alert set | unpushed (ids in §1d) | **It had NEITHER half of a capacity/occupancy pair** — host state slots, host KV and the pinned pool each report both plus a growth-refusal counter; the catalog reported nothing, and its failure was a bare `return std::nullopt` (now `resource_manager.h:2223`; a backfill run can inspect the same request repeatedly, so its unit is a successful planning run, not a request). **Not the only pool in that state**: the shared-prefix pool has neither half either, and `device-state-slots` has occupancy without a capacity (§4). **The first version of this instrument WAS WRONG and the review caught it (see §1e)**: it counted the goal builder's cell-free PROBES — 108,544 across 24 requests, of which the rate-limited print showed 220 lines, so "refusals=1…220" was the LINE count and never the counter — and the planner makes those probes from five call sites on its way to an ordinary eviction-to-publish. That number goes nonzero whenever retention fills the catalog, so it could not falsify the raise, and as an alert it fires on healthy traffic: a run with 97 such probes had four requests at **99.9% turn-closure reuse**. The event is now decided ONCE per planning run — a candidate whose every probe failed on the cell AND on nothing else, never produced a goal, and would have reused strictly more than the winner — and it is asserted by `ninfer_publication_cell_loss_test` (18 checks, mutation-checked, green control first). **It is NOT a general "the catalog is exhausted" signal, and the first version of this row overclaimed that**: what it detects is NO ADOPTABLE ROUTE AT ALL, and the case it was first named for — a candidate that RETAINS its source while a full catalog forces consumption or eviction — is excluded by construction, since consuming a private source publishes into that source's own cell and can never be a cell-only failure. The catalog's cost there is future reuse, invisible here (§4) |
+| **`--max-private-continuations` 18 → 32** | `~/.config/ninfer.conf:3` + `~/ninfer-ensure.sh:53` (the `swift` profile; both edited so the idempotent script does not revert it, and `--quasar`'s profile line 38 left at 18 deliberately) | capacity read-back 32 on the running prod exe |
 | **elastic pinned host budget** — one `PinnedHostPool` + `HostMemoryBudget`, drawn on by host KV (through spans) and host state slots | the unpushed commit whose subject is `feat(engine): one elastic pinned host budget, shared by host KV and host state slots` (id at push time: see §1b) | `pinned_host_pool` 90 / `host_memory_budget` 29 checks; `kv_cache` multi-span now carries THREE added cases: one per user of the span-keyed helper (`can_allocate_after_suballocation_releases`, `plan_after_releases`, and the REAL free list via `insert_free_extent`) (**mutation-checked, two runs each, ONE MUTANT PER CASE**: `m1` fails only the split case, `m2`/`m3`/`m4` only their own; unmutated gives `failures=0`. `m2`, `m3` and `m4` each passed the whole suite before their case existed); e2e phase 11 PASS on the repaired build (`spill=1053 h2d=1538`, 0 cold-starts, log `/tmp/ninfer-e2e-run-1790455115.log`; **no binary sha256 recorded — the "mtime 22:37:46" that stood here describes a binary that has since been relinked**), 11-14 = 11 PASS/6 WARN/1 FAIL (that 11/6/1 is phases 11-14; 12-14 alone are 8 PASS), where the state-pool checks WARNed rather than passed (see §4). **Its reachability limit is §3 item 6 — this is NOT a fix for eviction, and the first version of the commit message claimed it was** |
 
 ### 1b. Commit id map for the elastic-pool change (history was rebuilt)
@@ -236,6 +238,44 @@ Kept as the record of what a review pass named, and of what closed each item. No
 **What is still open, and it is NOT in this section** (see §2 and §3): the planner-level counter for #6
 ("a restorable victim was evicted while a FEASIBLE preserving alternative existed"), and the two items that
 genuinely need prod traffic -- #2's underflow and #9's wedge.
+
+### 1d. The catalog-instrument commits — **unpushed, so their own ids belong here and nowhere else**
+
+A commit cannot cite its own id, and the ones above cite each other. So the ids of the change that adds the
+catalog instrument (§1's "private catalog" row) are recorded here **at push time**, and until then a reader
+should cite the subject lines:
+
+| id | what it is |
+|---|---|
+| *(not yet pushed)* | the instrument: the catalog's capacity/occupancy pair, `publication_cell_refusals`, the journal line, its alert-set entry and the filter test |
+
+### 1e. The catalog instrument's review pass — REFUSED, AND EVERY FINDING CLOSED (2026-09-27)
+
+The first version was reviewed (brutal-honesty-review, opus) and the verdict was **not fit to push**. All of
+it was mine and all of it is now fixed; the list is kept because each item is a mistake worth not repeating.
+
+| # | finding | how it was closed |
+|---|---|---|
+| 1 | **LOAD-BEARING**: the counter counted `logical_goal` calls, not dropped candidates, so it fired on the ordinary eviction-to-publish path | the event moved to a per-request decision (`publication_cell_loss`), asserted host-only with one mutant per case |
+| 2 | The positive control showed no lost reuse — and the run beside it showed the opposite: 97 probe lines with four requests at 99.9% turn closure | replaced by three controls on 8085 with a bound stats port: cells=16/lanes=2 (`evictions 0, probes 10,467, losses 0`), cells=2/lanes=2 (`evictions 6, probes 13,780, losses 0`), cells=4/lanes=4 (`evictions 16, probes 45,533, losses 0`) — the last being the withdrawn counter's own shape, where it printed 97 lines during full reuse. **The loss has still never been seen nonzero**; §4 |
+| 3 | The "negative control" in the message and §1 **was never read** (`/tmp/catalog-instrument-exp.log` shows `CONTROL (before load, same process):` empty) | the claim is withdrawn; the probe's failure is recorded in §4 and the harness given `STATS_PORT` so it cannot recur |
+| 4 | "refusals=1…220" and "the counter advancing 1…220" are wrong: 220 is the PRINTED LINE count, the counter reached 108,544 | corrected in §1 and §4, with both numbers stated |
+| 5 | The explanation for run 1's zeros ("never contended") was invented and survived the death of its premise — run 1 had 97 refusals and 8 evictions | withdrawn. **The artifact is DESTROYED**: `~/ninfer-serve.log.prev` was rotated past by the later control window and is now case (b)'s log (0 `catalog full` lines). 220 = 8 + 108544/512 is consistent with the print's rate limit and nothing more can be checked |
+| 6 | The prod zero proves the capacity read-back only, not the loss wiring | stated as such in §4 |
+| 7 | "16 retained + 4 active > 18" is circular: retained is bounded by the catalog itself, so at most `capacity − lanes` | replaced with that bound; "structurally too small" is now labelled a workload claim |
+| 7b | **Second pass, 2026-09-27**: the bounds case (9) COULD NOT FAIL — removing the `std::min` passed rc=0 and only aborts under `-D_GLIBCXX_ASSERTIONS` (verified both ways) | the test target now sets that flag; the flag is checked present in `flags.make` |
+| 7c | The `probes == 0` conjunct had no test (a mutant removing it passed every check then existing) | DELETED as provably redundant: every tallied probe increments exactly one class, so `cell_only > 0` implies `probes > 0` |
+| 7d | Case 7 was named for "never probed" but passed through the `cell_only` guard | mapping recorded in the test header; **the first version of that table was measured BEFORE case 10 existed and was stale** — re-measured against HEAD, m2/m3/m4 also fail case 10 and m5 fails 6b/7 only |
+| 7e | The control rows were wrong: cells=16/lanes=2 is NOT a control (a `Vacant` cell always exists, so cell-only is impossible and BOTH instruments are structurally zero), and cells=2/lanes=2 had 24.9–25.1% shared-prefix reuse, not "no reuse" | both corrected in the commit body and §4 |
+| 7f | `~/ninfer-serve.log.prev`, cited as the artifact for the 97 lines, had been rotated away by the later window | the surviving logs are preserved with a sha256 manifest before rotation; the citation is corrected to what remains checkable |
+| 8 | `CatalogState::Vacant` is the right predicate, but its description was wrong: `ReservedForActive` is an active LANE's future cell, not the capture descriptor | corrected in `types.h`, with the consequence written down: `occupied == capacity` is the normal steady state and is NOT evidence that the catalog binds |
+| 9 | Stale line number (`:2191` → `:2216`), a contradiction the amend itself introduced about the shared pool, and "~13"/"twelve"/"~12" for the same set | all corrected; the set is **11** other nullopt returns in that lambda |
+| 10 | The two readings have different scopes (`assessed_targets_without_goal` resets per run, the counter does not) | the loss counter is per PLANNING RUN now, and the backfill loop can inspect one request several times, so "per request" is NOT claimed anywhere -- the two remain uncomparable and that is stated |
+
+**What the review confirmed as genuinely good**, verified rather than courteous: the filter test (mutation-
+checked through the `alerts FAIL` discriminator), the capacity read-back, the running-binary check, and the
+claim that the refusal site is the only silent drop — the execution-side `validate_choice` is a throw behind a
+revision check that returns `Stale` first, so it is the loud WORKER path, not a second silent one.
 
 ### 2. Open, in priority order
 
@@ -2022,35 +2062,49 @@ and nobody reads.
 - Every e2e timing taken before 2026-09-25 evening ran with all `MAT_*` probes on (the start script
   exported empty names, and `getenv` is non-NULL for an empty string), so those numbers are conservative
   against prod but not comparable with post-fix ones.
-- `diverged` has no positive control; the backend row is 0 in every W1-A reading, so that axis never
-  discriminates under dflash2.
-- The canary's own-canary control fails 8/8 (`missed_own`), so "survives" means no crash and no
-  divergence — **not** "no bleed".
-- **W1-B's invariant reproduces and its predicted harm does not.** `SHARED-FRONTIER advertised=20538
-  frozen=0 identity=20538 mismatches=1/1`: the entry advertises 20538 tokens and hands over a StateImage
-  frozen at 0. The pre-existing `NINFER_MAT_DEBUG` comment attributes cross-session bleed to exactly
-  this, but the canary runs read `bleed=0`. Either the invariant is stricter than the hazard, or the
-  harm needs a condition the canary does not create — do not cite the comment's claim as established.
-- **S2 r2 replies empty** (`len=0`) in several canary runs: reproducible, unchased.
-  **NARROWED 2026-09-26, and it did NOT reproduce.** The canary now records the reply SHAPE
-  (`kinds=[...] tools=N stop=...`) beside `len`, because `len` counts only the concatenated *text* -- so a
-  turn whose reply is a tool call measures zero, which made "empty reply" and "tool-only reply"
-  indistinguishable, and one of those is an engine finding while the other is the harness counting the
-  wrong thing. With that instrument, one run under the SAME arm settings the observation came from
-  (`sessions=4 rounds=4 private=40000 shared=20000`, log `/tmp/ninfer-e2e-run.log`): 16 turns,
-  `bleed=0 partial_foreign=0 missed_own=0 errors=0`, and **no `len=0` at all** -- every reply reads
-  `kinds=['thinking','text'] tools=0 stop=end_turn len=22`. So on this tree the observation does not
-  reproduce; whether it was a transient of an older build or needs conditions this arm does not set is not
-  established, and one non-reproducing run is not a fix. What is now true is that a recurrence will say
-  WHICH kind it is.
-- The W1-A foreign count (8/272 vs 9/272, agreeing through observation #4 then diverging) measures
-  interleaving *under the fixed code*; it does **not** quantify the old defect.
-- `479c92c4`'s message is wrong that the DFlash sink was re-published every step (fixed in `4bc421a6`).
-- The `NINFER_FORK_COPY` comment's claim is unverified and contradicted by the plan's own table.
-- The intermittent `failed during generation` 500: three occurrences on the test server (14:44, 17:15,
-  17:40), none reproducing; the 7 in the journal are the incident's own process, a different population.
-- `/stats` stops answering under heavy prefill while `/health` and `/v1/messages` keep working, so
-  "stats answers" is not a usable negative test for a wedge.
+- **The catalog instrument (2026-09-27): the at-risk meter CONFIRMS the bound it was built to test. My first
+  reading of it was BACKWARDS and the tree's own pre-registered rule is what catches that.** A review argued the
+  loss cannot be reached at a shape like prod's (a cell-only failure needs no free cell AND no evictable owner,
+  and a cell is obtainable whenever an owner is evictable, so the event needs roughly `C <= 2L + Claimed`; at
+  C=32/L=4 that is 8), and that what this instrument would fire on is search truncation. `materialization_budget.h`
+  pre-registered the test: "if at_risk > 0 always comes with evictable_owners > 0, the review is right and the
+  predicate must be rebuilt from catalog state."
+
+  | case | printed readings | evictable_owners | veto |
+  |---|---|---|---|
+  | lanes=2 cells=2 | 4 | 1, 2 | veto_goals=1, veto_other=0, veto_reuse=0 |
+  | lanes=4 cells=4 | 8 | 3, 4 | veto_goals=1..2, veto_other=0, veto_reuse=0 |
+
+  **Twelve readings, every one with owners AVAILABLE — so by the rule as written the review is CONFIRMED.** An
+  earlier version of this item said the opposite ("the review's 'impossible' is refuted") and that was wrong
+  three ways: the data meets the stated criterion for the reverse conclusion; both shapes sit inside the
+  review's own possible regime (2 ≤ 4, 4 ≤ 8), so neither speaks to C=32/L=4; and `at_risk` with `veto_goals`
+  means the candidate HAD a goal, i.e. a cell was obtainable.
+
+  **What the meter does establish:** the cell-only failure occurs (the planner does hit the cell), and every
+  at-risk candidate had a goal, so the catalog cost nothing in these loads. **What the predicate detects is
+  therefore "no adoptable route at all" — NOT the case it was first claimed to target**, a candidate that
+  retains its source while a full catalog forces consumption or eviction: that case is EXCLUDED BY CONSTRUCTION,
+  since consuming a private source publishes into the source's own cell (`publication_slot =
+  candidate.private_source->slot`) and can never be cell-only. The catalog's cost there is future reuse, not
+  this request's, and no counter here sees it.
+
+  **Two defects in the meter itself, both fixed:** the PRINTED LINE COUNT IS A SAMPLE (the print is capped at 8
+  then every 512th, so "8 at-risk runs" was eight lines — the documented eviction-print trap, made here; `/stats`
+  now carries uncapped totals), and `evictable_owners` was a CONFOUNDED PROXY: it printed the planner's
+  enumerated owner list, filled only once the planner reaches its pressure phase, so an early-returning run
+  reports zero owners even with a full catalog — and zero is the reading designated as "the catalog was empty".
+  It now reads `catalog_` directly with `owners_enumerated` beside it. Logs preserved with a sha256 manifest in
+  `results/catalog-controls-2026-09-27/`.
+
+- **Two more bounded pools still report occupancy without a capacity**, found while closing the catalog's:
+  `device-state-slots` has occupancy in `pressure.device_state_occupied_slots` and its capacity nowhere, and
+  `max_shared_prefixes` has NEITHER half -- only `shared_active_references` and the `reuse-select ...
+  longer_lost=1` line. Neither is claimed to be a live defect; both are unreadable the same way the catalog
+  was. (The shared pool's absence is what made two of the first version's documents contradict themselves.)
+- **`ninfer-start-test.sh` reinitialised `CT_FLAGS_EXTRA`, so a caller could not pass `--stats-port`.** Two
+  runs read empty `/stats` behind `2>/dev/null` and the failure modes were indistinguishable; the harness now
+  honours `STATS_PORT`. Any claim resting on a test-server `/stats` reading from before this is worthless.
 
 ### 5. Operating traps
 

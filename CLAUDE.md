@@ -263,6 +263,28 @@ while it lasts. In dev time that is the entire cost; in prod time it is the smal
   plan that preserved a restorable checkpoint was assessed feasible and a destroying one was taken anyway — needed
   because the eviction print below is rate-limited to the first 8 and then every 512th, so its silence
   after the 8th means "not printed", not "not recurring".
+- **The private catalog had NEITHER half of a capacity/occupancy pair** — host state slots, host KV and the
+  pinned pool each report both plus a growth-refusal counter, which is why `--max-private-continuations`
+  exhaustion used to be invisible. **It is not the only one**: the shared-prefix pool has neither half and
+  `device-state-slots` has occupancy without a capacity; both are recorded in `plan.md` §4. It now reads
+  `memory.private_catalog_capacity_cells` / `memory.private_catalog_occupied_cells` (as of the last stats
+  publication -- the 5 s interval plus ~20 event sites, not of the request) against
+  `pressure.publication_cell_losses`.
+- **`occupied == capacity` is NOT evidence that the catalog is binding, and must not be read as one.** Every
+  active lane holds a `ReservedForActive` cell (its own future publication cell — NOT the capture descriptor,
+  which is a Program address-space slot), so occupancy is at least the lane count by construction, and under
+  eviction-to-publish a full catalog is the ordinary steady state. The reading that means something is
+  `publication_cell_losses`: PLANNING RUNS where a candidate whose every goal probe failed on the cell -- and on
+  nothing else -- would have reused strictly more than the plan that won. Its journal line is
+  `[engine] catalog cell blocked reuse: occupied=%u/%u candidates=%u best_blocked_reuse=%u chosen_reuse=%u
+  probes=%llu losses=%llu`, rate-limited to the first 8 then every 512th.
+- **A PROBE COUNT IS A DENOMINATOR AND MUST NEVER ALERT OR BE QUOTED AS THE EVENT.** `pressure.publication_cell_probes`
+  is raw goal-probe calls: the planner probes a cell-free option from five sites (`materialization_planner.h`
+  `:163/:297/:471/:550/:590`) on its way to an ordinary eviction, so it runs ~1,900 per planning run on a measured case (45,533 over 24) — and the withdrawn counter's OWN cell-free count was 108,544 in
+  one 24-request run, and 97 lines in a run where four requests reused 99.9%. The first version of this
+  instrument reported that number as the loss count and put it in the alert set, which made it fire on healthy
+  traffic and unable to falsify a capacity raise. Keep the two apart: `losses` is the outcome, `probes` exists
+  only so `losses == 0` can be told from a planner that stopped probing.
 - **The eviction line is**
   `[engine] private victim evicted: demotable=%d restorable=%d session=%016llx cont=%u frontier=%u
   endpoint=%d rewrite=%d anchors=%zu victim_host_slots=%u victim_dev_slots=%u host_state_slots=%u/%llu

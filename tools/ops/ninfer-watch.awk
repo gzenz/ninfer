@@ -33,9 +33,31 @@ function alert(line) { print line; fflush(); keep(line) }
 # and the item it serves goes blind while the filter still looks correct. (The test caught exactly that.)
 /private victim evicted: demotable=1/ { alert($0); next }
 
+# #6's OTHER HALF, and it is not an error: a candidate that would have reused MORE than the plan that won had
+# NO adoptable route at all, because the catalog had no cell to offer. It is an alert because nothing else in
+# the stream shows it -- the request is served anyway, with less reuse.
+#
+# WHAT IT DOES **NOT** SHOW, and an earlier version of this comment overclaimed here: this is NOT a general
+# "the catalog is exhausted, raise it" signal. It fires only when a candidate has no route whatsoever -- no
+# cell AND no owner its own solution evicts -- and the case that looks like the obvious one (a candidate that
+# RETAINS its source while a full catalog forces consumption or eviction) is EXCLUDED BY CONSTRUCTION:
+# consuming a private source publishes into that source's own cell, so it can never be a cell-only failure.
+# The catalog's cost there is FUTURE reuse, which no counter here sees. Measured 2026-09-27: `at_risk > 0` in
+# 12 printed readings, all with evictable owners available and all with a goal -- i.e. the reading supports a
+# bound argument that this event needs `C <= ~2L + Claimed`, well below prod's 32 cells against 4 lanes.
+# So read it as "a request lost reuse with no other route", not as a capacity verdict.
+#
+# DO NOT ARM ON A PROBE COUNT. An earlier version of this instrument alerted on the goal builder's
+# cell-free probes (`catalog full: ... refusals=`), which the withdrawn counter reported in place of lost
+# reuse -- the planner makes those probes thousands of times per request on its
+# way to an ordinary eviction -- 108,544 in one 24-request run, and 97 in another run where four requests
+# reused 99.9%. It fired on healthy traffic and could not have falsified a capacity raise. `probes` is a
+# denominator, and a denominator is exactly the thing that must not alert.
+/catalog cell blocked reuse: occupied=/ { alert($0); next }
+
 # Insight, logpath-only: too frequent to notify on. Their ABSENCE is the signal -- a denominator that never
 # appears means the instrument stopped running, not that the count is zero.
-/checkpoint StateImage priced|fail-all cleanup|private victim evicted/ { keep($0); next }
+/checkpoint StateImage priced|fail-all cleanup|private victim evicted|catalog cell at-risk/ { keep($0); next }
 
 # THE WEDGE ITSELF. It lives in the SENTINEL's journal, not ninfer.service's: the sentinel is what
 # detects "engine idle with work pending" and restarts prod. The watcher tailed ONE unit, so on

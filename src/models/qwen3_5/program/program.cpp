@@ -479,6 +479,35 @@ std::uint64_t Program::evictions_with_victim_room() const noexcept {
 std::uint64_t Program::demotable_eviction_checks() const noexcept {
     return impl_->demotable_eviction_checks();
 }
+std::uint64_t Program::note_publication_cell_loss() noexcept { return impl_->note_publication_cell_loss(); }
+std::uint64_t Program::note_publication_cell_at_risk() noexcept {
+    return impl_->note_publication_cell_at_risk();
+}
+void Program::add_publication_cell_at_risk(std::uint32_t at_risk, std::uint32_t goals, std::uint32_t other,
+                                           std::uint32_t reuse) noexcept {
+    impl_->add_publication_cell_at_risk(at_risk, goals, other, reuse);
+}
+std::uint64_t Program::publication_cell_at_risk_runs() const noexcept {
+    return impl_->publication_cell_at_risk_runs();
+}
+std::uint64_t Program::publication_cell_veto_goals() const noexcept {
+    return impl_->publication_cell_veto_goals();
+}
+std::uint64_t Program::publication_cell_veto_other() const noexcept {
+    return impl_->publication_cell_veto_other();
+}
+std::uint64_t Program::publication_cell_veto_reuse() const noexcept {
+    return impl_->publication_cell_veto_reuse();
+}
+void Program::add_publication_cell_probes(std::uint64_t count) noexcept {
+    impl_->add_publication_cell_probes(count);
+}
+std::uint64_t Program::publication_cell_losses() const noexcept {
+    return impl_->publication_cell_losses();
+}
+std::uint64_t Program::publication_cell_probes() const noexcept {
+    return impl_->publication_cell_probes();
+}
 
 bool Program::isolated_request_feasible(const RequestBasePlan& base) const noexcept {
     return impl_->isolated_request_feasible(base);

@@ -4,6 +4,7 @@
 #include "runtime/contract/execution.h"
 #include "runtime/contract/resources.h"
 #include "runtime/engine/context_cache/context_cost.h"
+#include "runtime/engine/context_cache/materialization_budget.h"
 #include "runtime/engine/context_cache/materialization_planner.h"
 #include "runtime/engine/context_cache/shared_capture_planner.h"
 
@@ -28,6 +29,9 @@
 namespace ninfer::runtime {
 
 inline constexpr std::uint32_t kInvalidCatalogSlot = std::numeric_limits<std::uint32_t>::max();
+// A goal probe that never resolved a candidate (the caller passed an id no candidate carries). Distinct from
+// a resolved candidate index of 0, which is why it is a sentinel and not a zero.
+inline constexpr std::size_t kNoCandidateIndex = std::numeric_limits<std::size_t>::max();
 
 enum class LogicalLaneState : std::uint8_t {
     Free,
@@ -1209,6 +1213,17 @@ public:
         out.pressure_private_evictions_demotable = program.demotable_evictions();
         out.pressure_evictions_with_victim_room  = program.evictions_with_victim_room();
         out.pressure_private_eviction_checks    = program.demotable_eviction_checks();
+        // The catalog's capacity/occupancy pair, as of this publication. It had neither half, which is why its exhaustion could
+        // only be noticed as a silent loss of reuse. (Not the only pool in that state: the shared-prefix pool
+        // has neither half either and device-state-slots has occupancy without a capacity -- `plan.md` §4.)
+        out.private_catalog_capacity_cells      = catalog_count_;
+        out.private_catalog_occupied_cells      = catalog_occupied_cells();
+        out.pressure_publication_cell_losses    = program.publication_cell_losses();
+        out.pressure_publication_cell_probes    = program.publication_cell_probes();
+        out.pressure_publication_cell_at_risk_runs = program.publication_cell_at_risk_runs();
+        out.pressure_publication_cell_veto_goals   = program.publication_cell_veto_goals();
+        out.pressure_publication_cell_veto_other   = program.publication_cell_veto_other();
+        out.pressure_publication_cell_veto_reuse   = program.publication_cell_veto_reuse();
         out.pressure_checkpoints_dropped       = context_stats_.pressure_checkpoints_dropped;
         out.pressure_searches                  = context_stats_.pressure_searches;
         out.pressure_search_budget_exhaustions = context_stats_.pressure_search_budget_exhaustions;
@@ -1683,6 +1698,39 @@ private:
         advance_revision(entry.revision);
     }
 
+    // Cells not `Vacant` -- catalogued, claimed, or reserved for the in-flight capture. This is the
+    // occupancy half of the catalog's capacity pair, and the number the `/stats` read reports. COUNTED, not
+    // tracked: a separate counter would be one more thing that can drift from `catalog_`. Called only from
+    // `populate_runtime_stats`, i.e. on the engine worker under `execution_mutex_` -- the same lock planning
+    // runs under -- so this walk of `catalog_` is not a concurrent read of a mutating container.
+    // The owners a publication cell could be taken FROM, read from `catalog_` rather than from the planner's
+    // `private_owner_ids`. THAT DISTINCTION IS THE WHOLE POINT: `private_owner_ids` is filled inside
+    // `build_pressure_inputs`, which runs only if the planner reaches its pressure phase, so a run that
+    // returned early (the identity path) reports ZERO owners even when the catalog is full of them -- and
+    // zero owners is the reading that was designated as "the catalog really was empty". A confounded meter
+    // whose decisive value can be produced by lazy construction is worse than none. This mirrors the filter
+    // at `build_pressure_inputs` exactly: Catalogued, has a handle, no active edge.
+    [[nodiscard]] std::uint32_t evictable_private_owners() const noexcept {
+        std::uint32_t owners = 0;
+        for (std::uint32_t slot = 0; slot < catalog_count_; ++slot) {
+            const CatalogEntry& entry = catalog_[slot];
+            if (entry.state != CatalogState::Catalogued || !entry.handle ||
+                private_has_active_edge(slot)) {
+                continue;
+            }
+            ++owners;
+        }
+        return owners;
+    }
+
+    [[nodiscard]] std::uint32_t catalog_occupied_cells() const noexcept {
+        std::uint32_t occupied = 0;
+        for (const CatalogEntry& entry : catalog_) {
+            if (entry.state != CatalogState::Vacant) { ++occupied; }
+        }
+        return occupied;
+    }
+
     void clear_shared_entry(SharedCatalogEntry& entry) noexcept {
         entry.state = SharedCatalogState::Vacant;
         entry.id    = 0;
@@ -2102,29 +2150,37 @@ private:
             };
         };
 
-        const auto logical_goal = [&](PlanningCandidateId candidate_id,
-                                      PrivateSourceMode source_mode,
-                                      std::span<const PressureOwnerOutcome> outcomes)
-            -> std::optional<typename Planner::LogicalGoal> {
+        // The probe, split from the goal so that a FAILURE'S REASON survives: the planner calls this from five
+        // sites and most calls are the search exercising an option, so what matters is not how often it
+        // fails but whether the cell was the ONLY thing that could have blocked a candidate. `cell_only`
+        // marks the one failure that is the catalog's doing; every other return is `false`.
+        struct GoalProbe {
+            std::optional<typename Planner::LogicalGoal> goal;
+            std::size_t candidate_index = kNoCandidateIndex;
+            bool cell_only              = false;
+        };
+        const auto logical_goal_probe = [&](PlanningCandidateId candidate_id,
+                                            PrivateSourceMode source_mode,
+                                            std::span<const PressureOwnerOutcome> outcomes) -> GoalProbe {
             const auto candidate_record =
                 std::find_if(candidate_inputs.begin(), candidate_inputs.end(),
                              [&](const typename Planner::CandidateInput& input) {
                                  return input.id == candidate_id;
                              });
-            if (candidate_record == candidate_inputs.end()) { return std::nullopt; }
+            if (candidate_record == candidate_inputs.end()) { return GoalProbe{}; }
             const std::size_t candidate_index =
                 static_cast<std::size_t>(candidate_record - candidate_inputs.begin());
             const Candidate& candidate = candidates[candidate_index];
             if (candidate.shared_source && source_mode != PrivateSourceMode::Retain) {
-                return std::nullopt;
+                return GoalProbe{.candidate_index = candidate_index};
             }
             if (!candidate.private_source && !candidate.shared_source &&
                 source_mode == PrivateSourceMode::Retain) {
-                return std::nullopt;
+                return GoalProbe{.candidate_index = candidate_index};
             }
             if (candidate.private_source && source_mode != PrivateSourceMode::Retain &&
                 source_mode != PrivateSourceMode::ConsumeToActive) {
-                return std::nullopt;
+                return GoalProbe{.candidate_index = candidate_index};
             }
 
             std::uint32_t publication_slot = kInvalidCatalogSlot;
@@ -2143,31 +2199,31 @@ private:
                 const PressureOwnerOutcome& outcome = outcomes[row];
                 if (outcome.disposition != VictimDisposition::Retained &&
                     outcome.disposition != VictimDisposition::Evicted) {
-                    return std::nullopt;
+                    return GoalProbe{.candidate_index = candidate_index};
                 }
                 if (std::find_if(outcomes.begin(), outcomes.begin() + row,
                                  [&](const PressureOwnerOutcome& prior) {
                                      return prior.owner == outcome.owner;
                                  }) != outcomes.begin() + row) {
-                    return std::nullopt;
+                    return GoalProbe{.candidate_index = candidate_index};
                 }
                 const auto record = std::find_if(
                     owner_records.begin(), owner_records.end(),
                     [&](const PlanningOwnerRecord& item) { return item.id == outcome.owner; });
-                if (record == owner_records.end()) { return std::nullopt; }
+                if (record == owner_records.end()) { return GoalProbe{.candidate_index = candidate_index}; }
                 const bool shared = record->capability.owner.kind == LogicalOwnerKind::SharedPrefix;
                 if (!shared) {
                     const std::uint32_t slot = record->capability.slot;
                     if (slot >= catalog_count_ ||
                         (candidate.private_source && slot == candidate.private_source->slot)) {
-                        return std::nullopt;
+                        return GoalProbe{.candidate_index = candidate_index};
                     }
                     const CatalogEntry& entry = catalog_[slot];
                     if (entry.state != CatalogState::Catalogued || !entry.handle ||
                         entry.id != record->capability.owner.id ||
                         entry.revision != record->capability.generation ||
                         private_has_active_edge(slot)) {
-                        return std::nullopt;
+                        return GoalProbe{.candidate_index = candidate_index};
                     }
                     if (publication_slot == kInvalidCatalogSlot &&
                         outcome.disposition == VictimDisposition::Evicted) {
@@ -2177,19 +2233,54 @@ private:
                     const std::uint32_t slot = record->capability.slot;
                     if (slot >= shared_catalog_count_ ||
                         (candidate.shared_source && slot == candidate.shared_source->slot)) {
-                        return std::nullopt;
+                        return GoalProbe{.candidate_index = candidate_index};
                     }
                     const SharedCatalogEntry& entry = shared_catalog_[slot];
                     if (entry.state != SharedCatalogState::Catalogued || !entry.handle ||
                         entry.id != record->capability.owner.id ||
                         entry.revision != record->capability.generation ||
                         entry.transaction_pins != 0 || shared_active_edge_count(slot) != 0) {
-                        return std::nullopt;
+                        return GoalProbe{.candidate_index = candidate_index};
                     }
                 }
             }
-            if (publication_slot == kInvalidCatalogSlot) { return std::nullopt; }
-            return typename Planner::LogicalGoal{.publication_slot = publication_slot};
+            if (publication_slot == kInvalidCatalogSlot) {
+                // THE ONE FAILURE THAT IS THE CATALOG'S DOING -- reported as a REASON, not counted here. This
+                // site is reached only after every other validation passed, so it is precisely "this
+                // candidate could have been adopted if a cell had been obtainable". Whether that COST
+                // anything is not decidable at this point and is not decided here: the planner is allowed to
+                // probe this option on the way to taking an eviction, and it does so thousands of times per
+                // request. The loss is decided once per planning run, in `publication_cell_loss` below. (The
+                // first version of this instrument counted THESE calls, reached 108,544 across 24 requests,
+                // and printed a "dropped" line for candidates that then won -- see the header.)
+                return GoalProbe{.candidate_index = candidate_index, .cell_only = true};
+            }
+            return GoalProbe{.goal = typename Planner::LogicalGoal{.publication_slot = publication_slot},
+                             .candidate_index = candidate_index};
+        };
+
+        // The tally the planner's calls accumulate into, and the wrapper that is what the planner sees. The
+        // wrapper's signature is the one the five call sites already use, so nothing in the planner changed.
+        std::vector<PublicationCellProbe> probe_tally;
+        const auto logical_goal = [&](PlanningCandidateId candidate_id, PrivateSourceMode source_mode,
+                                      std::span<const PressureOwnerOutcome> outcomes)
+            -> std::optional<typename Planner::LogicalGoal> {
+            const GoalProbe probe = logical_goal_probe(candidate_id, source_mode, outcomes);
+            if (probe.candidate_index != kNoCandidateIndex) {
+                if (probe.candidate_index >= probe_tally.size()) {
+                    probe_tally.resize(probe.candidate_index + 1U);
+                }
+                PublicationCellProbe& tally = probe_tally[probe.candidate_index];
+                ++tally.probes;
+                if (probe.goal) {
+                    ++tally.goals;
+                } else if (probe.cell_only) {
+                    ++tally.cell_only;
+                } else {
+                    ++tally.other;
+                }
+            }
+            return probe.goal;
         };
 
         const auto final_schedule = [&](PlanningCandidateId candidate_id,
@@ -2211,6 +2302,14 @@ private:
         std::optional<typename Planner::Result> planned =
             planner_.plan(program, prompt, cost_model_, candidate_inputs, 0, build_pressure_inputs,
                           logical_goal, final_schedule, planning_started, allowance);
+        // The probe denominator is added BEFORE the early return, so a planning run that produced no plan still
+        // contributes its probes. Conditioning it on success made "probed but never planned" look identical to
+        // "stopped probing" -- the one thing a denominator exists to distinguish.
+        {
+            std::uint64_t probes_total = 0;
+            for (const PublicationCellProbe& tally : probe_tally) { probes_total += tally.probes; }
+            program.add_publication_cell_probes(probes_total);
+        }
         const auto selected_candidate =
             planned ? std::find_if(candidate_inputs.begin(), candidate_inputs.end(),
                                    [&](const typename Planner::CandidateInput& input) {
@@ -2223,6 +2322,71 @@ private:
 
         Candidate& candidate =
             candidates[static_cast<std::size_t>(selected_candidate - candidate_inputs.begin())];
+
+        // DID THE CATALOG COST THIS REQUEST ANY REUSE? Decided ONCE, here, after the winner is known -- and
+        // the whole of the instrument is this one question, because the raw probe count answers a different
+        // one. `probe_tally` holds, per candidate, how many times the goal builder failed for it and WHY:
+        // a candidate whose every failure was `cell_only` could not be adopted at all, so if it would have
+        // reused more than the plan that won, the cell took that reuse away. The winner is excluded: its own
+        // probes failing on the cell is the ordinary eviction-to-publish path, which is expected.
+        //
+        // The comparison is on `reusable_prompt_tokens`, the same quantity the selection instrument uses.
+        {
+            const std::size_t winner_index = static_cast<std::size_t>(&candidate - candidates.data());
+            const std::uint32_t winner_reuse =
+                candidate.plan ? candidate.plan->summary().reusable_prompt_tokens : 0U;
+            const auto reuse_of = [&](std::size_t index) -> std::uint32_t {
+                return candidates[index].plan ? candidates[index].plan->summary().reusable_prompt_tokens
+                                              : 0U;
+            };
+            const PublicationCellLoss loss =
+                publication_cell_loss(probe_tally, candidates.size(), winner_index, winner_reuse, reuse_of);
+            std::uint64_t probes_total = 0;
+            for (const PublicationCellProbe& tally : probe_tally) { probes_total += tally.probes; }
+            // THE AT-RISK LINE IS LOG-ONLY AND DELIBERATELY NOT AN ALERT (see the awk). Its purpose is to
+            // settle whether a catalog-caused loss is REACHABLE at this configuration: `evictable_owners` is
+            // the count of private owner records the planner had -- i.e. owners it could have taken a cell
+            // from -- so `at_risk` positive WITH `evictable_owners=0` is the mechanism real, and `at_risk`
+            // positive only ever with owners available says a cell was obtainable and this predicate is
+            // measuring search truncation instead. Until that is measured, arming on it would put an
+            // uninterpreted number in the alert stream.
+            // TALLIED UNCONDITIONALLY, and this is not tidiness: the PRINT is capped at 8 then every 512th, so
+            // the printed line count is a SAMPLE and never the count. Reading "8 at-risk runs" off eight lines
+            // is the exact error CLAUDE.md records for the eviction print, and it was made here before this
+            // counter existed. `/stats` carries the totals; the journal carries an example.
+            if (loss.at_risk != 0U) {
+                program.add_publication_cell_at_risk(loss.at_risk, loss.blocked_by_goals, loss.blocked_by_other,
+                                                     loss.blocked_by_reuse);
+                const std::uint64_t at_risk_seen = program.note_publication_cell_at_risk();
+                if (at_risk_seen <= 8U || at_risk_seen % 512U == 0U) {
+                    std::fprintf(stderr,
+                                 "[engine] catalog cell at-risk: occupied=%u/%u at_risk=%u evictable_owners=%u "
+                                 "owners_enumerated=%zu veto_goals=%u veto_other=%u veto_reuse=%u counted=%u "
+                                 "probes=%llu seen=%llu\n",
+                                 catalog_occupied_cells(), catalog_count_, loss.at_risk,
+                                 evictable_private_owners(), private_owner_ids.size(),
+                                 loss.blocked_by_goals, loss.blocked_by_other, loss.blocked_by_reuse,
+                                 loss.candidates, static_cast<unsigned long long>(probes_total),
+                                 static_cast<unsigned long long>(at_risk_seen));
+                    std::fflush(stderr);
+                }
+            }
+            if (loss.candidates != 0U) {
+                const std::uint64_t losses = program.note_publication_cell_loss();
+                // Rate-limited to the first 8 then every 512th, like the eviction print; the `/stats` counter
+                // is the un-muted reading, so silence after the 8th means "not printed", never "not recurring".
+                if (losses <= 8U || losses % 512U == 0U) {
+                    std::fprintf(stderr,
+                                 "[engine] catalog cell blocked reuse: occupied=%u/%u candidates=%u "
+                                 "best_blocked_reuse=%u chosen_reuse=%u probes=%llu losses=%llu\n",
+                                 catalog_occupied_cells(), catalog_count_, loss.candidates,
+                                 loss.best_blocked_reuse, winner_reuse,
+                                 static_cast<unsigned long long>(probes_total),
+                                 static_cast<unsigned long long>(losses));
+                    std::fflush(stderr);
+                }
+            }
+        }
 
         // THE DECIDING COMPARISON (2026-09-27). The reuse-choice instrument (`request_plan.cpp`) established
         // that a LONGER private continuation is alive when the shared snapshot is taken, and that is all it

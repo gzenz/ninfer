@@ -5,10 +5,94 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <span>
 
 namespace ninfer::runtime {
+
+// THE PUBLICATION-CELL LOSS, at namespace scope for the same reason as the cost key below: a host-only test
+// can decide the case without a GPU.
+//
+// WHY THIS IS NOT "A REFUSAL COUNTER", WHICH IS WHAT THE FIRST VERSION OF IT WAS AND WHY THAT WAS WRONG.
+// The planner probes a cell-free option from FIVE call sites (`materialization_planner.h:163, 297, 471,
+// 550, 590`) -- not once per assessed target: `rank_guidance` alone runs twice per candidate in
+// `start_path` and again for every construction option and every chosen target. Counting those calls
+// therefore counts SEARCH STEPS. Measured: 108,544 of them across 24 requests on one run, and the same
+// instrument printed 97 of them on another run in which four requests achieved 99.9% turn-closure reuse.
+// A number that goes nonzero whenever retention fills the catalog -- which is the normal state under
+// eviction-to-publish -- cannot falsify a capacity raise, and as an alert it fires during healthy
+// operation. So the event is decided HERE instead, once per planning run, and it means something narrow:
+//
+//   a candidate whose EVERY goal probe failed on the publication cell -- never on any other condition --
+//   could not be adopted at all, and would have reused strictly more tokens than the plan that won.
+//
+// That is the only shape in which the catalog has actually cost reuse.
+struct PublicationCellProbe {
+    // Every probe made for this candidate, with the reason a failed one failed. `cell_only` and `other` are
+    // the two ways to fail and they are exclusive; a candidate with `goals != 0` could be adopted.
+    std::uint32_t probes    = 0;
+    std::uint32_t cell_only = 0;
+    std::uint32_t other     = 0;
+    std::uint32_t goals     = 0;
+};
+
+struct PublicationCellLoss {
+    std::uint32_t candidates         = 0;  // candidates the cell alone made unadoptable
+    std::uint32_t best_blocked_reuse = 0;  // the most tokens any of them would have reused
+    // THE AT-RISK BREAKDOWN, and it exists to settle a disagreement that reading the code did not. A review
+    // pass argued that a catalog-caused loss cannot occur at prod's shape (C=32 cells, L=4 lanes) because a
+    // cell-only failure needs no free cell AND no evictable owner, and the count of non-evictable owned cells
+    // is bounded by the lane count -- so it needs roughly `C <= 2L + Claimed`. If that is right, this
+    // instrument can never fire on prod for the reason it claims, and its only firing would be search
+    // truncation. The counter-argument is that an owner being EVICTABLE is not the same as an owner this
+    // candidate's own solution EVICTS, and a preserving (zero-eviction) candidate gets no cell from victims
+    // however many owners are evictable.
+    //
+    // `at_risk` (non-winner candidates with any cell-only failure, whatever vetoed them) against
+    // `evictable_owners` (was there a private owner record at all) decides it: if at_risk > 0 always comes
+    // with evictable_owners > 0, the review is right and the predicate must be rebuilt from catalog state. If
+    // at_risk > 0 with evictable_owners == 0 occurs, the cell really was unobtainable and the mechanism is
+    // real. NOT counted by `candidates`: a candidate can be at risk and still not count (it was vetoed).
+    std::uint32_t at_risk            = 0;
+    std::uint32_t blocked_by_goals   = 0;  // at-risk candidates a successful goal also existed for
+    std::uint32_t blocked_by_other   = 0;  // at-risk candidates that also failed on something else
+    std::uint32_t blocked_by_reuse   = 0;  // at-risk candidates that would not have out-reused the winner
+};
+
+// `reuse_of(i)` is the tokens candidate `i` would have reused. Excluded: the winner itself (its own probes
+// failing on the cell is the eviction-to-publish path, which is expected and is not a loss) and any
+// candidate that could have been adopted or that failed for a reason other than the cell.
+template <typename ReuseOf>
+[[nodiscard]] PublicationCellLoss publication_cell_loss(std::span<const PublicationCellProbe> probes,
+                                                       std::size_t candidate_count,
+                                                       std::size_t winner_index,
+                                                       std::uint32_t winner_reuse, ReuseOf&& reuse_of) {
+    PublicationCellLoss loss;
+    const std::size_t bounded = std::min(candidate_count, probes.size());
+    for (std::size_t index = 0; index < bounded; ++index) {
+        const PublicationCellProbe& probe = probes[index];
+        // `probe.probes == 0U` USED to be the first conjunct and is deleted on purpose: every tallied probe
+        // increments exactly one of `goals`/`cell_only`/`other`, so `probes == goals + cell_only + other`
+        // always holds and `cell_only > 0` already implies `probes > 0`. A mutant that removes it passed all
+        // thirteen checks (verified 2026-09-27) -- an untestable conjunct is not a defensive one, and keeping
+        // it would invite a reader to think the classification can be skipped. If a future caller counts
+        // probes WITHOUT classifying them, the fix is that caller, not a guard here.
+        if (probe.cell_only == 0U || index == winner_index) { continue; }
+        // AT RISK: the cell blocked this candidate at least once. Whether any single veto is enough to
+        // disqualify it is the next question, and the breakdown says which veto did.
+        ++loss.at_risk;
+        if (probe.goals != 0U) { ++loss.blocked_by_goals; continue; }
+        if (probe.other != 0U) { ++loss.blocked_by_other; continue; }
+        const std::uint32_t reuse = static_cast<std::uint32_t>(reuse_of(index));
+        if (reuse <= winner_reuse) { ++loss.blocked_by_reuse; continue; }
+        ++loss.candidates;
+        loss.best_blocked_reuse = std::max(loss.best_blocked_reuse, reuse);
+    }
+    return loss;
+}
+
 // #6: THE INCUMBENT COST KEY, at namespace scope so a host-only test can compare two of them and assert
 // the ordering directly. It was private to the planner, which is why nothing tested it -- and the ordering
 // it encodes IS the operator's ruling ("evicting a victim that holds a restorable checkpoint while the host

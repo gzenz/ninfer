@@ -23,6 +23,21 @@ ninfer_add_test(ninfer_materialization_preservation_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_materialization_preservation.cpp"
   LIBRARIES ninfer_core)
 
+ninfer_add_test(ninfer_publication_cell_loss_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_publication_cell_loss.cpp"
+  LIBRARIES ninfer_core)
+
+# -D_GLIBCXX_ASSERTIONS, and it is LOAD-BEARING FOR ONE CASE IN THAT TEST. The bounds case (a candidate list
+# longer than the tally) asserts that `publication_cell_loss` does not read past the end of the span. With a
+# release-built libstdc++ that case CANNOT FAIL: removing the `std::min` bound makes it return rc=0 with every
+# check green, and only aborts (span:288, `__idx < size()`) once assertions are on -- verified both ways,
+# 2026-09-27. A control that cannot go red in the build it runs in is not a control, so the flag is set here
+# rather than left to a sanitizer job that does not exist.
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_compile_options(ninfer_publication_cell_loss_test PRIVATE
+    $<$<COMPILE_LANGUAGE:CXX>:-D_GLIBCXX_ASSERTIONS>)
+endif()
+
 ninfer_add_test(ninfer_kv_cache_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_kv_cache.cpp"
   LIBRARIES ninfer_core)

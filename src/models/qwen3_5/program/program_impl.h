@@ -585,6 +585,50 @@ public:
     [[nodiscard]] std::uint64_t demotable_eviction_checks() const noexcept {
         return demotable_eviction_checks_;
     }
+    // The private catalog's TWO readings, kept apart because they answer different questions. `losses` is
+    // the event -- a request where the cell alone made a better-reusing candidate unadoptable -- and is what
+    // the alert rests on -- NOT a capacity verdict, see the awk comment: it fires only when a candidate had no
+    // adoptable route at all, and the obvious case (Retain forced to consume) is excluded by construction.
+    // `probes` is the raw count of goal-probe calls, ~1,900 per
+    // planning run (45,533 over the 24 of one measured case, ~1,900 each -- NOT the old cell-free count's
+    // 4,500, which is a different quantity), kept only as the DENOMINATOR that says the loss count was
+    // measured rather than never asked:
+    // without it, `losses == 0` cannot be told from a planner that stopped probing. The first version of
+    // this instrument reported the probe count AS the loss and was wrong by three orders of magnitude.
+    [[nodiscard]] std::uint64_t publication_cell_losses() const noexcept {
+        return publication_cell_losses_;
+    }
+    [[nodiscard]] std::uint64_t publication_cell_probes() const noexcept {
+        return publication_cell_probes_;
+    }
+    // Returns the new count so the caller can rate-limit its print on it -- the reason the eviction site
+    // and the pool's growth both return a count instead of void.
+    std::uint64_t note_publication_cell_loss() noexcept { return ++publication_cell_losses_; }
+    // Runs where at least one non-winner candidate hit the cell-only failure. The diagnostic beside the loss,
+    // for deciding whether the loss is REACHABLE here; log-only, and not an alert.
+    std::uint64_t note_publication_cell_at_risk() noexcept { return ++publication_cell_at_risk_; }
+    // The at-risk TOTALS. The journal print is capped (8 then every 512th), so the printed line count is a
+    // SAMPLE: reading a count off it is the documented trap for the eviction print and was made here too.
+    void add_publication_cell_at_risk(std::uint32_t at_risk, std::uint32_t goals, std::uint32_t other,
+                                      std::uint32_t reuse) noexcept {
+        publication_cell_at_risk_runs_ += at_risk;
+        publication_cell_veto_goals_ += goals;
+        publication_cell_veto_other_ += other;
+        publication_cell_veto_reuse_ += reuse;
+    }
+    [[nodiscard]] std::uint64_t publication_cell_at_risk_runs() const noexcept {
+        return publication_cell_at_risk_runs_;
+    }
+    [[nodiscard]] std::uint64_t publication_cell_veto_goals() const noexcept {
+        return publication_cell_veto_goals_;
+    }
+    [[nodiscard]] std::uint64_t publication_cell_veto_other() const noexcept {
+        return publication_cell_veto_other_;
+    }
+    [[nodiscard]] std::uint64_t publication_cell_veto_reuse() const noexcept {
+        return publication_cell_veto_reuse_;
+    }
+    void add_publication_cell_probes(std::uint64_t count) noexcept { publication_cell_probes_ += count; }
     [[nodiscard]] detail::PhysicalResources admission_capacity() const noexcept;
     [[nodiscard]] bool isolated_request_feasible(const RequestBasePlan& base) const noexcept;
 
@@ -961,6 +1005,16 @@ private:
     // Every eviction the check above ran for -- the denominator. Without it a zero numerator cannot be
     // told from a gate that never had a chance to be true.
     std::uint64_t demotable_eviction_checks_             = 0;
+    // #6's other half, as a LOSS rather than a probe count: a request whose winning plan reused strictly
+    // fewer tokens than a candidate that the publication cell alone had made unadoptable. See the
+    // RuntimeStats field for why the probe count beside it must never be presented as this number.
+    std::uint64_t publication_cell_losses_               = 0;
+    std::uint64_t publication_cell_probes_               = 0;
+    std::uint64_t publication_cell_at_risk_              = 0;
+    std::uint64_t publication_cell_at_risk_runs_         = 0;
+    std::uint64_t publication_cell_veto_goals_           = 0;
+    std::uint64_t publication_cell_veto_other_           = 0;
+    std::uint64_t publication_cell_veto_reuse_           = 0;
     // W1-B (plan form): the durable {owner, state content epoch} pairing. Counted in every build with
     // its denominator; deliberately not enforced until a mismatch has actually been observed -- a throw
     // on this path kills the worker (the wedge, 2026-09-25), and an unobserved condition is not a licence

@@ -943,6 +943,20 @@ public:
     [[nodiscard]] std::uint64_t demotable_evictions() const noexcept;
     [[nodiscard]] std::uint64_t evictions_with_victim_room() const noexcept;
     [[nodiscard]] std::uint64_t demotable_eviction_checks() const noexcept;
+    // The private catalog: requests that LOST reuse to a missing cell, and the goal-probe denominator beside
+    // it. MUTATORS are needed because both are decided in `ResourceManager`'s planning, which holds only
+    // this façade -- every other counter in this block is incremented inside ProgramImpl's own TUs.
+    [[nodiscard]] std::uint64_t note_publication_cell_loss() noexcept;
+    [[nodiscard]] std::uint64_t note_publication_cell_at_risk() noexcept;
+    void add_publication_cell_at_risk(std::uint32_t at_risk, std::uint32_t goals, std::uint32_t other,
+                                      std::uint32_t reuse) noexcept;
+    [[nodiscard]] std::uint64_t publication_cell_at_risk_runs() const noexcept;
+    [[nodiscard]] std::uint64_t publication_cell_veto_goals() const noexcept;
+    [[nodiscard]] std::uint64_t publication_cell_veto_other() const noexcept;
+    [[nodiscard]] std::uint64_t publication_cell_veto_reuse() const noexcept;
+    void add_publication_cell_probes(std::uint64_t count) noexcept;
+    [[nodiscard]] std::uint64_t publication_cell_losses() const noexcept;
+    [[nodiscard]] std::uint64_t publication_cell_probes() const noexcept;
 
     [[nodiscard]] bool isolated_request_feasible(const RequestBasePlan& base) const noexcept;
     [[nodiscard]] runtime::ProgramResourceRevision resource_revision() const noexcept;

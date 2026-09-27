@@ -85,6 +85,19 @@ echo "Log: $LOG"
 
 CT_FLAGS_EXTRA=""
 [ -n "${CHAT_TEMPLATE:-}" ] && CT_FLAGS_EXTRA="--chat-template $CHAT_TEMPLATE"
+# STATS_PORT: bind the stats endpoint for the TEST server. The caller cannot do this through
+# CT_FLAGS_EXTRA -- this assignment REINITIALISES it, so a caller's value (and its `--stats-port`) is
+# discarded silently, which cost two runs on 2026-09-27: both read empty `/stats` behind `2>/dev/null`, and
+# "no stats server", "wrong port" and "bad parse" were indistinguishable, so an instrument that had in fact
+# fired looked dead. `stats_port = 0` (the default) means the stats server is never bound at all, so the
+# variable is required for any run that wants a second, independent read of a counter.
+if [ -n "${STATS_PORT:-}" ]; then
+  # 8081 is PROD's stats port. The 8080/8085 guards above do not cover it, and a test server answering
+  # `:8081` would serve prod's `/stats` readers their own numbers -- the same class of mix-up the port rules
+  # exist for, on the other channel.
+  [ "$STATS_PORT" = "8081" ] && { echo "REFUSED: STATS_PORT 8081 is prod's stats port"; exit 2; }
+  CT_FLAGS_EXTRA="$CT_FLAGS_EXTRA --stats-port $STATS_PORT"
+fi
 # --preserve-thinking retains the open assistant turn as a byte-stable
 # ResponseReplay rewrite checkpoint instead of re-rendering it (TurnClosure).
 # v2's render defaulted preserve_thinking=true, v3 to false — a known regression

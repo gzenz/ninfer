@@ -1028,6 +1028,30 @@ struct RuntimeStats {
     std::uint32_t device_main_kv_occupied_pages        = 0;
     std::uint32_t device_backend_kv_occupied_pages     = 0;
     std::size_t host_kv_occupied_bytes                 = 0;
+    // THE PRIVATE-CONTINUATION CATALOG (`--max-private-continuations`, 18 -> 32 on 2026-09-27). This is the
+    // occupancy/capacity PAIR, which this pool had NEITHER half of -- host state slots
+    // (`host_state_capacity_slots` vs `host_state_occupied_slots`), host KV (`host_kv_capacity_bytes` vs
+    // `host_kv_occupied_bytes`) and the pinned pool (`host_pinned_*`) each report both, which is why
+    // exhaustion here was invisible. The catalog is NOT the only one missing it: the shared-prefix pool has
+    // neither half either, and `device-state-slots` has occupancy without a capacity -- both still unexposed,
+    // recorded in `plan.md` §4.
+    //
+    // Occupancy counts cells that are not `Vacant` -- CATALOGUED, CLAIMED, or `ReservedForActive`, which is
+    // an ACTIVE LANE'S OWN future publication cell and not the in-flight capture descriptor (that is a
+    // Program address-space slot, `address_capacity = P + S + 1`). Read at STATS PUBLICATION, not on
+    // demand: `EngineCore::publish_runtime_stats` fills this snapshot on the engine worker (the same lock
+    // planning runs under, `execution_mutex_`) and `/stats` serves the published copy -- so it is as of the
+    // last publication (the interval, `--log-stats-interval-ms` = 5 s on prod, but also ~20 event sites), not
+    // of the request that reads it.
+    //
+    // **`occupied == capacity` is NOT evidence that the catalog is binding, and must not be read as one.**
+    // Every active lane holds a reserved cell, so occupancy is at least the lane count by construction, and
+    // under eviction-to-publish a full catalog is the ordinary steady state -- measured on a run with 99.9%
+    // turn-closure reuse. The reading that means something is `pressure_publication_cell_losses`, which is
+    // decided per PLANNING RUN against the candidate that lost (the backfill loop can inspect one request
+    // several times); occupancy only says whether to look at it.
+    std::uint32_t private_catalog_capacity_cells       = 0;
+    std::uint32_t private_catalog_occupied_cells       = 0;
     std::uint64_t pressure_private_owners_degraded     = 0;
     std::uint64_t pressure_private_owners_demoted      = 0;
     // The KV half of a demote-to-host. The counter above fires only on STATE residency, and
@@ -1057,6 +1081,36 @@ struct RuntimeStats {
     // reports room this victim's own footprint may not fit -- the three post-fix prod evictions were all
     // `demotable=1` at 17/18 slots with host KV 94% full.
     std::uint64_t pressure_evictions_with_victim_room = 0;
+    // The OTHER half of #6, and the one that had no signal at all: REQUESTS that lost reuse to the private
+    // catalog. A plan takes its publication cell from its own consumed private source, a `Vacant` cell, or a
+    // victim it evicts; when every cell is catalogued and no victim is evictable, a candidate that could
+    // have been adopted cannot be, and it used to be dropped with no counter, no journal line and no /stats
+    // field -- so "the catalog is too small" was indistinguishable from the eleven other reasons the goal
+    // builder returns nullopt. `assessed_targets_without_goal` (JSONL, 3e0880bf) does NOT cover it: it is
+    // per-request, conflates every reason, and is absent from /stats and from the journal.
+    //
+    // COUNTED ONCE PER REQUEST, and only when it cost something: the winning plan reused strictly fewer
+    // tokens than a candidate that EVERY one of whose goal probes failed on the cell and on nothing else.
+    // Both halves of that matter. Counting probe CALLS instead -- the first version of this instrument --
+    // reported 108,544 for 24 requests, because the planner probes a cell-less option from five sites on its
+    // way to taking an eviction; that number goes nonzero whenever retention fills the catalog, which is the
+    // normal state under eviction-to-publish, so it cannot falsify a capacity raise and fires as an alert on
+    // healthy traffic. Measured against it: 97 PRINTED LINES -- about 45.6k probes, since the print is
+    // rate-limited to 8 then every 512th -- in a run where four requests reused 99.9%.
+    std::uint64_t pressure_publication_cell_losses     = 0;
+    // The DENOMINATOR. Raw goal-probe calls, one or two orders of magnitude larger than any plausible loss
+    // count, kept only so that `losses == 0` can be told from a planner that stopped probing. Never read it
+    // as the loss: it is search pressure, not an outcome.
+    std::uint64_t pressure_publication_cell_probes     = 0;
+    // The at-risk totals, and they exist because the JOURNAL PRINT IS CAPPED -- 8 then every 512th -- so the
+    // printed line count is a SAMPLE and never the count. Reading "8 at-risk runs" off eight lines is the
+    // documented trap for the eviction print, and it was made here before these fields existed. `at_risk_runs`
+    // counts non-winner candidates that hit the cell-only failure; the veto fields say which single condition
+    // disqualified each (a goal existed / another failure / would not out-reuse the winner).
+    std::uint64_t pressure_publication_cell_at_risk_runs = 0;
+    std::uint64_t pressure_publication_cell_veto_goals   = 0;
+    std::uint64_t pressure_publication_cell_veto_other   = 0;
+    std::uint64_t pressure_publication_cell_veto_reuse   = 0;
     std::uint64_t pressure_checkpoints_dropped         = 0;
     std::uint64_t pressure_searches                    = 0;
     std::uint64_t pressure_search_budget_exhaustions   = 0;

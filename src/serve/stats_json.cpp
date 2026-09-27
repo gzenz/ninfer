@@ -108,6 +108,14 @@ std::string format_stats_json(const ninfer::RuntimeStats& s, const ninfer::Memor
         {"private_evictions_demotable", s.pressure_private_evictions_demotable},
         {"evictions_with_victim_room", s.pressure_evictions_with_victim_room},
         {"private_eviction_checks", s.pressure_private_eviction_checks},
+        {"publication_cell_losses", s.pressure_publication_cell_losses},
+        // The denominator beside it: goal-probe calls, not an outcome. See the RuntimeStats comment.
+        {"publication_cell_probes", s.pressure_publication_cell_probes},
+        // Uncapped, because the journal line that reports these is rate-limited to 8 then every 512th.
+        {"publication_cell_at_risk_runs", s.pressure_publication_cell_at_risk_runs},
+        {"publication_cell_veto_goals", s.pressure_publication_cell_veto_goals},
+        {"publication_cell_veto_other", s.pressure_publication_cell_veto_other},
+        {"publication_cell_veto_reuse", s.pressure_publication_cell_veto_reuse},
         {"checkpoints_dropped", s.pressure_checkpoints_dropped},
         {"searches", s.pressure_searches},
         {"search_budget_exhaustions", s.pressure_search_budget_exhaustions},
@@ -130,6 +138,11 @@ std::string format_stats_json(const ninfer::RuntimeStats& s, const ninfer::Memor
         {"host_kv_capacity_bytes", m.host_kv_capacity_bytes},
         {"host_kv_occupied_bytes", m.host_kv_occupied_bytes},
         {"host_state_capacity_slots", m.host_state_capacity_slots},
+        // From `s`, not `m`: the catalog lives in the ResourceManager (runtime) and the MemorySummary is
+        // assembled by ProgramImpl, which cannot see it. Kept in this block anyway so the capacity/occupancy
+        // pairs read together.
+        {"private_catalog_capacity_cells", s.private_catalog_capacity_cells},
+        {"private_catalog_occupied_cells", s.private_catalog_occupied_cells},
         {"host_pinned_capacity_bytes", m.host_pinned_capacity_bytes},
         {"host_pinned_free_bytes", m.host_pinned_free_bytes},
         {"host_pinned_chunks", m.host_pinned_chunks},

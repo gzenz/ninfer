@@ -245,14 +245,24 @@ while it lasts. In dev time that is the entire cost; in prod time it is the smal
   {entries,bytes}: dead/live/idle/active), host-KV unit bytes, `pressure.*`,
   `scheduler.*`. **The stats endpoint is `:8081`; `:8080/stats` serves nothing at all**
   (`http=000 bytes=0`) — querying the wrong port there once made a working counter look dead.
-- `/stats` is where a counter that the journal has stopped printing can still be read. Two for #6:
-  `pressure_private_evictions_demotable` and its denominator `pressure_private_eviction_checks` — needed
+- `/stats` is where a counter that the journal has stopped printing can still be read. Four for #6:
+  `pressure_private_evictions_demotable` and its denominator `pressure_private_eviction_checks`, plus
+  `pressure_evictions_with_victim_room` (evictions of a RESTORABLE victim whose own slots would have fitted
+  -- narrower than `demotable`) and, in the REQUEST LOG's `materialization` block, the decisive pair
+  `feasible_preserving_alternatives` against `chosen_restorable_evictions`: both > 0 in one request means a
+  plan that preserved a restorable checkpoint was assessed feasible and a destroying one was taken anyway — needed
   because the eviction print below is rate-limited to the first 8 and then every 512th, so its silence
   after the 8th means "not printed", not "not recurring".
 - **The eviction line is**
-  `[engine] private victim evicted: demotable=%d frontier=%u endpoint=%d rewrite=%d anchors=%zu
-  host_state_slots=%u/%llu host_kv=%zu/%llu checked=%llu demotable_total=%llu`
-  (`materialization.cpp:2157`). `demotable` is a **capacity** test at the decision — `host_state_slots` and
+  `[engine] private victim evicted: demotable=%d restorable=%d session=%016llx cont=%u frontier=%u
+  endpoint=%d rewrite=%d anchors=%zu victim_host_slots=%u victim_dev_slots=%u host_state_slots=%u/%llu
+  host_kv=%zu/%llu victim_room=%d checked=%llu demotable_total=%llu`
+  (`materialization.cpp`). **This spec had drifted**: it was written before `restorable=`, `session=`,
+  `victim_*_slots=` and `victim_room=` existed, so a reader parsing it would silently mis-read every field
+  after `demotable`. Corrected 2026-09-27 against the format string itself. `victim_room` is the ROOM
+  QUESTION ASKED PER VICTIM for state slots (usage + this victim's own slots <= capacity) -- `demotable` is
+  a pool-level `<` test that reports room the victim's footprint may not fit, which is why the two are
+  printed side by side. `demotable` is a **capacity** test at the decision — `host_state_slots` and
   `host_kv_bytes` both under capacity — and NOT a statement that the victim could have been demoted (that
   needs a complete, immutable, settled StateImage) nor that the planner chose eviction for value reasons.
   The per-tier `{dead,live,idle,active}` census is in `/stats`, not in the journal.

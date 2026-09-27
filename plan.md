@@ -1082,6 +1082,25 @@ task needs no re-derivation:
    `NINFER_SEARCH_MS`), and see whether `adoptable > 0` with `chosen = 0` appears in the same regime -- which
    would show the preserving plan EXISTS and the 400 ms cap was starving it, making the defect the budget
    rather than capacity. Nothing here says the fix is wrong; it says the fix's effect is still unmeasured.
+   **THE OVERRIDE WAS REMOVED EARLY, because it correlated with the workload FAILING (2026-09-27 13:09).**
+   Comparison over the operator's own traffic, same binary (`6197549f`), same workload:
+
+   | window | duration | `WORKER RECOVER` | `HTTP 500` |
+   |---|---|---|---|
+   | without `NINFER_SEARCH_MS` (12:25 -> 12:58) | 33 min | **0** | 10 |
+   | with `NINFER_SEARCH_MS=2000` (12:58 -> 13:09) | 11 min | **3** | 4 |
+
+   500s occur in both windows, so they are not the override's signature; **recoveries are** -- zero in 33
+   minutes without it against three in eleven minutes with it. The mechanism is plausible and worth stating:
+   a 5x search budget holds the admission path five times as long, and under concurrent sessions that is
+   exactly how the capture path gets starved of prepared State capacity. **No `#6` reading was obtained** --
+   no restorable eviction occurred under the 2 s budget (the engine demoted instead) -- so the run bought a
+   correlation and no measurement, at the price of the operator's requests. Removed rather than extended, and
+   the drop-in is gone (`/proc/<pid>/environ` has no `NINFER_SEARCH_MS`, task #21 closed). The NEW process is
+   itself the control: recoveries should stop.
+   **This is also evidence about the cut-off's value**, which the W5 section asked for: the 400 ms bound is
+   not arbitrary tuning if five times it correlates with capacity failures -- the bound appears to be
+   protecting admission latency, not merely saving planning work.
    **FIRST REAL-TRAFFIC EVENT AFTER THE OVERRIDE (2026-09-27 13:05, and it is NOT about the override):** one
    `WORKER RECOVER: selected capture has no prepared logical State capacity`, two `HTTP 500`s (req#25,
    req#26), and **zero non-zero residuals** -- the fail-all released everything

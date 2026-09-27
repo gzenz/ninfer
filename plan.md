@@ -1882,6 +1882,30 @@ it is an engine regression, which `git stash` settles in one run.
    fails to pin converts a clean eviction into the `bad_alloc` → worker-recovery path the plan's §Risks 1
    names, so the growth must be taken BEFORE the plan is priced, not during execution.
 
+### 3b. THE ELASTIC POOL'S PROD ACCEPTANCE, CHECKED AT LAST (2026-09-27) — one of three is FAILING
+
+The plan's Prod criterion was explicit: "`demotable` evictions should fall, `private_owners_demoted*` should
+rise, and the request-log monitor leg's reuse fraction should improve". **I checked two of the three and
+never checked the third, while the watcher alerted on it for hours and I reclassified it as background
+noise.** Recorded here as a criterion, because that is what it is:
+
+| criterion | measured | verdict |
+|---|---|---|
+| `demotable` evictions fall | they still occur, and the decisive pair shows no adoptable preserving plan in every case (adoptable>0 WITH chosen>0 = 0 across 49+133 records) | met in the sense that the remaining evictions are not ordering-caused; the pressure itself is unchanged |
+| `private_owners_demoted*` rise | **demoted 38 vs evicted 5** over the same window | **met**: 88% demotions |
+| **reuse fraction improves** | **FAILING**: the reused prefix is pinned at ~23,353 while sessions grow (75% at 31k tokens -> 36% at 65k), costing 6-11 s of re-prefill per turn | **FAILING, and it has been failing for hours** |
+
+**The mechanism, located:** the plan selects the `SharedStablePrefix` checkpoint's RECORDED frontier -- the
+stable head as published, which by construction never grows -- while the session's growing part lives in
+private continuations. Those measure 95.6-99.6% reuse (36k-88k tokens) when taken, so v3 HAS a growing
+mechanism; the failure is that the shared snapshot is taken instead, or that no private candidate exists.
+**Which of those two it is, is UNMEASURED** -- the request log carries no session key, so requests cannot be
+joined to a conversation, and no instrument reports whether a longer private candidate was available at the
+decision. That instrument is the next step; the fix (selection vs retention) follows from what it prints.
+**And the process lesson:** a plan's acceptance criterion is not a curiosity to be noticed later. This one was
+written down, alerted on continuously, and still never checked -- the same shape as an instrument that fires
+and nobody reads.
+
 ### 4. Open claims — do not quote these as settled
 
 - **`planner-latency` FAILS, and it is unattributed.** The suite counts materialization rows whose

@@ -1082,6 +1082,20 @@ task needs no re-derivation:
    `NINFER_SEARCH_MS`), and see whether `adoptable > 0` with `chosen = 0` appears in the same regime -- which
    would show the preserving plan EXISTS and the 400 ms cap was starving it, making the defect the budget
    rather than capacity. Nothing here says the fix is wrong; it says the fix's effect is still unmeasured.
+   **FIRST REAL-TRAFFIC EVENT AFTER THE OVERRIDE (2026-09-27 13:05, and it is NOT about the override):** one
+   `WORKER RECOVER: selected capture has no prepared logical State capacity`, two `HTTP 500`s (req#25,
+   req#26), and **zero non-zero residuals** -- the fail-all released everything
+   (`shared catalogued=5 released-refused=0 skipped=0 continuations-live=11`, residual all-zero on every
+   axis), so by the rule in CLAUDE.md this recovery left nothing unowned and is NOT #9's leak.
+   **The trigger is STATE-CAPACITY EXHAUSTION, and the pre-grow did not prevent it:** the pool was at
+   **21/22** when the capture failed, having been grown 16 -> 22 by **8 PRE-GROWN firings with zero
+   refusals** in the preceding minutes. So growth was permitted, happened, and the demand still exceeded
+   it. That is the honest limit of a one-slot-per-demand policy under a workload with many concurrent
+   sessions: it races demand rather than anticipating it, and losing the race costs a request (500), not a
+   demotion. Recorded against §3 item 6 as the measured cost side of that design.
+   Also seen in the same window: `FOREIGN-REBIND lane=0 expected=(0,0) record_lane=1 recorded=(1,0)
+   foreign=16/292` -- the kv-binding probe reporting a lane mismatch, the D2 family's instrument, noted
+   rather than diagnosed here.
    **THE SAME CONTROL IS NOW RUNNING ON REAL TRAFFIC (2026-09-27, operator-authorized).** A systemd drop-in
    `/etc/systemd/system/ninfer.service.d/zz-search-ms-experiment.conf` sets `Environment=NINFER_SEARCH_MS=2000`
    on `ninfer.service`, verified present in the running process's `/proc/<pid>/environ`; prod runs the same

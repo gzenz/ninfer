@@ -917,7 +917,7 @@ genuinely need prod traffic -- #2's underflow and #9's wedge.
    request, not by config text), the wiring is in `~/ninfer-ensure.sh` so it survives a reboot, and the
    old 22 GB artifact was referenced- or held-open-checked before deletion (`df`: 655 ->
    676 GB free).
-6. **#17 — CLOSED (2026-09-26): the STATE image's host-to-device restore is asserted end-to-end.** The
+6. **(numbered 6 alongside the live item below -- see the note at the end of this list) #17 — CLOSED (2026-09-26): the STATE image's host-to-device restore is asserted end-to-end.** The
    coverage behind `fc5d0cf3` (demote-before-H2D) and `9521103d` (the restore timer) now has a live
    assertion, in the scenario the item itself prescribed: **`state-image-restore`**
    (`tests/models/qwen3_5/test_engine_prefix_real.cpp`), whose route is §2c's cross-session adoption.
@@ -939,6 +939,11 @@ genuinely need prod traffic -- #2's underflow and #9's wedge.
    nothing and its flat H2D would read as a clean zero -- the silent-instrument failure this file keeps
    recording. A negative stays a possible result: if the adopter had restored main/backend WITHOUT the state
    image, that would have said the state axis is not on this path.
+**Numbering note (2026-09-27):** the list above has TWO entries numbered 6 -- the closed `#17` and the live
+`#6`. They are not renumbered because references to "§2 item 6" in the dated narrative mean the `#17` entry
+(where the state-image coverage was recorded) and renumbering would silently repoint them. Prefer the names
+`#17` and `#6` over the numbers.
+
 ### W5 port: `guided_closure` before `root_maximal` — **NOT A PORT, on the evidence available (2026-09-27);
 the residual is a heavier measurement, not an implementation**
 

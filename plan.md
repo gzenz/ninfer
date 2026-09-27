@@ -1724,7 +1724,23 @@ it is an engine regression, which `git stash` settles in one run.
    retries. Fail-closed on the budget, so a refusal returns nullopt and the caller is unchanged: the scenario
    battery is `rc=0` and behaviour-neutral.
    **The parameter's remaining role, stated plainly:** an initial size and the trim FLOOR -- not a ceiling.
-   **THE DECISIVE PAIR HAS A GAP, AND IT INVALIDATES PART OF WHAT I CONCLUDED FROM IT (2026-09-27 14:04).**
+   **⚠ THE "GAP IN THE PAIR" WAS MY READING ERROR, CORRECTED WITHIN THE HOUR — THERE IS NO GAP.**
+   I concluded the 14:04:28 burst had no matching record and blamed the capture planner. **The record exists:
+   `line=26378 14:04:56 adoptable=0 chosen=13 targets=1974`** -- it completed 28 SECONDS AFTER the evictions,
+   and I read the log ~a minute too early. Records are written at completion; a long request lands well after
+   the eviction it caused. My "the pair instruments only one path" reasoning was wrong, and the instrument
+   extension I was asked to build would have been work spent on a gap that is not there. (Fifth premature
+   conclusion today, this one caught before building on it rather than after.)
+   **What the record actually says, and it is the interesting part:** `adoptable=0` -- no adoptable
+   preserving plan -- for a request that evicted THIRTEEN victims with the state pool 8/16 FREE and host KV
+   at 2.03 GB of 32.2. Targets=1974, so the search was NOT arena-limited either.
+   **So the open question sharpens to this:** with room on the host state axis AND the host KV axis, why was
+   no preserving plan ADOPTABLE? The victims mostly held host slots already (6 of 7 `victim_host_slots>0`),
+   so "demote" is meaningless for them -- but they also held `victim_dev_slots=2` each, and a demote WOULD
+   have freed those device slots, which is what the burst actually did free (8/16 -> 1/16). So the eviction
+   looks like a DEVICE-side reclaim that a demote could equally have served. That is the question to chase,
+   and it is on the device axis, not the host one this item has been about.
+   **(Superseded, kept to show what it replaced:)**
    A burst of SEVEN evictions at 14:04:28 -- every one `demotable=1 restorable=1`, `victim_room=1`, frontiers
    54k-91k, with the state pool NOT full (8/16 occupied, so 8 slots free) and host KV at 2.03 GB of 32.2
    falling to 0 -- has NO matching request record. The two records either side of it both read

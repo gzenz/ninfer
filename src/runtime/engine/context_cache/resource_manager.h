@@ -2224,6 +2224,46 @@ private:
         Candidate& candidate =
             candidates[static_cast<std::size_t>(selected_candidate - candidate_inputs.begin())];
 
+        // THE DECIDING COMPARISON (2026-09-27). The reuse-choice instrument (`request_plan.cpp`) established
+        // that a LONGER private continuation is alive when the shared snapshot is taken, and that is all it
+        // could say -- which candidate won, and by what, was invisible. This reports the winner beside the
+        // best LOSING candidate, by the one quantity that says how much reuse each would have saved.
+        //
+        // It exists because a fix was attempted on a guess: `FoldedCost::key()` was reordered to promote
+        // `remaining_text_prefill` above the hit/credit terms, and after a rebuild the selections were
+        // BYTE-IDENTICAL -- so that key does not decide this comparison, or the term does not differ between
+        // these candidates. Reading the decision beats guessing at it, and this is the read.
+        //
+        // `longer_lost=1` is the defect: a candidate reusing strictly more tokens was available and lost.
+        {
+            static std::uint64_t selections = 0;
+            ++selections;
+            if (selections <= 8U || selections % 512U == 0U) {
+                const auto reuse_of = [](const Candidate& item) -> std::uint32_t {
+                    return item.plan ? item.plan->summary().reusable_prompt_tokens : 0U;
+                };
+                const std::uint32_t winner_reuse = reuse_of(candidate);
+                std::uint32_t best_other_reuse     = 0U;
+                bool          best_other_is_shared = false;
+                for (const Candidate& other : candidates) {
+                    if (&other == &candidate) { continue; }
+                    const std::uint32_t other_reuse = reuse_of(other);
+                    if (other_reuse > best_other_reuse) {
+                        best_other_reuse     = other_reuse;
+                        best_other_is_shared = other.shared_source.has_value();
+                    }
+                }
+                std::fprintf(stderr,
+                             "[engine] reuse-select: winner=%s reuse=%u | best_loser=%s reuse=%u "
+                             "longer_lost=%d candidates=%zu selects=%llu\n",
+                             candidate.shared_source.has_value() ? "shared" : "private", winner_reuse,
+                             best_other_is_shared ? "shared" : "private", best_other_reuse,
+                             static_cast<int>(best_other_reuse > winner_reuse), candidates.size(),
+                             static_cast<unsigned long long>(selections));
+                std::fflush(stderr);
+            }
+        }
+
         Choice choice(destination, std::move(*planned->plan), catalog_count_,
                       base.context_cache().session_key, base.context_cache().retention,
                       base.context_cache().update_session_index, publication_order);

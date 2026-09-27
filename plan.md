@@ -1724,9 +1724,32 @@ it is an engine regression, which `git stash` settles in one run.
    retries. Fail-closed on the budget, so a refusal returns nullopt and the caller is unchanged: the scenario
    battery is `rc=0` and behaviour-neutral.
    **The parameter's remaining role, stated plainly:** an initial size and the trim FLOOR -- not a ceiling.
-   **What would settle the fix:** the recovery rate over a window comparable to the ~0.7/min measured before
-   it. Live after the 13:19:17 restart: exe `d7e6f53f`, symbol present, 0 recoveries and 0 500s since -- a
-   few minutes of a possibly lighter workload, which is NOT a control (see the retraction above).
+   **MEASURED OVER COMPARABLE WINDOWS (2026-09-27):**
+
+   | | pre-fix (13:09:46 -> 13:19:17, 9.5 min) | post-fix (13:19:17 -> ~10 min) |
+   |---|---|---|
+   | state-capacity recoveries | **4** (0.42/min) | **0** |
+   | arena-full recoveries | 0 | 0 |
+   | HTTP 500s | 11 | 4 |
+
+   Zero recoveries over a window as long as the pre-fix one, on the same workload: strong support, NOT proof
+   -- the load is not controlled, only the duration and the workload are comparable. exe `d7e6f53f`, the new
+   symbol present in the running process, battery `rc=0` and behaviour-neutral.
+   **The eviction pressure is untouched by this fix, as it must be:** 8 evictions post-fix, ALL
+   `restorable=1`, in one second (13:22:54), frontiers 41k-57k, host KV 4.9-6.8 GB of 32.2 (15-21%) while the
+   state pool drained 30/31 -> 18/31. Five of the eight held THREE host slots, so the engine was reclaiming
+   host STATE -- the state axis is the binding resource, and this fix addresses capture FAILURES, not the
+   planner's eviction choice.
+   **That burst is also the reuse stall's cause, measured from the other side:** the frontier sits pinned at
+   ~23,353 while prompts reach 65-67k, so a turn recomputes 44,332 tokens in **11.2 s** (up from 17k/4 s
+   earlier in the same session). `shared_stable_prefix` 10 selections against 2 private says the engine keeps
+   taking the path that cannot advance, because the evictions removed the continuations that would.
+   **OPEN, NOT EXPLAINED:** 4 HTTP 500s post-fix with ZERO recoveries. Different cause from the ones fixed
+   here; recorded as unknown rather than folded into the improvement.
+   **The lever that remains is the pool FLOOR**: `~/ninfer-ensure.sh` line 53 (the 262144 profile prod runs)
+   sets `--host-state-slots 16`; 32 would cost ~3 GiB pinned (against 14.5 GB available) and stop the pool
+   saturating -- no saturation, no reclaim-evictions, and reuse could advance. It is the operator's file and
+   their call.
 6. **Make host growth REACHABLE from planning — IMPLEMENTED (`d629061c`), CORRECTED (`cefa1b03`), and now
    OBSERVED FIRING ON PROD (2026-09-27).** **What the soak shows, from two independent instruments that
    agree** (`results/prefix-real-evidence/20260927-100527/`: the journal lines, the `/stats` read, and a

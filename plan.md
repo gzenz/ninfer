@@ -917,6 +917,21 @@ genuinely need prod traffic -- #2's underflow and #9's wedge.
    request, not by config text), the wiring is in `~/ninfer-ensure.sh` so it survives a reboot, and the
    old 22 GB artifact was referenced- or held-open-checked before deletion (`df`: 655 ->
    676 GB free).
+6. **(NEW SIDE-EVIDENCE, 2026-09-27 — WHAT EVICTING A RESTORABLE VICTIM COSTS, in seconds.)** On the
+   operator's live workload the watcher raised 16 low-reuse alerts, and the distribution is the finding:
+   **40 occurrences of the SAME frontier `hit=23353`** (a few others at 45k-54k), on a session whose prompt
+   grew 41k -> 58k while the reused prefix stayed pinned at 23,353 — so every turn re-prefilled the whole
+   tail, **17.7k-34.7k tokens, measured at 3.9-7.8 s per turn**.
+   **And the path counts say why:** `shared_stable_prefix_selections = 50` against `private_endpoint = 3`,
+   `private_response_replay = 1`, `private_turn_closure = 1`. The engine keeps taking the SHARED prefix
+   path, which by construction cannot advance past where it was published, instead of a PRIVATE
+   continuation that would extend to the frontier. **The likely mechanism links this to the evictions above:**
+   a restorable victim holding host slots is evicted, its continuation goes with it, and the private path
+   loses the target that would have advanced reuse — leaving the shared prefix as the best available.
+   **So this is the cost of the demote-vs-evict defect expressed in a unit that is felt rather than argued:**
+   seconds of re-prefill per turn, for every turn after the eviction. It is also the strongest argument yet
+   for the operator's ruling -- the alternative to evicting is not only "preserve work", it is "keep using
+   the cache".
 6. **(numbered 6 alongside the live item below -- see the note at the end of this list) #17 — CLOSED (2026-09-26): the STATE image's host-to-device restore is asserted end-to-end.** The
    coverage behind `fc5d0cf3` (demote-before-H2D) and `9521103d` (the restore timer) now has a live
    assertion, in the scenario the item itself prescribed: **`state-image-restore`**

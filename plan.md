@@ -1761,7 +1761,24 @@ it is an engine regression, which `git stash` settles in one run.
    state pool drained 30/31 -> 18/31. Five of the eight held THREE host slots, so the engine was reclaiming
    host STATE -- the state axis is the binding resource, and this fix addresses capture FAILURES, not the
    planner's eviction choice.
-   **That burst is also the reuse stall's cause, measured from the other side:** the frontier sits pinned at
+   **CORRECTION (2026-09-27, and it refutes my own mechanism): THE STALL IS A SELECTION COST, NOT LOST
+   CONTINUATIONS.** I claimed the evictions destroyed the continuations whose reuse would advance the
+   frontier, leaving the shared prefix as the best available. The request log says otherwise, by path:
+
+   | reuse path | n | median hit tokens | median reuse | max hit |
+   |---|---|---|---|---|
+   | `shared_stable_prefix` | 38 | **23,353** | 69.8% | 47,119 |
+   | `private_endpoint` | 36 | 36,171 | **95.6%** | 87,641 |
+   | `private_response_replay` | 21 | 41,426 | **99.6%** | 88,505 |
+   | `root` | 9 | 0 | 0.0% | 0 |
+
+   **26 of 38 shared-prefix requests are within 200 tokens of 23,353** -- that path is pinned -- while the
+   PRIVATE paths reach 36k-88k at 95.6-99.6%. The private continuations are available and effective; the cost
+   is that some requests take the shared path instead. **So the question is not "why were the continuations
+   lost" but "why does the engine choose a ~70% path where a ~95-99% one exists"** -- a reuse-path SELECTION
+   question, the same family as #6 (a choice the cost model makes), and a better-targeted one than the
+   mechanism I had asserted without data.
+   **(Superseded text, kept only to show what it replaced:)** the frontier sits pinned at
    ~23,353 while prompts reach 65-67k, so a turn recomputes 44,332 tokens in **11.2 s** (up from 17k/4 s
    earlier in the same session). `shared_stable_prefix` 10 selections against 2 private says the engine keeps
    taking the path that cannot advance, because the evictions removed the continuations that would.

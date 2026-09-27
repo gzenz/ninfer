@@ -455,20 +455,28 @@ class Monitor:
                 pass
         else:
             try:
+                # 64 KiB rather than 4: the same high-rate pricing line drowns a small tail (see the
+                # journal branch above for the measurement that caught this).
                 with open(self.cfg.serve_log, "rb") as f:
                     f.seek(0, os.SEEK_END)
                     size = f.tell()
-                    f.seek(max(0, size - 4096))
-                    tail = f.read(4096)
+                    f.seek(max(0, size - 65536))
+                    tail = f.read(65536)
                 log_alive = _heartbeat_in(tail, binary=True)
             except OSError:
                 pass
             if not log_alive:
                 try:
+                    # BY TIME, NOT BY LINE COUNT. `-n 50` looked reasonable and was useless under load:
+                    # prod prints hundreds of `checkpoint StateImage priced:` lines per second, so the last
+                    # 50 lines contain none of the once-per-5s throughput lines -- measured 0 matches in the
+                    # last 50 lines against 37 in the last 3 minutes, while the engine was demonstrably
+                    # alive. A fallback that searches where the heartbeat cannot appear is a fallback that
+                    # reports a healthy server as dead.
                     out = subprocess.run(
                         ["journalctl", "-u", self.cfg.journal_unit, "--no-pager",
-                         "-o", "cat", "-n", "50"],
-                        capture_output=True, text=True, timeout=10,
+                         "-o", "cat", "--since", "-120s"],
+                        capture_output=True, text=True, timeout=20,
                     )
                     log_alive = _heartbeat_in(out.stdout)
                 except (OSError, subprocess.SubprocessError):
@@ -1231,10 +1239,17 @@ function renderKvBars(latest){
   } else {
     h+='<div class="empty">host KV cache disabled</div>';
   }
-  h+='<div style="font-size:12px;color:var(--muted);  // THE SHARED PINNED POOL (2026-09-26). Host KV and host state slots now come out of ONE elastic pile, so
-  // this panel says whether it is working: `grows` moving means the engine took room on demand instead of
-  // failing the plan; `refusals` moving means it wanted room and could not have it; and the demotable
-  // ratio says whether demotion is winning over eviction.
+  // THE SHARED PINNED POOL: host KV and host state slots come out of ONE elastic pile, so this panel says
+  // whether it is working -- `grows` moving means the engine took room on demand instead of failing the
+  // plan; `refusals` moving means it wanted room and could not have it; the demotable ratio says whether
+  // demotion is winning over eviction.
+  //
+  // THESE COMMENT LINES WERE THE BUG. They were inserted as PYTHON comments INSIDE this JavaScript string
+  // literal, so the string never closed, the whole script failed to parse ("Invalid or unexpected token")
+  // and NOTHING on the page ran -- no fetch, no tiles, every card empty, for every viewer. The page is a
+  // JS template inside a Python file, so a mistake here is invisible until a browser parses it: see
+  // tools/monitor/check-dashboard-js.sh, which extracts the script and runs `node --check`.
+  h+='<div style="font-size:12px;color:var(--muted);margin:6px 0 2px">shared pinned pool</div>';
   const poolCap=mem.host_pinned_capacity_bytes||0,poolFree=mem.host_pinned_free_bytes||0;
   const poolUsed=Math.max(0,poolCap-poolFree);
   const poolPct=poolCap?poolUsed/poolCap*100:0;

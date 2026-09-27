@@ -479,6 +479,8 @@ std::uint64_t Program::evictions_with_victim_room() const noexcept {
 std::uint64_t Program::demotable_eviction_checks() const noexcept {
     return impl_->demotable_eviction_checks();
 }
+std::uint64_t Program::pressure_options() const noexcept { return impl_->pressure_options(); }
+std::uint64_t Program::demote_options() const noexcept { return impl_->demote_options(); }
 std::uint64_t Program::note_publication_cell_loss() noexcept { return impl_->note_publication_cell_loss(); }
 std::uint64_t Program::note_publication_cell_at_risk() noexcept {
     return impl_->note_publication_cell_at_risk();
@@ -505,14 +507,14 @@ void Program::add_publication_cell_probes(std::uint64_t count) noexcept {
 Program::PrefixSplit Program::prefix_split(const ContinuationHandle& owner,
                                           const PreparedPrompt& prompt) const {
     const detail::ProgramImpl::PrefixSplit split =
-        impl_->prefix_split(owner, PreparedPromptAccess::view(prompt).token_ids);
+        impl_->prefix_split(owner, PreparedPromptAccess::view(prompt));
     return PrefixSplit{.tokens = split.tokens, .restorable = split.restorable,
                        .identity_ok = split.identity_ok};
 }
 Program::PrefixSplit Program::prefix_split(const SharedPrefixHandle& owner,
                                           const PreparedPrompt& prompt) const {
     const detail::ProgramImpl::PrefixSplit split =
-        impl_->prefix_split(owner, PreparedPromptAccess::view(prompt).token_ids);
+        impl_->prefix_split(owner, PreparedPromptAccess::view(prompt));
     return PrefixSplit{.tokens = split.tokens, .restorable = split.restorable,
                        .identity_ok = split.identity_ok};
 }

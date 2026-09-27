@@ -31,6 +31,7 @@ struct RequestLogContext {
     double acquisition_seconds = 0.0;
     ninfer::PromptPreparationStats preparation;
     std::optional<std::string> session_key;
+    std::optional<std::string> client_session_id;
 };
 
 struct RequestLogMetadata {
@@ -44,6 +45,10 @@ struct RequestLogMetadata {
     // FIRST user turn, which an agentic client's sibling requests share. The value is an FNV-1a digest of that
     // text, not the text.
     std::optional<std::string> session_key;
+    // The client's own session id, hashed, when the body carries `metadata.user_id`. Logged beside the
+    // derived key so the two are comparable per request: if the client sends a stable id, the derived FNV
+    // preimage -- which a client's concurrent siblings SHARE -- can be replaced by it at the root.
+    std::optional<std::string> client_session_id;
 };
 
 // A parsed generation request that failed during synchronous preparation. It intentionally has a

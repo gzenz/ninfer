@@ -322,11 +322,59 @@ std::uint32_t PressurePlanningSessionImpl::intern_target(std::uint32_t selected_
         return static_cast<std::uint32_t>(existing - targets.data());
     }
     const std::size_t maximum = candidates.size() + 1U + planning_detail::kOptionalTargetCapacity;
+    // WHICH ARENA, WITH ITS NUMBERS. This throw reaches the journal as `WORKER RECOVER: <what()>`, and the
+    // bare message made four different conditions indistinguishable -- so an occurrence said only that "the
+    // pressure target arena is full", while the useful facts are WHICH bound was hit and how close the others
+    // were. Prod hit this once on 2026-09-27, 12 s after eight restorable victims were evicted, and the
+    // hypothesis that the search was truncated before it could price a demote could not be tested against a
+    // message that carries no counters. The three candidate bounds:
+    //   * `targets` -- the target nodes, reserved to candidates + 1 + kOptionalTargetCapacity (4096);
+    //   * `target_choice_arena` -- the victim choices, reserved to owners * (11 + long anchors); the throw's
+    //     third condition is a REMAINING-capacity test, i.e. an incoming choice set that does not fit;
+    //   * the two uint32 casts, which are overflow guards and should never fire.
     if (targets.size() >= maximum || targets.size() == targets.capacity() ||
         choices.size() > target_choice_arena.capacity() - target_choice_arena.size() ||
         target_choice_arena.size() > std::numeric_limits<std::uint32_t>::max() ||
         choices.size() > std::numeric_limits<std::uint32_t>::max()) {
-        throw std::length_error("pressure target arena is full");
+        const char* which = targets.size() >= maximum
+                                ? "target-count"
+                                : (targets.size() == targets.capacity()
+                                       ? "target-capacity"
+                                       : (choices.size() > target_choice_arena.capacity() -
+                                                                 target_choice_arena.size()
+                                              ? "choice-arena"
+                                              : "uint32-overflow"));
+        char detail[320];
+        std::snprintf(detail, sizeof(detail),
+                      "pressure target arena is full [%s]: targets=%zu/%zu (maximum=%zu) "
+                      "choice_arena=%zu/%zu incoming_choices=%zu owners=%zu candidates=%zu",
+                      which, targets.size(), targets.capacity(), maximum, target_choice_arena.size(),
+                      target_choice_arena.capacity(), choices.size(), owners.size(), candidates.size());
+        throw std::length_error(detail);
+    }
+    // NEAR-FULL, BEFORE IT THROWS. The throw above is rare; whether it is *APPROACHED* on every pressured
+    // request is the question that decides whether the evictions are search truncation. Reported at 7/8 of
+    // either bound and rate-limited like the eviction print (first 8, then every 512th), so a saturated
+    // planner is visible on the requests that SURVIVE as well as the one that dies -- a print that fires only
+    // on the throw would leave "not saturated" and "never near" indistinguishable.
+    {
+        static std::uint64_t near_full_seen = 0;
+        const std::size_t choice_remaining = target_choice_arena.capacity() - target_choice_arena.size();
+        const bool near_targets = targets.size() * 8U >= maximum * 7U;
+        const bool near_choices = choices.size() * 8U >= choice_remaining * 7U;
+        if (near_targets || near_choices) {
+            ++near_full_seen;
+            if (near_full_seen <= 8U || near_full_seen % 512U == 0U) {
+                std::fprintf(stderr,
+                             "[engine] pressure arena near-full: targets=%zu/%zu (maximum=%zu) "
+                             "choice_arena=%zu/%zu incoming_choices=%zu near=%s seen=%llu\n",
+                             targets.size(), targets.capacity(), maximum, target_choice_arena.size(),
+                             target_choice_arena.capacity(), choices.size(),
+                             near_targets ? (near_choices ? "both" : "targets") : "choices",
+                             static_cast<unsigned long long>(near_full_seen));
+                std::fflush(stderr);
+            }
+        }
     }
     const std::uint32_t offset = static_cast<std::uint32_t>(target_choice_arena.size());
     target_choice_arena.insert(target_choice_arena.end(), choices.begin(), choices.end());

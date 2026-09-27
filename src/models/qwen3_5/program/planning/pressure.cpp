@@ -709,6 +709,7 @@ ProgramImpl::inspect_pressure_option(const SequenceState& sequence,
                                      std::span<const runtime::CheckpointRef> dropped_checkpoints,
                                      std::span<const StateImageHandle> released_states,
                                      const qwen3_5::detail::PressureDecision* current) const {
+    ++pressure_options_;  // the denominator for `demote_options_`: how often an option is inspected at all
     if (!sequence.kv || deficit.device.active_lanes != 0 ||
         (current != nullptr && current->evicts_continuation)) {
         return std::nullopt;
@@ -800,6 +801,12 @@ ProgramImpl::inspect_pressure_option(const SequenceState& sequence,
                    residual.device.state_slots != 0 &&
                    residency == StateReplicaResidency::DeviceOnly && host_state_images != nullptr) {
             change = endpoint_demote;
+            // #6's remaining half, counted where the DECISION is made: the store says whether a demote would
+            // have been refused (`demote_refusal` on the eviction line), and this says whether the planner ever
+            // OFFERED one. The first burst after that instrument went live showed the store refusing only for
+            // `already-on-host` or not at all -- so whether a demote was generated and lost on cost is the
+            // question that remains, and `demote_options_` over `pressure_options_` is its denominator.
+            ++demote_options_;
             ++option.effect.added.host.state_slots;
             append_pressure_transfer(option, state_transfer_requirement(
                                                  host_state_images->layout(),

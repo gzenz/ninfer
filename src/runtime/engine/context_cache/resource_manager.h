@@ -310,8 +310,18 @@ public:
         // it ON; that is deliberate here and is why the test harness unsets rather than blanks MAT_*.
         const bool cdbg = std::getenv("NINFER_MAT_DEBUG") != nullptr ||
                           std::getenv("NINFER_CANDGEN_DEBUG") != nullptr;
+        // RATE-LIMITED, and that is the whole point of this change (2026-09-27). Turning the gate on used to
+        // emit EVERY line: one nine-minute prod window produced 468,786 `[candgen]` lines out of 470,661
+        // journal lines, and journald responded by suppressing 28,058 messages -- which can drop `WORKER OOM`
+        // and the eviction line, with the watcher blind to the loss (`grep -i suppress tools/ops/ninfer-watch.*`
+        // finds nothing). A diagnostic that hides alerts is worse than no diagnostic, so the first 8 and then
+        // every 512th is the policy here too -- the same split the eviction print uses. The un-muted readings
+        // live in `/stats` and in the request record, which is where a rate limit cannot reach.
+        static std::uint64_t cdbg_seen = 0;
         const auto cdbg_log = [cdbg](const char* fmt, ...) {
             if (!cdbg) { return; }
+            ++cdbg_seen;
+            if (cdbg_seen > 8U && cdbg_seen % 512U != 0U) { return; }
             std::va_list ap;
             va_start(ap, fmt);
             std::vfprintf(stderr, fmt, ap);
@@ -337,6 +347,7 @@ public:
             base.context_cache().update_session_index) {
             current_session_cell = find_session_cell(*base.context_cache().session_key);
         }
+        CandidateCounters candidate_counters;
         std::vector<Candidate> candidates;
         candidates.reserve(1U + prefix_index_.size());
         std::optional<AdmissionCandidate> root = program.inspect_admission(
@@ -430,10 +441,43 @@ public:
                                  private_has_active_edge(index.slot) ? 1 : 0);
                         continue;
                     }
+                    // THE SIBLING CASE (2026-09-27). `retain` above is false exactly when the entry IS this
+                    // request's own session's -- so the request CONSUMES it, and the plan is Replace, which
+                    // destroys the entry's endpoint (`request_plan.cpp` Replace; the consume at
+                    // `storage/context.cpp`). That is right for the conversation's next turn and WRONG for a
+                    // SIBLING: a concurrent request built from the same prompt plus a small delta resumes the
+                    // same checkpoint, leaves the endpoint ledger before the endpoint, and takes the endpoint
+                    // with it. The real next turn then finds nothing at its own depth and falls back to the
+                    // shared marker's 23,353.
+                    //
+                    // Demonstrated live from traffic, per key (2026-09-27, `request.session_key`):
+                    //   prompt 36225 -> private_endpoint reuse 31160
+                    //   prompt 36363 -> private_endpoint reuse 31160   (+138: the sibling, same checkpoint)
+                    //   prompt 38472 -> shared_stable_prefix 23355     (the next turn, endpoint gone)
+                    // and 15 of the 55 ceiling requests have `split_best_tokens - 1` equal to an earlier
+                    // request's reuse point, in 15/15 cases a `private_response_replay`; 196 of 218 such
+                    // requests arrived BEFORE the request they extend finished, so they cannot contain its
+                    // response -- they are siblings, not next turns.
+                    //
+                    // The condition is the one that was measured: the request's whole prompt is SHORTER than
+                    // the entry's endpoint frontier, so consuming the entry would discard an endpoint this
+                    // request can never reach. Retain instead, and the endpoint survives for the turn that
+                    // needs it. GATED, because it is unproven and its cost is real: Retain needs a publication
+                    // cell where Replace took the source's own, and cells are what prod is short of.
+                    const bool endpoint_beyond_prompt =
+                        entry.summary.endpoint &&
+                        base.summary().prompt_tokens < entry.summary.endpoint->ref.frontier;
+                    // COUNTED EVEN WHILE THE BEHAVIOUR IS OFF: this sizes the population the sibling fix would
+                    // touch, from traffic, before anything changes. The audit's chain says such a request takes
+                    // `Replace` and destroys the conversation's endpoint; `retained_sources`/`consumed_sources`
+                    // verify that from the decision rather than from the code.
+                    if (endpoint_beyond_prompt) { ++candidate_counters.sibling_candidates; }
+                    static const bool sibling_retain = std::getenv("NINFER_SIBLING_RETAIN") != nullptr;
                     const bool retain =
-                        entry.session && (!base.context_cache().session_key ||
-                                          *entry.session != *base.context_cache().session_key ||
-                                          !base.context_cache().update_session_index);
+                        (entry.session && (!base.context_cache().session_key ||
+                                           *entry.session != *base.context_cache().session_key ||
+                                           !base.context_cache().update_session_index)) ||
+                        (sibling_retain && endpoint_beyond_prompt);
                     std::optional<AdmissionCandidate> plan =
                         program.inspect_admission(prompt, base, *destination, &*entry.handle,
                                                   nullptr, index.checkpoint, retain);
@@ -445,6 +489,7 @@ public:
                     cdbg_log("[candgen] priv BUILD slot=%u reuse_tok=%u retain=%d\n", index.slot,
                              static_cast<unsigned>(plan->summary().reusable_prompt_tokens),
                              retain ? 1 : 0);
+                    if (retain) { ++candidate_counters.retained_sources; } else { ++candidate_counters.consumed_sources; }
                     if (plan->summary().reusable_prompt_tokens == 0 ||
                         (retain &&
                          plan->identity_assessment().source_mode != PrivateSourceMode::Retain)) {
@@ -500,7 +545,8 @@ public:
         }
 
         std::optional<Choice> selected =
-            plan_materialization(program, prompt, base, *destination, candidates, publication_order,
+            plan_materialization(program, prompt, base, *destination, candidates, candidate_counters,
+                                 publication_order,
                                  planning_started, provisional_demand, allowance);
         if (!selected) {
             // "No plan" is only *temporary* when something can change the answer: an occupied lane
@@ -1223,6 +1269,8 @@ public:
         out.pressure_private_evictions_demotable = program.demotable_evictions();
         out.pressure_evictions_with_victim_room  = program.evictions_with_victim_room();
         out.pressure_private_eviction_checks    = program.demotable_eviction_checks();
+        out.pressure_demote_options             = program.demote_options();
+        out.pressure_options                    = program.pressure_options();
         // The catalog's capacity/occupancy pair, as of this publication. It had neither half, which is why its exhaustion could
         // only be noticed as a silent loss of reuse. (Not the only pool in that state: the shared-prefix pool
         // has neither half either and device-state-slots has occupancy without a capacity -- `plan.md` §4.)
@@ -1287,6 +1335,15 @@ public:
     }
 
 private:
+    // Counters the candidate loop produces and `plan_materialization` reports: they are known only where the
+    // source was offered (the retain decision and the endpoint-beyond-prompt test), and read only where the
+    // diagnostics are assembled, so they travel the same path as `candidates` rather than living as members.
+    struct CandidateCounters {
+        std::uint32_t sibling_candidates = 0;  // sources whose own endpoint lies beyond this prompt
+        std::uint32_t retained_sources   = 0;
+        std::uint32_t consumed_sources   = 0;
+    };
+
     struct Candidate {
         std::optional<AdmissionCandidate> plan;
         bool current_session_binding = false;
@@ -2007,7 +2064,8 @@ private:
     [[nodiscard]] std::optional<Choice>
     plan_materialization(Program& program, const PreparedPrompt& prompt,
                          const RequestBasePlan& base, LaneId destination,
-                         std::vector<Candidate>& candidates, std::uint64_t publication_order,
+                         std::vector<Candidate>& candidates, const CandidateCounters& candidate_counters,
+                         std::uint64_t publication_order,
                          typename Planner::Clock::time_point planning_started,
                          PrefixDemandRecord& provisional_demand, PlanningAllowance allowance) {
         std::vector<typename Planner::CandidateInput> candidate_inputs;
@@ -2487,8 +2545,9 @@ private:
             std::vector<PrefixSplitSample> samples;
             samples.reserve(static_cast<std::size_t>(catalog_count_) + shared_catalog_count_);
             const auto consider = [&](const Program::PrefixSplit& split) {
-                samples.push_back(PrefixSplitSample{.tokens = split.tokens,
-                                                    .restorable = split.restorable});
+                samples.push_back(PrefixSplitSample{.tokens      = split.tokens,
+                                                    .restorable  = split.restorable,
+                                                    .identity_ok = split.identity_ok});
             };
             for (std::uint32_t slot = 0; slot < catalog_count_; ++slot) {
                 const CatalogEntry& entry = catalog_[slot];
@@ -2504,6 +2563,10 @@ private:
             choice.diagnostics_.split_best_tokens     = best.tokens;
             choice.diagnostics_.split_best_restorable = best.restorable;
             choice.diagnostics_.split_entries         = best.entries;
+            choice.diagnostics_.split_identity_ok     = best.identity_ok;
+            choice.diagnostics_.sibling_candidates    = candidate_counters.sibling_candidates;
+            choice.diagnostics_.retained_sources      = candidate_counters.retained_sources;
+            choice.diagnostics_.consumed_sources      = candidate_counters.consumed_sources;
         }
         choice.diagnostics_.candidates         = std::move(candidate_rows);
         choice.diagnostics_.chosen_reuse       = selection_chosen_reuse;

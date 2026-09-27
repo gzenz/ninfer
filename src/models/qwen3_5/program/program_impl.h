@@ -550,10 +550,13 @@ public:
         std::uint32_t restorable     = 0;  // deepest restorable checkpoint frontier at or below `tokens`
         bool          identity_ok    = false;
     };
+    // Takes the prompt DATA, not just its tokens: the identity chain is a stricter test than the token
+    // comparison (`prefix_matches` = same tokens AND same render), and `identity_ok` is the field that
+    // separates "the tokens diverge here" from "the tokens match but the history was rendered differently".
     [[nodiscard]] PrefixSplit prefix_split(const ContinuationHandle& owner,
-                                           std::span<const TokenId> prompt_tokens) const;
+                                           const PreparedPromptData& prompt) const;
     [[nodiscard]] PrefixSplit prefix_split(const SharedPrefixHandle& owner,
-                                           std::span<const TokenId> prompt_tokens) const;
+                                           const PreparedPromptData& prompt) const;
     [[nodiscard]] bool shared_capture_matches(const CaptureOffer& offer,
                                               const SharedPrefixHandle& shared) const;
     void skip_capture(CaptureOffer&& offer);
@@ -601,6 +604,8 @@ public:
     [[nodiscard]] std::uint64_t demotable_eviction_checks() const noexcept {
         return demotable_eviction_checks_;
     }
+    [[nodiscard]] std::uint64_t pressure_options() const noexcept { return pressure_options_; }
+    [[nodiscard]] std::uint64_t demote_options() const noexcept { return demote_options_; }
     // The private catalog's TWO readings, kept apart because they answer different questions. `losses` is
     // the event -- a request where the cell alone made a better-reusing candidate unadoptable -- and is what
     // the alert rests on -- NOT a capacity verdict, see the awk comment: it fires only when a candidate had no
@@ -1021,6 +1026,15 @@ private:
     // Every eviction the check above ran for -- the denominator. Without it a zero numerator cannot be
     // told from a gate that never had a chance to be true.
     std::uint64_t demotable_eviction_checks_             = 0;
+    // #6's generation half: how often the planner inspected an option at all, and how often the option it
+    // built chose to DEMOTE rather than drop. Read as a ratio; either number alone is uninterpretable.
+    // MUTABLE, because the decision they count is made in a `const` method (`inspect_pressure_option`
+    // inspects and builds; it mutates nothing observable). A telemetry counter is the standard case for this,
+    // and the alternative -- routing the count out through the returned option so the caller can aggregate it
+    // -- would push plumbing through every call site for one diagnostic. The method is worker-serialised, so
+    // there is no concurrent increment.
+    mutable std::uint64_t pressure_options_              = 0;
+    mutable std::uint64_t demote_options_                = 0;
     // #6's other half, as a LOSS rather than a probe count: a request whose winning plan reused strictly
     // fewer tokens than a candidate that the publication cell alone had made unadoptable. See the
     // RuntimeStats field for why the probe count beside it must never be presented as this number.

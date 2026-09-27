@@ -108,6 +108,8 @@ std::string format_stats_json(const ninfer::RuntimeStats& s, const ninfer::Memor
         {"private_evictions_demotable", s.pressure_private_evictions_demotable},
         {"evictions_with_victim_room", s.pressure_evictions_with_victim_room},
         {"private_eviction_checks", s.pressure_private_eviction_checks},
+        {"options", s.pressure_options},
+        {"demote_options", s.pressure_demote_options},
         {"publication_cell_losses", s.pressure_publication_cell_losses},
         // The denominator beside it: goal-probe calls, not an outcome. See the RuntimeStats comment.
         {"publication_cell_probes", s.pressure_publication_cell_probes},

@@ -885,11 +885,18 @@ std::uint32_t deepest_token_match(std::span<const TokenId> prompt, std::span<con
 }
 
 ProgramImpl::PrefixSplit ProgramImpl::prefix_split(const ContinuationHandle& owner,
-                                                   std::span<const TokenId> prompt_tokens) const {
+                                                   const PreparedPromptData& prompt) const {
     PrefixSplit split;
     if (!valid_continuation(owner)) { return split; }
     const SequenceState& sequence = continuation_states[ContractAccess::index(owner)];
-    split.tokens                  = deepest_token_match(prompt_tokens, sequence.ledger);
+    split.tokens                  = deepest_token_match(prompt.token_ids, sequence.ledger);
+    // THE STRICTER TEST. Same tokens is not the same history: `prefix_matches` also requires the identity
+    // chain to agree, which is what a re-rendered (or thinking-stripped) earlier turn breaks. Only evaluated
+    // when there IS a match -- a zero-token match has nothing to verify.
+    if (split.tokens != 0U) {
+        split.identity_ok = qwen3_5::detail::prefix_matches(prompt, sequence.ledger,
+                                                            sequence.prefix_identity, split.tokens);
+    }
     // NO IDENTITY CHECK HERE, deliberately: `prefix_matches` needs the full PreparedPromptData (token types
     // and rope state), which this layer does not hold -- and the two numbers below are what §2f's verdict
     // turns on. `identity_ok` stays false and is documented as NOT MEASURED rather than as "not matching",
@@ -913,14 +920,19 @@ ProgramImpl::PrefixSplit ProgramImpl::prefix_split(const ContinuationHandle& own
 }
 
 ProgramImpl::PrefixSplit ProgramImpl::prefix_split(const SharedPrefixHandle& owner,
-                                                   std::span<const TokenId> prompt_tokens) const {
+                                                   const PreparedPromptData& prompt) const {
     PrefixSplit split;
     if (!valid_shared_prefix(owner)) { return split; }
     const SharedPrefixState& shared = shared_prefix_states[ContractAccess::index(owner)];
     // The shared prefix's tokens live on its identity, not on the state -- the same reach the materialization
     // path uses (`shared_state->identity->ledger()`), and there is no ledger without an identity.
     if (!shared.identity) { return split; }
-    split.tokens = deepest_token_match(prompt_tokens, shared.identity->ledger());
+    split.tokens = deepest_token_match(prompt.token_ids, shared.identity->ledger());
+    if (split.tokens != 0U && shared.identity->prefix_identity() != nullptr) {
+        split.identity_ok = qwen3_5::detail::prefix_matches(prompt, shared.identity->ledger(),
+                                                            *shared.identity->prefix_identity(),
+                                                            split.tokens);
+    }
     const qwen3_5::SharedPrefixSummary summary = shared_prefix_summary(shared);
     if (summary.checkpoint.ref.frontier <= split.tokens) {
         split.restorable = summary.checkpoint.ref.frontier;

@@ -105,21 +105,32 @@ template <typename ReuseOf>
 // The two maxima are INDEPENDENT and that is the whole point: the deepest MATCH and the deepest RESTORABLE
 // checkpoint need not come from the same entry, and a reader must not infer one from the other.
 struct PrefixSplitSample {
-    std::uint32_t tokens     = 0;  // this entry's token-exact match
-    std::uint32_t restorable = 0;  // this entry's deepest restorable checkpoint at or below its own match
+    std::uint32_t tokens      = 0;  // this entry's token-exact match
+    std::uint32_t restorable  = 0;  // this entry's deepest restorable checkpoint at or below its own match
+    bool          identity_ok = false;  // did the identity chain agree AT that match (stricter than tokens)
 };
 
 struct PrefixSplitBest {
-    std::uint32_t tokens     = 0;
-    std::uint32_t restorable = 0;
-    std::uint32_t entries    = 0;
+    std::uint32_t tokens            = 0;
+    std::uint32_t restorable        = 0;
+    std::uint32_t entries           = 0;
+    // From the DEEPEST-matching entry, not an OR over entries: the question is whether the entry this request
+    // would actually have resumed from was rendered the same way, and an unrelated shallow entry's agreement
+    // says nothing about it. `identity_checked` is the denominator -- the entries whose match was non-zero, so
+    // a `false` can be told from "no entry matched anything".
+    bool          identity_ok       = false;
+    std::uint32_t identity_checked  = 0;
 };
 
 [[nodiscard]] inline PrefixSplitBest best_prefix_split(std::span<const PrefixSplitSample> samples) noexcept {
     PrefixSplitBest best;
     for (const PrefixSplitSample& sample : samples) {
         ++best.entries;
-        best.tokens     = std::max(best.tokens, sample.tokens);
+        if (sample.tokens != 0) { ++best.identity_checked; }
+        if (sample.tokens > best.tokens) {
+            best.tokens      = sample.tokens;
+            best.identity_ok = sample.identity_ok;
+        }
         best.restorable = std::max(best.restorable, sample.restorable);
     }
     return best;

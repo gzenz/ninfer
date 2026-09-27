@@ -221,6 +221,8 @@ Json request_json(const RequestLogContext& context) {
                 // on the Responses path). Absent means the request ran with no key at all -- the condition
                 // that made everything session-scoped unreachable until 2026-09-27.
                 {"session_key", context.session_key ? Json(*context.session_key) : Json(nullptr)},
+                {"client_session_id",
+                 context.client_session_id ? Json(*context.client_session_id) : Json(nullptr)},
                 {"sampling", sampler_json(context.sampling)}};
 }
 
@@ -344,6 +346,10 @@ Json materialization_json(const ninfer::MaterializationDiagnostics& diagnostics)
         {"split_best_tokens", diagnostics.split_best_tokens},
         {"split_best_restorable", diagnostics.split_best_restorable},
         {"split_entries", diagnostics.split_entries},
+        {"split_identity_ok", diagnostics.split_identity_ok},
+        {"sibling_candidates", diagnostics.sibling_candidates},
+        {"retained_sources", diagnostics.retained_sources},
+        {"consumed_sources", diagnostics.consumed_sources},
         {"initial_predicted_total_ns", diagnostics.initial_predicted_total_ns},
         {"first_improvement_ns", diagnostics.first_improvement_ns
                                      ? Json(*diagnostics.first_improvement_ns)

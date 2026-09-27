@@ -863,6 +863,29 @@ struct MaterializationDiagnostics {
     std::uint32_t split_best_tokens     = 0;
     std::uint32_t split_best_restorable = 0;
     std::uint32_t split_entries         = 0;
+    // DOES THE TOKENS-MATCH-BUT-RENDER-DIFFERS CASE EXIST? `split_best_tokens` says how far the prompt matches
+    // a stored ledger token-by-token; the identity chain is a STRICTER test (the same tokens, rendered the
+    // same). When the tokens match deeply and the identity does not, the stored entry was built from a
+    // differently-RENDERED history -- which is the shape a re-rendered or thinking-stripped earlier turn
+    // produces, and it is the one thing the token comparison cannot distinguish. This is the half the first
+    // version of the split deliberately left OUT because the prompt was not reachable at that layer; it is
+    // reachable now, and the V2->v3 audit's group A (40 of the 55 ceiling requests) is exactly this question.
+    bool          split_identity_ok     = false;
+    // THE SIBLING CONDITION AND THE RETAIN DECISION, counted even while the behaviour is off (2026-09-27).
+    // `sibling_candidates` is how often a private source was found whose own endpoint lies BEYOND this
+    // request's prompt -- a request that cannot reach the endpoint it is about to consume -- and
+    // `retained_sources` / `consumed_sources` say what the planner did with the sources it did offer. The
+    // audit's chain asserts such a request takes `Replace` and destroys the conversation's endpoint; these
+    // three numbers size the population BEFORE anything changes behaviour, and verify the chain from traffic.
+    std::uint32_t sibling_candidates   = 0;
+    std::uint32_t retained_sources     = 0;
+    std::uint32_t consumed_sources     = 0;
+    // HOW OFTEN THE PLANNER GENERATED A DEMOTE OPTION. The eviction line now says WHY the store refused
+    // (`demote_refusal`), and the first burst after that instrument went live showed the store refusing only
+    // for `already-on-host` or not at all -- so the remaining question is whether a demote was ever GENERATED
+    // and lost on cost. Without this, "no demote was possible" and "no demote was offered" stay
+    // indistinguishable, which is the ambiguity that has surrounded this decision all along.
+    std::uint32_t demote_options       = 0;
 
     std::uint64_t initial_predicted_total_ns = 0;
     std::optional<std::uint64_t> first_improvement_ns;
@@ -1134,6 +1157,12 @@ struct RuntimeStats {
     // normal state under eviction-to-publish, so it cannot falsify a capacity raise and fires as an alert on
     // healthy traffic. Measured against it: 97 PRINTED LINES -- about 45.6k probes, since the print is
     // rate-limited to 8 then every 512th -- in a run where four requests reused 99.9%.
+    // #6's GENERATION half, as a ratio: how often the planner inspected a pressure option, and how often the
+    // option it built chose to demote. `demote_refusal` on the eviction line answers "would the store have
+    // refused"; these answer "was a demote ever offered". Both are needed: the store refusing and the planner
+    // never offering are different defects with different fixes.
+    std::uint64_t pressure_options                     = 0;
+    std::uint64_t pressure_demote_options              = 0;
     std::uint64_t pressure_publication_cell_losses     = 0;
     // The DENOMINATOR. Raw goal-probe calls, one or two orders of magnitude larger than any plausible loss
     // count, kept only so that `losses == 0` can be told from a planner that stopped probing. Never read it

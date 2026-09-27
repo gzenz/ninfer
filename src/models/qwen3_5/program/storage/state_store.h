@@ -562,16 +562,68 @@ public:
     // guess. `reserve_device_to_host` does grow -- that is the one place it is allowed to -- so a `false`
     // here means the demote needs a growth whose approval is unknowable from here, and `true` means it can
     // proceed without one.
-    [[nodiscard]] bool can_demote_to_host(StateImageHandle source) const noexcept {
-        if (host_ == nullptr || !valid(source)) { return false; }
+    // WHY a victim could not be demoted, one enumeration for the same nine conditions the execution path
+    // tests. It exists because the boolean made two different failures indistinguishable: an eviction line
+    // reading `demote_possible=0` could not say whether demotion was IMPOSSIBLE (a precondition) or simply
+    // never generated as an option -- and prod showed a victim with `victim_room=1` (its own slots fitted,
+    // there was room) being evicted with `demote_possible=0` in five of eight cases of one burst
+    // (2026-09-27). Without which condition failed, every fix for that is a guess, and this repo has already
+    // aborted the engine once on a guessed change to this decision (`preserving_root_target`, rc=134).
+    enum class DemoteRefusal : std::uint8_t {
+        None,
+        HostTierDisabled,   // no host pool at all (--host-kv-mib 0 / --host-state-slots 0)
+        InvalidHandle,
+        StaleGeneration,    // the handle's generation no longer names this object
+        NotImmutableCheckpoint,  // only an immutable checkpoint may be demoted
+        NotDeviceResident,  // nothing on the device to move
+        AlreadyOnHost,
+        PendingReplica,     // a transfer is already in flight for it
+        PinSaturated,       // source_pins at its maximum
+        NoHostCapacity,     // the pool could not take it
+    };
+
+    [[nodiscard]] DemoteRefusal demote_refusal(StateImageHandle source) const noexcept {
+        if (host_ == nullptr) { return DemoteRefusal::HostTierDisabled; }
+        if (!valid(source)) { return DemoteRefusal::InvalidHandle; }
         const Object& object = objects_[source.index_];
-        if (object.generation != source.generation_ ||
-            object.role != StateImageRole::CheckpointImmutable || !object.device_slot ||
-            object.host_slot || has_pending_replica(object) ||
-            object.source_pins == std::numeric_limits<std::uint32_t>::max()) {
-            return false;
+        if (object.generation != source.generation_) { return DemoteRefusal::StaleGeneration; }
+        if (object.role != StateImageRole::CheckpointImmutable) {
+            return DemoteRefusal::NotImmutableCheckpoint;
         }
-        return host_->capacity() > host_->occupied();
+        // ALREADY-ON-HOST IS CHECKED BEFORE NOT-DEVICE-RESIDENT, and the order matters for reading, not for
+        // behaviour: both are refusals, but an image whose state sits on the HOST has no device slot, so the
+        // execution path's order (device first) labels it `not-device-resident` -- which reads as "nothing to
+        // move, nowhere near a demote" when the truth is "there is nothing to demote because it was ALREADY
+        // demoted". The first burst after this instrument went live had six of eight victims in exactly that
+        // state (`victim_host_slots=3 victim_dev_slots=0`) and the label made them look unrelated to demotion.
+        if (object.host_slot) { return DemoteRefusal::AlreadyOnHost; }
+        if (!object.device_slot) { return DemoteRefusal::NotDeviceResident; }
+        if (has_pending_replica(object)) { return DemoteRefusal::PendingReplica; }
+        if (object.source_pins == std::numeric_limits<std::uint32_t>::max()) {
+            return DemoteRefusal::PinSaturated;
+        }
+        if (!(host_->capacity() > host_->occupied())) { return DemoteRefusal::NoHostCapacity; }
+        return DemoteRefusal::None;
+    }
+
+    [[nodiscard]] static const char* demote_refusal_name(DemoteRefusal refusal) noexcept {
+        switch (refusal) {
+            case DemoteRefusal::None: return "none";
+            case DemoteRefusal::HostTierDisabled: return "host-tier-disabled";
+            case DemoteRefusal::InvalidHandle: return "invalid-handle";
+            case DemoteRefusal::StaleGeneration: return "stale-generation";
+            case DemoteRefusal::NotImmutableCheckpoint: return "not-immutable-checkpoint";
+            case DemoteRefusal::NotDeviceResident: return "not-device-resident";
+            case DemoteRefusal::AlreadyOnHost: return "already-on-host";
+            case DemoteRefusal::PendingReplica: return "pending-replica";
+            case DemoteRefusal::PinSaturated: return "pin-saturated";
+            case DemoteRefusal::NoHostCapacity: return "no-host-capacity";
+        }
+        return "unknown";
+    }
+
+    [[nodiscard]] bool can_demote_to_host(StateImageHandle source) const noexcept {
+        return demote_refusal(source) == DemoteRefusal::None;
     }
 
     [[nodiscard]] std::optional<StateImageTransfer>

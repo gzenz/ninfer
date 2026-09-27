@@ -2214,6 +2214,11 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
                     // was possible". Non-mutating: it takes no host slot.
                     const bool demote_possible =
                         state_store->can_demote_to_host(victim.state.write);
+                    // WHICH PRECONDITION failed, because the boolean could not say. Prod showed a victim with
+                    // `victim_room=1` -- its own slots fitted and there was room -- evicted with
+                    // `demote_possible=0` in five of eight cases of one burst, and no fix can be aimed at that
+                    // without knowing whether the demote path was refused or simply never offered.
+                    const auto demote_refusal = state_store->demote_refusal(victim.state.write);
                     const bool victim_room =
                         usage.host_state_slots + victim_host_slots <= room.host.state_slots &&
                         usage.host_kv_bytes < room.host.kv_bytes;
@@ -2226,7 +2231,8 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
                                      "[engine] private victim evicted: demotable=%d restorable=%d "
                                      "session=%016llx cont=%u frontier=%u endpoint=%d rewrite=%d "
                                      "anchors=%zu victim_host_slots=%u victim_dev_slots=%u host_state_slots=%u/%llu host_kv=%zu/%llu "
-                                     "victim_room=%d demote_possible=%d checked=%llu demotable_total=%llu\n",
+                                     "victim_room=%d demote_possible=%d demote_refusal=%s "
+                                     "checked=%llu demotable_total=%llu\n",
                                      static_cast<int>(demotable),
                                      static_cast<int>(state_restorable),
                                      static_cast<unsigned long long>(victim.session_key_hash),
@@ -2240,6 +2246,7 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
                                      static_cast<unsigned long long>(room.host.kv_bytes),
                                      static_cast<int>(victim_room),
                                      static_cast<int>(demote_possible),
+                                     StateImageStore::demote_refusal_name(demote_refusal),
                                      static_cast<unsigned long long>(demotable_eviction_checks_),
                                      static_cast<unsigned long long>(demotable_evictions_));
                         std::fflush(stderr);

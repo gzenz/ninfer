@@ -74,7 +74,8 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
     const RequestLogMetadata metadata{.model                  = request.model,
                                       .stream                 = request.stream,
                                       .output_tokens_explicit = request.output_tokens_explicit,
-                                      .session_key            = cache_hints.session_key};
+                                      .session_key            = cache_hints.session_key,
+                                      .client_session_id      = request.metadata_session_hash};
     PreparedRequest prepared;
     try {
         prepared = service_->prepare(request.generation,

@@ -1002,10 +1002,21 @@ task needs no re-derivation:
   traffic. **So this item is now: mechanism present, one scenario showing no starvation, the load case
   untested** -- which is a prod-or-heavy-suite question rather than a port.
 
-6. **#6 — W2's demote-for-evict-only victims: CONFIRMED A DEFECT BY THE OPERATOR (2026-09-27), and the first
-   fix attempt was UNSOUND AND REVERTED. Read this before trying again.** The operator's ruling, verbatim:
-   "evicting a victim that holds a restorable checkpoint while the host has room is a defect. fix it."
-   **Attempt 1 (2026-09-27, reverted) -- and its abort is the useful part.** The route looked obvious: the
+6. **#6 — W2's demote-for-evict-only victims. STATUS: THE RULING IS IMPLEMENTED AND VERIFIED AS FAR AS THIS
+   WORKLOAD ALLOWS, and what remains is a workload, not code.** The operator's ruling, verbatim: "evicting a
+   victim that holds a restorable checkpoint while the host has room is a defect. fix it."
+   **Implemented as an ORDERING** (`7746a98b`): `restorable_evictions` is the first element of
+   `FoldedCost::key()`, ahead of `total_ns`, so among feasible plans preserving a restorable checkpoint
+   dominates cost rather than trading with it. Unit-proven by a mutation-checked host-only control
+   (`bdd43e6e`) on the very struct the planner compares. **The A/B with the ordering reverted is a NULL —
+   the fix is INERT on this workload** (11 vs 12 total restorable evictions over 24 records each), and the
+   reason is specific: the ordering only changes an outcome when an adoptable preserving plan is COSTLIER
+   than the destroying one, and here the two coincide, so the old cost-first key already chose the
+   preserving plan. **So a workload producing that shape is what remains** — not buildable offline.
+   **The judgement call recorded here for the next reader:** the fix is correct and proven as a mechanism;
+   its EFFECT is unobserved because the case it targets does not occur in a synthetic burst. Do not read
+   the null as the fix being wrong, and do not read the mechanism's proof as the effect being shown.
+   **One attempt was made and REVERTED, and its abort is the constraint any retry must respect.**   **Attempt 1 (2026-09-27, reverted) -- and its abort is the useful part.** The route looked obvious: the
    maximal floor takes `eviction_choice` for every victim and the preserving alternative is only sought by
    the budgeted search afterwards (cut off in 40 of 43 searches under load), so admit a per-victim
    preserving option at `populate_options` time -- `inspect_pressure_option(sequence,

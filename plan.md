@@ -1046,6 +1046,16 @@ task needs no re-derivation:
    `/stats` -- the room question asked PER VICTIM for state slots (the KV half stays pool-level, no
    per-sequence figure being reachable there), with `demotable` keeping its documented meaning because it is
    the monitor's alert token.
+   **THE CORRECTED FIRST READING (2026-09-27, prod, 16-session soak, request-log line 23998):
+   `adoptable_preserving_alternatives=0` with `chosen_restorable_evictions=1`.** That is the answer this item
+   needed: the adopted plan evicted a restorable victim, and NO ADOPTABLE PLAN preserved one -- so the
+   eviction is not the ordering letting a preserving plan through, there was nothing feasible to prefer. It
+   is the KV-infeasible case the 94%-full readings predicted, now MEASURED rather than inferred, and it
+   means the operator's ruling was not violated in those instances: the host had no room usable by THAT
+   victim, which is what the per-victim room field expresses and the pool-level `demotable=1` obscured.
+   **What would still be the defect:** a request reporting `adoptable_preserving_alternatives > 0` together
+   with `chosen_restorable_evictions > 0` -- a preserving plan available and a destroying one taken. None
+   has appeared so far; the soak continues and the monitor reports the first one if it does.
    **AND ITS FIRST READING EXPOSED TWO BUGS IN ITSELF (`9e816284`), which is the clearest argument for
    having built it.** The first decisive record read `feasible_preserving_alternatives=607
    chosen_restorable_evictions=1` -- and that combination is IMPOSSIBLE with the ordering fix in place: the

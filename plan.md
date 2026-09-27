@@ -1773,11 +1773,20 @@ it is an engine regression, which `git stash` settles in one run.
    | `root` | 9 | 0 | 0.0% | 0 |
 
    **26 of 38 shared-prefix requests are within 200 tokens of 23,353** -- that path is pinned -- while the
-   PRIVATE paths reach 36k-88k at 95.6-99.6%. The private continuations are available and effective; the cost
-   is that some requests take the shared path instead. **So the question is not "why were the continuations
-   lost" but "why does the engine choose a ~70% path where a ~95-99% one exists"** -- a reuse-path SELECTION
-   question, the same family as #6 (a choice the cost model makes), and a better-targeted one than the
-   mechanism I had asserted without data.
+   PRIVATE paths reach 36k-88k at 95.6-99.6%. So the private paths are EFFECTIVE WHEN TAKEN, and the cost is
+   that some requests take the shared path instead.
+   **AND DO NOT OVERREAD THAT, which is what the first version of this correction did.** "Effective when
+   taken" is NOT "available to the stalled requests": the table says nothing about whether a private
+   candidate EXISTED for the requests that took the shared path. So my original mechanism -- the evictions
+   removing the continuation whose reuse would advance the frontier -- is NOT refuted by this data; it is
+   UNMEASURED, and it remains live alongside the selection explanation. What the table does establish is
+   that the ceiling is not the private path's quality (95-99% is achievable on this workload), which is
+   worth knowing because it rules out one whole class of explanation.
+   **The two live explanations, and what separates them:** (a) SELECTION -- a private candidate existed and
+   the engine took the shared one anyway; (b) AVAILABILITY -- no private candidate existed (evicted, or never
+   captured), so the shared prefix was the only option. Per-request candidate data separates them; the prior
+   session's `[candgen]` work already found re-prefill to be a candidate-generation/retention problem rather
+   than a value-gate one, which points at (b) without settling it here.
    **(Superseded text, kept only to show what it replaced:)** the frontier sits pinned at
    ~23,353 while prompts reach 65-67k, so a turn recomputes 44,332 tokens in **11.2 s** (up from 17k/4 s
    earlier in the same session). `shared_stable_prefix` 10 selections against 2 private says the engine keeps

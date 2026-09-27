@@ -103,6 +103,10 @@ public:
         if (candidates.empty() || root_candidate_index >= candidates.size()) {
             throw std::invalid_argument("materialization planning problem has no root candidate");
         }
+        // #6's counter is PER RUN, and the first version of it was not: it is a member of a planner that
+        // outlives a request, so it accumulated -- which is how two different requests reported the same
+        // 607. Reset here, at the only point a planning run begins, so the number means "in THIS run".
+        feasible_preserving_alternatives_ = 0;
         for (std::size_t index = 0; index < candidates.size(); ++index) {
             if (candidates[index].candidate == nullptr ||
                 std::find_if(candidates.begin(), candidates.begin() + index,
@@ -457,15 +461,10 @@ public:
             // destroys no restorable checkpoint is a plan that would have preserved one, whether or not the
             // search adopts it. Paired with the chosen plan's own count in the diagnostics, this is what
             // separates "the ordering let one through" from "nothing feasible preserved".
-            const bool assessment_feasible =
-                assessment.physical_status == MaterializationPhysicalStatus::Feasible;
             planning_saturating_add(projection_work, assessment.projection_work);
             const FoldedCost cost =
                 fold_assessment(candidates[expected_candidate], assessment, pressure.owner_policy,
                                 pressure.checkpoint_policy, machine_cost);
-            if (assessment_feasible && cost.restorable_evictions == 0) {
-                ++feasible_preserving_alternatives_;
-            }
             std::optional<LogicalGoal> goal;
             if (assessment.physical_status == MaterializationPhysicalStatus::Feasible) {
                 goal = logical_goal(assessment.candidate, assessment.source_mode,
@@ -474,6 +473,14 @@ public:
             if (goal) {
                 mark_target(assessment.stable_target_ordinal, kTargetFeasible);
                 candidate_seeded[expected_candidate] = true;
+                // #6's "was a preserving plan ADOPTABLE" -- and the first version of this counter got it
+                // wrong in a way its own reading exposed: it incremented on physical feasibility alone, so
+                // it reported 607 available preserving alternatives against a chosen plan that evicted one
+                // (line=23809), a combination the key ordering makes impossible if those alternatives were
+                // real. They were not: a target with no `logical_goal` can never become an incumbent (the
+                // adoption below is `goal && cost.less(...)`), so counting it claims availability that the
+                // planner could not use. Gated on `goal` now, which is the same condition adoption uses.
+                if (cost.restorable_evictions == 0) { ++feasible_preserving_alternatives_; }
             }
             const bool becomes_incumbent = goal && cost.less(incumbent.cost);
             if (dbg) {

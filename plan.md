@@ -1046,6 +1046,20 @@ task needs no re-derivation:
    `/stats` -- the room question asked PER VICTIM for state slots (the KV half stays pool-level, no
    per-sequence figure being reachable there), with `demotable` keeping its documented meaning because it is
    the monitor's alert token.
+   **AND ITS FIRST READING EXPOSED TWO BUGS IN ITSELF (`9e816284`), which is the clearest argument for
+   having built it.** The first decisive record read `feasible_preserving_alternatives=607
+   chosen_restorable_evictions=1` -- and that combination is IMPOSSIBLE with the ordering fix in place: the
+   key ranks `restorable_evictions` first, so an adoptable preserving plan wins. The counter was wrong twice:
+   1. it incremented on PHYSICAL feasibility alone, so it counted targets that never produced a
+      `logical_goal` and therefore could never become an incumbent (adoption is `goal && cost.less(...)`);
+      gated on `goal` now, the same condition adoption uses;
+   2. it is a member of a planner that OUTLIVES a request and was never reset, so it accumulated -- which is
+      why two different requests reported the identical 607. Reset at the only point a planning run begins.
+   `chosen_restorable_evictions` was right throughout: those requests did adopt a plan that evicted a
+   restorable victim, which the eviction lines independently show. **So the corrected pair is the reading to
+   trust, and the 607/1 one is an artifact of an instrument that had not been validated** -- the exact
+   failure this file keeps recording, caught this time by the instrument's own inconsistency rather than by
+   a reviewer.
    **(Earlier text, kept because it names the instrument this replaced.)** a counter for "a restorable victim was evicted while a
    FEASIBLE preserving alternative existed" -- i.e. the plan lost on the ordering, rather than on
    feasibility. `private_owners_evicted` cannot tell those apart, and neither can the eviction line. It

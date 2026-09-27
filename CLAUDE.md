@@ -80,6 +80,16 @@ a superseded duplicate kept only for the session that produced it.
   `RelWithDebInfo` and already contains `build-diag/apps/ninfer-serve`, so the next wedge captured while that
   binary is running will name the caller of the spin -- which the release build cannot (its frames below the
   innermost were `??`, and that caller is the frame that identifies the lock).
+- **A `health 200 -> 000` transition under heavy load is NOT an outage until you check two things.** Observed
+  2026-09-27 with prod serving an agentic workload: the watcher reported `200 -> 000` while the unit was
+  ACTIVE on the SAME pid and start time, and the journal showed it working throughout (throughput lines,
+  checkpoint pricing, evictions). Under that load `/stats` took 60+ s -- the handler takes the engine's
+  execution mutex -- and `/health` itself can miss a probe's timeout behind a prefill, though it answers in
+  0.0003 s when free. **So `000` means "did not answer in time", and the check is:** the unit's
+  `MainPID` and `ExecMainStartTimestamp` unchanged, and the journal still printing progress. **This is not
+  the wedge signature**: a wedge gives `/health` **503** with `/stats` still answering, which is the
+  opposite shape. The sentinel is not fooled either -- it restarts on idle-with-work-pending or stalled
+  progress, has a 90 s grace, and its own notes say a healthy busy server "never arms".
 - One monitor at a time (duplicates double-notify). After stopping one, kill any orphaned `journalctl` —
   by **`pkill -f 'journalctl -u ninfe[r]'`**, bracketed, because an unbracketed `-f` pattern matches the
   calling shell's own command line (see the traps below).

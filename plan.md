@@ -1423,7 +1423,23 @@ it is an engine regression, which `git stash` settles in one run.
    `forty-heavy`'s rc=1 is the harness's own over-budget 400s on its last rounds, not an engine error.
 5. **Re-run the gate before quoting an acceptance** for any tree that has since changed — only an
    artifact whose own `build_id` re-hashes equal to the binary describes it.
-6. **Make host growth REACHABLE from planning — IMPLEMENTED 2026-09-26 (`d629061c`); effect UNOBSERVED.**
+6. **Make host growth REACHABLE from planning — IMPLEMENTED (`d629061c`), then CORRECTED (`ae0e26bb`); effect
+   still UNOBSERVED.** **The first version was WRONG in a way no run could see**: `reserve_slots(count)`
+   ADDS, so the caller's `capacity + 1` DOUBLED the pool (16 -> 33 -> 67 -> 135, ~3 GiB pinned
+   synchronously) instead of growing it by one — found by the review of that commit, which ran the call
+   against the real pool and reproduced it twice. It shipped unexercised, which is exactly the gap: with
+   no positive control, a wrong SIZE looks identical to a right one. `ae0e26bb` fixes the call, extracts
+   the decision so a host-only unit test asserts the capacity DIFFERENCE, mutation-checks it (the shipped
+   form fails exactly the two assertions written for it), counts and exports refusals in `/stats`, and
+   corrects the `capacity == 0` rationale (the pool is NULL with `--host-state-slots 0`, so the guard was
+   never what protected the disabled tier). **prod ran the doubling form for ~10 minutes** (pool 0/16, so
+   it never fired) and now runs the fixed build, verified by exe hash.
+   **VALIDATION RESTATED:** the criterion is NOT "the 8-line `demotable=0 restorable=1` shape stops
+   appearing". `demotable` reads a LIVE `admission_capacity()`, so a pre-grow makes that shape read
+   `demotable=1` whether or not a demote was offered — it moves the denominator, and a criterion that
+   passes because the measured thing was redefined is the pattern this repo keeps paying for. Measure
+   DEMOTES instead: `pressure.private_owners_demoted` rising, or the state D2H count, in a soak that
+   reaches a full pool. Nothing runnable here does (recorded at §1c).
    `ensure_host_state_headroom()` grows the host state pool by one slot when it is FULL, called once from
    the pressure planning session's constructor (not from the search -- see the commit). The tier-disabled
    guard is in (`--host-state-slots 0` is DISABLED, not full: `0 < 0` would otherwise have conjured a

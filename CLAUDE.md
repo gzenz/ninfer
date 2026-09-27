@@ -215,6 +215,15 @@ while it lasts. In dev time that is the entire cost; in prod time it is the smal
   **running exe's hash**, not the build directory's: `sha256sum /proc/$(systemctl show -p MainPID --value
   ninfer.service)/exe` must equal `sha256sum build/apps/ninfer-serve`. A build-directory hash changes on
   every relink and proves nothing on its own.
+  **That check proves "running == last link", never "last link == HEAD", and the difference has already cost
+  a deploy:** while iterating on one target (`ninfer_qwen3_5_prefix_real_test`) and never rebuilding
+  `ninfer-serve`, the two hashes agreed because both were the OLD build, and prod served a version of the
+  change that lacked its guard and its instrument for ~10 minutes. **So pair it with a build-freshness
+  check:** `cmake --build build -j --target ninfer-serve` first, then either
+  `find src include apps -newer build/apps/ninfer-serve` (must print nothing) or grep the RUNNING exe for a
+  string the change introduces — `grep -ac '<new log line>' /proc/$(systemctl show -p MainPID --value
+  ninfer.service)/exe` must be ≥ 1, with an old string absent as the control. Without one of those, a change
+  that prints nothing cannot be observed on prod no matter how long you watch.
 - **Stopping prod is not a "kill it if busy" operation.** The unit runs with `TimeoutStopSec=300` (raised
   from 30 on 2026-09-26, `/etc/systemd/system/ninfer.service`; nothing else writes it, and
   `~/ninfer-ensure.sh` does not, so an edit there is authoritative). A stop-timeout SIGKILL destroys the

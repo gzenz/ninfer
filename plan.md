@@ -1724,6 +1724,27 @@ it is an engine regression, which `git stash` settles in one run.
    retries. Fail-closed on the budget, so a refusal returns nullopt and the caller is unchanged: the scenario
    battery is `rc=0` and behaviour-neutral.
    **The parameter's remaining role, stated plainly:** an initial size and the trim FLOOR -- not a ceiling.
+   **THE 2s EXPERIMENT ANSWERED IT, BY SHOWING THE BUDGET IS NOT THE BINDING CONSTRAINT (2026-09-27 13:32-13:37,
+   operator-authorized).** With `NINFER_SEARCH_MS=2000` live in the process, the searches do NOT run to 2 s:
+
+   | | 400 ms default | 2000 ms override |
+   |---|---|---|
+   | search elapsed | 400 ms (`stop=assessment`) | **271-718 ms** |
+   | targets assessed | 1902-2535 | **4080-4099** |
+   | stop phase | `assessment` | **`expansion`** |
+   | eviction record | `adoptable=0 chosen=16` | `adoptable=0 chosen=1` (697 ms, 4079 targets) |
+   | defect pair over the window | 0 | **0** (49 records) |
+
+   **The search is bounded by the TARGET ARENA (~4096 = `kTargetBudget` + candidates), not by the clock**: five
+   times the budget buys more targets assessed (4080-4099 against 1902-2535) and the same verdict --
+   `adoptable = 0` for the eviction, with no record in the window showing `adoptable > 0` together with
+   `chosen > 0`. **So the ambiguity narrows from "the 400 ms clock cut it off" to "it explored the arena and
+   found nothing"**, and the evictions are victims no ADOPTABLE preserving plan covered. That is the capacity
+   reading surviving, now with the search no longer clock-limited.
+   **Caveat, stated because it is load-bearing:** the arena is ITSELF a bound, so "the search explored
+   everything" is NOT proven -- only that it explored the arena's full 4096 and found nothing. This also
+   explains the `pressure target arena is full` recovery: the arena is genuinely reachable, and it is the
+   planner's real ceiling, which is what "the cut-off" should be understood as.
    **MEASURED OVER COMPARABLE WINDOWS (2026-09-27):**
 
    | | pre-fix (13:09:46 -> 13:19:17, 9.5 min) | post-fix (13:19:17 -> ~10 min) |

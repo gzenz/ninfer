@@ -1760,6 +1760,20 @@ it is an engine regression, which `git stash` settles in one run.
    **The next step:** extend the instrumentation to the capture path (or instrument the eviction site with
    the same availability question the reuse instrument asks), so "was a preserving alternative available"
    is answered on BOTH paths rather than one.
+   **⚠ THE RULING IS VIOLATED, PROVEN ON LIVE TRAFFIC (2026-09-27 14:22:29, the first `demote_possible=1`).**
+   `demotable=1 restorable=1 cont=13 frontier=38501 victim_host_slots=1 victim_dev_slots=2
+   host_state_slots=31/32 host_kv=4.55GB/32.2GB victim_room=1 demote_possible=1`
+   -- a RESTORABLE victim, on the DEVICE, with a demote that WAS CONSTRUCTIBLE, evicted anyway. The
+   instrument's three preceding readings were all `=0` (victims already holding host slots, or with nothing
+   restorable), so it discriminates rather than firing on everything, and this is the first case where the
+   operator's ruling is broken with the evidence attached rather than argued.
+   **Why it took an instrument to see:** `demotable` is a pool-level comparison and `restorable` is an
+   eligibility test; neither asks whether a demote could actually be CONSTRUCTED for THIS victim.
+   `can_demote_to_host` asks exactly that (the demote path's own seven preconditions, non-mutating), which
+   is what turns this from "possibly a defect" into "a defect, with the state the plan was looking at".
+   **What is NOT yet established:** that the same burst's request reports `adoptable > 0` in the decisive
+   pair -- the two instrument two DIFFERENT planners' views, and `#6`'s own history is full of cases where one
+   said "available" and the other said "none". The pair reading for this request is the next check.
    **THE 2s EXPERIMENT ANSWERED IT, BY SHOWING THE BUDGET IS NOT THE BINDING CONSTRAINT (2026-09-27 13:32-13:37,
    operator-authorized).** With `NINFER_SEARCH_MS=2000` live in the process, the searches do NOT run to 2 s:
 

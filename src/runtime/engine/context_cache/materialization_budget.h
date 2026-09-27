@@ -93,6 +93,38 @@ template <typename ReuseOf>
     return loss;
 }
 
+// THE SPLIT'S AGGREGATION, at namespace scope so a host-only test can drive it -- because the first version
+// of this was WRONG in a way no test would have caught, and it sent a fix the wrong way.
+//
+// What it did: it reported `restorable` from whichever entry matched DEEPEST, so an entry matching 28,530 with
+// no restorable checkpoint hid a second entry matching 23,353 WITH one. The field then contradicted the
+// request's own `chosen_reuse` in 94 of 309 records -- the request demonstrably resumed from a checkpoint the
+// field said did not exist -- and the "no checkpoint below the match, so capture one" conclusion was built on
+// that artifact.
+//
+// The two maxima are INDEPENDENT and that is the whole point: the deepest MATCH and the deepest RESTORABLE
+// checkpoint need not come from the same entry, and a reader must not infer one from the other.
+struct PrefixSplitSample {
+    std::uint32_t tokens     = 0;  // this entry's token-exact match
+    std::uint32_t restorable = 0;  // this entry's deepest restorable checkpoint at or below its own match
+};
+
+struct PrefixSplitBest {
+    std::uint32_t tokens     = 0;
+    std::uint32_t restorable = 0;
+    std::uint32_t entries    = 0;
+};
+
+[[nodiscard]] inline PrefixSplitBest best_prefix_split(std::span<const PrefixSplitSample> samples) noexcept {
+    PrefixSplitBest best;
+    for (const PrefixSplitSample& sample : samples) {
+        ++best.entries;
+        best.tokens     = std::max(best.tokens, sample.tokens);
+        best.restorable = std::max(best.restorable, sample.restorable);
+    }
+    return best;
+}
+
 // #6: THE INCUMBENT COST KEY, at namespace scope so a host-only test can compare two of them and assert
 // the ordering directly. It was private to the planner, which is why nothing tested it -- and the ordering
 // it encodes IS the operator's ruling ("evicting a victim that holds a restorable checkpoint while the host

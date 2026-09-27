@@ -538,6 +538,22 @@ public:
     [[nodiscard]] std::vector<runtime::CheckpointRecoveryAlternativeWork>
     checkpoint_recovery_work(const SharedPrefixHandle& owner,
                              runtime::CheckpointRef checkpoint) const;
+    // THE SPLIT (plan.md §2f), and it is deliberately not a counter: for a stored continuation, the deepest
+    // token-exact common prefix with an incoming prompt, whether the IDENTITY CHAIN agrees at that depth, and
+    // the deepest restorable checkpoint at or below it. The two numbers together are what names the cause:
+    //   tokens deep, identity FALSE -> the tokens match but the render differs (a re-rendered earlier turn);
+    //   tokens shallow (e.g. 23k where another request reaches 34k from the same entry) -> the PROMPT diverged;
+    //   tokens deep, restorable shallow -> placement or retention, which is ours.
+    // No engine in the survey needs a session id for this; the comparison is the whole answer.
+    struct PrefixSplit {
+        std::uint32_t tokens         = 0;  // longest token-exact common prefix
+        std::uint32_t restorable     = 0;  // deepest restorable checkpoint frontier at or below `tokens`
+        bool          identity_ok    = false;
+    };
+    [[nodiscard]] PrefixSplit prefix_split(const ContinuationHandle& owner,
+                                           std::span<const TokenId> prompt_tokens) const;
+    [[nodiscard]] PrefixSplit prefix_split(const SharedPrefixHandle& owner,
+                                           std::span<const TokenId> prompt_tokens) const;
     [[nodiscard]] bool shared_capture_matches(const CaptureOffer& offer,
                                               const SharedPrefixHandle& shared) const;
     void skip_capture(CaptureOffer&& offer);

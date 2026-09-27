@@ -120,4 +120,35 @@ int main() {
         std::cerr << error.what() << '\n';
         return 1;
     }
+
+    // THE SPLIT'S AGGREGATION. The first version returned `restorable` from whichever entry matched deepest,
+    // so a deep match with NO restorable checkpoint hid a shallower match WITH one -- and the value then
+    // contradicted the request's own reuse in 94 of 309 records. These two cases pin the maxima as
+    // INDEPENDENT, which is the property that was wrong.
+    {
+        const ninfer::runtime::PrefixSplitSample deep_without_checkpoint{.tokens = 28530,
+                                                                        .restorable = 0};
+        const ninfer::runtime::PrefixSplitSample shallow_with_checkpoint{.tokens = 23353,
+                                                                        .restorable = 23353};
+        const std::array samples{deep_without_checkpoint, shallow_with_checkpoint};
+        const ninfer::runtime::PrefixSplitBest best = ninfer::runtime::best_prefix_split(samples);
+        if (best.tokens != 28530) { std::cerr << "deepest match must come from the deepest entry\n"; return 1; }
+        if (best.restorable != 23353) {
+            std::cerr << "MUTATION-SENSITIVE: restorable must be the max over entries, not the deepest "
+                         "entry's own value (the bug that produced restorable=0 and sent a fix the wrong "
+                         "way)\n";
+            return 1;
+        }
+        if (best.entries != 2) { std::cerr << "the denominator must count every entry scanned\n"; return 1; }
+    }
+    // And the degenerate shapes: no entries, and one entry whose checkpoint is below its match.
+    {
+        const ninfer::runtime::PrefixSplitBest none =
+            ninfer::runtime::best_prefix_split(std::span<const ninfer::runtime::PrefixSplitSample>{});
+        if (none.entries != 0 || none.tokens != 0 || none.restorable != 0) {
+            std::cerr << "an empty scan must report zeroes, not stale values\n";
+            return 1;
+        }
+    }
+    std::cout << "prefix-split aggregation ok\n";
 }

@@ -955,6 +955,19 @@ public:
     [[nodiscard]] std::uint64_t publication_cell_veto_other() const noexcept;
     [[nodiscard]] std::uint64_t publication_cell_veto_reuse() const noexcept;
     void add_publication_cell_probes(std::uint64_t count) noexcept;
+    struct PrefixSplit {
+        std::uint32_t tokens      = 0;
+        std::uint32_t restorable  = 0;
+        bool          identity_ok = false;
+    };
+    // Takes the PROMPT, not a token span: reading the prompt's tokens requires the frontend's
+    // `PreparedPromptAccess`, and doing that in the caller forced the model-agnostic `ResourceManager` to
+    // include a qwen3_5 header -- which broke `ninfer_resource_manager_test`'s ability to compile against a
+    // fake prompt at all. The view happens here, in the model layer.
+    [[nodiscard]] PrefixSplit prefix_split(const ContinuationHandle& owner,
+                                           const PreparedPrompt& prompt) const;
+    [[nodiscard]] PrefixSplit prefix_split(const SharedPrefixHandle& owner,
+                                           const PreparedPrompt& prompt) const;
     [[nodiscard]] std::uint64_t publication_cell_losses() const noexcept;
     [[nodiscard]] std::uint64_t publication_cell_probes() const noexcept;
 

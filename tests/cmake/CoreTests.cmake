@@ -38,6 +38,10 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     $<$<COMPILE_LANGUAGE:CXX>:-D_GLIBCXX_ASSERTIONS>)
 endif()
 
+ninfer_add_test(ninfer_serve_session_key_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_serve_session_key.cpp"
+  LIBRARIES ninfer_core)
+
 ninfer_add_test(ninfer_kv_cache_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_kv_cache.cpp"
   LIBRARIES ninfer_core)

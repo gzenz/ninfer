@@ -874,6 +874,60 @@ ProgramImpl::checkpoint_recovery_work(const ContinuationHandle& owner,
     return alternatives;
 }
 
+// The deepest token-exact common prefix between an incoming prompt and a stored ledger. Half (a) of the split
+// in plan.md §2f: with half (b) below it names the cause -- a shallow match is the PROMPT diverging, a deep
+// match with a shallow restorable frontier is placement or retention, which is ours.
+std::uint32_t deepest_token_match(std::span<const TokenId> prompt, std::span<const TokenId> stored) {
+    const std::size_t limit = std::min(prompt.size(), stored.size());
+    std::size_t shared      = 0;
+    while (shared < limit && prompt[shared] == stored[shared]) { ++shared; }
+    return static_cast<std::uint32_t>(shared);
+}
+
+ProgramImpl::PrefixSplit ProgramImpl::prefix_split(const ContinuationHandle& owner,
+                                                   std::span<const TokenId> prompt_tokens) const {
+    PrefixSplit split;
+    if (!valid_continuation(owner)) { return split; }
+    const SequenceState& sequence = continuation_states[ContractAccess::index(owner)];
+    split.tokens                  = deepest_token_match(prompt_tokens, sequence.ledger);
+    // NO IDENTITY CHECK HERE, deliberately: `prefix_matches` needs the full PreparedPromptData (token types
+    // and rope state), which this layer does not hold -- and the two numbers below are what §2f's verdict
+    // turns on. `identity_ok` stays false and is documented as NOT MEASURED rather than as "not matching",
+    // because a false there would be read as "the render differs" and that would be an invented finding.
+    // The deepest RESTORABLE checkpoint at or below the match: an endpoint or rewrite frontier the sequence
+    // can actually be restored from. This is half (b) of the split -- a deep match with a shallow
+    // restorable frontier is placement or retention, and it is ours.
+    const qwen3_5::ContinuationSummary summary = continuation_summary(sequence);
+    const auto consider = [&](const std::optional<qwen3_5::CheckpointSummary>& checkpoint) {
+        if (!checkpoint || checkpoint->ref.frontier > split.tokens) { return; }
+        split.restorable = std::max(split.restorable, checkpoint->ref.frontier);
+    };
+    consider(summary.endpoint);
+    consider(summary.rewrite);
+    for (const auto& anchor : summary.long_anchors) {
+        if (anchor.ref.frontier <= split.tokens) {
+            split.restorable = std::max(split.restorable, anchor.ref.frontier);
+        }
+    }
+    return split;
+}
+
+ProgramImpl::PrefixSplit ProgramImpl::prefix_split(const SharedPrefixHandle& owner,
+                                                   std::span<const TokenId> prompt_tokens) const {
+    PrefixSplit split;
+    if (!valid_shared_prefix(owner)) { return split; }
+    const SharedPrefixState& shared = shared_prefix_states[ContractAccess::index(owner)];
+    // The shared prefix's tokens live on its identity, not on the state -- the same reach the materialization
+    // path uses (`shared_state->identity->ledger()`), and there is no ledger without an identity.
+    if (!shared.identity) { return split; }
+    split.tokens = deepest_token_match(prompt_tokens, shared.identity->ledger());
+    const qwen3_5::SharedPrefixSummary summary = shared_prefix_summary(shared);
+    if (summary.checkpoint.ref.frontier <= split.tokens) {
+        split.restorable = summary.checkpoint.ref.frontier;
+    }
+    return split;
+}
+
 std::vector<runtime::CheckpointRecoveryAlternativeWork>
 ProgramImpl::checkpoint_recovery_work(const SharedPrefixHandle& owner,
                                       runtime::CheckpointRef checkpoint) const {

@@ -299,7 +299,17 @@ public:
         if (!destination) { return {.readiness = Readiness::TemporarilyBlocked}; }
 
         const typename Planner::Clock::time_point planning_started = Planner::Clock::now();
-        const bool cdbg = std::getenv("NINFER_MAT_DEBUG") != nullptr;
+        // THE CANDGEN DIAGNOSTIC GETS ITS OWN GATE. Every `cdbg_log` site in this file (10 of them) is a
+        // `[candgen]` line, and it was reachable only through `NINFER_MAT_DEBUG` -- which also switches on the
+        // planner's `[mat-debug]` probes: 1.7 MB of output for one prod4 run, 678 MB of serve log, and all of
+        // it on the paths the suite TIMES. So the one diagnostic that answers "was the session's own cell even
+        // found" could not be enabled on a serving instance, which is exactly where the question was asked
+        // (2026-09-27: a third of requests after a restart reused a shared prefix for 23,353 tokens with NO
+        // private candidate, and three same-shaped requests took a root instead -- 0% -- and the difference is
+        // visible in these lines). `getenv` is non-NULL for an EMPTY string, so an exported empty name turns
+        // it ON; that is deliberate here and is why the test harness unsets rather than blanks MAT_*.
+        const bool cdbg = std::getenv("NINFER_MAT_DEBUG") != nullptr ||
+                          std::getenv("NINFER_CANDGEN_DEBUG") != nullptr;
         const auto cdbg_log = [cdbg](const char* fmt, ...) {
             if (!cdbg) { return; }
             std::va_list ap;
@@ -2399,6 +2409,13 @@ private:
         // these candidates. Reading the decision beats guessing at it, and this is the read.
         //
         // `longer_lost=1` is the defect: a candidate reusing strictly more tokens was available and lost.
+        // Populated for the REQUEST LOG, not just the rate-limited line below. See the field's comment in
+        // `types.h`: the journal line answers "was a longer candidate refused" only for the first 8
+        // selections per process, which is precisely when nobody is asking.
+        std::vector<MaterializationDiagnostics::MaterializationCandidate> candidate_rows;
+        std::uint32_t selection_chosen_reuse = 0;
+        std::uint32_t selection_best_loser   = 0;
+        bool          selection_longer_lost  = false;
         {
             static std::uint64_t selections = 0;
             ++selections;
@@ -2419,6 +2436,25 @@ private:
                 }
             }
             const bool longer_lost = best_other_reuse > winner_reuse;
+            selection_chosen_reuse = winner_reuse;
+            selection_best_loser   = best_other_reuse;
+            selection_longer_lost  = longer_lost;
+            candidate_rows.reserve(candidates.size());
+            for (std::size_t index = 0; index < candidates.size(); ++index) {
+                const Candidate& item = candidates[index];
+                MaterializationDiagnostics::MaterializationCandidate row;
+                row.reuse          = item.plan ? item.plan->summary().reusable_prompt_tokens : 0U;
+                row.winner         = &item == &candidate;
+                row.private_source = item.private_source.has_value();
+                row.shared_source  = item.shared_source.has_value();
+                if (index < probe_tally.size()) {
+                    row.probes    = probe_tally[index].probes;
+                    row.goals     = probe_tally[index].goals;
+                    row.cell_only = probe_tally[index].cell_only;
+                    row.other     = probe_tally[index].other;
+                }
+                candidate_rows.push_back(row);
+            }
             // `longer_lost` is the ONLY case worth acting on, so it is never rate-limited away. The 8-sample
             // limit meant "the planner consistently picks the longer candidate" rested on the process's first
             // eight admissions -- before any shared prefix was even captured -- while ~70 later selections
@@ -2444,6 +2480,35 @@ private:
         choice.publication_slot_               = planned->publication_slot;
         choice.selected_observation_           = candidate.selected_observation;
         choice.diagnostics_                    = planned->diagnostics;
+        // THE SPLIT, over the catalog itself. Reported per request because §2f's verdict is per request:
+        // whether the deepest match is shallow (the prompt diverged) or deep with a shallow restorable
+        // frontier (ours). Every stored entry is scanned, not only the ones the search happened to offer.
+        {
+            std::vector<PrefixSplitSample> samples;
+            samples.reserve(static_cast<std::size_t>(catalog_count_) + shared_catalog_count_);
+            const auto consider = [&](const Program::PrefixSplit& split) {
+                samples.push_back(PrefixSplitSample{.tokens = split.tokens,
+                                                    .restorable = split.restorable});
+            };
+            for (std::uint32_t slot = 0; slot < catalog_count_; ++slot) {
+                const CatalogEntry& entry = catalog_[slot];
+                if (entry.state != CatalogState::Catalogued || !entry.handle) { continue; }
+                consider(program.prefix_split(*entry.handle, prompt));
+            }
+            for (std::uint32_t slot = 0; slot < shared_catalog_count_; ++slot) {
+                const SharedCatalogEntry& entry = shared_catalog_[slot];
+                if (entry.state != SharedCatalogState::Catalogued || !entry.handle) { continue; }
+                consider(program.prefix_split(*entry.handle, prompt));
+            }
+            const PrefixSplitBest best = best_prefix_split(samples);
+            choice.diagnostics_.split_best_tokens     = best.tokens;
+            choice.diagnostics_.split_best_restorable = best.restorable;
+            choice.diagnostics_.split_entries         = best.entries;
+        }
+        choice.diagnostics_.candidates         = std::move(candidate_rows);
+        choice.diagnostics_.chosen_reuse       = selection_chosen_reuse;
+        choice.diagnostics_.best_loser_reuse   = selection_best_loser;
+        choice.diagnostics_.longer_lost        = selection_longer_lost;
         provisional_demand.selected_source_key = candidate.source_key;
         choice.demand_                         = std::move(provisional_demand);
         for (const PressureOwnerOutcome& outcome : planned->owner_outcomes) {

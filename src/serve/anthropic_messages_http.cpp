@@ -64,15 +64,23 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
     }
 
     const std::uint64_t req_id = ++request_seq_;
+    // DERIVED BEFORE THE METADATA IS BUILT, so the key the engine is handed and the key the log records cannot
+    // disagree. THE V2 SESSION-KEY PORT (613171bd): the Messages path carries no session key, so derive one
+    // from the conversation's own first turn. Without it every request landed in its own reuse domain
+    // (`reuse_domain` falls back to the per-request publication_order) and retention stayed RecentPrivate,
+    // which is the condition V2 describes as units that "classify dead forever".
+    ContextCacheHints cache_hints;
+    cache_hints.session_key = derive_session_key(request.generation.messages);
     const RequestLogMetadata metadata{.model                  = request.model,
                                       .stream                 = request.stream,
-                                      .output_tokens_explicit = request.output_tokens_explicit};
+                                      .output_tokens_explicit = request.output_tokens_explicit,
+                                      .session_key            = cache_hints.session_key};
     PreparedRequest prepared;
     try {
         prepared = service_->prepare(request.generation,
                                      request.stream ? GenerationConsumerMode::Streaming
                                                     : GenerationConsumerMode::Aggregate,
-                                     {}, [&req] { return client_disconnected(req); });
+                                     {}, [&req] { return client_disconnected(req); }, cache_hints);
     } catch (const ApiException& exception) {
         const ApiError error = normalize_anthropic_error(exception.error());
         record_request_rejected(make_request_rejection_log_context(

@@ -217,6 +217,10 @@ Json request_json(const RequestLogContext& context) {
                 {"preserve_thinking",
                  context.preserve_thinking ? Json(*context.preserve_thinking) : Json(nullptr)},
                 {"preserve_thinking_semantic_change", context.preserve_thinking_semantic_change},
+                // The key the engine actually scoped this request to (derived on the Messages path, explicit
+                // on the Responses path). Absent means the request ran with no key at all -- the condition
+                // that made everything session-scoped unreachable until 2026-09-27.
+                {"session_key", context.session_key ? Json(*context.session_key) : Json(nullptr)},
                 {"sampling", sampler_json(context.sampling)}};
 }
 
@@ -314,6 +318,32 @@ Json materialization_json(const ninfer::MaterializationDiagnostics& diagnostics)
         {"feasible_preserving_alternatives", diagnostics.feasible_preserving_alternatives},
         {"chosen_restorable_evictions", diagnostics.chosen_restorable_evictions},
         {"assessed_targets_without_goal", diagnostics.assessed_targets_without_goal},
+        // THE CANDIDATE SET, per request. `longer_lost` true beside a `best_loser_reuse` above
+        // `chosen_reuse` is the defect: a longer source was available and refused. Each row then says what
+        // happened to that candidate -- how many goal probes it got, how many produced an adoptable goal,
+        // and how many were blocked by the publication cell alone versus anything else.
+        {"candidates", [&] {
+             Json array = Json::array();
+             for (const auto& row : diagnostics.candidates) {
+                 array.push_back(Json{{"reuse", row.reuse},
+                                      {"probes", row.probes},
+                                      {"goals", row.goals},
+                                      {"cell_only", row.cell_only},
+                                      {"other", row.other},
+                                      {"winner", row.winner},
+                                      {"private_source", row.private_source},
+                                      {"shared_source", row.shared_source}});
+             }
+             return array;
+         }()},
+        {"chosen_reuse", diagnostics.chosen_reuse},
+        {"best_loser_reuse", diagnostics.best_loser_reuse},
+        {"longer_lost", diagnostics.longer_lost},
+        // THE SPLIT (§2f): the deepest token-exact match against ANY stored ledger, the deepest restorable
+        // checkpoint at or below it, and the entry count examined.
+        {"split_best_tokens", diagnostics.split_best_tokens},
+        {"split_best_restorable", diagnostics.split_best_restorable},
+        {"split_entries", diagnostics.split_entries},
         {"initial_predicted_total_ns", diagnostics.initial_predicted_total_ns},
         {"first_improvement_ns", diagnostics.first_improvement_ns
                                      ? Json(*diagnostics.first_improvement_ns)

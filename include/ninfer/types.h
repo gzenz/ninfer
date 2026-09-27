@@ -826,6 +826,43 @@ struct MaterializationDiagnostics {
     // This counts the targets that were assessed and produced NO goal, which is the difference between
     // "the relief step was generated and could not be adopted" and "it was never reached".
     std::uint64_t assessed_targets_without_goal       = 0;
+    // PER-REQUEST CANDIDATE VISIBILITY (2026-09-27), added because a served run showed twelve consecutive
+    // requests reusing exactly 23,353 tokens through `shared_stable_prefix` while their prompts ran 39k-56k,
+    // and nothing in the record could say whether a LONGER source had existed and been refused, or whether
+    // the frozen snapshot was simply the longest thing available. The journal's `reuse-select` line answers
+    // that in principle, but it fires for the first 8 selections per process, so it was silent for exactly
+    // the requests being asked about; the reason a candidate had no goal was folded into the conflating
+    // counter above. This is the same information ATTACHED TO THE REQUEST.
+    //
+    // One entry per candidate the planner built, in the order it built them.
+    struct MaterializationCandidate {
+        std::uint32_t reuse      = 0;  // tokens this candidate would have reused (its own plan summary)
+        std::uint32_t probes     = 0;  // goal-builder probes the planner made FOR it
+        std::uint32_t goals      = 0;  // probes that produced an adoptable goal
+        std::uint32_t cell_only  = 0;  // probes blocked by the publication cell and by NOTHING else
+        std::uint32_t other      = 0;  // probes blocked for any other reason
+        bool          winner     = false;
+        bool          private_source = false;
+        bool          shared_source  = false;
+    };
+    std::vector<MaterializationCandidate> candidates;
+    // The selection comparison itself, promoted out of the rate-limited journal line: `longer_lost` true
+    // means a candidate reusing strictly MORE than the adopted plan was available and lost, which is the
+    // defect this pair exists to catch.
+    std::uint32_t chosen_reuse     = 0;
+    std::uint32_t best_loser_reuse = 0;
+    bool          longer_lost      = false;
+    // THE SPLIT (plan.md §2f), per request: the deepest TOKEN-EXACT common prefix between this prompt and any
+    // stored ledger, the deepest RESTORABLE checkpoint at or below it, and how many entries were scanned (the
+    // denominator -- without it a zero cannot be told from "nothing was examined"). Its verdict is
+    // pre-committed in §2f, so this is not a counter to interpret later: best_tokens ~23k means the PROMPT
+    // diverged there and no engine in the surveyed set would do better; best_tokens deep (say 60k) with
+    // best_restorable shallow (23k) means the match exists and our retention or placement lost it, which is
+    // ours. Scanning the CATALOG directly rather than the pressure-enumerated owner list is deliberate: that
+    // list is built lazily and its emptiness has already been mistaken for an empty catalog once.
+    std::uint32_t split_best_tokens     = 0;
+    std::uint32_t split_best_restorable = 0;
+    std::uint32_t split_entries         = 0;
 
     std::uint64_t initial_predicted_total_ns = 0;
     std::optional<std::uint64_t> first_improvement_ns;

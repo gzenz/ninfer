@@ -502,6 +502,20 @@ std::uint64_t Program::publication_cell_veto_reuse() const noexcept {
 void Program::add_publication_cell_probes(std::uint64_t count) noexcept {
     impl_->add_publication_cell_probes(count);
 }
+Program::PrefixSplit Program::prefix_split(const ContinuationHandle& owner,
+                                          const PreparedPrompt& prompt) const {
+    const detail::ProgramImpl::PrefixSplit split =
+        impl_->prefix_split(owner, PreparedPromptAccess::view(prompt).token_ids);
+    return PrefixSplit{.tokens = split.tokens, .restorable = split.restorable,
+                       .identity_ok = split.identity_ok};
+}
+Program::PrefixSplit Program::prefix_split(const SharedPrefixHandle& owner,
+                                          const PreparedPrompt& prompt) const {
+    const detail::ProgramImpl::PrefixSplit split =
+        impl_->prefix_split(owner, PreparedPromptAccess::view(prompt).token_ids);
+    return PrefixSplit{.tokens = split.tokens, .restorable = split.restorable,
+                       .identity_ok = split.identity_ok};
+}
 std::uint64_t Program::publication_cell_losses() const noexcept {
     return impl_->publication_cell_losses();
 }

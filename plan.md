@@ -216,29 +216,26 @@ commit. A message citing a pre-rewrite id resolves for nobody after a push, so t
 
 **Cite the subject line, or an id that resolves on the remote, never a row above it.**
 
-### 1c. Review findings left open (2026-09-26, from the pass on the state-image-restore commit)
+### 1c. Review findings from the state-image-restore commit — ALL CLOSED (2026-09-27)
 
-Two documentation defects the review named, NOT yet fixed, recorded here so they are not re-derived:
+Kept as the record of what a review pass named, and of what closed each item. Nothing here is open.
 
-1. **The test commit's message says both manifests carry `tree_diff_sha256`; only `232403` does.** The
-   `231449` manifest has `git_head` + `git_dirty_paths` only, and its binary (`2ec23c8e`) predates the
-   commit, so that hash cannot be reconstructed from a later tree. Fix: correct the message (or state the
-   asymmetry). Either way it needs an amend of that commit, not of HEAD.
-2. **Both manifests' hand-written `started=` fields are wrong** -- each records the SECOND window's start
-   (23:15:54 and 23:26:32) rather than the first (23:14:49 and 23:24:03); the journal has the cycles. Fix in
-   the manifests, or drop the field: a hand-written timestamp that is 65 s late is exactly what the
-   "hand-written manifest" caveat warns about, and it happened inside the caveat's own commit.
+1. **The test commit's message claimed both manifests carry `tree_diff_sha256`; only `232403` does.**
+   CLOSED: the message now says which one carries it and that it is the only one tying a binary to the
+   committed source (`231449`'s binary `2ec23c8e` predates the commit, so the hash is not reconstructible).
+2. **Both manifests' hand-written `started=` fields recorded the SECOND window.** CLOSED: corrected to the
+   journal's cycles (23:14:49 and 23:24:03) and the field now says it is hand-written, in the file itself;
+   `34d9bac2`.
+3. **The new state-image assertion could not be shown to FAIL.** CLOSED: `NINFER_STATE_IMAGE_HOST_SLOTS=0`
+   removes the host state pool and the scenario then refuses -- two runs, identical, `rc=1`, at its own
+   precondition (`state_d2h 0 -> 0`). What that shows is the GUARD firing; the H2D check's own reachability
+   still rests on the contrast with `host_restore` (0 there, 1 here) and not on a second negative, which is
+   stated at the scenario. `build-diag` was rebuilt with the new scenario, so the battery's name lookup no
+   longer dies on it (`#19`).
 
-**And one claim still unverified, which the review called the cheapest real improvement:** that the new
-state-image assertion can FAIL. **NOW VERIFIED (2026-09-26):** `NINFER_STATE_IMAGE_HOST_SLOTS=0` removes the
-host state pool, and the scenario then refuses -- two runs, identical, `rc=1`, stopping at its own
-precondition (`state_d2h 0 -> 0`). What that control shows is the GUARD firing; the H2D check's own
-reachability still rests on the contrast with `host_restore` (0 there, 1 here) rather than on a second
-negative. `build-diag` has been rebuilt with the new scenario, so the battery's name lookup no longer dies. Two identical passing runs show it executes and is deterministic; they do not
-show it can fail. The control: the same scenario with `host_state_slots = 0`, twice, expecting a non-zero
-exit at the precondition or the H2D check. It needs a small scenario parameter (the options come from
-`host_restore_engine_options`) and a GPU window; the battery's half of the wiring has likewise never been run
-(see the note in §1's battery line).
+**What is still open, and it is NOT in this section** (see §2 and §3): the planner-level counter for #6
+("a restorable victim was evicted while a FEASIBLE preserving alternative existed"), and the two items that
+genuinely need prod traffic -- #2's underflow and #9's wedge.
 
 ### 2. Open, in priority order
 

@@ -1310,6 +1310,16 @@ public:
         // only be noticed as a silent loss of reuse. (Not the only pool in that state: the shared-prefix pool
         // has neither half either and device-state-slots has occupancy without a capacity -- `plan.md` §4.)
         out.private_catalog_capacity_cells      = catalog_count_;
+        // THE COPY-OUT, and its absence is why the first reading of these five was all zeros: the counters
+        // were incremented at nine sites and never copied, so `/stats` served the struct's default 0 -- a dead
+        // instrument reading as a clean zero, which would have been read as "no cell is ever cleared" and that
+        // is a claim about the ENGINE drawn from a counter that was never wired. `terminal` alone must be at
+        // least one per completed request, so a zero here is an instrument failure, not a finding.
+        out.catalog_cell_clears_terminal  = cell_clears_[static_cast<std::size_t>(CellClearReason::Terminal)];
+        out.catalog_cell_clears_action    = cell_clears_[static_cast<std::size_t>(CellClearReason::Action)];
+        out.catalog_cell_clears_cancelled = cell_clears_[static_cast<std::size_t>(CellClearReason::Cancelled)];
+        out.catalog_cell_clears_cleanup   = cell_clears_[static_cast<std::size_t>(CellClearReason::Cleanup)];
+        out.catalog_cell_clears_rollback  = cell_clears_[static_cast<std::size_t>(CellClearReason::Rollback)];
         out.private_catalog_occupied_cells      = catalog_occupied_cells();
         out.pressure_publication_cell_losses    = program.publication_cell_losses();
         out.pressure_publication_cell_probes    = program.publication_cell_probes();
@@ -2600,6 +2610,28 @@ private:
         // whether the deepest match is shallow (the prompt diverged) or deep with a shallow restorable
         // frontier (ours). Every stored entry is scanned, not only the ones the search happened to offer.
         {
+            // THE SESSION CELL vs THE CANDIDATES, computed here where both are in scope: the cell holds the
+            // conversation's NEWEST published continuation, and this says what it holds and whether it was
+            // offered. `candidates` carries each one's slot through `private_source`.
+            std::uint32_t session_cell_frontier = 0;
+            bool          session_cell_offered  = false;
+            if (cache_enabled_ && base.context_cache().session_key &&
+                base.context_cache().update_session_index) {
+                const std::optional<std::size_t> cell = find_session_cell(*base.context_cache().session_key);
+                if (cell && session_index_[*cell].slot < catalog_count_) {
+                    const std::uint32_t slot  = session_index_[*cell].slot;
+                    const CatalogEntry& entry = catalog_[slot];
+                    if (entry.state == CatalogState::Catalogued && entry.summary.endpoint) {
+                        session_cell_frontier = entry.summary.endpoint->ref.frontier;
+                        for (const Candidate& offered : candidates) {
+                            if (offered.private_source && offered.private_source->slot == slot) {
+                                session_cell_offered = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
             std::vector<PrefixSplitSample> samples;
             samples.reserve(static_cast<std::size_t>(catalog_count_) + shared_catalog_count_);
             const auto consider = [&](const Program::PrefixSplit& split) {
@@ -2622,6 +2654,8 @@ private:
             choice.diagnostics_.split_best_restorable = best.restorable;
             choice.diagnostics_.split_entries         = best.entries;
             choice.diagnostics_.split_identity_ok     = best.identity_ok;
+            choice.diagnostics_.session_cell_frontier = session_cell_frontier;
+            choice.diagnostics_.session_cell_offered  = session_cell_offered;
             choice.diagnostics_.sibling_candidates    = candidate_counters.sibling_candidates;
             choice.diagnostics_.retained_sources      = candidate_counters.retained_sources;
             choice.diagnostics_.consumed_sources      = candidate_counters.consumed_sources;

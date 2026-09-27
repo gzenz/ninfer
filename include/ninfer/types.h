@@ -877,6 +877,14 @@ struct MaterializationDiagnostics {
     // `retained_sources` / `consumed_sources` say what the planner did with the sources it did offer. The
     // audit's chain asserts such a request takes `Replace` and destroys the conversation's endpoint; these
     // three numbers size the population BEFORE anything changes behaviour, and verify the chain from traffic.
+    // WHAT THE SESSION CELL HOLDS, versus what was offered. The conversation's session cell holds ONE entry —
+    // the newest continuation published for it — and this reports that entry's frontier and whether it became
+    // a candidate at all. Without it, "the newest fork is not the one we resume from" cannot be told from "the
+    // newest fork was never offered", and those have opposite fixes. Measured case that motivated it: a
+    // conversation whose 71,655 fork was used at one request, and whose next request at a 109,798-token prompt
+    // was offered only [39,096, 39,212].
+    std::uint32_t session_cell_frontier = 0;
+    bool          session_cell_offered  = false;
     std::uint32_t sibling_candidates   = 0;
     std::uint32_t retained_sources     = 0;
     std::uint32_t consumed_sources     = 0;

@@ -1771,8 +1771,22 @@ it is an engine regression, which `git stash` settles in one run.
    eligibility test; neither asks whether a demote could actually be CONSTRUCTED for THIS victim.
    `can_demote_to_host` asks exactly that (the demote path's own seven preconditions, non-mutating), which
    is what turns this from "possibly a defect" into "a defect, with the state the plan was looking at".
-   **What is NOT yet established:** that the same burst's request reports `adoptable > 0` in the decisive
-   pair -- the two instrument two DIFFERENT planners' views, and `#6`'s own history is full of cases where one
+   **AND THE TWO INSTRUMENTS DISAGREE IN A WAY THAT LOCATES THE DEFECT (2026-09-27, 55 records this run).**
+   `demote_possible=1` on two of six real evictions (device-resident, restorable, with room -- 14:22:29 and
+   14:22:47), while `adoptable_preserving_alternatives=0` on EVERY eviction record, and the defect pair is 0
+   across all 55. Both instruments describe the same bursts, so the preserving option was **CONSTRUCTIBLE BUT
+   NOT ADOPTABLE**: it satisfies the demote path's seven preconditions and the plan machinery still would not
+   take it.
+   **That is a THIRD category, and it rules out the two I had been arguing between:**
+   * not "no room" -- `demote_possible=1`, and the pool had free slots;
+   * not "no option generated" -- the demote path's own preconditions are met;
+   * **the option existed and the ADOPTION TEST rejected it** -- `logical_goal`, or the incumbent comparison
+     that consumes it into `make_incumbent`.
+   **So the fix is not the reuse selection and not the ordering key**: it is whatever makes a constructible
+   preserve fail adoption. `logical_goal` gates on `publication_slot` being valid, and the incumbent is only
+   adopted when `goal && cost.less(...)` -- so the question is which of those rejects a demote whose physical
+   path is provably open. That is the next read, and it is a bounded one.
+   **(Superseded, kept to show what it replaced:)** -- the two instrument two DIFFERENT planners' views, and `#6`'s own history is full of cases where one
    said "available" and the other said "none". The pair reading for this request is the next check.
    **THE 2s EXPERIMENT ANSWERED IT, BY SHOWING THE BUDGET IS NOT THE BINDING CONSTRAINT (2026-09-27 13:32-13:37,
    operator-authorized).** With `NINFER_SEARCH_MS=2000` live in the process, the searches do NOT run to 2 s:

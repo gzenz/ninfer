@@ -1744,8 +1744,16 @@ it is an engine regression, which `git stash` settles in one run.
    ~23,353 while prompts reach 65-67k, so a turn recomputes 44,332 tokens in **11.2 s** (up from 17k/4 s
    earlier in the same session). `shared_stable_prefix` 10 selections against 2 private says the engine keeps
    taking the path that cannot advance, because the evictions removed the continuations that would.
-   **OPEN, NOT EXPLAINED:** 4 HTTP 500s post-fix with ZERO recoveries. Different cause from the ones fixed
-   here; recorded as unknown rather than folded into the improvement.
+   **THE 4 UNEXPLAINED 500s ARE EXPLAINED, and they are not engine failures (2026-09-27, task #22 closed).**
+   Each is `req#N response failed during response rendering | HTTP 500 | internal error`, and each is
+   preceded by `req#N done | anthropic | cancelled | prompt X | output 0` and followed by
+   `req#N response failed during transport | HTTP 499 | client disconnected`. So the CLIENT cancelled; the
+   engine produced nothing and lost nothing. **The 500 is a mislabel**: a client disconnect is reported as an
+   internal error before the 499, which sends a reader hunting an engine bug that is not there. Small
+   instrument defect, recorded rather than fixed here.
+   **And part of it was mine:** the batch sits at 13:25:53, just after the battery window restarted prod at
+   13:25:10, so the client's in-flight requests were cancelled by that restart. The pre-fix window's 11 500s
+   were mostly recovery casualties; these are cancellations.
    **The lever that remains is the pool FLOOR**: `~/ninfer-ensure.sh` line 53 (the 262144 profile prod runs)
    sets `--host-state-slots 16`; 32 would cost ~3 GiB pinned (against 14.5 GB available) and stop the pool
    saturating -- no saturation, no reclaim-evictions, and reuse could advance. It is the operator's file and

@@ -472,6 +472,10 @@ void Program::fail_all_cleanup() noexcept { impl_->fail_all_cleanup(); }
 void Program::resource_census() const noexcept { impl_->resource_census(); }
 std::uint64_t Program::shared_replacements() const noexcept { return impl_->shared_replacements(); }
 std::uint64_t Program::demotable_evictions() const noexcept { return impl_->demotable_evictions(); }
+
+std::uint64_t Program::evictions_with_victim_room() const noexcept {
+    return impl_->evictions_with_victim_room();
+}
 std::uint64_t Program::demotable_eviction_checks() const noexcept {
     return impl_->demotable_eviction_checks();
 }

@@ -2190,7 +2190,27 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
                     if (!victim.state.read_has_external_owner()) { tally_slots(victim.state.read); }
                     if (victim.rewrite_state) { tally_slots(*victim.rewrite_state); }
                     for (const auto& anchor_state : victim.long_anchors) { tally_slots(anchor_state.state); }
+                    // PER-VICTIM ROOM (#6, 2026-09-27). `demotable` above is a POOL comparison with `<`, so
+                    // it reports room that THIS victim's own footprint may not fit -- the comment above
+                    // already flagged that ("`demotable=1` on a victim that itself holds a host slot is
+                    // weaker evidence than it reads"). The three post-fix evictions on prod were all
+                    // `demotable=1 restorable=1` at `host_state_slots=17/18` with host KV 94% full, i.e. the
+                    // flag claimed room while the victim held slots and the KV axis was nearly exhausted.
+                    //
+                    // So the state-slot half is asked the per-victim question. `demotable` KEEPS its
+                    // documented meaning -- it is the monitor's alert token and changing what it counts
+                    // would silently move the semantics of every past reading -- and this is reported
+                    // beside it.
+                    //
+                    // The KV half stays pool-level ON PURPOSE, and the reason is stated rather than
+                    // implied: no per-sequence host-KV byte figure is reachable at this site (the tally
+                    // below covers state slots only), so a per-victim KV test would have to be invented,
+                    // and an invented number is worse than a labelled pool one.
+                    const bool victim_room =
+                        usage.host_state_slots + victim_host_slots <= room.host.state_slots &&
+                        usage.host_kv_bytes < room.host.kv_bytes;
                     if (demotable) { ++demotable_evictions_; }
+                    if (victim_room && state_restorable) { ++evictions_with_victim_room_; }
                     ++demotable_eviction_checks_;
                     if (demotable_eviction_checks_ <= 8ULL ||
                         demotable_eviction_checks_ % 512ULL == 0ULL) {
@@ -2198,7 +2218,7 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
                                      "[engine] private victim evicted: demotable=%d restorable=%d "
                                      "session=%016llx cont=%u frontier=%u endpoint=%d rewrite=%d "
                                      "anchors=%zu victim_host_slots=%u victim_dev_slots=%u host_state_slots=%u/%llu host_kv=%zu/%llu "
-                                     "checked=%llu demotable_total=%llu\n",
+                                     "victim_room=%d checked=%llu demotable_total=%llu\n",
                                      static_cast<int>(demotable),
                                      static_cast<int>(state_restorable),
                                      static_cast<unsigned long long>(victim.session_key_hash),
@@ -2210,6 +2230,7 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
                                      static_cast<unsigned long long>(room.host.state_slots),
                                      usage.host_kv_bytes,
                                      static_cast<unsigned long long>(room.host.kv_bytes),
+                                     static_cast<int>(victim_room),
                                      static_cast<unsigned long long>(demotable_eviction_checks_),
                                      static_cast<unsigned long long>(demotable_evictions_));
                         std::fflush(stderr);

@@ -941,6 +941,7 @@ public:
     void resource_census() const noexcept;
     [[nodiscard]] std::uint64_t shared_replacements() const noexcept;
     [[nodiscard]] std::uint64_t demotable_evictions() const noexcept;
+    [[nodiscard]] std::uint64_t evictions_with_victim_room() const noexcept;
     [[nodiscard]] std::uint64_t demotable_eviction_checks() const noexcept;
 
     [[nodiscard]] bool isolated_request_feasible(const RequestBasePlan& base) const noexcept;

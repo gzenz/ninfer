@@ -578,6 +578,10 @@ public:
     // #6's numerator and denominator. Exported because the journal print is rate-limited: after the
     // first 8 evictions the only way to see the counter move is here.
     [[nodiscard]] std::uint64_t demotable_evictions() const noexcept { return demotable_evictions_; }
+
+    [[nodiscard]] std::uint64_t evictions_with_victim_room() const noexcept {
+        return evictions_with_victim_room_;
+    }
     [[nodiscard]] std::uint64_t demotable_eviction_checks() const noexcept {
         return demotable_eviction_checks_;
     }
@@ -950,6 +954,10 @@ private:
     // deliberately at the COMMIT site (`evict_private_result`) and not in the planner: the planner's two
     // disposition assignments run per candidate evaluated, so counting there would count search steps.
     std::uint64_t demotable_evictions_                   = 0;
+    // #6's per-victim shape (2026-09-27): a victim evicted that was RESTORABLE **and** whose own host state
+    // slots would have fit in the room left -- i.e. the pool-level `demotable` flag was right about room in
+    // the way that matters for THIS victim. The KV half stays pool-level; see the site's comment.
+    std::uint64_t evictions_with_victim_room_             = 0;
     // Every eviction the check above ran for -- the denominator. Without it a zero numerator cannot be
     // told from a gate that never had a chance to be true.
     std::uint64_t demotable_eviction_checks_             = 0;

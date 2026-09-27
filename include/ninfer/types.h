@@ -1034,6 +1034,11 @@ struct RuntimeStats {
     // rate-limited to 8 then every 512th, so these are the only un-muted reading of the item.
     std::uint64_t pressure_private_evictions_demotable = 0;
     std::uint64_t pressure_private_eviction_checks    = 0;
+    // #6 (2026-09-27): evictions of a victim that was RESTORABLE **and** whose own host state slots would
+    // have fitted the room left. Narrower than `demotable` above, which is a pool-level `<` test and so
+    // reports room this victim's own footprint may not fit -- the three post-fix prod evictions were all
+    // `demotable=1` at 17/18 slots with host KV 94% full.
+    std::uint64_t pressure_evictions_with_victim_room = 0;
     std::uint64_t pressure_checkpoints_dropped         = 0;
     std::uint64_t pressure_searches                    = 0;
     std::uint64_t pressure_search_budget_exhaustions   = 0;

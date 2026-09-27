@@ -515,4 +515,13 @@ void StateImageDevicePool::copy_from_host(HostStateImageConstView source, std::i
     }
 }
 
+HostStatePreGrow pre_grow_host_state_pool(HostStatePool& pool) noexcept {
+    const std::uint32_t capacity = pool.capacity();
+    if (capacity == 0U) { return HostStatePreGrow::Disabled; }
+    if (pool.occupied() < capacity) { return HostStatePreGrow::NotFull; }
+    // ADDS, so the argument is the number of NEW slots and must be 1. See the unit test.
+    return pool.reserve_slots(HOST_STATE_PREGROW_SLOTS) == 0U ? HostStatePreGrow::Refused
+                                                              : HostStatePreGrow::Grew;
+}
+
 } // namespace ninfer::models::qwen3_5

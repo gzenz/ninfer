@@ -151,12 +151,11 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
                                            StartupProgressUnit::Bytes, host_state_bytes);
         host_state_images =
             std::make_unique<qwen3_5::HostStatePool>(state_images->host_layout(), *pinned_host_pool);
-        // The configured count is an initial reservation. The pool CAN grow past it, but nothing on the
-        // demote path does so today: feasibility is priced against `admission_capacity()`, which is the
-        // CURRENT slot count, so any demote that passes already has a free slot and the grow branch in
-        // `allocate_growing()` cannot run. The configured count is therefore still the effective ceiling for
-        // demotion -- growth becomes reachable only if a caller plans against growable headroom, and the
-        // planner pre-grow that did that was deliberately removed (it pre-grew inside the search).
+        // The configured count is a FLOOR and an initial reservation. It is no longer the effective
+        // ceiling for demotion: `ensure_host_state_headroom()` grows the pool by one slot when it is FULL,
+        // before the planner prices anything (§3 item 6, 2026-09-26), so a demote can be offered where the
+        // capacity that existed at the time said there was no room. The in-search pre-grow that was
+        // removed stays removed -- this one runs once per planning session, not per assessed node.
         (void)host_state_images->reserve_slots(plan.context_cache.host_state_slots);
         host_state_phase.complete(host_state_bytes, host_state_bytes);
     }
@@ -602,6 +601,9 @@ MemorySummary ProgramImpl::memory_summary() const noexcept {
             out.host_kv_grow_refusals = host_kv_arena->growth_refusals();
         }
         out.host_state_occupied_slots = host_state_images->occupied();
+        out.host_state_pregrow_attempts = host_state_pregrow_attempts_;
+        out.host_state_pregrows         = host_state_pregrows_;
+        out.host_state_pregrow_refusals = host_state_pregrow_refusals_;
     }
     if (host_kv_arena) {
         out.host_kv_capacity_bytes = host_kv_arena->capacity_bytes();

@@ -7,6 +7,8 @@
 #include <cstdint>
 #include <exception>
 #include <iostream>
+#include <memory>
+#include <optional>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -212,6 +214,69 @@ void test_host_roundtrip(bool dflash, ninfer::DeviceContext& device, bool dflash
 
 } // namespace
 
+// THE POSITIVE CONTROL for §3 item 6's pre-grow, and it exists because its first version had a bug no run
+// could see: `reserve_slots(count)` ADDS `count` slots, so the caller's `capacity + 1` DOUBLED the pool
+// (16 -> 33 -> 67, ~3 GiB pinned synchronously) instead of growing it by one. Nothing exercised it, so
+// nothing failed. This asserts the DIFFERENCE in capacity, not the function's return value, and it is
+// host-only: malloc-backed chunks, no device, so it runs anywhere.
+void test_host_state_pregrow() {
+    const q36::StateImageHostLayout host_layout = plan_pool(true).layout.host;
+    const auto make_pool = [&](std::uint64_t max_bytes) {
+        auto pinned = std::make_unique<ninfer::PinnedHostPool>(
+            ninfer::PinnedHostPool::Config{/*chunk_bytes=*/host_layout.image_bytes,
+                                           /*alignment=*/256U,
+                                           /*initial_bytes=*/0U,
+                                           /*max_bytes=*/max_bytes},
+            [](std::size_t bytes) { return std::malloc(bytes); },
+            [](void* base) { std::free(base); });
+        return std::make_pair(std::move(pinned), std::make_unique<q36::HostStatePool>(host_layout, *pinned));
+    };
+
+    {
+        // FULL by exactly one slot -> grew by EXACTLY ONE. Under the shipped `capacity + 1` call this read
+        // `capacity * 2 + 1` and the assertion below is what fails.
+        auto [pinned, pool] = make_pool(0U);
+        expect(pool->reserve_slots(2) == 2U, "pre-grow fixture reserves two slots");
+        const std::uint32_t before = pool->capacity();
+        const auto a = pool->allocate();
+        const auto b = pool->allocate();
+        expect(a.has_value() && b.has_value() && pool->occupied() == before,
+               "pre-grow fixture fills the pool");
+        expect(q36::pre_grow_host_state_pool(*pool) == q36::HostStatePreGrow::Grew,
+               "a FULL pool is grown");
+        expect(pool->capacity() == before + q36::HOST_STATE_PREGROW_SLOTS,
+               "and by EXACTLY HOST_STATE_PREGROW_SLOTS -- reserve_slots ADDS, it is not a total");
+        expect(pool->capacity() == before + 1U, "which is one slot, the number that matters here");
+    }
+    {
+        // NOT FULL -> nothing pinned, nothing changed.
+        auto [pinned, pool] = make_pool(0U);
+        expect(pool->reserve_slots(2) == 2U, "not-full fixture reserves two slots");
+        const std::uint32_t before = pool->capacity();
+        expect(q36::pre_grow_host_state_pool(*pool) == q36::HostStatePreGrow::NotFull,
+               "a pool with a free slot is not grown");
+        expect(pool->capacity() == before, "and its capacity does not move");
+    }
+    {
+        // CAPACITY 0 -> disabled, not "full": the startup reservation was refused, and guessing is worse.
+        auto [pinned, pool] = make_pool(0U);
+        expect(pool->capacity() == 0U, "disabled fixture has no slots");
+        expect(q36::pre_grow_host_state_pool(*pool) == q36::HostStatePreGrow::Disabled,
+               "a zero-capacity pool is DISABLED, not full");
+        expect(pool->capacity() == 0U, "and nothing is pinned for it");
+    }
+    {
+        // REFUSED -> the budget says no, and the caller counts it rather than staying silent.
+        auto [pinned, pool] = make_pool(host_layout.image_bytes);  // room for the first chunk only
+        expect(pool->reserve_slots(2) == 1U, "refusal fixture gets one slot, not two");
+        const auto held = pool->allocate();
+        expect(held.has_value() && pool->occupied() == pool->capacity(),
+               "refusal fixture fills its single slot");
+        expect(q36::pre_grow_host_state_pool(*pool) == q36::HostStatePreGrow::Refused,
+               "a budget refusal is REPORTED, not silently absent");
+    }
+}
+
 int main() {
     int count                   = 0;
     const cudaError_t count_err = cudaGetDeviceCount(&count);
@@ -220,6 +285,8 @@ int main() {
         return 77;
     }
     CUDA_CHECK(count_err);
+
+    test_host_state_pregrow();
 
     ninfer::DeviceContext device(0);
     PlannedPool planned = plan_pool(true);

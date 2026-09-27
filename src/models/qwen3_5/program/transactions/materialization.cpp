@@ -2138,6 +2138,12 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
                 // (noted by the review of `5aff7b3c`, and it is right): the check runs at the DECISION
                 // point, before `release_materialization_victim` runs, so (a) `usage` still includes the
                 // victim's OWN host pages, which a demote would free and which are not yet free here, and
+                // **(c), added 2026-09-26: `demotable` reads `admission_capacity()`, which is LIVE, so
+                // after `ensure_host_state_headroom` pre-grows the pool (§3 item 6) an eviction taken
+                // while that new slot is free reads `demotable=1` whether or not a demote was ever
+                // offered. The 8-line `demotable=0 restorable=1` shape therefore CANNOT be used as the
+                // pre-grow's success criterion: the pre-grow changes this counter's denominator. Measure
+                // demotes instead -- `private_owners_demoted`, or the state D2H count rising.**
                 // (b) an eviction that subsequently throws is counted anyway. `demotable` is therefore
                 // "the host tier had room at the moment of the decision", not "this victim would have fit
                 // after demotion" -- and neither the planner's degradation-unit weighting nor the

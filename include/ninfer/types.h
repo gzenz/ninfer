@@ -897,6 +897,13 @@ struct MemorySummary {
     std::uint32_t host_pinned_chunks         = 0;
     std::uint64_t host_pinned_grows          = 0;
     std::uint64_t host_pinned_grow_refusals  = 0;
+    // The PLANNING-TIME pre-grow (§3 item 6), separately from the pool's total growth: the pool's
+    // `grows` counts host-KV spans and demote-path slots too, so without these three a pre-grow that fired
+    // is indistinguishable from one that never did -- and a REFUSAL is invisible unless it is counted,
+    // which is how "the budget said no every time" reads exactly like "we never asked".
+    std::uint64_t host_state_pregrow_attempts = 0;
+    std::uint64_t host_state_pregrows         = 0;
+    std::uint64_t host_state_pregrow_refusals = 0;
     // KV's own growth, so a host-KV span added on demand is visible and not only inferable from total
     // capacity. With these three -- grew, could not grow, and the existing `maximal_fallback_selections`
     // (evicted everything) -- the three outcomes a full host tier can produce are DISTINGUISHABLE, which

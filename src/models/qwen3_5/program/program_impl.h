@@ -1115,8 +1115,9 @@ private:
     // "the pool was full at planning and we asked it to grow" vs "it grew": two counters because a refusal
     // and a success look identical from outside, and because a growth that never happens must be
     // distinguishable from one that happens constantly.
-    std::uint64_t host_state_pregrow_attempts_ = 0;
+    std::uint64_t host_state_pregrow_attempts_  = 0;
     std::uint64_t host_state_pregrows_          = 0;
+    std::uint64_t host_state_pregrow_refusals_  = 0;
     [[nodiscard]] StateImageHandle
     selected_state(const SequenceState& sequence, ReusePath reuse,
                    std::optional<runtime::CheckpointRef> checkpoint) const;

@@ -105,11 +105,10 @@ public:
     // `keep` is a FLOOR and it is not optional. `capacity()` is `slots_.size()`, which `admission_capacity()`
     // feeds to `physical_peak_fits`, so trimming below the configured reservation makes every demote option
     // fail feasibility -- the engine would have no host room to demote INTO. Trimming is only ever safe above
-    // the configured count: although growth is reachable from EXECUTION paths (the demote path's
-    // `allocate_growing`, the KV `prepare` path), a demote that passed feasibility already has a free slot,
-    // so it does NOT grow -- and neither axis is pre-grown at planning time (the KV pre-grow this comment
-    // used to credit was deliberately removed). A trim taken here therefore cannot be undone before the next
-    // plan is priced.
+    // the configured count: the state pool IS now pre-grown at planning time by one slot when full
+    // (`ensure_host_state_headroom`, §3 item 6), but that growth happens BEFORE a plan is priced, so a trim
+    // taken here is not restored by it -- the floor is what keeps `admission_capacity()` from dropping below
+    // what the planner needs to demote into.
     [[nodiscard]] std::uint32_t trim_idle_slots(std::uint32_t keep) noexcept;
 
     // Slots added by growth. A pool that grew silently is a pool whose capacity change cannot be told from
@@ -208,5 +207,25 @@ private:
     std::optional<CyclicKVCache> dflash_local_;
     StateImageHostLayout host_layout_;
 };
+
+// Pre-grow decision for the host state pool, as a free function so it can be TESTED host-only: the planner
+// prices `host.state_slots` against the capacity that exists NOW, so a full pool must be grown by exactly
+// ONE slot before planning or a demote can never be offered (§3 item 6).
+//
+// `reserve_slots(count)` ADDS `count` slots -- it is not "reserve up to this total". The first version of
+// the caller passed `capacity + 1` and DOUBLED the pool (16 -> 33 -> 67), pinning ~3 GiB synchronously the
+// first time prod's pool filled; a review found it by running the call against the real object. This
+// function exists so the increment is asserted by a TEST: the unit test checks the capacity DIFFERENCE,
+// which is the thing the return value does not tell you.
+inline constexpr std::uint32_t HOST_STATE_PREGROW_SLOTS = 1U;
+
+enum class HostStatePreGrow {
+    Disabled,  // capacity 0: the startup reservation was refused. Fail closed rather than guess.
+    NotFull,   // a free slot exists; nothing to do, and nothing is pinned.
+    Grew,
+    Refused,  // the pool or the host budget said no. Counted by the caller, so it is not silence.
+};
+
+[[nodiscard]] HostStatePreGrow pre_grow_host_state_pool(HostStatePool& pool) noexcept;
 
 } // namespace ninfer::models::qwen3_5

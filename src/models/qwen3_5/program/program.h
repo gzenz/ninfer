@@ -970,6 +970,7 @@ public:
         std::uint32_t tokens      = 0;
         std::uint32_t restorable  = 0;
         bool          identity_ok = false;
+        std::uint8_t  match_end   = 0;  // 0 = diverged, 1 = the stored ledger ended, 2 = the prompt ended
     };
     // Takes the PROMPT, not a token span: reading the prompt's tokens requires the frontend's
     // `PreparedPromptAccess`, and doing that in the caller forced the model-agnostic `ResourceManager` to

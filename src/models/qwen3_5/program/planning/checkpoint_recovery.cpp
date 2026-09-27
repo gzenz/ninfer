@@ -874,14 +874,35 @@ ProgramImpl::checkpoint_recovery_work(const ContinuationHandle& owner,
     return alternatives;
 }
 
-// The deepest token-exact common prefix between an incoming prompt and a stored ledger. Half (a) of the split
-// in plan.md §2f: with half (b) below it names the cause -- a shallow match is the PROMPT diverging, a deep
-// match with a shallow restorable frontier is placement or retention, which is ours.
-std::uint32_t deepest_token_match(std::span<const TokenId> prompt, std::span<const TokenId> stored) {
+// The deepest token-exact common prefix between an incoming prompt and a stored ledger, AND WHY IT STOPPED.
+//
+// WHY IT MUST SAY THAT, and the false reading it corrects: the loop stops at `min(prompt.size(), stored.size())`,
+// so "the stored ledger ENDED" and "the prompt DIVERGED here" produced the SAME NUMBER -- and the comment that
+// stood here asserted the wrong one as fact ("a shallow match is the PROMPT diverging"). A reviewer reading
+// 480 strict next-turn pairs against this field found the divergence-inside-the-prompt population to be ~0,
+// because nearly every apparent divergence was a ledger ending, a sibling's ledger, an entry missing from the
+// catalogue (this function only ever sees `Catalogued` entries, so a parent still running or already consumed is
+// invisible and the match falls back to some other ledger), or a pair split by a server restart. A field whose
+// zero and whose finding look identical has to carry its own discriminator.
+enum class MatchEnd : std::uint8_t {
+    Diverged,    // the tokens differ here: the two really do differ from this index
+    StoredEnded, // the stored ledger ran out first -- divergence may be beyond it, or nowhere
+    PromptEnded, // the prompt ran out first -- the stored ledger is a PREFIX of the prompt
+};
+
+struct TokenMatch {
+    std::uint32_t length = 0;
+    MatchEnd      end    = MatchEnd::Diverged;
+};
+
+[[nodiscard]] inline TokenMatch deepest_token_match(std::span<const TokenId> prompt,
+                                                    std::span<const TokenId> stored) {
     const std::size_t limit = std::min(prompt.size(), stored.size());
     std::size_t shared      = 0;
     while (shared < limit && prompt[shared] == stored[shared]) { ++shared; }
-    return static_cast<std::uint32_t>(shared);
+    MatchEnd end = MatchEnd::Diverged;
+    if (shared == limit) { end = prompt.size() <= stored.size() ? MatchEnd::PromptEnded : MatchEnd::StoredEnded; }
+    return TokenMatch{.length = static_cast<std::uint32_t>(shared), .end = end};
 }
 
 ProgramImpl::PrefixSplit ProgramImpl::prefix_split(const ContinuationHandle& owner,
@@ -889,7 +910,9 @@ ProgramImpl::PrefixSplit ProgramImpl::prefix_split(const ContinuationHandle& own
     PrefixSplit split;
     if (!valid_continuation(owner)) { return split; }
     const SequenceState& sequence = continuation_states[ContractAccess::index(owner)];
-    split.tokens                  = deepest_token_match(prompt.token_ids, sequence.ledger);
+    const TokenMatch continuation_match = deepest_token_match(prompt.token_ids, sequence.ledger);
+    split.tokens                        = continuation_match.length;
+    split.match_end                     = static_cast<std::uint8_t>(continuation_match.end);
     // THE STRICTER TEST. Same tokens is not the same history: `prefix_matches` also requires the identity
     // chain to agree, which is what a re-rendered (or thinking-stripped) earlier turn breaks. Only evaluated
     // when there IS a match -- a zero-token match has nothing to verify.
@@ -927,7 +950,9 @@ ProgramImpl::PrefixSplit ProgramImpl::prefix_split(const SharedPrefixHandle& own
     // The shared prefix's tokens live on its identity, not on the state -- the same reach the materialization
     // path uses (`shared_state->identity->ledger()`), and there is no ledger without an identity.
     if (!shared.identity) { return split; }
-    split.tokens = deepest_token_match(prompt.token_ids, shared.identity->ledger());
+    const TokenMatch shared_match = deepest_token_match(prompt.token_ids, shared.identity->ledger());
+    split.tokens                  = shared_match.length;
+    split.match_end               = static_cast<std::uint8_t>(shared_match.end);
     if (split.tokens != 0U && shared.identity->prefix_identity() != nullptr) {
         split.identity_ok = qwen3_5::detail::prefix_matches(prompt, shared.identity->ledger(),
                                                             *shared.identity->prefix_identity(),

@@ -550,6 +550,10 @@ public:
         std::uint32_t tokens         = 0;  // longest token-exact common prefix
         std::uint32_t restorable     = 0;  // deepest restorable checkpoint frontier at or below `tokens`
         bool          identity_ok    = false;
+        // WHY THE MATCH STOPPED: 0 = the tokens differ here, 1 = the stored ledger ended, 2 = the prompt ended.
+        // Without it `tokens` cannot distinguish "the prompt diverged" from "the ledger ran out", and a field
+        // whose zero and whose finding look identical will be read as whichever the reader expects.
+        std::uint8_t  match_end      = 0;
     };
     // Takes the prompt DATA, not just its tokens: the identity chain is a stricter test than the token
     // comparison (`prefix_matches` = same tokens AND same render), and `identity_ok` is the field that

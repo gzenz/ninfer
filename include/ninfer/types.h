@@ -871,6 +871,10 @@ struct MaterializationDiagnostics {
     // version of the split deliberately left OUT because the prompt was not reachable at that layer; it is
     // reachable now, and the V2->v3 audit's group A (40 of the 55 ceiling requests) is exactly this question.
     bool          split_identity_ok     = false;
+    // 0 = the deepest match stopped because the tokens differ; 1 = the stored ledger ended first; 2 = the prompt
+    // ended first (the ledger is a PREFIX of the prompt). Read it with `split_best_tokens`: the same number means
+    // opposite things depending on this.
+    std::uint8_t  split_ended_by        = 0;
     // THE SIBLING CONDITION AND THE RETAIN DECISION, counted even while the behaviour is off (2026-09-27).
     // `sibling_candidates` is how often a private source was found whose own endpoint lies BEYOND this
     // request's prompt -- a request that cannot reach the endpoint it is about to consume -- and

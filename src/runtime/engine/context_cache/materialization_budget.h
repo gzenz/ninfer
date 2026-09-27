@@ -108,6 +108,7 @@ struct PrefixSplitSample {
     std::uint32_t tokens      = 0;  // this entry's token-exact match
     std::uint32_t restorable  = 0;  // this entry's deepest restorable checkpoint at or below its own match
     bool          identity_ok = false;  // did the identity chain agree AT that match (stricter than tokens)
+    std::uint8_t  match_end   = 0;      // 0 = diverged, 1 = the stored ledger ended, 2 = the prompt ended
 };
 
 struct PrefixSplitBest {
@@ -120,6 +121,7 @@ struct PrefixSplitBest {
     // a `false` can be told from "no entry matched anything".
     bool          identity_ok       = false;
     std::uint32_t identity_checked  = 0;
+    std::uint8_t  match_end         = 0;  // from the deepest-matching entry, like identity_ok
 };
 
 [[nodiscard]] inline PrefixSplitBest best_prefix_split(std::span<const PrefixSplitSample> samples) noexcept {
@@ -130,6 +132,7 @@ struct PrefixSplitBest {
         if (sample.tokens > best.tokens) {
             best.tokens      = sample.tokens;
             best.identity_ok = sample.identity_ok;
+            best.match_end   = sample.match_end;
         }
         best.restorable = std::max(best.restorable, sample.restorable);
     }

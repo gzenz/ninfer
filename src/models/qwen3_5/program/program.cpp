@@ -513,14 +513,14 @@ Program::PrefixSplit Program::prefix_split(const ContinuationHandle& owner,
     const detail::ProgramImpl::PrefixSplit split =
         impl_->prefix_split(owner, PreparedPromptAccess::view(prompt));
     return PrefixSplit{.tokens = split.tokens, .restorable = split.restorable,
-                       .identity_ok = split.identity_ok};
+                       .identity_ok = split.identity_ok, .match_end = split.match_end};
 }
 Program::PrefixSplit Program::prefix_split(const SharedPrefixHandle& owner,
                                           const PreparedPrompt& prompt) const {
     const detail::ProgramImpl::PrefixSplit split =
         impl_->prefix_split(owner, PreparedPromptAccess::view(prompt));
     return PrefixSplit{.tokens = split.tokens, .restorable = split.restorable,
-                       .identity_ok = split.identity_ok};
+                       .identity_ok = split.identity_ok, .match_end = split.match_end};
 }
 std::uint64_t Program::publication_cell_losses() const noexcept {
     return impl_->publication_cell_losses();

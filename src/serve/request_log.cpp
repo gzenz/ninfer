@@ -350,6 +350,7 @@ Json materialization_json(const ninfer::MaterializationDiagnostics& diagnostics)
         {"split_best_restorable", diagnostics.split_best_restorable},
         {"split_entries", diagnostics.split_entries},
         {"split_identity_ok", diagnostics.split_identity_ok},
+        {"split_ended_by", diagnostics.split_ended_by},
         {"session_cell_frontier", diagnostics.session_cell_frontier},
         {"session_cell_offered", diagnostics.session_cell_offered},
         {"sibling_candidates", diagnostics.sibling_candidates},

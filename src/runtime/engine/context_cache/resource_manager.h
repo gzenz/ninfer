@@ -2644,7 +2644,8 @@ private:
             const auto consider = [&](const Program::PrefixSplit& split) {
                 samples.push_back(PrefixSplitSample{.tokens      = split.tokens,
                                                     .restorable  = split.restorable,
-                                                    .identity_ok = split.identity_ok});
+                                                    .identity_ok = split.identity_ok,
+                                                    .match_end   = split.match_end});
             };
             for (std::uint32_t slot = 0; slot < catalog_count_; ++slot) {
                 const CatalogEntry& entry = catalog_[slot];
@@ -2661,6 +2662,10 @@ private:
             choice.diagnostics_.split_best_restorable = best.restorable;
             choice.diagnostics_.split_entries         = best.entries;
             choice.diagnostics_.split_identity_ok     = best.identity_ok;
+            // WHY the deepest match stopped: a field whose zero and whose finding look identical gets read as
+            // whichever the reader expects -- and it was, by me, as "61% of prompts diverge inside the region
+            // they should share", when nearly every case was a ledger ending or a missing entry.
+            choice.diagnostics_.split_ended_by         = best.match_end;
             choice.diagnostics_.session_cell_frontier = session_cell_frontier;
             choice.diagnostics_.session_cell_offered  = session_cell_offered;
             choice.diagnostics_.sibling_candidates    = candidate_counters.sibling_candidates;

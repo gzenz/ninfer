@@ -1053,6 +1053,13 @@ task needs no re-derivation:
    is the KV-infeasible case the 94%-full readings predicted, now MEASURED rather than inferred, and it
    means the operator's ruling was not violated in those instances: the host had no room usable by THAT
    victim, which is what the per-victim room field expresses and the pool-level `demotable=1` obscured.
+   **AND THE INSTRUMENT IS VALIDATED, which is what makes the `0` mean something.** Across the 14 records
+   carrying the pair since the deploy: `adoptable > 0` in **11** of them (12, 21, 31, 43, 43, 69, 110, 122,
+   182 ...), each with `chosen = 0`; `chosen = 1` in **2**, each with `adoptable = 0`; and
+   **`adoptable > 0` WITH `chosen > 0` in ZERO**. So the counter demonstrably CAN fire -- the
+   instrument-that-cannot-fire trap is excluded by measurement rather than by assertion -- and the two
+   halves never co-occur: every restorable eviction happened where no adoptable preserving plan existed, and
+   every request that had one preserved instead.
    **THE CAVEAT THAT MUST TRAVEL WITH IT, or `0` gets over-read as "impossible":** the counter counts
    targets that were ASSESSED. A preserving plan the search never GENERATED because its budget ran out --
    40 of 43 searches exhausted it under load, measured in the W5 section -- is invisible to it. So `0` reads

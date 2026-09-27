@@ -1743,10 +1743,12 @@ void ProgramImpl::maintain_host_memory(std::size_t retain_bytes) noexcept {
     }
     // Give back trailing idle slots first; their pool extents then become free, which is what lets a chunk
     // go idle. Order matters: the pool can only unpin a chunk that holds NOTHING.
-    // The FLOOR is the configured slot count: trimming below it would lower the limit the planner demotes
-    // against. Nothing restores that room at planning time -- this change deliberately made growth
-    // UNREACHABLE from the planner (an earlier version pre-grew inside the search), so neither axis has a
-    // planning-time pre-grow to raise the limit again. The floor is what keeps `admission_capacity()` honest.
+    // The FLOOR is the configured slot count, and it is what keeps `admission_capacity()` from dropping
+    // below the count the operator asked for. The state pool IS pre-grown at planning time now
+    // (`ensure_host_state_headroom`, §3 item 6) -- the IN-SEARCH pre-grow is what was removed, not growth
+    // from the planner's path -- but a pre-grow happens before a plan is priced, so it is no substitute for
+    // this floor: without the floor a trim could leave the next plan with less room than the configuration
+    // promises, and nothing would put it back before that plan is priced.
     if (host_state_images != nullptr) {
         (void)host_state_images->trim_idle_slots(context_cache.host_state_slots);
     }
@@ -1772,6 +1774,14 @@ void ProgramImpl::ensure_host_state_headroom() noexcept {
     // them; ONE slot is that function's contract, and the first version of this call site asked for
     // `capacity + 1` -- which ADDS, and doubled the pool. The counters below exist so "never fired" and
     // "refused every time" are different observations.
+    //
+    // IT IS BOUNDED, and the bound is weaker than it first looks. A pool WITH room costs a comparison and
+    // pins nothing, and each growth buys exactly one slot -- but `host_state_pregrows_` is a GROSS count, not
+    // net capacity added: `maintain_host_memory` trims idle trailing slots back to the configured floor on
+    // every shared-prefix release, so a pre-grown slot nobody used is given back and can be grown again
+    // later, bumping this count twice for one net slot. Read `host_state_capacity_slots` (in `/stats`) for
+    // the net figure. A trim landing between planning and execution is recovered by the demote path's
+    // `allocate_growing`.
     switch (pre_grow_host_state_pool(*host_state_images)) {
     case qwen3_5::HostStatePreGrow::NotFull:
     case qwen3_5::HostStatePreGrow::Disabled:

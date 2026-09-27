@@ -278,15 +278,19 @@ void test_host_state_pregrow() {
 }
 
 int main() {
+    // THE ONE CASE THAT NEEDS NO GPU RUNS BEFORE THE GATE, on purpose: it is a pure bookkeeping test over
+    // malloc-backed chunks, so it can and should run on a machine with no device. Called after the gate (as
+    // the first version did) it silently skipped there -- a host-only test that never runs where it is most
+    // useful, and a comment claiming it "runs anywhere" that was false.
+    test_host_state_pregrow();
+
     int count                   = 0;
     const cudaError_t count_err = cudaGetDeviceCount(&count);
     if (cuda_unavailable(count_err) || count == 0) {
-        std::cout << "SKIP: no usable CUDA device\n";
+        std::cout << "SKIP: no usable CUDA device (the pregrow case above already ran)\n";
         return 77;
     }
     CUDA_CHECK(count_err);
-
-    test_host_state_pregrow();
 
     ninfer::DeviceContext device(0);
     PlannedPool planned = plan_pool(true);

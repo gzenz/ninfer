@@ -92,10 +92,11 @@ public:
     // applying an already-planned decision must not change the pool underneath it.
     [[nodiscard]] std::optional<HostStateSlotHandle> allocate_growing() noexcept;
 
-    // Create up to `count` slots and leave them FREE. This is how a configured count is honoured without a
-    // fixed capacity in the type -- and NOT a claim that the configured count stopped bounding anything: see
-    // the caller in `program_impl.cpp`, the configured count remains the effective ceiling for demotion
-    // because feasibility is priced against the current capacity.
+    // Create up to `count` slots and leave them FREE -- `count` is the number of NEW slots ADDED, not a
+    // total (the unit test asserts that: `reserve_slots(3)` gives `floor + 3`). This is how a configured
+    // count is honoured without a fixed capacity in the type. The configured count is a FLOOR, not the
+    // ceiling it once was: `ensure_host_state_headroom` pre-grows the pool by one slot when it is full,
+    // before the planner prices anything.
     // Returns how many were created (fewer than asked if the pool refused to grow).
     [[nodiscard]] std::uint32_t reserve_slots(std::uint32_t count) noexcept;
 

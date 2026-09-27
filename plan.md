@@ -1031,7 +1031,22 @@ task needs no re-derivation:
    plan to prefer, and evicting was correct -- the ordering cannot help when the binding axis is host KV.
    Counts are also unchanged pre- vs post-fix (checks=1, demotable=1, evicted=1 in both), so **this
    workload does not exercise the fix either way**.
-   **THE DECISIVE INSTRUMENT, not yet built:** a counter for "a restorable victim was evicted while a
+   **THE DECISIVE INSTRUMENT NOW EXISTS (2026-09-27, `06920a50`), and the reason I twice said it could not be
+   built was wrong.** I called it a cross-layer change; it is not. Both facts belong to the RUNTIME planner,
+   and `MaterializationDiagnostics` already carries data from that planner into the request log, so the
+   whole change is one layer plus the serialization:
+   * `feasible_preserving_alternatives` -- targets the run assessed FEASIBLE whose cost evicted no restorable
+     victim, counted once in `assess_target` (both the seeded path and the search mark feasibility there);
+   * `chosen_restorable_evictions` -- the adopted plan's own count, from the incumbent's `FoldedCost`.
+   **The reading, and both halves are needed:** both >0 in one request = #6 SURVIVING (a preserving plan was
+   available and a destroying one was taken); `chosen > 0` with the other 0 = nothing feasible preserved,
+   which is what the three post-fix prod evictions looked like at host KV 94%. `private_owners_evicted`
+   could never separate those, and neither could the eviction line.
+   Also landed with it: `victim_room=` on the eviction line and `pressure.evictions_with_victim_room` in
+   `/stats` -- the room question asked PER VICTIM for state slots (the KV half stays pool-level, no
+   per-sequence figure being reachable there), with `demotable` keeping its documented meaning because it is
+   the monitor's alert token.
+   **(Earlier text, kept because it names the instrument this replaced.)** a counter for "a restorable victim was evicted while a
    FEASIBLE preserving alternative existed" -- i.e. the plan lost on the ordering, rather than on
    feasibility. `private_owners_evicted` cannot tell those apart, and neither can the eviction line. It
    belongs where the choice is made (the fold / the planner), must be exposed in `/stats`, and the

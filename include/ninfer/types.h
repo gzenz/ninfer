@@ -1179,6 +1179,16 @@ struct RuntimeStats {
     // option it built chose to demote. `demote_refusal` on the eviction line answers "would the store have
     // refused"; these answer "was a demote ever offered". Both are needed: the store refusing and the planner
     // never offering are different defects with different fixes.
+    // THE FIVE WAYS AN OPTIONAL CAPTURE IS SKIPPED. Consuming a checkpoint is mandatory (the release happens
+    // at activation) and re-creating it is optional, so a conversation's continuation can end up with a deep
+    // token ledger and shallow keys -- offering only its old anchors -- and nothing anywhere said why.
+    // `not_feasible_no_pressure` is the one that matters most: a private-only capture that did not fit, with NO
+    // pressure planning, so nothing was evicted or demoted to make room for it.
+    std::uint64_t capture_skips_transaction_or_fork     = 0;
+    std::uint64_t capture_skips_cancelled               = 0;
+    std::uint64_t capture_skips_nothing_to_publish      = 0;
+    std::uint64_t capture_skips_stale_pressure_plan     = 0;
+    std::uint64_t capture_skips_not_feasible_no_pressure = 0;
     std::uint64_t pressure_options                     = 0;
     std::uint64_t pressure_demote_options              = 0;
     std::uint64_t pressure_publication_cell_losses     = 0;

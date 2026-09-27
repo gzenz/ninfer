@@ -423,6 +423,7 @@ runtime::ContextTransactionReserveStatus ProgramImpl::reserve_active_capture_imp
     // the whole batch with HTTP 500 (reproduced: 4 concurrent sessions sharing a large
     // prefix, all four killed by "WORKER RECOVER: capture transaction is not reservable").
     if (has_context_transaction() || has_unsettled_state_fork()) {
+        note_capture_skip(CaptureSkipReason::TransactionOrFork);
         skip_capture(std::move(offer));
         return runtime::ContextTransactionReserveStatus::Aborted;
     }
@@ -436,12 +437,14 @@ runtime::ContextTransactionReserveStatus ProgramImpl::reserve_active_capture_imp
         throw std::logic_error("capture offer is stale (invalid for this program state)");
     }
     if (cancellation.requested()) {
+        note_capture_skip(CaptureSkipReason::Cancelled);
         skip_capture(std::move(offer));
         return runtime::ContextTransactionReserveStatus::Aborted;
     }
     const CaptureAssessment assessment = inspect_capture(
         offer, exact_shared, replacement, private_replacement, permit_shared_publication, "reserve");
     if (!assessment.publishes_private && !assessment.publishes_shared) {
+        note_capture_skip(CaptureSkipReason::NothingToPublish);
         skip_capture(std::move(offer));
         return runtime::ContextTransactionReserveStatus::Aborted;
     }
@@ -452,10 +455,12 @@ runtime::ContextTransactionReserveStatus ProgramImpl::reserve_active_capture_imp
          pressure_details->summary.prompt_tokens != assessment.frontier ||
          pressure_details->blocked_host_allocation_bytes != 0 ||
          !physical_peak_fits(pressure_details->demand.physical_peak_additional))) {
+        note_capture_skip(CaptureSkipReason::StalePressurePlan);
         skip_capture(std::move(offer));
         return runtime::ContextTransactionReserveStatus::Aborted;
     }
     if (!pressure && !assessment.physically_feasible) {
+        note_capture_skip(CaptureSkipReason::NotFeasibleNoPressure);
         skip_capture(std::move(offer));
         return runtime::ContextTransactionReserveStatus::Aborted;
     }

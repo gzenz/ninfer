@@ -560,6 +560,41 @@ public:
                                            const PreparedPromptData& prompt) const;
     [[nodiscard]] bool shared_capture_matches(const CaptureOffer& offer,
                                               const SharedPrefixHandle& shared) const;
+    // A CAPTURE THAT DOES NOT HAPPEN IS INDISTINGUISHABLE FROM ONE THAT WAS NEVER NEEDED unless it is counted.
+    // Consuming a checkpoint is mandatory and re-creating it is optional: the release happens at activation,
+    // and the replacement is an optional capture that can be skipped for any of five reasons -- so a
+    // conversation's continuation can end up with a deep token ledger and shallow keys, offering only its old
+    // anchors, with nothing anywhere saying why. That is the mechanism behind "the newest fork is not resumed
+    // from", and these are its counters.
+    enum class CaptureSkipReason : std::uint8_t {
+        TransactionOrFork,   // another context transaction is open, or a state fork is unsettled
+        Cancelled,           // the request was cancelled
+        NothingToPublish,    // the assessment would publish neither a private nor a shared checkpoint
+        StalePressurePlan,   // a pressure plan that no longer fits the revision/frontier/demand
+        NotFeasibleNoPressure,  // PRIVATE-ONLY and not physically feasible, WITH NO PRESSURE PLANNING -- so
+                                // nothing was evicted or demoted to make room for it
+        Count,
+    };
+    std::array<std::uint64_t, static_cast<std::size_t>(CaptureSkipReason::Count)> capture_skips_{};
+
+    void note_capture_skip(CaptureSkipReason reason) noexcept {
+        ++capture_skips_[static_cast<std::size_t>(reason)];
+    }
+    [[nodiscard]] static const char* capture_skip_reason_name(CaptureSkipReason reason) noexcept {
+        switch (reason) {
+            case CaptureSkipReason::TransactionOrFork: return "transaction-or-fork";
+            case CaptureSkipReason::Cancelled: return "cancelled";
+            case CaptureSkipReason::NothingToPublish: return "nothing-to-publish";
+            case CaptureSkipReason::StalePressurePlan: return "stale-pressure-plan";
+            case CaptureSkipReason::NotFeasibleNoPressure: return "not-feasible-no-pressure";
+            case CaptureSkipReason::Count: break;
+        }
+        return "unknown";
+    }
+    [[nodiscard]] std::uint64_t capture_skips(CaptureSkipReason reason) const noexcept {
+        return capture_skips_[static_cast<std::size_t>(reason)];
+    }
+
     void skip_capture(CaptureOffer&& offer);
     [[nodiscard]] runtime::ContextTransactionReserveStatus
     reserve_active_capture(CaptureOffer&& offer, const SharedPrefixHandle* exact_shared,

@@ -951,6 +951,9 @@ public:
     [[nodiscard]] std::uint64_t demotable_eviction_checks() const noexcept;
     [[nodiscard]] std::uint64_t pressure_options() const noexcept;
     [[nodiscard]] std::uint64_t demote_options() const noexcept;
+    // The five capture-skip reasons. An optional capture that silently does not happen is indistinguishable
+    // from one that was never needed without these.
+    [[nodiscard]] std::uint64_t capture_skips(std::uint32_t reason) const noexcept;
     // The private catalog: requests that LOST reuse to a missing cell, and the goal-probe denominator beside
     // it. MUTATORS are needed because both are decided in `ResourceManager`'s planning, which holds only
     // this façade -- every other counter in this block is incremented inside ProgramImpl's own TUs.

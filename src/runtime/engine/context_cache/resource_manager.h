@@ -1306,6 +1306,13 @@ public:
         out.pressure_private_eviction_checks    = program.demotable_eviction_checks();
         out.pressure_demote_options             = program.demote_options();
         out.pressure_options                    = program.pressure_options();
+        // WIRED WITH THE COUNTERS, not after them: the catalog-cell counters shipped incremented at nine sites
+        // and never copied, so /stats served a hardcoded zero that read like a clean finding.
+        out.capture_skips_transaction_or_fork      = program.capture_skips(0U);
+        out.capture_skips_cancelled                = program.capture_skips(1U);
+        out.capture_skips_nothing_to_publish       = program.capture_skips(2U);
+        out.capture_skips_stale_pressure_plan      = program.capture_skips(3U);
+        out.capture_skips_not_feasible_no_pressure = program.capture_skips(4U);
         // The catalog's capacity/occupancy pair, as of this publication. It had neither half, which is why its exhaustion could
         // only be noticed as a silent loss of reuse. (Not the only pool in that state: the shared-prefix pool
         // has neither half either and device-state-slots has occupancy without a capacity -- `plan.md` §4.)

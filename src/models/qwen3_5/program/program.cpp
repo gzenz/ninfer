@@ -482,6 +482,9 @@ std::uint64_t Program::demotable_eviction_checks() const noexcept {
 }
 std::uint64_t Program::pressure_options() const noexcept { return impl_->pressure_options(); }
 std::uint64_t Program::demote_options() const noexcept { return impl_->demote_options(); }
+std::uint64_t Program::capture_skips(std::uint32_t reason) const noexcept {
+    return impl_->capture_skips(static_cast<detail::ProgramImpl::CaptureSkipReason>(reason));
+}
 std::uint64_t Program::note_publication_cell_loss() noexcept { return impl_->note_publication_cell_loss(); }
 std::uint64_t Program::note_publication_cell_at_risk() noexcept {
     return impl_->note_publication_cell_at_risk();

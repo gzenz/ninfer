@@ -110,6 +110,11 @@ std::string format_stats_json(const ninfer::RuntimeStats& s, const ninfer::Memor
         {"private_eviction_checks", s.pressure_private_eviction_checks},
         {"options", s.pressure_options},
         {"demote_options", s.pressure_demote_options},
+        {"capture_skips_transaction_or_fork", s.capture_skips_transaction_or_fork},
+        {"capture_skips_cancelled", s.capture_skips_cancelled},
+        {"capture_skips_nothing_to_publish", s.capture_skips_nothing_to_publish},
+        {"capture_skips_stale_pressure_plan", s.capture_skips_stale_pressure_plan},
+        {"capture_skips_not_feasible_no_pressure", s.capture_skips_not_feasible_no_pressure},
         {"publication_cell_losses", s.pressure_publication_cell_losses},
         // The denominator beside it: goal-probe calls, not an outcome. See the RuntimeStats comment.
         {"publication_cell_probes", s.pressure_publication_cell_probes},

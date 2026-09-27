@@ -586,6 +586,40 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
         plan->reuse       = ReusePath::SharedStablePrefix;
         plan->reuse_base  = selected.frontier;
         plan->source_mode = runtime::PrivateSourceMode::Retain;
+
+        // THE REUSE-CHOICE INSTRUMENT (2026-09-27). The shared path reuses a SNAPSHOT -- the stable head as
+        // published -- so its frontier never grows, while a session's growing part lives in private
+        // continuations. When that path is taken, this reports what the ALTERNATIVE was: the best private
+        // continuation frontier alive at that moment. The point is to separate the two explanations for the
+        // production reuse stall, which no existing record can distinguish:
+        //   * a LONGER private frontier exists here  -> availability was NOT the obstacle, and the cost is
+        //     the CHOICE (selection);
+        //   * nothing longer exists                  -> there was no growing candidate to take, and the cost
+        //     is RETENTION/capture.
+        // Rate-limited like the eviction line (first 8, then every 512th), so it is readable on prod without
+        // an env change and cannot flood the journal -- and it prints its own denominator so "never fired"
+        // is distinguishable from "fired and found nothing longer".
+        {
+            static std::uint64_t shared_choices = 0;
+            ++shared_choices;
+            if (shared_choices <= 8U || shared_choices % 512U == 0U) {
+                std::uint32_t best_private = 0U;
+                std::size_t   live_private = 0U;
+                for (const SequenceState& candidate_state : continuation_states) {
+                    if (candidate_state.execution_frontier == 0U) { continue; }
+                    ++live_private;
+                    best_private = std::max(best_private, candidate_state.execution_frontier);
+                }
+                std::fprintf(stderr,
+                             "[engine] shared-prefix reuse chosen: frontier=%u prompt=%zu "
+                             "best_private_frontier=%u live_private=%zu longer_private_exists=%d "
+                             "choice=%llu\n",
+                             selected.frontier, prompt.token_ids.size(), best_private, live_private,
+                             static_cast<int>(best_private > selected.frontier), 
+                             static_cast<unsigned long long>(shared_choices));
+                std::fflush(stderr);
+            }
+        }
     } else if (source != nullptr) {
         const runtime::CheckpointRef selected = *checkpoint;
         plan->selected_checkpoint             = selected;

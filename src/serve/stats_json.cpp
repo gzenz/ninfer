@@ -144,6 +144,11 @@ std::string format_stats_json(const ninfer::RuntimeStats& s, const ninfer::Memor
         // assembled by ProgramImpl, which cannot see it. Kept in this block anyway so the capacity/occupancy
         // pairs read together.
         {"private_catalog_capacity_cells", s.private_catalog_capacity_cells},
+        {"catalog_cell_clears_terminal", s.catalog_cell_clears_terminal},
+        {"catalog_cell_clears_action", s.catalog_cell_clears_action},
+        {"catalog_cell_clears_cancelled", s.catalog_cell_clears_cancelled},
+        {"catalog_cell_clears_cleanup", s.catalog_cell_clears_cleanup},
+        {"catalog_cell_clears_rollback", s.catalog_cell_clears_rollback},
         {"private_catalog_occupied_cells", s.private_catalog_occupied_cells},
         {"host_pinned_capacity_bytes", m.host_pinned_capacity_bytes},
         {"host_pinned_free_bytes", m.host_pinned_free_bytes},

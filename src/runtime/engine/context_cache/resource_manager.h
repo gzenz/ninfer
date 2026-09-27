@@ -1144,6 +1144,7 @@ public:
                     "Program could neither retain nor discard terminal sequence");
             }
             release_active_references(lane);
+            note_cell_clear(CellClearReason::Terminal);
             clear_catalog_entry(catalog_.at(active.publication_slot));
             reset_active_entry(active);
             lanes_[lane.value] = LogicalLaneState::Free;
@@ -1161,6 +1162,7 @@ public:
                 throw std::logic_error("released finish returned a continuation");
             }
             release_active_references(lane);
+            note_cell_clear(CellClearReason::Terminal);
             clear_catalog_entry(publication);
             reset_active_entry(active);
             lanes_[lane.value] = LogicalLaneState::Free;
@@ -1212,7 +1214,8 @@ public:
             throw std::logic_error("Program did not consume aborted sequence");
         }
         release_active_references(lane);
-        clear_catalog_entry(catalog_.at(active_[lane.value].publication_slot));
+        note_cell_clear(CellClearReason::Cancelled);
+    clear_catalog_entry(catalog_.at(active_[lane.value].publication_slot));
         reset_active_entry(active_[lane.value]);
         lanes_[lane.value] = LogicalLaneState::Free;
         return result;
@@ -1351,6 +1354,8 @@ public:
         transaction_.template emplace<std::monostate>();
         for (CatalogEntry& entry : catalog_) {
             entry.handle.reset();
+            note_cell_clear(CellClearReason::Cleanup);
+            note_cell_clear(CellClearReason::Action);
             clear_catalog_entry(entry);
         }
         for (SharedCatalogEntry& entry : shared_catalog_) {
@@ -1781,6 +1786,27 @@ private:
         for (const CheckpointObservation& observation : observation_scratch_) {
             entry.observations.push_back(observation);
         }
+    }
+
+    // WHY A CATALOG CELL WAS EMPTIED -- five paths, counted separately, because inferring it from outside took
+    // two rounds and settled nothing: a join proved that of 231 forks that vanished between one request and the
+    // next of the same conversation, ZERO were named by an eviction line. So the removal is one of the paths
+    // below, and which one decides whether it is a defect (a policy destroying state) or ordinary spend (a turn
+    // consuming the fork it used and publishing a new one). `mark_terminal_pending` is expected and correct for
+    // a consumed source; `apply_private_action` is the pressure path; `release_cancelled_lane` is a
+    // cancellation; the other two are failure paths.
+    enum class CellClearReason : std::uint8_t {
+        Terminal,   // mark_terminal_pending -- a lane finished (the ordinary consume/replace)
+        Action,     // apply_private_action -- the pressure path (evict/discard)
+        Cancelled,  // release_cancelled_lane
+        Cleanup,    // clear_after_program_cleanup
+        Rollback,   // rollback_logical_materialization
+        Count,
+    };
+    std::array<std::uint64_t, static_cast<std::size_t>(CellClearReason::Count)> cell_clears_{};
+
+    void note_cell_clear(CellClearReason reason) noexcept {
+        ++cell_clears_[static_cast<std::size_t>(reason)];
     }
 
     void clear_catalog_entry(CatalogEntry& entry) noexcept {
@@ -2782,6 +2808,8 @@ private:
         }
         CatalogEntry& publication = catalog_[record.publication_slot];
         if (publication.id == 0 && !publication.handle) {
+            // The restore path also clears the cell it had to abandon; counted here rather than left dead.
+            note_cell_clear(CellClearReason::Rollback);
             publication.state = CatalogState::Vacant;
         }
     }
@@ -3170,6 +3198,8 @@ private:
         CatalogEntry& publication = catalog_[record.publication_slot];
         if (publication.state == CatalogState::Claimed && publication.id == 0 &&
             !publication.handle) {
+            // The restore path also clears the cell it had to abandon; counted here rather than left dead.
+            note_cell_clear(CellClearReason::Rollback);
             publication.state = CatalogState::Vacant;
         }
     }
@@ -3664,7 +3694,8 @@ private:
             throw std::logic_error("cancelled lane has no logical active owner");
         }
         release_active_references(lane);
-        clear_catalog_entry(catalog_.at(active_[lane.value].publication_slot));
+        note_cell_clear(CellClearReason::Cancelled);
+    clear_catalog_entry(catalog_.at(active_[lane.value].publication_slot));
         reset_active_entry(active_[lane.value]);
         lanes_[lane.value] = LogicalLaneState::Free;
     }

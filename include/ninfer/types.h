@@ -1111,6 +1111,16 @@ struct RuntimeStats {
     // decided per PLANNING RUN against the candidate that lost (the backfill loop can inspect one request
     // several times); occupancy only says whether to look at it.
     std::uint32_t private_catalog_capacity_cells       = 0;
+    // WHY PRIVATE CATALOG CELLS WERE EMPTIED, counted by path, because a fork that disappears must be
+    // ATTRIBUTED and not inferred. A join proved 231 forks vanished between consecutive requests of the same
+    // conversation and ZERO were named by an eviction line -- which left consume-vs-release undecided after two
+    // rounds of reasoning. `terminal` is a lane finishing (the ordinary consume and replace), `action` is the
+    // pressure path, `cancelled` a cancellation, `cleanup`/`rollback` are failure paths.
+    std::uint64_t catalog_cell_clears_terminal         = 0;
+    std::uint64_t catalog_cell_clears_action           = 0;
+    std::uint64_t catalog_cell_clears_cancelled        = 0;
+    std::uint64_t catalog_cell_clears_cleanup          = 0;
+    std::uint64_t catalog_cell_clears_rollback         = 0;
     std::uint32_t private_catalog_occupied_cells       = 0;
     std::uint64_t pressure_private_owners_degraded     = 0;
     std::uint64_t pressure_private_owners_demoted      = 0;

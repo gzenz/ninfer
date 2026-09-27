@@ -1065,6 +1065,27 @@ task needs no re-derivation:
    `NINFER_SEARCH_MS`), and see whether `adoptable > 0` with `chosen = 0` appears in the same regime -- which
    would show the preserving plan EXISTS and the 400 ms cap was starving it, making the defect the budget
    rather than capacity. Nothing here says the fix is wrong; it says the fix's effect is still unmeasured.
+   **THE 5x-BUDGET CONTROL RAN (2026-09-27, off-prod window: test server on :8085, `CTX=prod4` = prod's slot
+   shape, prod's artifact and spec, `NINFER_SEARCH_MS=2000`, verified present in the running server's
+   `/proc/<pid>/environ`; prod restored after, health 200 + sentinel active).** Result, against the
+   default-budget records above:
+
+   | | 400 ms | 2000 ms |
+   |---|---|---|
+   | records | 14 | 24 |
+   | targets assessed in eviction records | 508-574 | **1861-3346** |
+   | eviction records | 3 | 10 |
+   | `adoptable > 0` among them | 0 | **0** |
+   | `adoptable > 0` overall (the counter firing) | 11 | **12** |
+   | `adoptable > 0` WITH `chosen > 0` (the defect) | 0 | **0** |
+
+   **So "the 400 ms cap was starving a preserving plan that exists" is NOT supported:** five times the budget,
+   assessing four to seven times as many targets, still finds nothing to preserve in every restorable
+   eviction -- while the same runs DO report `adoptable > 0` in 12 records (all with `chosen = 0`), so the
+   counter discriminates. The truncation caveat is WEAKENED, not eliminated: the 2 s budget was still
+   exhausted in 20 of 24 records, so a still-larger budget is the last stone unturned -- but the trend over a
+   5x increase argues the preserving plan does not exist in those cases, i.e. the evictions are
+   capacity-bound as the KV-94% and per-victim-room readings said.
    **AND THE INSTRUMENT IS VALIDATED, which is what makes the `0` mean something.** Across the 14 records
    carrying the pair since the deploy: `adoptable > 0` in **11** of them (12, 21, 31, 43, 43, 69, 110, 122,
    182 ...), each with `chosen = 0`; `chosen = 1` in **2**, each with `adoptable = 0`; and

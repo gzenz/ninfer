@@ -1019,7 +1019,19 @@ task needs no re-derivation:
    with the identity deficit, which is not this target's residual -- produces an option whose numbers do
    not hold, and the failure surfaces only at execution. This is the "half-ported strategy" the W5 section
    warns about, caught by the run rather than by review.
-   **The sound route:** seed the PRESERVING CHOICE through the construction cursor
+   **AND THE MECHANISM IS NOW IDENTIFIED, in one place (`materialization_planner.h:1011-1024`):** the
+   incumbent comparison is a LEXICOGRAPHIC KEY, and `owner_evictions` is the FOURTH element -- behind
+   `total_ns`, `affected_selected_hits` and `newest_affected_hit_epoch`. So a plan that is merely CHEAPER
+   wins over one that preserves a restorable checkpoint, which is precisely the ruling reversed: the fold
+   prices a demote (host bytes, transfers) and an eviction (free), and `total_ns` decides before the
+   eviction count is ever consulted. **The directed fix: count evictions of victims that hold a RESTORABLE
+   checkpoint separately, and put THAT count ahead of `total_ns` in the key** -- dominant, not traded.
+   (`owner_evictions` as it stands counts every eviction, so making it dominant would also refuse to evict
+   throwaway victims; the restorable subset is what the ruling is about. The per-victim checkpoint data is
+   already in `assessment.checkpoint_impacts`, which the fold walks, and the eviction line's own
+   `restorable=` flag is computed from the same shape.)
+   ------------------------------------------------------------
+   **The sound route if the key change is not enough:** seed the PRESERVING CHOICE through the construction cursor
    (`begin_construction` / `next_construction_option` / `choose_construction`), which is where the residual
    is known and where the search already enumerates per-victim demote alternatives -- i.e. do the W5
    ordering INSIDE the search rather than beside it. Validate with the scenario battery (must stay

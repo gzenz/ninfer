@@ -587,11 +587,21 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
         plan->reuse_base  = selected.frontier;
         plan->source_mode = runtime::PrivateSourceMode::Retain;
 
-        // THE REUSE-CHOICE INSTRUMENT (2026-09-27). The shared path reuses a SNAPSHOT -- the stable head as
-        // published -- so its frontier never grows, while a session's growing part lives in private
-        // continuations. When that path is taken, this reports what the ALTERNATIVE was: the best private
-        // continuation frontier alive at that moment. The point is to separate the two explanations for the
-        // production reuse stall, which no existing record can distinguish:
+        // THE REUSE INSTRUMENT, AND ITS FIRST VERSION WAS MISLABELLED AND MISREAD (corrected 2026-09-27 after
+        // a code analysis showed both). **"chosen" was the damaging word**: this fires once for EVERY shared
+        // CANDIDATE CONSTRUCTED, including the ones that lose. At 14:19:37 it printed four times while the
+        // request went on to report `private_endpoint` at 45815 -- so a diagnosis of "the request plan takes
+        // the shared path while a longer private candidate exists" was built on a line that said nothing
+        // about which candidate won. It now says CONSTRUCTED.
+        //
+        // **And `best_private_frontier` had no prompt-length check**, so in 11 of 19 prints it named a
+        // continuation LONGER THAN THE PROMPT ITSELF -- which cannot be a prefix of that prompt, making
+        // `longer_private_exists=1` largely meaningless. A continuation can only be a prefix if its frontier
+        // fits inside the prompt, and that is now required.
+        //
+        // The shared path reuses a SNAPSHOT -- the stable head as published -- so its frontier never grows,
+        // while a session's growing part lives in private continuations. With both defects fixed this
+        // separates the two explanations for the production reuse stall:
         //   * a LONGER private frontier exists here  -> availability was NOT the obstacle, and the cost is
         //     the CHOICE (selection);
         //   * nothing longer exists                  -> there was no growing candidate to take, and the cost
@@ -608,10 +618,13 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
                 for (const SequenceState& candidate_state : continuation_states) {
                     if (candidate_state.execution_frontier == 0U) { continue; }
                     ++live_private;
+                    // ONLY WHAT COULD BE A PREFIX OF THIS PROMPT. A continuation longer than the prompt
+                    // cannot be one, and counting it manufactured the reading this instrument was misread for.
+                    if (candidate_state.execution_frontier > prompt.token_ids.size()) { continue; }
                     best_private = std::max(best_private, candidate_state.execution_frontier);
                 }
                 std::fprintf(stderr,
-                             "[engine] shared-prefix reuse chosen: frontier=%u prompt=%zu "
+                             "[engine] shared candidate CONSTRUCTED: frontier=%u prompt=%zu "
                              "best_private_frontier=%u live_private=%zu longer_private_exists=%d "
                              "choice=%llu\n",
                              selected.frontier, prompt.token_ids.size(), best_private, live_private,

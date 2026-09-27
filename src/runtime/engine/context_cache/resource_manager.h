@@ -2238,27 +2238,34 @@ private:
         {
             static std::uint64_t selections = 0;
             ++selections;
-            if (selections <= 8U || selections % 512U == 0U) {
-                const auto reuse_of = [](const Candidate& item) -> std::uint32_t {
-                    return item.plan ? item.plan->summary().reusable_prompt_tokens : 0U;
-                };
-                const std::uint32_t winner_reuse = reuse_of(candidate);
-                std::uint32_t best_other_reuse     = 0U;
-                bool          best_other_is_shared = false;
-                for (const Candidate& other : candidates) {
-                    if (&other == &candidate) { continue; }
-                    const std::uint32_t other_reuse = reuse_of(other);
-                    if (other_reuse > best_other_reuse) {
-                        best_other_reuse     = other_reuse;
-                        best_other_is_shared = other.shared_source.has_value();
-                    }
+            // COMPUTE FIRST, THEN DECIDE WHETHER TO SPEAK -- the first version tested the condition before the
+            // loop that produces it, so the interesting case could not have been selected for anyway.
+            const auto reuse_of = [](const Candidate& item) -> std::uint32_t {
+                return item.plan ? item.plan->summary().reusable_prompt_tokens : 0U;
+            };
+            const std::uint32_t winner_reuse       = reuse_of(candidate);
+            std::uint32_t       best_other_reuse   = 0U;
+            bool                best_other_is_shared = false;
+            for (const Candidate& other : candidates) {
+                if (&other == &candidate) { continue; }
+                const std::uint32_t other_reuse = reuse_of(other);
+                if (other_reuse > best_other_reuse) {
+                    best_other_reuse     = other_reuse;
+                    best_other_is_shared = other.shared_source.has_value();
                 }
+            }
+            const bool longer_lost = best_other_reuse > winner_reuse;
+            // `longer_lost` is the ONLY case worth acting on, so it is never rate-limited away. The 8-sample
+            // limit meant "the planner consistently picks the longer candidate" rested on the process's first
+            // eight admissions -- before any shared prefix was even captured -- while ~70 later selections
+            // went unprinted. A conclusion drawn from the unrepresentative 12% is how that claim got made.
+            if (selections <= 8U || selections % 512U == 0U || longer_lost) {
                 std::fprintf(stderr,
                              "[engine] reuse-select: winner=%s reuse=%u | best_loser=%s reuse=%u "
                              "longer_lost=%d candidates=%zu selects=%llu\n",
                              candidate.shared_source.has_value() ? "shared" : "private", winner_reuse,
                              best_other_is_shared ? "shared" : "private", best_other_reuse,
-                             static_cast<int>(best_other_reuse > winner_reuse), candidates.size(),
+                             static_cast<int>(longer_lost), candidates.size(),
                              static_cast<unsigned long long>(selections));
                 std::fflush(stderr);
             }

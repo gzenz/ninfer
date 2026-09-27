@@ -818,6 +818,14 @@ struct MaterializationDiagnostics {
     // preserved, which is what the three post-fix prod evictions looked like (host KV 94% full).
     std::uint64_t feasible_preserving_alternatives = 0;
     std::uint64_t chosen_restorable_evictions      = 0;
+    // AND WHY THE PRESERVING TARGET WAS NOT COUNTED (2026-09-27). A code analysis showed that a
+    // zero-eviction target can fail for a reason neither `demotable` nor `demote_possible` can see: a plan
+    // obtains its publication cell from its own consumed private source, a VACANT catalog cell, or a victim
+    // it EVICTS (`resource_manager.h:2130-2191`) -- so a fully-preserving target has no cell and is
+    // unadoptable, and the pair above cannot count it because its counter sits behind the same `goal`.
+    // This counts the targets that were assessed and produced NO goal, which is the difference between
+    // "the relief step was generated and could not be adopted" and "it was never reached".
+    std::uint64_t assessed_targets_without_goal       = 0;
 
     std::uint64_t initial_predicted_total_ns = 0;
     std::optional<std::uint64_t> first_improvement_ns;

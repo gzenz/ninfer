@@ -107,6 +107,7 @@ public:
         // outlives a request, so it accumulated -- which is how two different requests reported the same
         // 607. Reset here, at the only point a planning run begins, so the number means "in THIS run".
         feasible_preserving_alternatives_ = 0;
+        assessed_targets_without_goal_    = 0;
         for (std::size_t index = 0; index < candidates.size(); ++index) {
             if (candidates[index].candidate == nullptr ||
                 std::find_if(candidates.begin(), candidates.begin() + index,
@@ -470,6 +471,10 @@ public:
                 goal = logical_goal(assessment.candidate, assessment.source_mode,
                                     assessment.owner_outcomes);
             }
+            // COUNTED HERE, beside the goal decision: a target with no goal is one that was ASSESSED and
+            // could not be adopted -- which is what separates "the relief step was generated and rejected"
+            // from "it was never reached in the arena".
+            if (!goal) { ++assessed_targets_without_goal_; }
             if (goal) {
                 mark_target(assessment.stable_target_ordinal, kTargetFeasible);
                 candidate_seeded[expected_candidate] = true;
@@ -954,7 +959,7 @@ public:
         MaterializationDiagnostics diagnostics = make_diagnostics(
             incumbent.cost, targets_evaluated, projection_work, planning_started, search_elapsed_ns,
             stop_reason, budget_exhausted, incumbent.degradation_units, incumbent.root_maximal,
-            feasible_preserving_alternatives_);
+            feasible_preserving_alternatives_, assessed_targets_without_goal_);
         // #6's decisive pair is `feasible_preserving_alternatives` (set above) against
         // `chosen_restorable_evictions` (the incumbent's own count, filled by make_diagnostics). Both
         // non-zero in one record means a preserving plan was available and a destroying one was taken.
@@ -1528,7 +1533,8 @@ private:
                      std::uint64_t search_elapsed_ns, MaterializationStopReason reason,
                      bool budget_exhausted, std::uint32_t degradation_units,
                      bool maximal_fallback,
-                     std::uint64_t feasible_preserving_alternatives = 0) noexcept {
+                     std::uint64_t feasible_preserving_alternatives = 0,
+                     std::uint64_t assessed_targets_without_goal = 0) noexcept {
         return MaterializationDiagnostics{
             .predicted_now_ns           = cost.now_ns,
             .predicted_future_loss_ns   = cost.future_loss_ns,
@@ -1543,6 +1549,7 @@ private:
             .selected_maximal_fallback        = maximal_fallback,
             .feasible_preserving_alternatives = feasible_preserving_alternatives,
             .chosen_restorable_evictions      = cost.restorable_evictions,
+            .assessed_targets_without_goal    = assessed_targets_without_goal,
             .initial_predicted_total_ns       = cost.total_ns,
         };
     }
@@ -1555,6 +1562,7 @@ private:
     // `assess_target` because BOTH paths (the seeded candidate and the search) mark feasibility there, so
     // one site covers both; see the diagnostics field of the same name.
     std::uint64_t feasible_preserving_alternatives_ = 0;
+    std::uint64_t assessed_targets_without_goal_    = 0;
     BoundedTargetLedger target_ledger_;
     std::vector<CombinedImpact> impact_scratch_;
     ContextPortfolioValue portfolio_value_;

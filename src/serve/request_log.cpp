@@ -313,6 +313,7 @@ Json materialization_json(const ninfer::MaterializationDiagnostics& diagnostics)
         // case: nothing feasible preserved, which is what the KV-saturated prod evictions looked like.
         {"feasible_preserving_alternatives", diagnostics.feasible_preserving_alternatives},
         {"chosen_restorable_evictions", diagnostics.chosen_restorable_evictions},
+        {"assessed_targets_without_goal", diagnostics.assessed_targets_without_goal},
         {"initial_predicted_total_ns", diagnostics.initial_predicted_total_ns},
         {"first_improvement_ns", diagnostics.first_improvement_ns
                                      ? Json(*diagnostics.first_improvement_ns)

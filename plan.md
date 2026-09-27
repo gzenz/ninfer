@@ -1086,6 +1086,25 @@ task needs no re-derivation:
    exhausted in 20 of 24 records, so a still-larger budget is the last stone unturned -- but the trend over a
    5x increase argues the preserving plan does not exist in those cases, i.e. the evictions are
    capacity-bound as the KV-94% and per-victim-room readings said.
+   **THE A/B THAT WAS STILL MISSING, and it returns a NULL (`2026-09-27`): the ordering reverted, same
+   window shape, same budget.** Mutant built into `/tmp/ninfer-serve-mutant` (prod's binary untouched, and
+   verified by reading the RUNNING test server's `/proc/<pid>/exe` -- `e658e5e2`, not the correct build):
+
+   | | fixed ordering | reverted (mutant) |
+   |---|---|---|
+   | records | 24 | 24 |
+   | `adoptable > 0` | 12 | 12 |
+   | `chosen > 0` | 10 | 11 |
+   | total `chosen_restorable_evictions` | **11** | **12** |
+   | `adoptable > 0` AND `chosen > 0` (the defect) | 0 | 0 |
+
+   **So the fix is INERT ON THIS WORKLOAD** -- 12 against 11 is one run each, and the workload's own
+   run-to-run variation is of that order. The reason is specific and worth keeping: the ordering only
+   changes an outcome when an adoptable preserving plan is COSTLIER than the destroying one; here the two
+   coincide, so the old cost-first key already chose the preserving plan. The fix encodes the operator's
+   ruling correctly and its ordering is unit-proven; what is NOT shown is any instance where it changed a
+   decision, and this workload contains none. Every restorable eviction in either build is a case with
+   `adoptable = 0` -- no plan to prefer.
    **AND THE INSTRUMENT IS VALIDATED, which is what makes the `0` mean something.** Across the 14 records
    carrying the pair since the deploy: `adoptable > 0` in **11** of them (12, 21, 31, 43, 43, 69, 110, 122,
    182 ...), each with `chosen = 0`; `chosen = 1` in **2**, each with `adoptable = 0`; and

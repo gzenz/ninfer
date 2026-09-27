@@ -982,7 +982,19 @@ task needs no re-derivation:
   lost reuse. **Scope, stated rather than implied:** that scenario is small (a handful of turns); the
   item's validation is root share UNDER LOAD, and a heavier run is what would test the cut-off claim.
   `pressure_searches`/`pressure_search_budget_exhaustions`/`root_selections` are all in `RuntimeStats` and
-  appear in `/stats`, so the load reading needs no new instrument -- only a suite heavy enough, or prod
+  appear in `/stats`, so the load reading needs no new instrument -- only a suite heavy enough, or prod.
+  **MEASURED UNDER LOAD (2026-09-27, the 16-session prod run of §3 item 6's soak):**
+  `pressure.searches = 43`, `pressure.search_budget_exhaustions = 40`, `cache_reuse.root_selections = 12`.
+  So the CUT-OFF DOES BITE HEAVILY UNDER LOAD -- 93% of searches ran out of budget, against 0% in the small
+  scenario -- and that is the item's stated question answered in the direction the planner's own comment
+  worried about. **But the outcome counters say preservation is winning anyway**: over the same window
+  `private_owners_demoted=18`, `demoted_kv=42`, `degraded=64`, `private_owners_evicted=1` -- sixty
+  demotions to one eviction. **So the honest reading is split, and neither half stands alone:** the budget
+  is exhausted far more often than the small scenario suggested, AND the demote-preferring outcome is still
+  chosen almost always, so this run does NOT support "the cutoff is starving the preserving alternative".
+  What it does support is that the cut-off is not a completeness bound (the code's own word) and that a
+  root-share comparison needs a heavier, more agentic workload than a synthetic burst: the 8-line shape's
+  own traffic. Recorded so the next reader does not re-run this to learn the same two numbers.
   traffic. **So this item is now: mechanism present, one scenario showing no starvation, the load case
   untested** -- which is a prod-or-heavy-suite question rather than a port.
 

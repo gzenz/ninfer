@@ -135,6 +135,21 @@ struct ChatTurn {
 // is stable across its turns and changes after a client compaction -- correct, because pre-compaction units
 // no longer match the post-compaction prompt. A conversation with no user text (an image-only first turn)
 // gets NO key and keeps the pre-fix behaviour rather than getting an arbitrary one.
+// THE OTHER HALF OF A JOIN the engine side has been waiting for. `prefill.cpp` hashes the session key onto
+// the sequence (`session_key_hash`, with 0 remapped to 1 so "no key" is distinguishable from a hash that came
+// out zero), and the eviction line prints it as `session=%016llx`. The request log recorded no matching field,
+// so an eviction could not be tied to the request whose state it destroyed -- which is exactly the link that
+// would say whether #6's evictions are what caps reuse at ~31k. This computes the SAME hash over the SAME
+// bytes, so the two logs can be joined on it. Must stay byte-identical to `prefill.cpp`'s loop.
+[[nodiscard]] inline std::uint64_t session_key_hash_of(const std::string& session_key) noexcept {
+    std::uint64_t owner = 1469598103934665603ULL;
+    for (const char byte : session_key) {
+        owner ^= static_cast<std::uint8_t>(byte);
+        owner *= 1099511628211ULL;
+    }
+    return owner == 0 ? 1 : owner;
+}
+
 [[nodiscard]] inline std::optional<std::string> derive_session_key(std::span<const ChatTurn> messages) {
     const auto text_of = [](const ChatTurn& turn) {
         std::string out;

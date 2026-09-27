@@ -478,9 +478,29 @@ public:
                                            *entry.session != *base.context_cache().session_key ||
                                            !base.context_cache().update_session_index)) ||
                         (sibling_retain && endpoint_beyond_prompt);
+                    // THE BRANCH ANCHOR'S FRONTIER, computed per entry and decided BEFORE the plan build --
+                    // the only place it can work, since the planner seals the executed plan (and
+                    // `seal_materialization` copies), so a group attached after selection lands on a discarded
+                    // object. `tokens > restorable` is the measured condition: this prompt matches stored
+                    // content deeper than any checkpoint below it can resume from, so the matched tail is
+                    // re-prefilled (28,564 against 23,353 on the shared class; 45,717 against 31,229 on the
+                    // private one, both with the identity chain AGREEING).
+                    //
+                    // COMPUTED ONLY WHEN THE FLAG IS ON. The split scans this entry's ledger, and the review
+                    // has not measured that cost at 64 cells -- so the default path must not pay it.
+                    static const bool branch_anchor_enabled = std::getenv("NINFER_BRANCH_ANCHOR") != nullptr;
+                    std::optional<std::uint32_t> branch_anchor;
+                    if (branch_anchor_enabled) {
+                        const typename Program::PrefixSplit split =
+                            program.prefix_split(*entry.handle, prompt);
+                        if (split.tokens > split.restorable &&
+                            split.tokens <= base.summary().prompt_tokens) {
+                            branch_anchor = split.tokens;
+                        }
+                    }
                     std::optional<AdmissionCandidate> plan =
                         program.inspect_admission(prompt, base, *destination, &*entry.handle,
-                                                  nullptr, index.checkpoint, retain);
+                                                  nullptr, index.checkpoint, retain, branch_anchor);
                     if (!plan) {
                         cdbg_log("[candgen] priv SKIP slot=%u inspect_admission=nullopt\n",
                                  index.slot);

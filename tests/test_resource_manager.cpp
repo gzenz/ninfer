@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstdint>
 #include <iostream>
+#include <map>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -665,6 +666,104 @@ public:
     // from the moment those two lines were added, because only the serve binary was built at the time.
     [[nodiscard]] std::uint64_t demotable_evictions() const noexcept { return 0U; }
     [[nodiscard]] std::uint64_t demotable_eviction_checks() const noexcept { return 0U; }
+    // Same class as the two above: in the real Program these are incremented inside ProgramImpl's own
+    // eviction/pressure TUs, which the fake does not model -- the fake never evaluates a victim's room or
+    // enumerates demote options, so zero is its truthful count, not a placeholder for one.
+    [[nodiscard]] std::uint64_t evictions_with_victim_room() const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t pressure_options() const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t demote_options() const noexcept { return 0U; }
+
+    // The private-catalog counters. Unlike the block above, these are MUTATED BY `ResourceManager` itself
+    // (planning decides them and holds only the Program façade), so the fake implements the real contract
+    // (`program_impl.h`): `note_*` pre-increments and returns the new total, `add_*` accumulates. Tests can
+    // therefore read what the manager recorded.
+    [[nodiscard]] std::uint64_t note_publication_cell_loss() noexcept {
+        return ++publication_cell_losses_;
+    }
+    [[nodiscard]] std::uint64_t note_publication_cell_at_risk() noexcept {
+        return ++publication_cell_at_risk_;
+    }
+    void add_publication_cell_at_risk(std::uint32_t at_risk, std::uint32_t goals, std::uint32_t other,
+                                      std::uint32_t reuse) noexcept {
+        publication_cell_at_risk_runs_ += at_risk;
+        publication_cell_veto_goals_ += goals;
+        publication_cell_veto_other_ += other;
+        publication_cell_veto_reuse_ += reuse;
+    }
+    void add_publication_cell_probes(std::uint64_t count) noexcept {
+        publication_cell_probes_ += count;
+    }
+    [[nodiscard]] std::uint64_t publication_cell_losses() const noexcept {
+        return publication_cell_losses_;
+    }
+    [[nodiscard]] std::uint64_t publication_cell_probes() const noexcept {
+        return publication_cell_probes_;
+    }
+    [[nodiscard]] std::uint64_t publication_cell_at_risk_runs() const noexcept {
+        return publication_cell_at_risk_runs_;
+    }
+    [[nodiscard]] std::uint64_t publication_cell_veto_goals() const noexcept {
+        return publication_cell_veto_goals_;
+    }
+    [[nodiscard]] std::uint64_t publication_cell_veto_other() const noexcept {
+        return publication_cell_veto_other_;
+    }
+    [[nodiscard]] std::uint64_t publication_cell_veto_reuse() const noexcept {
+        return publication_cell_veto_reuse_;
+    }
+
+    // THE SPLIT (`Program::prefix_split`). Contract: `tokens` = longest token-exact common prefix of the
+    // prompt with the owner's stored ledger; `restorable` = deepest restorable checkpoint frontier <= tokens;
+    // `identity_ok` = the identity chain also agrees at that match (only evaluated when tokens != 0); a stale
+    // or unknown owner yields the empty split.
+    //
+    // The fake's model of a ledger, which is INVENTED and must be read as such: the fake prompt carries only
+    // a `content_key`, and the fake's own reuse rule (`inspect_admission`) is "same content_key = the prompt
+    // extends that owner's history". So an owner the fake itself PUBLISHED (a finished continuation, or a
+    // shared prefix it published at capture) has a ledger of its published frontier and content key; a
+    // prompt with the same key matches the whole ledger, any other key matches nothing. The restorable set
+    // is the owner's CURRENT checkpoint summary as the fake last reported it (finish, or a retained victim's
+    // final summary after checkpoint drops). identity_ok = (tokens != 0): the fake has no render, so it
+    // cannot model a same-tokens/different-render divergence. Owners the fake never published (handles a
+    // test constructs by hand) are unknown to it and give the empty split, like a stale handle does.
+    struct PrefixSplit {
+        std::uint32_t tokens      = 0;
+        std::uint32_t restorable  = 0;
+        bool          identity_ok = false;
+    };
+    [[nodiscard]] PrefixSplit prefix_split(const FakeContinuationHandle& owner,
+                                           const FakePreparedPrompt& prompt) const {
+        ++prefix_split_calls;
+        const auto found = private_ledgers_.find(owner.id);
+        if (owner.id == 0 || found == private_ledgers_.end()) { return {}; }
+        const PrivateLedger& ledger = found->second;
+        PrefixSplit split;
+        split.tokens = ledger.content_key == prompt.content_key ? ledger.length : 0U;
+        if (split.tokens == 0U) { return split; }
+        split.identity_ok = true;
+        const auto consider = [&](const std::optional<FakeCheckpointSummary>& checkpoint) {
+            if (checkpoint && checkpoint->ref.frontier <= split.tokens) {
+                split.restorable = std::max(split.restorable, checkpoint->ref.frontier);
+            }
+        };
+        consider(ledger.summary.endpoint);
+        consider(ledger.summary.rewrite);
+        for (const FakeCheckpointSummary& anchor : ledger.summary.long_anchors) { consider(anchor); }
+        return split;
+    }
+    [[nodiscard]] PrefixSplit prefix_split(const FakeSharedPrefixHandle& owner,
+                                           const FakePreparedPrompt& prompt) const {
+        ++prefix_split_calls;
+        const auto found = shared_ledgers_.find(owner.id);
+        if (owner.id == 0 || found == shared_ledgers_.end()) { return {}; }
+        const SharedLedger& ledger = found->second;
+        PrefixSplit split;
+        split.tokens = ledger.content_key == prompt.content_key ? ledger.length : 0U;
+        if (split.tokens == 0U) { return split; }
+        split.identity_ok = true;
+        if (ledger.checkpoint_frontier <= split.tokens) { split.restorable = ledger.checkpoint_frontier; }
+        return split;
+    }
 
     [[nodiscard]] std::optional<FakeAdmissionCandidate>
     inspect_admission(const FakePreparedPrompt& prompt, const FakeRequestBasePlan& base, LaneId,
@@ -858,6 +957,9 @@ public:
                             victim.final_summary->rewrite =
                                 rewrite_checkpoint(content, finish_frontier - 1U);
                         }
+                        note_private_summary(owner, *victim.final_summary);
+                    } else {
+                        private_ledgers_.erase(pending_plan_->private_owner_ids[index]);
                     }
                     result.victims.push_back(std::move(victim));
                 }
@@ -875,6 +977,12 @@ public:
                         victim.final_summary      = FakeSharedPrefixSummary{
                                  .checkpoint = shared_checkpoint(owner, finish_frontier),
                         };
+                        const auto ledger = shared_ledgers_.find(owner);
+                        if (ledger != shared_ledgers_.end()) {
+                            ledger->second.checkpoint_frontier = finish_frontier;
+                        }
+                    } else {
+                        shared_ledgers_.erase(pending_plan_->shared_owner_ids[index]);
                     }
                     result.shared_victims.push_back(std::move(victim));
                 }
@@ -895,6 +1003,10 @@ public:
                     FakeSharedPrefixHandle handle;
                     handle.id          = next_shared_id_++;
                     handle.content_key = capture_assessment.shortlist_key.digest;
+                    shared_ledgers_[handle.id] = SharedLedger{
+                        .content_key         = capture_assessment.shortlist_key.digest,
+                        .length              = capture_assessment.shortlist_key.frontier,
+                        .checkpoint_frontier = capture_assessment.shortlist_key.frontier};
                     result.shared      = FakeSharedPrefixPublication{
                              .handle = std::move(handle),
                              .summary =
@@ -937,11 +1049,15 @@ public:
                     victim.final_summary->rewrite =
                         rewrite_checkpoint(content, finish_frontier - 1U);
                 }
+                note_private_summary(owner_id, *victim.final_summary);
+            } else {
+                private_ledgers_.erase(plan.private_owner_ids.at(index));
             }
             result.victims.push_back(std::move(victim));
         }
         for (std::size_t index = 0; index < plan.shared_actions.size(); ++index) {
             const FakeTargetDecision& action = plan.shared_actions[index];
+            if (action.evicts_continuation) { shared_ledgers_.erase(plan.shared_owner_ids.at(index)); }
             result.shared_victims.push_back(FakeMaterializationSharedVictimResult{
                 .owner              = plan.shared_planning_ids[index],
                 .disposition        = action.evicts_continuation ? VictimDisposition::Evicted
@@ -1124,6 +1240,8 @@ public:
             result.summary.rewrite = rewrite_checkpoint(key, finish_frontier - 1U);
         }
         result.continuation.emplace(sequence.id, key);
+        private_ledgers_[sequence.id] =
+            PrivateLedger{.content_key = key, .length = finish_frontier, .summary = result.summary};
         return result;
     }
 
@@ -1138,6 +1256,7 @@ public:
     [[nodiscard]] FakeReleaseResult
     release_continuation(FakeContinuationHandle&& continuation) noexcept {
         released_continuations.push_back(continuation.id);
+        private_ledgers_.erase(continuation.id);
         advance_revision();
         return FakeReleaseResult{.status = ConsumeStatus::Consumed};
     }
@@ -1201,10 +1320,40 @@ public:
     std::vector<std::uint32_t> selected_shared_capture_frontiers;
     std::vector<std::uint32_t> released_continuations;
 
+    mutable std::uint64_t prefix_split_calls = 0;
+
 private:
+    struct PrivateLedger {
+        std::uint32_t content_key = 0;
+        std::uint32_t length      = 0;
+        FakeContinuationSummary summary;
+    };
+    struct SharedLedger {
+        std::uint32_t content_key         = 0;
+        std::uint32_t length              = 0;
+        std::uint32_t checkpoint_frontier = 0;
+    };
+
     void advance_revision() noexcept {
         if (++revision_.value == 0) { ++revision_.value; }
     }
+
+    // A retained private victim's checkpoint set changed (drops): the ledger is unchanged, the restorable
+    // set follows the final summary the fake reported. Unknown owners stay unknown.
+    void note_private_summary(std::uint32_t id, const FakeContinuationSummary& summary) {
+        const auto found = private_ledgers_.find(id);
+        if (found != private_ledgers_.end()) { found->second.summary = summary; }
+    }
+
+    std::uint64_t publication_cell_losses_       = 0;
+    std::uint64_t publication_cell_probes_       = 0;
+    std::uint64_t publication_cell_at_risk_      = 0;
+    std::uint64_t publication_cell_at_risk_runs_ = 0;
+    std::uint64_t publication_cell_veto_goals_   = 0;
+    std::uint64_t publication_cell_veto_other_   = 0;
+    std::uint64_t publication_cell_veto_reuse_   = 0;
+    std::map<std::uint32_t, PrivateLedger> private_ledgers_;
+    std::map<std::uint32_t, SharedLedger> shared_ledgers_;
 
     ProgramResourceRevision revision_{.value = 1};
     std::uint32_t planning_generation_ = 0;
@@ -2435,6 +2584,61 @@ void test_root_lifecycle_and_prefix_reuse() {
             "failed start did not roll back its logical source claim");
 }
 
+// THE SPLIT, end to end through `ResourceManager`: every Catalogued entry is scanned with
+// `Program::prefix_split`, and `best_prefix_split` folds them into the request's diagnostics. Asserts values
+// that DIFFER by prompt, so a fake (or a manager) that returns constants cannot pass both halves: the
+// unrelated prompt must read 0 tokens over the same entries the related prompt reads 16 over.
+void test_prefix_split_diagnostics_follow_catalog() {
+    FakeManager manager = make_manager(1, 4);
+    FakeProgram program;
+    const auto materialize = [&](std::uint32_t key, std::uint64_t order) {
+        auto inspection = manager.inspect(program, FakePreparedPrompt{key}, make_base(key), order);
+        require(inspection.choice.has_value(), "split fixture produced no choice");
+        const LaneId lane   = inspection.choice->destination();
+        const auto reserved = manager.reserve_materialization(program, std::move(*inspection.choice),
+                                                              FakePreparedPrompt{key}, {});
+        require(reserved == FakeManager::MaterializationReserveResult::Reserved,
+                "split fixture was not reserved");
+        auto outcome = [&]() -> FakeManager::MaterializationOutcome {
+            auto progress = manager.progress_context_transaction(program, {});
+            if (!std::holds_alternative<ContextTransactionInProgress>(progress)) {
+                return std::get<FakeManager::MaterializationOutcome>(std::move(progress));
+            }
+            auto completed = manager.progress_context_transaction(program, {});
+            return std::get<FakeManager::MaterializationOutcome>(std::move(completed));
+        }();
+        require(outcome.status == ContextTransactionStatus::Published && outcome.activation,
+                "split fixture did not publish");
+        auto activation                   = std::move(*outcome.activation);
+        const FakeSequenceHandle sequence = activation.sequence();
+        manager.adopt(program, std::move(activation));
+        return std::pair{ActiveRequest{.lane = lane, .sequence = sequence}, outcome.diagnostics};
+    };
+
+    // Empty catalog: nothing scanned, nothing matched -- the denominator is what tells this from a miss.
+    auto [first, empty] = materialize(7, 1);
+    require(empty.split_entries == 0 && empty.split_best_tokens == 0,
+            "empty catalog reported split entries");
+    program.finish_with_rewrite = true;
+    (void)finish_active(manager, program, first, 16);  // key 7: ledger 16, endpoint 16, rewrite 15
+    program.finish_with_rewrite = false;
+    auto [second, one] = materialize(9, 2);
+    require(one.split_entries == 1 && one.split_best_tokens == 0 && one.split_best_restorable == 0 &&
+                !one.split_identity_ok,
+            "unrelated prompt matched a foreign catalog entry");
+    (void)finish_active(manager, program, second, 24);  // key 9: ledger 24, endpoint 24
+
+    const std::uint64_t calls_before = program.prefix_split_calls;
+    auto [third, related]            = materialize(7, 3);
+    require(program.prefix_split_calls - calls_before == 2,
+            "split did not scan every Catalogued entry exactly once");
+    require(related.split_entries == 2, "split denominator does not count both entries");
+    require(related.split_best_tokens == 16 && related.split_best_restorable == 16 &&
+                related.split_identity_ok,
+            "related prompt did not read its own entry's match and restorable frontier");
+    (void)third;
+}
+
 void test_stale_revision_is_retryable() {
     FakeManager manager = make_manager();
     FakeProgram program;
@@ -3438,9 +3642,13 @@ void test_complete_search_against_small_exhaustive_oracle() {
                     }
                     return std::nullopt;
                 };
-                std::uint64_t oracle = UINT64_MAX;
+                std::uint64_t oracle           = UINT64_MAX;
+                // The other half of the ranking: the oracle now minimises (restorable evictions, cost), the
+                // order `FoldedCost::key()` uses, so the pair needs a second accumulator.
+                std::uint32_t oracle_evictions = UINT32_MAX;
                 for (unsigned source = 0; source < 2; ++source) {
                     for (unsigned raw = 0; raw < 27; ++raw) {
+                        std::uint32_t evictions = 0;
                         unsigned digits = raw, relief = 0;
                         bool frees_slot = false, protects_source = true;
                         std::uint64_t cost                    = (source ? 100 : 800) * ms;
@@ -3454,6 +3662,18 @@ void test_complete_search_against_small_exhaustive_oracle() {
                             relief += choice;
                             if (choice == 2) {
                                 frees_slot = true;
+                                // THE POLICY THIS ORACLE ENCODES, and it changed under it (2026-09-27). The
+                                // operator's ruling is "evicting a victim that holds a restorable checkpoint
+                                // while the host has room is a defect", and `7746a98b` made the planner rank
+                                // RESTORABLE EVICTIONS ahead of cost. This oracle still chose the cheapest
+                                // plan, so it began failing on a configuration where the cheapest plan
+                                // evicts (912 ms, 1 eviction) while the best plan under the ruling does not
+                                // (1050 ms, 0). The planner picked 1050 -- the ruling, applied.
+                                //
+                                // So the oracle is updated to the policy rather than the case bent to go
+                                // green: in THIS test every chosen owner reports a restorable checkpoint, so
+                                // the count is simply the number of evicted owners.
+                                ++evictions;
                                 cost += drop[owner] +
                                         rebuild[owner] * weights[(owner + weight_rotation) % 3];
                             } else {
@@ -3467,7 +3687,13 @@ void test_complete_search_against_small_exhaustive_oracle() {
                             continue;
                         }
                         cost += rebuild[0] - remaining_public_saving;
-                        oracle = std::min(oracle, cost);
+                        // LEXICOGRAPHIC, the way `FoldedCost::key()` now is: fewer restorable evictions wins
+                        // outright, and cost decides among equals.
+                        if (evictions < oracle_evictions ||
+                            (evictions == oracle_evictions && cost < oracle)) {
+                            oracle_evictions = evictions;
+                            oracle           = cost;
+                        }
                     }
                 }
                 Planner planner;
@@ -3787,6 +4013,8 @@ int main() {
     run_test("dominating identity fast path",
              test_dominating_identity_does_not_build_pressure_graph);
     run_test("root lifecycle and prefix reuse", test_root_lifecycle_and_prefix_reuse);
+    run_test("prefix split diagnostics follow the catalog",
+             test_prefix_split_diagnostics_follow_catalog);
     run_test("stale revision is retryable", test_stale_revision_is_retryable);
     run_test("materialization abort preserves source", test_materialization_abort_preserves_source);
     run_test("committed victim survives abort", test_committed_victim_survives_transaction_abort);

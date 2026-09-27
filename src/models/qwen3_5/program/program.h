@@ -856,10 +856,17 @@ public:
                                                const runtime::ResolvedExecutionOptions& options);
     [[nodiscard]] std::vector<float> causal_score(PreparedPrompt&& prompt,
                                                   std::uint32_t first_target);
+    // `branch_anchor_frontier` is THE DEPTH AT WHICH TO CAPTURE A CHECKPOINT, and it has to arrive HERE --
+    // with the plan build -- rather than being attached to the plan afterwards. The first version of this did
+    // the latter and could never work: `planner_.plan(...)` seals the executed plan (and `seal_materialization`
+    // works on a COPY), so a group added after selection landed on a discarded object. Deciding it here also
+    // means the capture group exists BEFORE the plan is priced and sealed, which is what makes the search
+    // account for it.
     [[nodiscard]] std::optional<AdmissionCandidate> inspect_admission(
         const PreparedPrompt& prompt, const RequestBasePlan& base, runtime::LaneId destination,
         const ContinuationHandle* source, const SharedPrefixHandle* shared_source,
-        std::optional<runtime::CheckpointRef> checkpoint, bool must_retain_private_source);
+        std::optional<runtime::CheckpointRef> checkpoint, bool must_retain_private_source,
+        std::optional<std::uint32_t> branch_anchor_frontier = std::nullopt);
     [[nodiscard]] std::optional<ResourcePlan> seal_identity(const AdmissionCandidate& candidate,
                                                             const PreparedPrompt& prompt,
                                                             runtime::FinalScheduleIntent intent);

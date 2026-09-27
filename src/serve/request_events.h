@@ -32,6 +32,7 @@ struct RequestLogContext {
     ninfer::PromptPreparationStats preparation;
     std::optional<std::string> session_key;
     std::optional<std::string> client_session_id;
+    std::optional<std::string> session_key_hash;
 };
 
 struct RequestLogMetadata {
@@ -49,6 +50,9 @@ struct RequestLogMetadata {
     // derived key so the two are comparable per request: if the client sends a stable id, the derived FNV
     // preimage -- which a client's concurrent siblings SHARE -- can be replaced by it at the root.
     std::optional<std::string> client_session_id;
+    // THE SAME HASH `prefill.cpp` puts on the sequence and the eviction line prints as `session=%016llx`, so an
+    // eviction can be tied to the request whose state it destroyed. Rendered as 16 hex digits for that match.
+    std::optional<std::string> session_key_hash;
 };
 
 // A parsed generation request that failed during synchronous preparation. It intentionally has a

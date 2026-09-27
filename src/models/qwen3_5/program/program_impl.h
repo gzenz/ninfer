@@ -488,7 +488,8 @@ public:
     [[nodiscard]] std::optional<AdmissionCandidate> inspect_admission(
         const PreparedPromptData& prompt, const RequestBasePlan& base, runtime::LaneId destination,
         const ContinuationHandle* source, const SharedPrefixHandle* shared_source,
-        std::optional<runtime::CheckpointRef> checkpoint, bool must_retain_private_source);
+        std::optional<runtime::CheckpointRef> checkpoint, bool must_retain_private_source,
+        std::optional<std::uint32_t> branch_anchor_frontier = std::nullopt);
     [[nodiscard]] std::optional<AdmissionCandidate> seal_materialization(
         const AdmissionCandidate& admission, const PreparedPromptData& prompt,
         std::span<const ContinuationHandle* const> pressure_owners,
@@ -1136,7 +1137,8 @@ private:
     [[nodiscard]] std::optional<AdmissionCandidate>
     inspect_lane(std::uint32_t lane, const PreparedPromptData& prompt, const RequestBasePlan& base,
                  const SequenceState* source, const SharedPrefixState* shared_source,
-                 std::optional<runtime::CheckpointRef> checkpoint, bool must_retain_private_source);
+                 std::optional<runtime::CheckpointRef> checkpoint, bool must_retain_private_source,
+                     std::optional<std::uint32_t> branch_anchor_frontier = std::nullopt);
     [[nodiscard]] StartResult start_request(MaterializationTransaction& transaction);
     void prepare_materialization(MaterializationTransaction& transaction);
     void enqueue_materialization_transfers(MaterializationTransaction& transaction);

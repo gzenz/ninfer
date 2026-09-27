@@ -71,11 +71,19 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
     // which is the condition V2 describes as units that "classify dead forever".
     ContextCacheHints cache_hints;
     cache_hints.session_key = derive_session_key(request.generation.messages);
-    const RequestLogMetadata metadata{.model                  = request.model,
-                                      .stream                 = request.stream,
-                                      .output_tokens_explicit = request.output_tokens_explicit,
-                                      .session_key            = cache_hints.session_key,
-                                      .client_session_id      = request.metadata_session_hash};
+    RequestLogMetadata metadata{.model                  = request.model,
+                                .stream                 = request.stream,
+                                .output_tokens_explicit = request.output_tokens_explicit,
+                                .session_key            = cache_hints.session_key,
+                                .client_session_id      = request.metadata_session_hash};
+    // The join key with the engine's eviction line (`session=%016llx`): the SAME hash over the SAME bytes that
+    // `prefill.cpp` puts on the sequence, so an eviction can be matched to the request whose state it destroyed.
+    if (cache_hints.session_key) {
+        char hex[24];
+        std::snprintf(hex, sizeof(hex), "%016llx",
+                      static_cast<unsigned long long>(session_key_hash_of(*cache_hints.session_key)));
+        metadata.session_key_hash = std::string(hex);
+    }
     PreparedRequest prepared;
     try {
         prepared = service_->prepare(request.generation,

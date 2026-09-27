@@ -30,6 +30,7 @@ RequestLogContext make_request_log_context(std::uint64_t id, std::string protoco
     context.preserve_thinking_semantic_change = metadata.preserve_thinking_semantic_change;
     context.session_key                       = metadata.session_key;
     context.client_session_id                 = metadata.client_session_id;
+    context.session_key_hash                  = metadata.session_key_hash;
     context.sampling                          = prepared.sampling;
     context.acquisition_seconds               = prepared.acquisition_seconds;
     context.preparation                       = prepared.preparation;

@@ -2059,6 +2059,23 @@ and nobody reads.
   on a workload nothing like the suite's. **The 7-of-11 (or 6-of-10) instance ratio quoted earlier had no
   reproducible denominator and is withdrawn.** The control that settles it — this phase against a
   pre-change binary — has not been run.
+- **`7746a98b`'s own message claim is FALSE, and the suite that could have caught it did not compile (2026-09-27).**
+  That commit ("prefer preserving a restorable checkpoint over a cheaper eviction") says the scenario battery is
+  `rc=0` with engine output BYTE-IDENTICAL to the baseline, i.e. "no plan in those scenarios had a
+  restorable-checkpoint eviction a cheaper alternative could beat, so the change is unexercised there". The
+  restored `ninfer_resource_manager_test` -- which could NOT compile when that commit was made, so the claim was
+  unverifiable at the time -- shows the reorder DOES change a decision: in its exhaustive-oracle configuration
+  the cheapest plan costs 912 ms and evicts once, while the best plan under the ruling costs 1050 ms and evicts
+  nothing, and **the planner picks 1050**. That is the ruling applied, not a defect; the oracle had encoded the
+  old policy and was updated to rank `(restorable evictions, cost)`. So the change IS exercised, in the one
+  suite that drives `plan_materialization` -- which is precisely the suite that was missing for 47 commits.
+  **The commit is 47 back and unpushed; amending its message would need a 47-commit rebase, so the correction
+  lives here (and in the test's own comment) rather than in the message.**
+- **`ninfer_resource_manager_test` runs again, and its baseline is ONE failure**, not the five an older note
+  records and not the two measured before this fix: `guided deep retention` fails, and it failed at `def9a895`
+  too (the commit before `7746a98b`), so it is pre-existing and not a regression. The second failure the
+  restore measured (`independent complete-target oracle`) was `7746a98b`'s, and it is resolved by aligning the
+  oracle with the policy rather than by weakening the case.
 - Every e2e timing taken before 2026-09-25 evening ran with all `MAT_*` probes on (the start script
   exported empty names, and `getenv` is non-NULL for an empty string), so those numbers are conservative
   against prod but not comparable with post-fix ones.

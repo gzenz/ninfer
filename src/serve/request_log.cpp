@@ -223,6 +223,9 @@ Json request_json(const RequestLogContext& context) {
                 {"session_key", context.session_key ? Json(*context.session_key) : Json(nullptr)},
                 {"client_session_id",
                  context.client_session_id ? Json(*context.client_session_id) : Json(nullptr)},
+                // Join key with the engine's eviction line (`session=%016llx`, `prefill.cpp`'s hash).
+                {"session_key_hash",
+                 context.session_key_hash ? Json(*context.session_key_hash) : Json(nullptr)},
                 {"sampling", sampler_json(context.sampling)}};
 }
 

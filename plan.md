@@ -1000,7 +1000,33 @@ task needs no re-derivation:
   traffic. **So this item is now: mechanism present, one scenario showing no starvation, the load case
   untested** -- which is a prod-or-heavy-suite question rather than a port.
 
-6. **#6 — W2's demote-for-evict-only victims. MEASURED; the counter exists and read 7.**
+6. **#6 — W2's demote-for-evict-only victims: CONFIRMED A DEFECT BY THE OPERATOR (2026-09-27), and the first
+   fix attempt was UNSOUND AND REVERTED. Read this before trying again.** The operator's ruling, verbatim:
+   "evicting a victim that holds a restorable checkpoint while the host has room is a defect. fix it."
+   **Attempt 1 (2026-09-27, reverted) -- and its abort is the useful part.** The route looked obvious: the
+   maximal floor takes `eviction_choice` for every victim and the preserving alternative is only sought by
+   the budgeted search afterwards (cut off in 40 of 43 searches under load), so admit a per-victim
+   preserving option at `populate_options` time -- `inspect_pressure_option(sequence,
+   candidate.identity_pressure_deficit, ...)` -- and add `preserving_root_target` for the planner to try
+   before `root_maximal_target`.
+   **It aborts the engine:** the scenario battery dies with
+   `terminate called after throwing an instance of 'ninfer::RequestError'  what(): request reservation
+   exceeds Engine shared KV capacity` (`rc=134`, ~25 log lines in against 232), i.e. the planner calls the
+   plan feasible and execution rejects it.
+   **Why, and this is the constraint any retry must respect:** a `PressureDecision`'s effect is computed
+   from the deficit it is handed, and it is the SEARCH's own residual-consistent machinery that keeps an
+   option's claimed removals equal to what the target actually frees. Building one beside that machinery --
+   with the identity deficit, which is not this target's residual -- produces an option whose numbers do
+   not hold, and the failure surfaces only at execution. This is the "half-ported strategy" the W5 section
+   warns about, caught by the run rather than by review.
+   **The sound route:** seed the PRESERVING CHOICE through the construction cursor
+   (`begin_construction` / `next_construction_option` / `choose_construction`), which is where the residual
+   is known and where the search already enumerates per-victim demote alternatives -- i.e. do the W5
+   ordering INSIDE the search rather than beside it. Validate with the scenario battery (must stay
+   byte-identical or better; a `rc=134` is a hard fail) and an e2e run, then review.
+   **State after the revert:** the tree is the known-good one -- battery `rc=0`, engine output
+   byte-identical to the pre-change baseline (`results/prefix-real-evidence/20260927-101451/`).
+   **The original #6 evidence follows, still standing.**
    **LIVE PROD EVIDENCE, and the first of it (2026-09-26 18:13:09, three lines in one second, on real
    traffic):** the watcher alerts on `demotable=1` precisely for this item, and it fired with
    `frontier=69475 endpoint=1 rewrite=0 host_state_slots=11/16 host_kv=9089187840/32212254720`,

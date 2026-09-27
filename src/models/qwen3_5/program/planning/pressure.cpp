@@ -316,8 +316,7 @@ detail::PhysicalResources pressure_residual(detail::PhysicalResources deficit,
 std::optional<AdmissionCandidate> ProgramImpl::inspect_admission(
     const PreparedPromptData& prompt, const RequestBasePlan& base, runtime::LaneId destination,
     const ContinuationHandle* source, const SharedPrefixHandle* shared_source,
-    std::optional<runtime::CheckpointRef> checkpoint, bool must_retain_private_source,
-    std::optional<std::uint32_t> branch_anchor_frontier) {
+    std::optional<runtime::CheckpointRef> checkpoint, bool must_retain_private_source) {
     const std::uint32_t lane = destination.value;
     if (lane >= max_concurrency) { throw std::out_of_range("admission lane is out of range"); }
     if (requests[lane].lifecycle != Lifecycle::Empty ||
@@ -343,9 +342,8 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_admission(
         shared_state = &shared_prefix_states[ContractAccess::index(*shared_source)];
     }
 
-    std::optional<AdmissionCandidate> plan =
-        inspect_lane(lane, prompt, base, source_state, shared_state, checkpoint,
-                     must_retain_private_source, branch_anchor_frontier);
+    std::optional<AdmissionCandidate> plan = inspect_lane(
+        lane, prompt, base, source_state, shared_state, checkpoint, must_retain_private_source);
     if (!plan) { return std::nullopt; }
     plan->impl_->destination       = destination;
     plan->impl_->destination_epoch = lane_epochs[lane];

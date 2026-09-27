@@ -259,8 +259,9 @@ Program::Program(std::unique_ptr<detail::ProgramImpl> impl) noexcept : impl_(std
 Program::~Program() noexcept = default;
 
 RequestBasePlan Program::plan_request(const PreparedPrompt& prompt,
-                                      const runtime::ResolvedExecutionOptions& options) {
-    return impl_->plan_request(PreparedPromptAccess::view(prompt), options);
+                                      const runtime::ResolvedExecutionOptions& options,
+                                      std::optional<std::uint32_t> branch_anchor_frontier) {
+    return impl_->plan_request(PreparedPromptAccess::view(prompt), options, branch_anchor_frontier);
 }
 
 std::vector<float> Program::causal_score(PreparedPrompt&& prompt, std::uint32_t first_target) {
@@ -270,11 +271,9 @@ std::vector<float> Program::causal_score(PreparedPrompt&& prompt, std::uint32_t 
 std::optional<AdmissionCandidate> Program::inspect_admission(
     const PreparedPrompt& prompt, const RequestBasePlan& base, runtime::LaneId destination,
     const ContinuationHandle* source, const SharedPrefixHandle* shared_source,
-    std::optional<runtime::CheckpointRef> checkpoint, bool must_retain_private_source,
-    std::optional<std::uint32_t> branch_anchor_frontier) {
+    std::optional<runtime::CheckpointRef> checkpoint, bool must_retain_private_source) {
     return impl_->inspect_admission(PreparedPromptAccess::view(prompt), base, destination, source,
-                                    shared_source, checkpoint, must_retain_private_source,
-                                    branch_anchor_frontier);
+                                    shared_source, checkpoint, must_retain_private_source);
 }
 
 std::optional<ResourcePlan> Program::seal_identity(const AdmissionCandidate& admission,

@@ -482,14 +482,14 @@ public:
     ~ProgramImpl() noexcept;
 
     [[nodiscard]] RequestBasePlan plan_request(const PreparedPromptData& prompt,
-                                               const runtime::ResolvedExecutionOptions& options);
+                                               const runtime::ResolvedExecutionOptions& options,
+                                     std::optional<std::uint32_t> branch_anchor_frontier = std::nullopt);
     [[nodiscard]] std::vector<float> causal_score(PreparedPromptData&& prompt,
                                                   std::uint32_t first_target);
     [[nodiscard]] std::optional<AdmissionCandidate> inspect_admission(
         const PreparedPromptData& prompt, const RequestBasePlan& base, runtime::LaneId destination,
         const ContinuationHandle* source, const SharedPrefixHandle* shared_source,
-        std::optional<runtime::CheckpointRef> checkpoint, bool must_retain_private_source,
-        std::optional<std::uint32_t> branch_anchor_frontier = std::nullopt);
+        std::optional<runtime::CheckpointRef> checkpoint, bool must_retain_private_source);
     [[nodiscard]] std::optional<AdmissionCandidate> seal_materialization(
         const AdmissionCandidate& admission, const PreparedPromptData& prompt,
         std::span<const ContinuationHandle* const> pressure_owners,
@@ -1137,8 +1137,7 @@ private:
     [[nodiscard]] std::optional<AdmissionCandidate>
     inspect_lane(std::uint32_t lane, const PreparedPromptData& prompt, const RequestBasePlan& base,
                  const SequenceState* source, const SharedPrefixState* shared_source,
-                 std::optional<runtime::CheckpointRef> checkpoint, bool must_retain_private_source,
-                     std::optional<std::uint32_t> branch_anchor_frontier = std::nullopt);
+                 std::optional<runtime::CheckpointRef> checkpoint, bool must_retain_private_source);
     [[nodiscard]] StartResult start_request(MaterializationTransaction& transaction);
     void prepare_materialization(MaterializationTransaction& transaction);
     void enqueue_materialization_transfers(MaterializationTransaction& transaction);

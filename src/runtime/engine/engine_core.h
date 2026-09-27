@@ -1480,8 +1480,17 @@ private:
 
     void ensure_base_plan(const std::shared_ptr<Request>& request) {
         if (!request->base_plan) {
-            request->base_plan.emplace(
-                instance_.program->plan_request(request->prompt, request->options.execution));
+            // THE BRANCH ANCHOR'S FRONTIER, computed BEFORE the plan is built so the capture group can be part
+            // of it from the start (identity and pricing included). GATED, because the search scans the
+            // catalog's ledgers and that cost has never been measured at 64 cells -- the default path must not
+            // pay it.
+            static const bool branch_anchor_enabled = std::getenv("NINFER_BRANCH_ANCHOR") != nullptr;
+            std::optional<std::uint32_t> branch_anchor;
+            if (branch_anchor_enabled) {
+                branch_anchor = resources_.branch_anchor_frontier(*instance_.program, request->prompt);
+            }
+            request->base_plan.emplace(instance_.program->plan_request(
+                request->prompt, request->options.execution, branch_anchor));
         }
         const RequestPlanSummary& summary = request->base_plan->summary();
         if (summary.service_work_quanta == 0) {

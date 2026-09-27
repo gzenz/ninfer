@@ -209,7 +209,8 @@ detail::PhysicalResources positive_difference(detail::PhysicalResources value,
 } // namespace
 
 RequestBasePlan ProgramImpl::plan_request(const PreparedPromptData& prompt,
-                                          const runtime::ResolvedExecutionOptions& options) {
+                                          const runtime::ResolvedExecutionOptions& options,
+                                              std::optional<std::uint32_t> branch_anchor_frontier) {
     if (prompt.token_ids.empty()) { throw std::invalid_argument("prompt must contain tokens"); }
     if (prompt.token_ids.size() > capacity) {
         throw std::invalid_argument("prompt exceeds configured context capacity");
@@ -464,6 +465,17 @@ RequestBasePlan ProgramImpl::plan_request(const PreparedPromptData& prompt,
                         opportunity.kind == PromptCacheMarkerKind::PrivateLongAnchor,
                         opportunity.evidence);
         }
+        // THE BRANCH ANCHOR: a capture at the depth this prompt matched stored content to, when no checkpoint
+        // below that depth can resume from it. INSERTED HERE, through the plan's own `add_capture`, so it is
+        // merged, sorted, given an identity and priced exactly like a client marker -- the thing both earlier
+        // attempts missed. (Attempt 1 attached it after the plan was sealed, to a discarded copy; attempt 2 put
+        // it in the candidate's copy and produced a group with no identity, which the engine rejected with
+        // `planned capture identity is invalid` and then recovered through, on prod.)
+        if (branch_anchor_frontier && *branch_anchor_frontier != 0 &&
+            *branch_anchor_frontier <= base->summary.prompt_tokens) {
+            add_capture(*branch_anchor_frontier, 0, std::nullopt, false, true,
+                        SharedCandidateEvidence::None);
+        }
         std::sort(base->capture_groups.begin(), base->capture_groups.end(),
                   [](const CaptureGroup& left, const CaptureGroup& right) {
                       return std::tie(left.frontier, left.input_order) <
@@ -546,8 +558,7 @@ RequestBasePlan ProgramImpl::plan_request(const PreparedPromptData& prompt,
 std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
     std::uint32_t lane, const PreparedPromptData& prompt, const RequestBasePlan& base_plan,
     const SequenceState* source, const SharedPrefixState* shared_source,
-    std::optional<runtime::CheckpointRef> checkpoint, bool must_retain_private_source,
-    std::optional<std::uint32_t> branch_anchor_frontier) {
+    std::optional<runtime::CheckpointRef> checkpoint, bool must_retain_private_source) {
     if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
     const RequestControl& request = requests[lane];
     if (request.lifecycle != Lifecycle::Empty) {
@@ -864,37 +875,6 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
         plan->capture_groups.push_back(std::move(group));
     }
 
-    // THE BRANCH ANCHOR, decided HERE and not after the fact. The planner later observes that a request
-    // matched stored tokens at a depth where no restorable checkpoint exists below it -- so the matched tail is
-    // re-prefilled (measured 2026-09-27: tokens match to 28,564 against a deepest-checkpoint 23,353 on the
-    // shared class, identity chain AGREEING, and to 45,717 against 31,229 on the private one). Capturing a
-    // long anchor at the depth this request matched to gives the NEXT request a checkpoint there.
-    //
-    // It has to be added during the plan BUILD: the first version attached it to the plan after selection and
-    // could never work, because `planner_.plan(...)` seals the executed plan and `seal_materialization` works
-    // on a copy -- so the group landed on a discarded object. Adding it here also means the capture is part of
-    // what the search prices and seals, instead of a surprise bolted on afterwards.
-    if (branch_anchor_frontier && *branch_anchor_frontier != 0 &&
-        *branch_anchor_frontier <= plan->summary.prompt_tokens) {
-        const std::uint32_t frontier = *branch_anchor_frontier;
-        const auto existing          = std::find_if(plan->capture_groups.begin(), plan->capture_groups.end(),
-                                        [frontier](const CaptureGroup& group) {
-                                            return group.frontier == frontier;
-                                        });
-        if (existing != plan->capture_groups.end()) {
-            existing->long_anchor = true;
-        } else {
-            CaptureGroup group;
-            group.frontier    = frontier;
-            group.input_order = 0;
-            group.long_anchor = true;
-            plan->capture_groups.push_back(std::move(group));
-            std::sort(plan->capture_groups.begin(), plan->capture_groups.end(),
-                      [](const CaptureGroup& left, const CaptureGroup& right) {
-                          return left.frontier < right.frontier;
-                      });
-        }
-    }
     plan->shared_candidates.reserve(base.shared_candidates.size());
     for (CaptureGroup group : base.shared_candidates) {
         if (group.frontier >= plan->reuse_base) {

@@ -276,6 +276,38 @@ public:
         }
     }
 
+    // THE DEPTH AT WHICH TO CAPTURE A CHECKPOINT, computed BEFORE the base plan is built -- which is the only
+    // point from which it can be made correct. Two earlier attempts failed for two different reasons, and the
+    // second is instructive: injecting the group into the CANDIDATE copy produced a group with NO identity and
+    // no pricing, and every capture group must carry a `PreparedCaptureIdentity` (`backing`, work at its
+    // frontier, per-frontier digests) or the engine throws `planned capture identity is invalid` and recovers
+    // (observed on prod 2026-09-27, followed by a cascade of `prepared prompt is empty`). Injecting here, via
+    // the base build's own `add_capture`, means the group passes through the identity AND pricing passes like
+    // every client marker.
+    //
+    // The condition is the measured one: this prompt matches stored content DEEPER than any checkpoint below it
+    // can resume from, so the matched tail is re-prefilled (28,564 against 23,353 on the shared class; 45,717
+    // against 31,229 on the private one, both with the identity chain agreeing).
+    [[nodiscard]] std::optional<std::uint32_t> branch_anchor_frontier(const Program& program,
+                                                                      const PreparedPrompt& prompt) const {
+        std::uint32_t best = 0;
+        const auto consider = [&](const Program::PrefixSplit& split) {
+            if (split.tokens > split.restorable && split.tokens > best) { best = split.tokens; }
+        };
+        for (std::uint32_t slot = 0; slot < catalog_count_; ++slot) {
+            const CatalogEntry& entry = catalog_[slot];
+            if (entry.state != CatalogState::Catalogued || !entry.handle) { continue; }
+            consider(program.prefix_split(*entry.handle, prompt));
+        }
+        for (std::uint32_t slot = 0; slot < shared_catalog_count_; ++slot) {
+            const SharedCatalogEntry& entry = shared_catalog_[slot];
+            if (entry.state != SharedCatalogState::Catalogued || !entry.handle) { continue; }
+            consider(program.prefix_split(*entry.handle, prompt));
+        }
+        if (best == 0) { return std::nullopt; }
+        return best;
+    }
+
     [[nodiscard]] Inspection inspect(Program& program, const PreparedPrompt& prompt,
                                      const RequestBasePlan& base, std::uint64_t publication_order,
                                      PlanningAllowance allowance = {}) {
@@ -478,29 +510,9 @@ public:
                                            *entry.session != *base.context_cache().session_key ||
                                            !base.context_cache().update_session_index)) ||
                         (sibling_retain && endpoint_beyond_prompt);
-                    // THE BRANCH ANCHOR'S FRONTIER, computed per entry and decided BEFORE the plan build --
-                    // the only place it can work, since the planner seals the executed plan (and
-                    // `seal_materialization` copies), so a group attached after selection lands on a discarded
-                    // object. `tokens > restorable` is the measured condition: this prompt matches stored
-                    // content deeper than any checkpoint below it can resume from, so the matched tail is
-                    // re-prefilled (28,564 against 23,353 on the shared class; 45,717 against 31,229 on the
-                    // private one, both with the identity chain AGREEING).
-                    //
-                    // COMPUTED ONLY WHEN THE FLAG IS ON. The split scans this entry's ledger, and the review
-                    // has not measured that cost at 64 cells -- so the default path must not pay it.
-                    static const bool branch_anchor_enabled = std::getenv("NINFER_BRANCH_ANCHOR") != nullptr;
-                    std::optional<std::uint32_t> branch_anchor;
-                    if (branch_anchor_enabled) {
-                        const typename Program::PrefixSplit split =
-                            program.prefix_split(*entry.handle, prompt);
-                        if (split.tokens > split.restorable &&
-                            split.tokens <= base.summary().prompt_tokens) {
-                            branch_anchor = split.tokens;
-                        }
-                    }
                     std::optional<AdmissionCandidate> plan =
                         program.inspect_admission(prompt, base, *destination, &*entry.handle,
-                                                  nullptr, index.checkpoint, retain, branch_anchor);
+                                                  nullptr, index.checkpoint, retain);
                     if (!plan) {
                         cdbg_log("[candgen] priv SKIP slot=%u inspect_admission=nullopt\n",
                                  index.slot);

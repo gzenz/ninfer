@@ -1082,6 +1082,24 @@ task needs no re-derivation:
    `NINFER_SEARCH_MS`), and see whether `adoptable > 0` with `chosen = 0` appears in the same regime -- which
    would show the preserving plan EXISTS and the 400 ms cap was starving it, making the defect the budget
    rather than capacity. Nothing here says the fix is wrong; it says the fix's effect is still unmeasured.
+   **A SECOND, DIFFERENT RECOVERY — AND IT WEAKENS MY OVERRIDE CORRELATION (2026-09-27 13:10:45, in the NEW
+   process, override already removed):** `WORKER RECOVER: pressure target arena is full`. So recoveries are
+   NOT exclusively the override's signature -- but note the reasons differ, and the correlation above was
+   specifically with `selected capture has no prepared logical State capacity` (3 in the override window, 0
+   in the 33 minutes before it). This one is a different failure and it is RARE: **once in 24 hours**, and
+   that once is this event.
+   **What it is, checked rather than guessed:** `target_ledger_.reset(candidates.size() + 1 + kTargetBudget)`
+   runs at the top of `plan()`, so the arena is reset PER RUN and this is NOT accumulation across requests
+   (the shape a counter bug of mine had earlier today). A SINGLE planning run generated more targets than
+   its ~4096 + candidates arena holds. Given the same traffic reports 2200-3400 `targets_evaluated` per
+   request, a heavier request exceeding ~4100 is the plausible route.
+   **A hypothesis worth naming, not asserting:** if the pre-grow widens host feasibility, more candidate
+   plans become feasible and a run explores more targets -- which could push a heavy request over the arena.
+   n=1 cannot establish it. The comparison that would: `targets_evaluated` from the request log before and
+   after the pre-grow landed, on comparable load.
+   **Both recovery kinds are CLEAN**: `fail-all cleanup: released-refused=0 skipped=0` and the
+   post-recovery residual is all-zero on every axis, so neither is #9's leak. The cost is one in-flight
+   request (HTTP 500) per recovery.
    **THE OVERRIDE WAS REMOVED EARLY, because it correlated with the workload FAILING (2026-09-27 13:09).**
    Comparison over the operator's own traffic, same binary (`6197549f`), same workload:
 

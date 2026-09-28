@@ -902,6 +902,40 @@ struct TokenMatch {
 // 2026-09-28 once they had answered: an instrument that logs user content should not outlive the question it
 // was gated for. The INDEX stays and is unconditional -- it is a number, and gating it once made it read a
 // constant 0 on the path production runs while four comments called it unconditional.
+// THE BOUNDED DIVERGENCE PROBE (2026-09-28). One question, one window, a handful of samples: after the
+// content-logging windows were removed, the surviving `split_probe_index` could say the digest matches stop
+// ~190 tokens before the ledger's end (tight, p25-p75 of 178-215, across ledgers of 32k-78k) but not WHAT is
+// in that band. This prints the ids either side of ONE divergence, to stderr, at most `kSampleCap` times per
+// process, only when `NINFER_DIVERGENCE_PROBE` is set.
+//
+// It deliberately does NOT touch the request log or the diagnostics: the ids are content, and the record is
+// the one place they must never land. Decoding happens OFFLINE with the model's own tokenizer -- that is how
+// the earlier windows were read (`assistant\n thinking\n<reasoning>` against `assistant\n thinking\n\n</think>\n\n`),
+// and it keeps the detokenizer, which lives in the frontend layer, out of this one.
+inline constexpr std::size_t kProbeWindow  = 40;
+inline constexpr std::size_t kProbeSamples = 8;
+
+inline void probe_divergence(std::span<const TokenId> prompt, std::span<const TokenId> stored,
+                             std::size_t index) {
+    static const bool enabled = std::getenv("NINFER_DIVERGENCE_PROBE") != nullptr;
+    if (!enabled) { return; }
+    static std::size_t emitted = 0;
+    if (emitted >= kProbeSamples) { return; }
+    const std::size_t limit = std::min(prompt.size(), stored.size());
+    if (index >= limit) { return; }
+    const std::size_t begin = index >= kProbeWindow / 2 ? index - kProbeWindow / 2 : 0;
+    const std::size_t count = std::min(kProbeWindow, limit - begin);
+    ++emitted;
+    std::fprintf(stderr, "[divergence] sample=%zu index=%zu ledger=%zu prompt=%zu begin=%zu n=%zu\n",
+                 emitted, index, stored.size(), prompt.size(), begin, count);
+    std::fprintf(stderr, "[divergence] stored=");
+    for (std::size_t i = 0; i < count; ++i) { std::fprintf(stderr, "%u,", stored[begin + i]); }
+    std::fprintf(stderr, "\n[divergence] prompt=");
+    for (std::size_t i = 0; i < count; ++i) { std::fprintf(stderr, "%u,", prompt[begin + i]); }
+    std::fprintf(stderr, "\n");
+    std::fflush(stderr);
+}
+
 template <typename Split>
 void note_probe_index(Split& split) {
     if (split.match_end != static_cast<std::uint8_t>(MatchEnd::Diverged)) { return; }
@@ -928,6 +962,9 @@ ProgramImpl::PrefixSplit ProgramImpl::prefix_split(const ContinuationHandle& own
     split.match_end                     = static_cast<std::uint8_t>(continuation_match.end);
     split.stored                        = static_cast<std::uint32_t>(sequence.ledger.size());
     note_probe_index(split);
+    if (split.match_end == static_cast<std::uint8_t>(MatchEnd::Diverged)) {
+        probe_divergence(prompt.token_ids, sequence.ledger, split.tokens);
+    }
     // THE STRICTER TEST. Same tokens is not the same history: `prefix_matches` also requires the identity
     // chain to agree, which is what a re-rendered (or thinking-stripped) earlier turn breaks. Only evaluated
     // when there IS a match -- a zero-token match has nothing to verify.
@@ -970,6 +1007,9 @@ ProgramImpl::PrefixSplit ProgramImpl::prefix_split(const SharedPrefixHandle& own
     split.match_end               = static_cast<std::uint8_t>(shared_match.end);
     split.stored                  = static_cast<std::uint32_t>(shared.identity->ledger().size());
     note_probe_index(split);
+    if (split.match_end == static_cast<std::uint8_t>(MatchEnd::Diverged)) {
+        probe_divergence(prompt.token_ids, shared.identity->ledger(), split.tokens);
+    }
     if (split.tokens != 0U && shared.identity->prefix_identity() != nullptr) {
         split.identity_ok = qwen3_5::detail::prefix_matches(prompt, shared.identity->ledger(),
                                                             *shared.identity->prefix_identity(),

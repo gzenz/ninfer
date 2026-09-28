@@ -150,5 +150,93 @@ int main() {
             return 1;
         }
     }
+    // WHY THE MATCH STOPPED, AND HOW FAR THE LEDGER WENT. `match_end` and `stored` were added to the split
+    // with no test at all, and the first deployment of `split_ended_by` read `diverged` on every sample --
+    // which is exactly what an unwired field reads like, so it cost a deploy cycle to tell a real reading from
+    // a dead one. Both halves of that ambiguity are pinned here: the values must follow the DEEPEST entry, and
+    // a tie must not silently pick by iteration order without the rule being written down.
+    {
+        // The shallow entry deliberately has the LONGER ledger, so a max-over-entries implementation cannot
+        // coincide with the right answer. The first draft of this case used a shallow entry with a SHORTER
+        // ledger and passed against a mutant that took the max -- the test measured nothing. (Mutation-checked
+        // both ways, which is the only reason that was caught.)
+        const ninfer::runtime::PrefixSplitSample deep{      .tokens = 28530, .match_end = 0, .stored = 41000};
+        const ninfer::runtime::PrefixSplitSample shallow{   .tokens = 23353, .match_end = 2, .stored = 90000};
+        const std::array samples{shallow, deep};
+        const ninfer::runtime::PrefixSplitBest best = ninfer::runtime::best_prefix_split(samples);
+        if (best.match_end != 0) {
+            std::cerr << "match_end must come from the DEEPEST entry, not the max over entries: a shallow "
+                         "entry whose ledger ended says nothing about where the deepest match stopped\n";
+            return 1;
+        }
+        if (best.stored != 41000) {
+            std::cerr << "stored must be the deepest entry's own ledger length -- it is the denominator that "
+                         "localises the divergence, so a shallow value would move the reported position\n";
+            return 1;
+        }
+    }
+    // The tie rule, written down rather than left to the iteration order: the FIRST entry at the greatest
+    // depth wins, so among equally-deep entries the reading depends on catalog order. That is a real limit of
+    // this field and it is asserted here so a reader meets it, instead of rediscovering it as "why does the
+    // same prompt read differently on another run".
+    {
+        const ninfer::runtime::PrefixSplitSample first{ .tokens = 900, .match_end = 1, .stored = 900};
+        const ninfer::runtime::PrefixSplitSample tie{   .tokens = 900, .match_end = 2, .stored = 1400};
+        const std::array samples{first, tie};
+        const ninfer::runtime::PrefixSplitBest best = ninfer::runtime::best_prefix_split(samples);
+        if (best.match_end != 1 || best.stored != 900) {
+            std::cerr << "an equal-depth tie must resolve to the first sample (documented), not to the "
+                         "deeper ledger or the larger restorable\n";
+            return 1;
+        }
+    }
+    // THE DIVERGENCE PROBE. Same rule as `match_end`/`stored` -- the windows belong to the DEEPEST entry --
+    // and the sample order here is deliberate: the deepest entry is FIRST, so an implementation that let the
+    // last entry win would take the shallow one's window and fail. (The order is the whole test: with the
+    // reverse order a last-wins mutant passes, which is how the previous case in this file was written wrong
+    // the first time.)
+    {
+        // THREE samples, all with windows, and the shallow FIRST one carries the LARGEST count. The previous
+        // version of this case had one shallow sample with a smaller count, which left three mutant classes
+        // alive: first-sample-wins, first-nonempty-wins and max-count all survived it. The counts here are
+        // 5 / 3 / 4 so that only "the deepest entry's own window" produces 3.
+        ninfer::runtime::PrefixSplitSample head{.tokens = 100, .stored = 200, .probe_index = 100,
+                                                .probe_count = 5};
+        head.probe_stored = {1, 2, 3, 4, 5};
+        head.probe_prompt = {6, 7, 8, 9, 10};
+        ninfer::runtime::PrefixSplitSample deep{.tokens = 900, .stored = 1000, .probe_index = 900,
+                                                .probe_count = 3};
+        deep.probe_stored = {11, 22, 33};
+        deep.probe_prompt = {44, 55, 66};
+        ninfer::runtime::PrefixSplitSample tail{.tokens = 300, .stored = 400, .probe_index = 300,
+                                                .probe_count = 4};
+        tail.probe_stored = {70, 71, 72, 73};
+        tail.probe_prompt = {80, 81, 82, 83};
+        const std::array samples{head, deep, tail};
+        const ninfer::runtime::PrefixSplitBest best = ninfer::runtime::best_prefix_split(samples);
+        if (best.probe_index != 900 || best.probe_count != 3 || best.probe_stored[0] != 11 ||
+            best.probe_prompt[0] != 44 || best.probe_stored[2] != 33) {
+            std::cerr << "the divergence window must come from the DEEPEST entry: a shallow entry's tokens "
+                         "are not the ones that stopped this match, and reading them would name the wrong "
+                         "token as the cause\n";
+            return 1;
+        }
+    }
+    // `probe_enabled` IS A PROPERTY OF THE REQUEST, not of the winning entry. Taken from the deepest sample it
+    // read `false` on every record whose match never ran -- an empty catalog, and the first turn of every
+    // conversation -- while the probe was on, which is the same "reads the same whether it works or not"
+    // shape as the index that was gated behind its own gate.
+    {
+        ninfer::runtime::PrefixSplitSample a{.tokens = 0, .probe_enabled = true};
+        ninfer::runtime::PrefixSplitSample b{.tokens = 0, .probe_enabled = true};
+        const std::array samples{a, b};
+        const ninfer::runtime::PrefixSplitBest best = ninfer::runtime::best_prefix_split(samples);
+        if (!best.probe_enabled) {
+            std::cerr << "probe_enabled must be an OR across samples: with no matching entry the deepest-taken "
+                         "value is the default, so the first turn of every conversation would report the probe "
+                         "as off while it is running\n";
+            return 1;
+        }
+    }
     std::cout << "prefix-split aggregation ok\n";
 }

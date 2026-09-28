@@ -20,6 +20,14 @@ using TokenId = std::int32_t;
 inline constexpr std::uint32_t kMaximumConcurrency               = 8;
 inline constexpr std::size_t kMaximumContextCacheSessionKeyBytes = 256;
 inline constexpr std::size_t kMaximumExplicitPromptCacheMarkers  = 4;
+// THE DIVERGENCE PROBE'S WINDOW. When the deepest match against a stored ledger stops because the tokens
+// differ, the two id windows either side of that index are the only thing that says WHY -- a missing
+// end-of-turn token, a different tokenization of the same text, a rewind, or a thinking block. The ids are
+// CONTENT (decodable with the tokenizer), so the window is filled only behind `NINFER_TOKEN_PROBE`; the INDEX
+// is a plain number and is always recorded. `kTokenProbeLead` ids before the divergence are included because
+// the divergence itself is often the first token of a structural marker.
+inline constexpr std::size_t kTokenProbeWindow = 12;
+inline constexpr std::size_t kTokenProbeLead   = 4;
 // Aggregate encoded image/video payload retained by one prompt, independent of item count.
 inline constexpr std::size_t kMaximumPromptMediaBytes    = 256ULL << 20;
 inline constexpr std::size_t kDefaultMediaCacheBytes     = 1ULL << 30;
@@ -875,6 +883,55 @@ struct MaterializationDiagnostics {
     // ended first (the ledger is a PREFIX of the prompt). Read it with `split_best_tokens`: the same number means
     // opposite things depending on this.
     std::uint8_t  split_ended_by        = 0;
+    // WHERE THE DIVERGENCE IS, which `split_ended_by = 0` alone cannot say. `split_best_tokens` is the match
+    // and this is the deepest entry's OWN ledger length, so the three numbers read together localise the stop:
+    // a match short of BOTH means the tokens really differ at that index, and `split_best_tokens` against the
+    // prompt's own length says whether that index falls inside this turn or past the previous one's end. The
+    // 2026-09-27 finding ("divergence at the replayed-assistant boundary") was inferred from the match alone
+    // and stayed an inference for exactly this missing denominator.
+    std::uint32_t split_best_stored     = 0;
+    // WHY the conversation's session cell was not a candidate, which `session_cell_offered` states but cannot
+    // explain: on its first real reading that flag was FALSE in 100% of shared-class requests, including ones
+    // whose cell held a frontier at 39k/42k/51k tokens. Read WITH `session_cell_frontier`, which says whether
+    // there was a cell at all -- a reason here is only meaningful when the frontier is non-zero.
+    // PRIVATE ENTRIES ONLY: a shared catalog slot is a separate index namespace and must never write here.
+    // 0 = no cell / no session key / `update_session_index` false / cache disabled; 1 = offered (and STICKY);
+    // 2 = the slot has no index entry at all; 3 = no shortlist key at its frontier; 4 = identity-tag mismatch;
+    // 5 = digest mismatch; 7 = the entry is held by a running lane's edge; 8 = `inspect_admission` refused it.
+    // COVERAGE, because a value no test can produce is a value a reader may be inventing: 1, 3, 4, 5 and 8 are
+    // pinned by value in `test_resource_manager`; 9 only as an absence (never emitted on the no-cell path);
+    // 7 is UNTESTED -- it needs a second lane, and a mutant deleting that site survives. 2 is the provisional
+    // "no index entry at all".
+    // 6 is retired as unreachable. 9 ("failed validation") is emitted at that site but is unreachable on the
+    // path audited so far: the index is validated with the same criteria immediately before the loop and
+    // nothing mutates the catalog in between; a slot recycled after the rebuild would land there and that case
+    // is NOT audited (see `resource_manager.h`). 0 was ALSO unreachable for a while -- with no session cell, the no-cell
+    // sentinel equalled the unoccupied entry's slot sentinel and every such request wrote 9, so the default
+    // path (the Bash classifier's traffic) read "failed validation".
+    std::uint8_t  session_cell_skip     = 0;
+    // THE CONVERSATION'S OWN ENDPOINT, separately: one catalog slot holds several index entries (endpoint,
+    // rewrite, each long anchor), so once a shallower anchor has been offered `session_cell_skip` is a sticky 1
+    // and can no longer say why the endpoint was lost -- which is the question. Same codes; 0 = the loop never
+    // met an entry that is this slot's endpoint.
+    std::uint8_t  session_endpoint_skip = 0;
+    // THE EXACT DIVERGENCE (see `kTokenProbeWindow`). `split_probe_index` is the first token index at which
+    // the deepest entry's ledger and this prompt differ -- equal to `split_best_tokens` when `split_ended_by`
+    // is 0, and 0 otherwise, so it is meaningful only beside that discriminator. The windows are empty unless
+    // the probe is enabled, and they are the difference between "the tokens differ" and knowing which token
+    // and of what kind: the alternative was inferring a cause from aggregate counters, which produced three
+    // wrong mechanisms in one day before controls caught them.
+    // SET WHENEVER THE DEEPEST MATCH DIVERGED, gate or no gate: the index is a number, not content, and a
+    // field that reads 0 on the default path while its own comments call it unconditional is an instrument
+    // that cannot fire exactly where production runs. Only the WINDOWS below are opt-in.
+    std::uint32_t split_probe_index     = 0;
+    std::uint8_t  split_probe_count     = 0;
+    // WHETHER THE PROBE WAS ON for this request. An empty array otherwise reads the same whether the probe is
+    // off or the wiring is broken, and the record must say which -- so this is an OR across every scanned
+    // entry, not a property of the winning one. It is FALSE on a request with NO scanned entries (an empty
+    // catalog) even with the probe running: read it together with `split_entries == 0`.
+    bool          split_probe_enabled   = false;
+    std::array<std::uint32_t, kTokenProbeWindow> split_probe_stored{};
+    std::array<std::uint32_t, kTokenProbeWindow> split_probe_prompt{};
     // THE SIBLING CONDITION AND THE RETAIN DECISION, counted even while the behaviour is off (2026-09-27).
     // `sibling_candidates` is how often a private source was found whose own endpoint lies BEYOND this
     // request's prompt -- a request that cannot reach the endpoint it is about to consume -- and

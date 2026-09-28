@@ -2153,6 +2153,65 @@ and nobody reads.
 - A wedged engine is not fixed by `~/ninfer-ensure.sh`. Restart, then confirm `/health` 200 and the
   sentinel active.
 
+## 2026-09-28 — the 23,353 ceiling: the session cell's entry is never offered, and three instruments to say why (narrative)
+
+**The measured shape.** On the operator's traffic, 278 of 821 requests (34%) took `shared_stable_prefix` and
+reused a PINNED ~23,353 tokens -- the common system prompt -- while their own continuation was worth 31k-50k.
+Within ONE conversation with a stable session key the failure is INTERMITTENT, not permanent:
+
+```
+req 18  hit=31069  private_endpoint      ok
+req 26  hit=31069  private_endpoint      ok
+req 33  hit=23355  shared_stable_prefix  PINNED
+req 45  hit=23353  shared_stable_prefix  PINNED
+req 59  hit=36500  private_endpoint      ok
+```
+
+23 conversations in the log show this. **A first reading of "the derived session key is unstable" was WRONG
+and was caught by ordering the requests**: one client id hosts many concurrent conversations (sub-agents), each
+with its own stable key that recurs across requests -- `be536a59...` at 21/28/33, `4bb95816...` at 22/29/37.
+
+**What was built** (all read-only; `4fcbfd7f` plus this change):
+- `split_best_stored` -- the deepest entry's own ledger length, the denominator that localizes a divergence;
+- `session_cell_skip` / `session_endpoint_skip` -- WHY the conversation's own cell was not a candidate, from
+  seven sites, in the request record, no flag;
+- `split_probe_index` + 12-id windows either side of it, gated behind `NINFER_TOKEN_PROBE` because ids are
+  content; the index itself is NOT gated.
+
+**The run, and the control that could have failed.** Prod was restarted on the built binary with the probe on,
+traffic driven, the drop-in then removed. 12 records carried the new fields, `split_probe_enabled` took both
+values, and 9 diverged records showed the windows. **My first control was tautological** -- `probe_index ==
+best_tokens`, "12 and 12 ids" and "the first four agree" all follow from the producer's own arithmetic, so a
+copy-paste bug filling `probe_prompt` from `stored` would have passed them. The control that holds is that
+element `[index - begin]` DIFFERS and nothing before it does: first difference at offset 4, 9 of 9. **Cite that,
+not "9 of 9 self-consistent".**
+
+**The mechanism, observed not inferred.** Decoding the windows: stored `assistant\n thinking\n<reasoning>`,
+prompt `assistant\n thinking\n\n</think>\n\n` -- divergence at the thinking block of the replayed turn, and
+`session_endpoint_skip == 5` (digest mismatch) agrees. **This is ONE pattern seen 9 times across ~3 concurrent
+lanes, not 9 independent observations, and it is NOT the production cause**: all 821 production requests have
+`model_thinking_tokens = 0`. It demonstrates the gate's blast radius (one differing token discards a 30k-50k
+continuation) without explaining the production trigger, which still needs the probe read on real traffic.
+
+**Corrections recorded rather than smoothed over, because each cost a cycle:**
+- The digest gate is all-or-nothing at a frontier BEYOND the reply, so a single differing token there discards
+  the whole continuation. Three candidate explanations of the trigger died to controls in one day -- reply
+  truncation, natural end-of-turn, and "the session key is unstable".
+- `ninfer_resource_manager_test` **did not compile from `7d2ad646`** (the fake Program lacked `match_end`,
+  `stored`, the probe fields and `capture_skips`), so it ran NOTHING while looking like a suite with no new
+  failures. This change restores it: `47 run, 1 failed`, the failure being the recorded baseline
+  `guided deep retention`.
+- **Five stale-binary artifacts** in one session, one inside a mutation loop whose restore step did not relink:
+  a mutation result is void until the binary is shown newer than the mutated source.
+- The `session_cell_skip` sentinel collided with `kInvalidCatalogSlot` (both `0xFFFFFFFF`), so every
+  session-keyless request -- the Bash classifier's traffic -- read `9`, "failed validation", while the
+  documented 0 was unreachable.
+
+**Coverage, stated where a reader meets the field**: codes 1, 3, 4, 5 and 8 pinned by value; 9 only as an
+absence; **7 untested** (needs a second lane); 4 and 7 were the last two until this change added 4. The
+shared/private slot collision fix rests on code order and NO test -- a control was written, passed with the
+guard removed, and was withdrawn rather than shipped.
+
 ## #14/#9 wedge — reconstructed 2026-09-25 (narrative; state is in Current state §2)
 
 Restored verbatim from the deleted hand-off when a review found that the rewrite of Current

@@ -109,6 +109,12 @@ struct PrefixSplitSample {
     std::uint32_t restorable  = 0;  // this entry's deepest restorable checkpoint at or below its own match
     bool          identity_ok = false;  // did the identity chain agree AT that match (stricter than tokens)
     std::uint8_t  match_end   = 0;      // 0 = diverged, 1 = the stored ledger ended, 2 = the prompt ended
+    std::uint32_t stored      = 0;      // this entry's own ledger length -- the denominator `match_end` needs
+    std::uint32_t probe_index = 0;      // first differing token index (see `kTokenProbeWindow`)
+    std::uint8_t  probe_count = 0;      // 0 when the probe is off
+    bool          probe_enabled = false;
+    std::array<std::uint32_t, kTokenProbeWindow> probe_stored{};
+    std::array<std::uint32_t, kTokenProbeWindow> probe_prompt{};
 };
 
 struct PrefixSplitBest {
@@ -122,6 +128,12 @@ struct PrefixSplitBest {
     bool          identity_ok       = false;
     std::uint32_t identity_checked  = 0;
     std::uint8_t  match_end         = 0;  // from the deepest-matching entry, like identity_ok
+    std::uint32_t stored            = 0;  // from the deepest-matching entry, like identity_ok
+    std::uint32_t probe_index       = 0;  // ...and these too: a shallower entry's divergence is not this one's
+    std::uint8_t  probe_count       = 0;
+    bool          probe_enabled     = false;
+    std::array<std::uint32_t, kTokenProbeWindow> probe_stored{};
+    std::array<std::uint32_t, kTokenProbeWindow> probe_prompt{};
 };
 
 [[nodiscard]] inline PrefixSplitBest best_prefix_split(std::span<const PrefixSplitSample> samples) noexcept {
@@ -133,8 +145,20 @@ struct PrefixSplitBest {
             best.tokens      = sample.tokens;
             best.identity_ok = sample.identity_ok;
             best.match_end   = sample.match_end;
+            best.stored      = sample.stored;
+            best.probe_index = sample.probe_index;
+            best.probe_count = sample.probe_count;
+            best.probe_stored = sample.probe_stored;
+            best.probe_prompt = sample.probe_prompt;
         }
         best.restorable = std::max(best.restorable, sample.restorable);
+        // OR ACROSS EVERY SAMPLE, not taken from the deepest one. Inside the depth branch it inherited "the
+        // deepest entry diverged", so a record whose match never ran reported the probe as OFF while it was
+        // running -- and the first turn of every conversation is such a record. This is a property of the
+        // REQUEST, not of the winning entry.
+        // WHAT IT DOES NOT COVER: an EMPTY CATALOG, where the loop below never runs and this stays false with
+        // the probe on. `split_entries == 0` is the discriminator a reader has; recorded rather than implied.
+        best.probe_enabled = best.probe_enabled || sample.probe_enabled;
     }
     return best;
 }

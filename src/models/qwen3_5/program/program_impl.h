@@ -554,6 +554,16 @@ public:
         // Without it `tokens` cannot distinguish "the prompt diverged" from "the ledger ran out", and a field
         // whose zero and whose finding look identical will be read as whichever the reader expects.
         std::uint8_t  match_end      = 0;
+        // THIS entry's own ledger length, i.e. the denominator `match_end` needs: `diverged` only asserts the
+        // match stopped short of BOTH lengths, and without this the stop cannot be localised to an index.
+        std::uint32_t stored         = 0;
+        // THE DIVERGENCE PROBE: the two id windows either side of the first differing token. Filled only when
+        // `NINFER_TOKEN_PROBE` is set (the ids are content); `probe_count` is 0 when it was not.
+        std::uint32_t probe_index    = 0;
+        std::uint8_t  probe_count    = 0;
+        bool          probe_enabled  = false;
+        std::array<std::uint32_t, kTokenProbeWindow> probe_stored{};
+        std::array<std::uint32_t, kTokenProbeWindow> probe_prompt{};
     };
     // Takes the prompt DATA, not just its tokens: the identity chain is a stricter test than the token
     // comparison (`prefix_matches` = same tokens AND same render), and `identity_ok` is the field that

@@ -895,6 +895,46 @@ struct TokenMatch {
     MatchEnd      end    = MatchEnd::Diverged;
 };
 
+// THE DIVERGENCE PROBE (2026-09-27). Everything about this failure had been inferred from aggregate
+// counters -- and each inference was wrong: three mechanisms died to controls in one day (a reply-replay
+// boundary, a truncation effect, a natural end-of-turn effect). This captures the one fact none of them
+// could: WHICH token differs, and what the ids either side of it are. The ids are content, so they are
+// opt-in (`NINFER_TOKEN_PROBE`); the index is a number and always lands in the record.
+template <typename Split>
+void fill_token_probe(Split& split, std::span<const TokenId> prompt, std::span<const TokenId> stored) {
+    // Read once, and SAY SO ONCE. All of this sits ABOVE the "did it diverge" return on purpose: the flag
+    // answers "is the probe on", so a record whose match ended cleanly must still be able to say yes. Placed
+    // below that return it read `false` on every non-diverging record with the probe running -- the same
+    // "reads the same whether it works or not" defect, one level in. The banner also means an operator must
+    // not read its absence as "probe off": it prints at the first diverging match, not at startup.
+    static const bool enabled = [] {
+        const bool on = std::getenv("NINFER_TOKEN_PROBE") != nullptr;
+        if (on) {
+            std::fprintf(stderr, "[engine] token probe ENABLED: request records will carry token ids\n");
+            std::fflush(stderr);
+        }
+        return on;
+    }();
+    split.probe_enabled = enabled;
+    if (split.match_end != static_cast<std::uint8_t>(MatchEnd::Diverged)) { return; }
+    // THE INDEX IS NOT GATED, only the windows. It was gated in the first version, behind the `getenv` above,
+    // which made it read a constant 0 on the default path -- that is, on production -- while four comments
+    // called it unconditional. A number is not content; the ids are.
+    split.probe_index = static_cast<std::uint32_t>(split.tokens);
+    if (!enabled) { return; }
+    const std::size_t index = split.tokens;
+    const std::size_t limit = std::min(prompt.size(), stored.size());
+    if (index >= limit) { return; }  // cannot happen with Diverged, but this is the array bound
+    const std::size_t begin = index >= kTokenProbeLead ? index - kTokenProbeLead : 0;
+    const std::size_t count = std::min(kTokenProbeWindow, limit - begin);
+    for (std::size_t i = 0; i < count; ++i) {
+        split.probe_stored[i] = stored[begin + i];
+        split.probe_prompt[i] = prompt[begin + i];
+    }
+    split.probe_index = static_cast<std::uint32_t>(index);
+    split.probe_count = static_cast<std::uint8_t>(count);
+}
+
 [[nodiscard]] inline TokenMatch deepest_token_match(std::span<const TokenId> prompt,
                                                     std::span<const TokenId> stored) {
     const std::size_t limit = std::min(prompt.size(), stored.size());
@@ -913,6 +953,8 @@ ProgramImpl::PrefixSplit ProgramImpl::prefix_split(const ContinuationHandle& own
     const TokenMatch continuation_match = deepest_token_match(prompt.token_ids, sequence.ledger);
     split.tokens                        = continuation_match.length;
     split.match_end                     = static_cast<std::uint8_t>(continuation_match.end);
+    split.stored                        = static_cast<std::uint32_t>(sequence.ledger.size());
+    fill_token_probe(split, prompt.token_ids, sequence.ledger);
     // THE STRICTER TEST. Same tokens is not the same history: `prefix_matches` also requires the identity
     // chain to agree, which is what a re-rendered (or thinking-stripped) earlier turn breaks. Only evaluated
     // when there IS a match -- a zero-token match has nothing to verify.
@@ -953,6 +995,8 @@ ProgramImpl::PrefixSplit ProgramImpl::prefix_split(const SharedPrefixHandle& own
     const TokenMatch shared_match = deepest_token_match(prompt.token_ids, shared.identity->ledger());
     split.tokens                  = shared_match.length;
     split.match_end               = static_cast<std::uint8_t>(shared_match.end);
+    split.stored                  = static_cast<std::uint32_t>(shared.identity->ledger().size());
+    fill_token_probe(split, prompt.token_ids, shared.identity->ledger());
     if (split.tokens != 0U && shared.identity->prefix_identity() != nullptr) {
         split.identity_ok = qwen3_5::detail::prefix_matches(prompt, shared.identity->ledger(),
                                                             *shared.identity->prefix_identity(),

@@ -420,8 +420,73 @@ public:
                              base.prefix_shortlist_size());
                 }
             }
+            // The session cell's slot, resolved BEFORE the loop so each skip site below can say whether the entry
+            // it just dropped was the conversation's OWN. Resolving it after the loop would report the outcome
+            // without the cause, which is the shape that has cost this work several cycles already.
+            static constexpr std::uint32_t kNoSessionSlot = 0xFFFFFFFFu;
+            const std::uint32_t session_slot =
+                (current_session_cell && session_index_[*current_session_cell].slot < catalog_count_)
+                    ? session_index_[*current_session_cell].slot
+                    : kNoSessionSlot;
+            if (session_slot != kNoSessionSlot) {
+                // Provisional: "the slot never appeared in the index". Every site below overwrites it, so a
+                // final reason of 2 means the loop genuinely never met this slot.
+                candidate_counters.session_cell_skip = 2;
+            }
+            // A PRIVATE SLOT NUMBER IS NOT A SHARED SLOT NUMBER, and the first version of this treated them as
+            // one. `rebuild_prefix_index` appends every shared entry AFTER every private one, so shared entries
+            // are visited last; both namespaces start at 0; and the three key sites below run before the
+            // `if (!index.shared)` branch. A shared entry whose key missed this prompt could therefore write
+            // its reason into the private session cell's field -- producing a plausible-looking 3/4/5 for a
+            // cell that was in fact offered. Every reason below is therefore taken ONLY from a private entry.
+            //
+            // TWO FIELDS, because one slot can hold several index entries (endpoint, rewrite, each long
+            // anchor) and they compete: an endpoint skipped for a reason and a shallower anchor offered
+            // afterwards would otherwise report a bare `1`, hiding exactly the question this instrument exists
+            // to answer. `session_cell_skip` answers "did the cell produce a candidate"; `session_endpoint_skip`
+            // answers what happened to the conversation's OWN endpoint.
+            //
+            // UNVERIFIED BY TEST, and that is recorded rather than implied: a red control for the shared-slot
+            // collision was attempted and WITHDRAWN, because it passed with the guard removed -- the fixture
+            // never produced the slot-number equality the bug needs, so it proved nothing. The fix rests on the
+            // code order above (shared appended after private, both numbering from 0, key sites before the
+            // `if (!index.shared)` branch) and on no run. A control that cannot fail is worse than none: it
+            // reads as verification.
+            // THE SENTINEL COLLISION, and it is the same value on both sides: `kNoSessionSlot` is 0xFFFFFFFF
+            // and `PrefixIndexEntry::slot` defaults to `kInvalidCatalogSlot`, which is
+            // `numeric_limits<uint32_t>::max()` -- the same number. `prefix_index_` is a FIXED array filled
+            // only at its head, so a request with no session cell used to match every UNOCCUPIED tail entry
+            // (`index.slot != session_slot` was 0xFFFFFFFF != 0xFFFFFFFF, i.e. false) and write reason 9 --
+            // making "failed validation" the reading on every request without a session key, the Bash
+            // classifier's traffic included, while the documented 0 was unreachable. The first version also
+            // indexed `catalog_[0xFFFFFFFF]` on that path and segfaulted the whole suite; the guard added for
+            // that stopped the crash and left the misreport, which is the wrong repair -- the sentinel is what
+            // made it misreport, not the slot's trustworthiness. NOTE the two guards below are REDUNDANT:
+            // `!index.occupied` alone closes the collision, because an unoccupied entry is exactly what carries
+            // the colliding slot default. Both are kept so the intent reads directly, but a control that removes
+            // only one of them will not fail, and the one in the suite pins only their union.
+            const auto note_session_slot = [&](const PrefixIndexEntry& index, std::uint8_t reason) {
+                if (session_slot == kNoSessionSlot || !index.occupied || index.shared ||
+                    index.slot != session_slot) {
+                    return;
+                }
+                const CatalogEntry& own = catalog_[index.slot];
+                if (own.summary.endpoint && index.checkpoint == own.summary.endpoint->ref) {
+                    candidate_counters.session_endpoint_skip = reason;
+                }
+                if (reason == 1) {
+                    candidate_counters.session_cell_skip = 1;  // offered is sticky: later entries cannot undo it
+                } else if (candidate_counters.session_cell_skip != 1) {
+                    candidate_counters.session_cell_skip = reason;
+                }
+            };
             for (const PrefixIndexEntry& index : prefix_index_) {
-                if (!valid_prefix_index_entry(index)) { continue; }
+                if (!valid_prefix_index_entry(index)) {
+                    // 9, not the provisional 2: the slot IS in the index but failed validation here, and a
+                    // reader must be able to tell that from "no index entry at all".
+                    note_session_slot(index, 9);
+                    continue;
+                }
                 const std::optional<PrefixShortlistKey> incoming =
                     base.prefix_shortlist_key(index.key.frontier);
                 if (!incoming) {
@@ -434,12 +499,14 @@ public:
                              "sl_size=%zu sess=%016lx %s\n",
                              index.slot, index.key.frontier, index.shared ? 1 : 0,
                              base.prefix_shortlist_size(), nh, nown ? "OWN" : "XSESSION");
+                    note_session_slot(index, 3);
                     continue;
                 }
                 if (incoming->identity_tag != index.key.identity_tag) {
                     cdbg_log("[candgen] priv SKIP slot=%u TAG-MISMATCH base=%u idx=%u f=%u\n",
                              index.slot, incoming->identity_tag, index.key.identity_tag,
                              index.key.frontier);
+                    note_session_slot(index, 4);
                     continue;
                 }
                 if (*incoming != index.key) {
@@ -459,6 +526,7 @@ public:
                              index.key.frontier,
                              incoming->digests[0], incoming->digests[1],
                              index.key.digests[0], index.key.digests[1]);
+                    note_session_slot(index, 5);
                     continue;
                 }
 
@@ -466,11 +534,17 @@ public:
                     const CatalogEntry& entry = catalog_[index.slot];
                     if (entry.state != CatalogState::Catalogued || !entry.handle ||
                         private_has_active_edge(index.slot)) {
+                        const bool held_by_active_edge = private_has_active_edge(index.slot);
                         cdbg_log("[candgen] priv SKIP slot=%u state=%d handle=%d active_edge=%d "
                                  "(key matched)\n",
                                  index.slot, static_cast<int>(entry.state),
                                  entry.handle ? 1 : 0,
-                                 private_has_active_edge(index.slot) ? 1 : 0);
+                                 held_by_active_edge ? 1 : 0);
+                        // 7 only. The validator above (`valid_prefix_index_entry`) already requires
+                        // `state == Catalogued && handle`, so the state/handle arm of this ternary was
+                        // unreachable and code 6 could never be emitted -- a reason in the table that no
+                        // input could produce.
+                        note_session_slot(index, 7);
                         continue;
                     }
                     // THE SIBLING CASE (2026-09-27). `retain` above is false exactly when the entry IS this
@@ -516,6 +590,7 @@ public:
                     if (!plan) {
                         cdbg_log("[candgen] priv SKIP slot=%u inspect_admission=nullopt\n",
                                  index.slot);
+                        note_session_slot(index, 8);
                         continue;
                     }
                     cdbg_log("[candgen] priv BUILD slot=%u reuse_tok=%u retain=%d\n", index.slot,
@@ -533,6 +608,7 @@ public:
                         session_index_[*current_session_cell].owner_id == entry.id &&
                         session_index_[*current_session_cell].revision == entry.revision;
                     append_unique(provisional_demand.exact_resident_keys, index.key);
+                    note_session_slot(index, 1);
                     candidates.push_back(Candidate{
                         .plan                    = std::move(*plan),
                         .current_session_binding = current_session_binding,
@@ -1396,6 +1472,28 @@ private:
         std::uint32_t sibling_candidates = 0;  // sources whose own endpoint lies beyond this prompt
         std::uint32_t retained_sources   = 0;
         std::uint32_t consumed_sources   = 0;
+        // WHY THE CONVERSATION'S OWN CELL ENTRY WAS NOT A CANDIDATE. `session_cell_offered` says whether it
+        // was; on the first real reading it was FALSE in 100% of shared-class requests -- including ones whose
+        // cell held a deep frontier -- and a bare false cannot tell "no cell exists" from "the entry is held by
+        // a running lane" from "identity refused it". The five sites below are where that is actually known.
+        // PRIVATE ENTRIES ONLY -- a shared entry's slot is a different namespace (see `note_session_slot`).
+        // COVERAGE: `test_resource_manager` pins codes 1, 3, 4, 5 and 8 by value -- each has a case whose
+        // asserted number changes if its site is deleted. 9 is pinned only as an ABSENCE: a no-cell request
+        // must NOT read it, and nothing asserts it is ever emitted (the table calls it unreachable).
+        // 7 (a lane's active edge) is UNTESTED: it needs a second lane, and a mutant deleting that site
+        // survives. Read 7 with that in mind.
+        // 0 = no cell / no session key / `update_session_index` false / cache disabled; 1 = offered (the cell's
+        // slot produced a candidate, and this is STICKY -- a later entry cannot undo it); 2 = the slot has no
+        // index entry at all; 3 = no shortlist key at its frontier; 4 = identity-tag mismatch; 5 = digest
+        // mismatch; 7 = the entry is held by an active lane's edge; 8 = `inspect_admission` refused it.
+        // (6 is retired: the validator already requires `Catalogued && handle`. 9 -- "failed validation" -- is
+        // emitted at that site but unreachable on the current path; kept rather than retired because a slot
+        // recycled after the rebuild would land there, and that case is not audited.)
+        std::uint8_t  session_cell_skip  = 0;
+        // ...and what happened to the conversation's OWN endpoint specifically, which `session_cell_skip` cannot
+        // report once a shallower anchor of the same slot has been offered. Same codes; 0 means the loop never
+        // met an index entry that is this slot's endpoint.
+        std::uint8_t  session_endpoint_skip = 0;
     };
 
     struct Candidate {
@@ -2645,7 +2743,13 @@ private:
                 samples.push_back(PrefixSplitSample{.tokens      = split.tokens,
                                                     .restorable  = split.restorable,
                                                     .identity_ok = split.identity_ok,
-                                                    .match_end   = split.match_end});
+                                                    .match_end   = split.match_end,
+                                                    .stored      = split.stored,
+                                                    .probe_index = split.probe_index,
+                                                    .probe_count = split.probe_count,
+                                                    .probe_enabled = split.probe_enabled,
+                                                    .probe_stored = split.probe_stored,
+                                                    .probe_prompt = split.probe_prompt});
             };
             for (std::uint32_t slot = 0; slot < catalog_count_; ++slot) {
                 const CatalogEntry& entry = catalog_[slot];
@@ -2666,8 +2770,16 @@ private:
             // whichever the reader expects -- and it was, by me, as "61% of prompts diverge inside the region
             // they should share", when nearly every case was a ledger ending or a missing entry.
             choice.diagnostics_.split_ended_by         = best.match_end;
+            choice.diagnostics_.split_best_stored      = best.stored;
+            choice.diagnostics_.split_probe_index      = best.probe_index;
+            choice.diagnostics_.split_probe_count      = best.probe_count;
+            choice.diagnostics_.split_probe_enabled    = best.probe_enabled;
+            choice.diagnostics_.split_probe_stored     = best.probe_stored;
+            choice.diagnostics_.split_probe_prompt     = best.probe_prompt;
             choice.diagnostics_.session_cell_frontier = session_cell_frontier;
             choice.diagnostics_.session_cell_offered  = session_cell_offered;
+            choice.diagnostics_.session_cell_skip     = candidate_counters.session_cell_skip;
+            choice.diagnostics_.session_endpoint_skip = candidate_counters.session_endpoint_skip;
             choice.diagnostics_.sibling_candidates    = candidate_counters.sibling_candidates;
             choice.diagnostics_.retained_sources      = candidate_counters.retained_sources;
             choice.diagnostics_.consumed_sources      = candidate_counters.consumed_sources;

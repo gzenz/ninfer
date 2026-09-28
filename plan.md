@@ -277,6 +277,21 @@ checked through the `alerts FAIL` discriminator), the capacity read-back, the ru
 claim that the refusal site is the only silent drop — the execution-side `validate_choice` is a throw behind a
 revision check that returns `Stale` first, so it is the loud WORKER path, not a second silent one.
 
+### 1f. HISTORY WAS COLLAPSED FOR THE PULL REQUEST (2026-09-28)
+
+The 149 local commits from `fork/master` (`e919931a`, 2026-09-24 "Update README.md") were squashed into ONE
+commit on the branch `engine/cache-reuse-and-host-budget`, and that branch was pushed to `gzenz/ninfer`. The
+reason is mechanical: `gzenz/ninfer` master was four days behind, so any PR from this tree carries the whole
+delta, and the operator chose to send it as a single commit.
+
+**So the ids this file cites below no longer exist on the remote**, and a message citing one will not resolve
+for a reader there. The mapping is the identity, not a table: *every* local id from `e919931a` to the tip is
+collapsed into that one commit. The narrative below is unchanged and still names them, deliberately -- it is
+the record of what was done and in what order, and rewriting its ids to a single hash would destroy the only
+account of the sequence. Read them as local history, not as remote refs.
+
+`git log --oneline eb975b80` on this host still resolves every one of them.
+
 ### 2. Open, in priority order
 
 1. **#9 — the leak, a LATENT FRAGILITY with a named mechanism and an UNEXPLAINED incident.** Not "the

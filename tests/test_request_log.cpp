@@ -423,7 +423,64 @@ int main() {
                                                    .injected_tokens       = 19,
                                                    .applied               = true};
 
+    // THE CANDIDATE SET (2026-09-27), asserted on the FORMATTED RECORD rather than by eyeballing a served run:
+    // a served run showed twelve consecutive requests reusing exactly 23,353 tokens through a shared prefix
+    // while their prompts ran 39k-56k, and this is the field that says whether a longer source existed and
+    // was refused. Two candidates here, one of them the winner, and `longer_lost` true -- so the check fails
+    // if any of: the array is missing, the rows lose their per-candidate detail, or the selection pair is
+    // dropped from a record that already carries it in the journal.
+    outcome.metrics.materialization.candidates = {
+        ninfer::MaterializationDiagnostics::MaterializationCandidate{.reuse          = 23353,
+                                                                     .probes         = 8,
+                                                                     .goals          = 8,
+                                                                     .cell_only      = 0,
+                                                                     .other          = 0,
+                                                                     .winner         = true,
+                                                                     .private_source = false,
+                                                                     .shared_source  = true},
+        ninfer::MaterializationDiagnostics::MaterializationCandidate{.reuse          = 51932,
+                                                                     .probes         = 3,
+                                                                     .goals          = 0,
+                                                                     .cell_only      = 2,
+                                                                     .other          = 1,
+                                                                     .winner         = false,
+                                                                     .private_source = true,
+                                                                     .shared_source  = false}};
+    outcome.metrics.materialization.chosen_reuse     = 23353;
+    outcome.metrics.materialization.best_loser_reuse = 51932;
+    outcome.metrics.materialization.longer_lost      = true;
+
     const Json done = Json::parse(format_request_done_json("serve-test", 3000, context, outcome));
+    {
+        const Json& rows = done.at("materialization").at("candidates");
+        failures += check(rows.is_array() && rows.size() == 2, "candidate rows missing from the record");
+        failures += check(rows.at(0).at("reuse") == 23353 && rows.at(0).at("winner") == true &&
+                              rows.at(0).at("shared_source") == true,
+                          "the winning candidate's row is wrong");
+        failures += check(rows.at(1).at("reuse") == 51932 && rows.at(1).at("winner") == false &&
+                              rows.at(1).at("cell_only") == 2 && rows.at(1).at("other") == 1 &&
+                              rows.at(1).at("goals") == 0,
+                          "the losing candidate's row lost its per-candidate detail");
+        failures += check(done.at("materialization").at("chosen_reuse") == 23353 &&
+                              done.at("materialization").at("best_loser_reuse") == 51932 &&
+                              done.at("materialization").at("longer_lost") == true,
+                          "the selection pair is missing, so a longer loser cannot be seen per request");
+    }
+    // THE SPLIT (§2f), asserted on the formatted record: the deepest token-exact match, the deepest
+    // restorable checkpoint at or below it, and the denominator. The verdict this feeds is pre-committed --
+    // shallow match means the prompt diverged, deep match with a shallow restorable frontier means ours -- so
+    // a record that drops the pair cannot be judged at all.
+    outcome.metrics.materialization.split_best_tokens     = 23353;
+    outcome.metrics.materialization.split_best_restorable = 23353;
+    outcome.metrics.materialization.split_entries         = 9;
+    {
+        const Json done_split = Json::parse(format_request_done_json("serve-test", 3000, context, outcome));
+        failures += check(done_split.at("materialization").at("split_best_tokens") == 23353 &&
+                              done_split.at("materialization").at("split_best_restorable") == 23353 &&
+                              done_split.at("materialization").at("split_entries") == 9,
+                          "the split is missing from the record, so a shallow match cannot be told from a "
+                          "deep one whose restorable frontier was lost");
+    }
     failures += check(done.at("materialization").at("initial_predicted_total_ns") == 500000 &&
                           done.at("materialization").at("first_improvement_ns") == 2000 &&
                           done.at("materialization").at("search_granted_ns") == 8000 &&
@@ -435,6 +492,24 @@ int main() {
     failures += check(done.at("result").at("prompt_tokens") == 401, "prompt tokens missing");
     failures += check(done.at("result").at("computed_prefill_tokens") == 300,
                       "computed prefill tokens missing");
+    // THE SESSION KEY IN THE RECORD. Without it, "does one conversation keep one key" and "do two concurrent
+    // streams share one" are unanswerable from traffic -- and both are live questions: the derived key uses the
+    // system text plus the FIRST user turn, which a client's sibling requests share. The absent case must be
+    // distinguishable from a key, because "ran with no key" is the condition that made everything
+    // session-scoped unreachable.
+    {
+        RequestLogContext keyed = context;
+        keyed.session_key       = "derived-0123456789abcdef";
+        const Json with_key = Json::parse(format_request_done_json("serve-test", 3000, keyed, outcome));
+        failures += check(with_key.at("request").at("session_key") == "derived-0123456789abcdef",
+                          "the derived session key is missing from the request record");
+
+        RequestLogContext keyless = context;
+        keyless.session_key       = std::nullopt;
+        const Json without_key = Json::parse(format_request_done_json("serve-test", 3000, keyless, outcome));
+        failures += check(without_key.at("request").at("session_key").is_null(),
+                          "a request with no key must read as null, not as absent or empty");
+    }
     failures += check(done.at("result").at("prefix_reuse_path") == "private_turn_closure",
                       "prefix reuse path missing");
     failures += check(done.at("result").at("thinking_budget") == 256 &&

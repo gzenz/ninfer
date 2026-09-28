@@ -709,6 +709,7 @@ ProgramImpl::inspect_pressure_option(const SequenceState& sequence,
                                      std::span<const runtime::CheckpointRef> dropped_checkpoints,
                                      std::span<const StateImageHandle> released_states,
                                      const qwen3_5::detail::PressureDecision* current) const {
+    ++pressure_options_;  // the denominator for `demote_options_`: how often an option is inspected at all
     if (!sequence.kv || deficit.device.active_lanes != 0 ||
         (current != nullptr && current->evicts_continuation)) {
         return std::nullopt;
@@ -800,6 +801,12 @@ ProgramImpl::inspect_pressure_option(const SequenceState& sequence,
                    residual.device.state_slots != 0 &&
                    residency == StateReplicaResidency::DeviceOnly && host_state_images != nullptr) {
             change = endpoint_demote;
+            // #6's remaining half, counted where the DECISION is made: the store says whether a demote would
+            // have been refused (`demote_refusal` on the eviction line), and this says whether the planner ever
+            // OFFERED one. The first burst after that instrument went live showed the store refusing only for
+            // `already-on-host` or not at all -- so whether a demote was generated and lost on cost is the
+            // question that remains, and `demote_options_` over `pressure_options_` is its denominator.
+            ++demote_options_;
             ++option.effect.added.host.state_slots;
             append_pressure_transfer(option, state_transfer_requirement(
                                                  host_state_images->layout(),
@@ -2301,6 +2308,19 @@ bool ProgramImpl::compose_pressure_candidate(
             }
             requested_bytes += bytes;
         }
+        // NO PRE-GROW HERE, and this is a deliberate reversal of the first version of this change. This
+        // function is called for EVERY node the planner assesses (`pressure_planner.cpp` ~1013/1023), so
+        // pinning from inside it meant cudaMallocHost of at least one chunk -- measured at ~1 s per GiB on
+        // the engine thread -- plus a /proc/meminfo read, repeatedly, for candidates that are never selected,
+        // inside a search whose p95 is 400 ms. **Planning must be free of side effects.** The room is taken
+        // when the SELECTED plan executes instead (`host_kv_store::prepare` grows the arena and extends its
+        // own tables together), which is where the cost belongs.
+        //
+        // The cost of the reversal, stated rather than hidden: feasibility now counts PINNED capacity only, so
+        // a plan that would be affordable by growing reads as blocked and the caller may evict where a demote
+        // was possible -- the very failure this change exists to fix. That is the conservative direction, and
+        // removing it properly needs the planner to see capacity PLUS the growth policy's answer without
+        // acting on it (a pure query), which is not this change.
         if (host_kv_extents == nullptr ||
             !host_kv_extents->can_allocate_after_page_releases(
                 host_releases, host_last_reference_releases, host_requests)) {
@@ -2571,6 +2591,21 @@ ProgramImpl::revalidate_materialization(const AdmissionCandidate& plan,
 
 detail::PhysicalResources ProgramImpl::admission_capacity() const noexcept {
     const qwen3_5::PagedKVCache* backend = backend_kv_cache();
+    // THE TWO HOST AXES ARE PRICED ON DIFFERENT BASES, AND THIS FILE CANNOT FIX THAT BY ARITHMETIC.
+    // `state_slots` reports what EXISTS (so a full state pool reads full) while `kv_bytes` reports what is
+    // RESERVED (the arena's 30 GiB span, so it reads roomy with only 8.6 GiB used) -- one shared pile read two
+    // ways, which is what starves the state axis and forced the evictions of 2026-09-28.
+    //
+    // PRICING BOTH FROM THE POOL'S GROWABLE HEADROOM WAS TRIED AND REVERTED THE SAME DAY. It is the obvious
+    // fix and it is unsafe: the growth gate's answer is a statement about the FUTURE -- `decide` compares a
+    // memory reading against the reserve -- so a plan priced from it can be executed minutes later against a
+    // worse reading. That is what happened: `WORKER OOM: std::bad_alloc ... mat=69`, a worker recovery,
+    // within minutes of the change running. The only host memory that cannot be taken away between planning
+    // and allocation is memory ALREADY PINNED, and that is mostly locked inside the KV arena's reservation --
+    // which is the thing that has to change for these two axes to share a pile.
+    // When it does: report the shared pinned pile for BOTH fields, and re-arm the cross-dimension sum check
+    // in `physical_peak_fits` in the same change, because once the two limits are the same number
+    // `o_s + p_s <= L_s && o_k + p_k <= L_k` no longer implies the sum.
     return detail::PhysicalResources{
         .device =
             {
@@ -2581,11 +2616,21 @@ detail::PhysicalResources ProgramImpl::admission_capacity() const noexcept {
             },
         .host =
             {
+                // THE STATE AXIS PROMISES ONLY WHAT IS PINNED. `capacity()` is slots the pool has actually
+                // allocated, so pricing against it cannot over-promise -- and it is the axis that threw
+                // `bad_alloc` (worker recovery, 2026-09-28) when it was priced on growth that later failed.
                 .state_slots = host_state_images ? host_state_images->capacity() : 0U,
-                .kv_bytes    = host_kv_arena ? host_kv_arena->capacity_bytes() : 0U,
+                // PINNED ONLY, for the same reason the state axis is (2026-09-28, and the first version of
+                // this line got it wrong): BOTH callers of the KV demote path turn a failed growth into
+                // `throw std::bad_alloc` (`materialization.cpp:1137-1138` and `:1771-1772`), so reporting the
+                // shared ceiling here would not "cost a declined demote" -- it would produce the same worker
+                // recovery the state axis produced. `host_kv_store.h:158` returning `nullopt` is necessary but
+                // not sufficient; the callers decide, and they throw.
+                .kv_bytes = host_kv_arena ? host_kv_arena->capacity_bytes() : 0U,
             },
     };
 }
+
 
 bool ProgramImpl::isolated_request_feasible(const RequestBasePlan& base) const noexcept {
     if (base.impl_ == nullptr) { return false; }

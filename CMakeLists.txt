@@ -16,8 +16,17 @@ project(ninfer LANGUAGES C CXX CUDA)
 
 # --- Global settings ---------------------------------------------------------
 option(NINFER_BUILD_APPS "Build the NInfer CLI, server and perplexity evaluator" ON)
+# Diagnostics that MUTATE device memory, scheduler membership or a bound (see src/core/diagnostics.h).
+# OFF by default so a stray exported environment variable cannot make a shipped binary behave like an
+# instrumented one. Without this option those controls are unreachable *and* announce that they were
+# ignored -- an unreachable-but-silent control is the failure mode this repo keeps paying for.
+option(NINFER_HARMFUL_CONTROLS "Compile in state-mutating diagnostic controls" OFF)
 option(BUILD_TESTING "Build NInfer tests" OFF)
 option(NINFER_BUILD_BENCHMARKS "Build NInfer benchmarks" OFF)
+
+if(NINFER_HARMFUL_CONTROLS)
+  add_compile_definitions(NINFER_ENABLE_HARMFUL_CONTROLS=1)
+endif()
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

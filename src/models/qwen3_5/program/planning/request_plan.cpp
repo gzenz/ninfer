@@ -209,7 +209,8 @@ detail::PhysicalResources positive_difference(detail::PhysicalResources value,
 } // namespace
 
 RequestBasePlan ProgramImpl::plan_request(const PreparedPromptData& prompt,
-                                          const runtime::ResolvedExecutionOptions& options) {
+                                          const runtime::ResolvedExecutionOptions& options,
+                                              std::optional<std::uint32_t> branch_anchor_frontier) {
     if (prompt.token_ids.empty()) { throw std::invalid_argument("prompt must contain tokens"); }
     if (prompt.token_ids.size() > capacity) {
         throw std::invalid_argument("prompt exceeds configured context capacity");
@@ -464,6 +465,17 @@ RequestBasePlan ProgramImpl::plan_request(const PreparedPromptData& prompt,
                         opportunity.kind == PromptCacheMarkerKind::PrivateLongAnchor,
                         opportunity.evidence);
         }
+        // THE BRANCH ANCHOR: a capture at the depth this prompt matched stored content to, when no checkpoint
+        // below that depth can resume from it. INSERTED HERE, through the plan's own `add_capture`, so it is
+        // merged, sorted, given an identity and priced exactly like a client marker -- the thing both earlier
+        // attempts missed. (Attempt 1 attached it after the plan was sealed, to a discarded copy; attempt 2 put
+        // it in the candidate's copy and produced a group with no identity, which the engine rejected with
+        // `planned capture identity is invalid` and then recovered through, on prod.)
+        if (branch_anchor_frontier && *branch_anchor_frontier != 0 &&
+            *branch_anchor_frontier <= base->summary.prompt_tokens) {
+            add_capture(*branch_anchor_frontier, 0, std::nullopt, false, true,
+                        SharedCandidateEvidence::None);
+        }
         std::sort(base->capture_groups.begin(), base->capture_groups.end(),
                   [](const CaptureGroup& left, const CaptureGroup& right) {
                       return std::tie(left.frontier, left.input_order) <
@@ -586,6 +598,53 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
         plan->reuse       = ReusePath::SharedStablePrefix;
         plan->reuse_base  = selected.frontier;
         plan->source_mode = runtime::PrivateSourceMode::Retain;
+
+        // THE REUSE INSTRUMENT, AND ITS FIRST VERSION WAS MISLABELLED AND MISREAD (corrected 2026-09-27 after
+        // a code analysis showed both). **"chosen" was the damaging word**: this fires once for EVERY shared
+        // CANDIDATE CONSTRUCTED, including the ones that lose. At 14:19:37 it printed four times while the
+        // request went on to report `private_endpoint` at 45815 -- so a diagnosis of "the request plan takes
+        // the shared path while a longer private candidate exists" was built on a line that said nothing
+        // about which candidate won. It now says CONSTRUCTED.
+        //
+        // **And `best_private_frontier` had no prompt-length check**, so in 11 of 19 prints it named a
+        // continuation LONGER THAN THE PROMPT ITSELF -- which cannot be a prefix of that prompt, making
+        // `longer_private_exists=1` largely meaningless. A continuation can only be a prefix if its frontier
+        // fits inside the prompt, and that is now required.
+        //
+        // The shared path reuses a SNAPSHOT -- the stable head as published -- so its frontier never grows,
+        // while a session's growing part lives in private continuations. With both defects fixed this
+        // separates the two explanations for the production reuse stall:
+        //   * a LONGER private frontier exists here  -> availability was NOT the obstacle, and the cost is
+        //     the CHOICE (selection);
+        //   * nothing longer exists                  -> there was no growing candidate to take, and the cost
+        //     is RETENTION/capture.
+        // Rate-limited like the eviction line (first 8, then every 512th), so it is readable on prod without
+        // an env change and cannot flood the journal -- and it prints its own denominator so "never fired"
+        // is distinguishable from "fired and found nothing longer".
+        {
+            static std::uint64_t shared_choices = 0;
+            ++shared_choices;
+            if (shared_choices <= 8U || shared_choices % 512U == 0U) {
+                std::uint32_t best_private = 0U;
+                std::size_t   live_private = 0U;
+                for (const SequenceState& candidate_state : continuation_states) {
+                    if (candidate_state.execution_frontier == 0U) { continue; }
+                    ++live_private;
+                    // ONLY WHAT COULD BE A PREFIX OF THIS PROMPT. A continuation longer than the prompt
+                    // cannot be one, and counting it manufactured the reading this instrument was misread for.
+                    if (candidate_state.execution_frontier > prompt.token_ids.size()) { continue; }
+                    best_private = std::max(best_private, candidate_state.execution_frontier);
+                }
+                std::fprintf(stderr,
+                             "[engine] shared candidate CONSTRUCTED: frontier=%u prompt=%zu "
+                             "best_private_frontier=%u live_private=%zu longer_private_exists=%d "
+                             "choice=%llu\n",
+                             selected.frontier, prompt.token_ids.size(), best_private, live_private,
+                             static_cast<int>(best_private > selected.frontier), 
+                             static_cast<unsigned long long>(shared_choices));
+                std::fflush(stderr);
+            }
+        }
     } else if (source != nullptr) {
         const runtime::CheckpointRef selected = *checkpoint;
         plan->selected_checkpoint             = selected;
@@ -734,6 +793,42 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
             selected_state_requires_fork(*source, plan->reuse, plan->rewrite_disposition,
                                          plan->selected_checkpoint, plan->reuse_base);
     }
+    // Probe (NINFER_CAPTURE_PROBE): WHY `preserve_rewrite` came out the way it did. `preserve_rewrite`
+    // is `rewrite_disposition == RetainExisting` (`prefill.cpp:526`), and RetainExisting is off whenever
+    // `can_retain_rewrite` is false -- which silently reduces the turn to a consume-and-clear, erasing
+    // the precondition #11(a) needs. Printed alongside the fork decision, because a Move consume also
+    // clears the checkpoint at commit (`commit.cpp:662`: rewrite_state aliasing state.read is dropped at :676-678),
+    // so "retained" is not sufficient on its own: the consume must FORK.
+    if (std::getenv("NINFER_CAPTURE_PROBE") != nullptr) {
+        // `n` and `tokens` exist to attribute a plan line to a turn. The scenario prints its own turn
+        // lines on stdout, which is block-buffered when piped while these probes are fflush'd on
+        // stderr, so line ORDER between the two streams is not evidence -- and the first reading of
+        // this trace was sequenced by position. `tokens` is the incoming prompt's length, which
+        // distinguishes the turns directly.
+        static std::uint64_t plan_probe_seq = 0;
+        std::fprintf(stderr,
+                     "[plan] n=%llu tokens=%zu reuse=%d reuse_base=%u desired=%d desired_frontier=%u "
+                     "src=%d ckpt_valid=%d ckpt_frontier=%u ckpt_refs=%d can_retain=%d disposition=%d "
+                     "fork_required=%d source_mode=%d\n",
+                     static_cast<unsigned long long>(++plan_probe_seq), prompt.token_ids.size(),
+                     static_cast<int>(plan->reuse), plan->reuse_base,
+                     static_cast<int>(desired.has_value()),
+                     desired ? desired->frontier : 0U, static_cast<int>(source != nullptr),
+                     static_cast<int>(source != nullptr && source->rewrite_checkpoint.valid),
+                     source != nullptr ? source->rewrite_checkpoint.frontier : 0U,
+                     // `valid()` is not decoration: `checkpoint_references` calls `require()`, which
+                     // throws on a stale handle -- and the neighbouring `can_retain_rewrite_checkpoint`
+                     // checks `valid()` precisely because a stale handle is possible here. Without this
+                     // guard, setting the probe variable could turn a probe into a planning exception.
+                     static_cast<int>(source != nullptr && source->rewrite_state &&
+                                              state_store->valid(*source->rewrite_state)
+                                          ? state_store->checkpoint_references(*source->rewrite_state)
+                                          : -1),
+                     static_cast<int>(can_retain_rewrite),
+                     static_cast<int>(plan->rewrite_disposition),
+                     static_cast<int>(plan->state_fork_required), static_cast<int>(plan->source_mode));
+        std::fflush(stderr);
+    }
     if (source != nullptr && is_rewrite_checkpoint_restore(plan->reuse) &&
         plan->source_mode == runtime::PrivateSourceMode::ConsumeToActive) {
         std::vector<StateImageHandle> optional_states;
@@ -779,6 +874,7 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
         if (!group.rewrite && !group.shared && !group.long_anchor) { continue; }
         plan->capture_groups.push_back(std::move(group));
     }
+
     plan->shared_candidates.reserve(base.shared_candidates.size());
     for (CaptureGroup group : base.shared_candidates) {
         if (group.frontier >= plan->reuse_base) {

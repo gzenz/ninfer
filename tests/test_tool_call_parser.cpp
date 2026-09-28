@@ -789,6 +789,105 @@ int test_tolerant_recovery() {
     return failures;
 }
 
+int test_tolerant_spurious_leading_marker() {
+    using Reason = ninfer::ToolCallParseFallbackReason;
+    int failures = 0;
+
+    // The model sometimes writes a literal <tool_call> in leading prose (e.g. mentioning the
+    // tag) before the real call. The region must not anchor on the spurious marker: tolerant
+    // mode recovers the following well-formed call; strict mode keeps the output as text.
+    const auto contract = contract_for("configure", Json{{"value", Json{{"type", "string"}}}});
+    const std::string spurious =
+        "The model emitted a <tool_call> marker here. " + tool_call("configure", {{"value", "x"}});
+
+    const auto tolerant = fi::parse_qwen_tool_call_output(spurious, 64, contract, /*tolerant*/ true);
+    failures += check(tolerant.is_tool_call_response, "tolerant spurious marker was not recovered");
+    failures += check(tolerant.tool_calls.size() == 1 && tolerant.tool_calls.front().name == "configure",
+                      "tolerant spurious marker lost the recovered call");
+    failures += check(tolerant.diagnostics.fallback_reason == Reason::None,
+                      "tolerant spurious marker was not a clean parse");
+
+    const auto strict = fi::parse_qwen_tool_call_output(spurious, 64, contract);
+    failures += check(!strict.is_tool_call_response, "strict spurious marker was recovered instead of text");
+    failures += check(strict.diagnostics.fallback_reason == Reason::MalformedStructure,
+                      "strict spurious marker was not flagged as malformed");
+    return failures;
+}
+
+int test_tolerant_literal_markers_in_value() {
+    using Reason = ninfer::ToolCallParseFallbackReason;
+    int failures = 0;
+
+    // A tool payload may legitimately contain the parser's own markup: a Write/Edit body, a
+    // chat template, or source that mentions the tags. A `</parameter>` inside the value is
+    // content, not a close. Closing on it truncated the value, left the parse loop in the
+    // middle of the payload and failed the call, so the whole response came back as plain
+    // text -- the "tool markup returned as text | malformed structure" leak. Tolerant mode
+    // now accepts a close only when the call can go on after it.
+    const auto contract = output_contract_for(
+        "write_file", Json{{"path", Json{{"type", "string"}}}, {"content", Json{{"type", "string"}}}});
+
+    std::string content;
+    const std::string body = "line\n</parameter>\nmid\n</parameter>\n</function>\nend\n";
+    while (content.size() < 50000) { content += body; }
+    content += "tail\n</parameter>\n</function>\n";
+
+    const std::string text = "<tool_call>\n<function=write_file>\n"
+                             "<parameter=path>\n/tmp/out.txt\n</parameter>\n"
+                             "<parameter=content>\n" + content + "\n</parameter>\n"
+                             "</function>\n</tool_call>";
+
+    const auto tolerant = fi::parse_qwen_tool_call_output(text, 64, *contract, /*tolerant*/ true);
+    failures += check(tolerant.is_tool_call_response, "tolerant literal-marker payload was not recovered");
+    failures += check(tolerant.tool_calls.size() == 1 &&
+                          tolerant.tool_calls.front().name == "write_file",
+                      "tolerant literal-marker payload lost the call");
+    failures += check(tolerant.content.find("<tool_call>") == std::string::npos,
+                      "tolerant literal-marker payload leaked tool markup into the text");
+    if (tolerant.tool_calls.size() == 1) {
+        const Json args = Json::parse(tolerant.tool_calls.front().arguments_json);
+        failures += check(args.at("path") == "/tmp/out.txt", "literal-marker payload lost the path");
+        failures += check(args.at("content") == content,
+                          "literal-marker payload was not byte-identical to the written content");
+    }
+
+    // The same payload in strict mode keeps the hard structural failure (an explicit decision:
+    // tolerant recovery is the product behaviour for this class, strict stays literal).
+    const auto strict = fi::parse_qwen_tool_call_output(text, 64, *contract);
+    failures += check(!strict.is_tool_call_response, "strict literal-marker payload was recovered");
+    failures += check(strict.diagnostics.fallback_reason == Reason::MalformedStructure,
+                      "strict literal-marker payload was not flagged as malformed");
+
+    // Chunked delivery must not change the outcome: the same call, byte-identical content.
+    fi::ToolCallOutputDecoder bytewise(contract, 64, /*tolerant*/ true);
+    std::string visible;
+    for (const char byte : text) { visible += bytewise.feed(std::string_view(&byte, 1)); }
+    const auto terminal = bytewise.finish();
+    failures += check(terminal.content.empty() && terminal.tool_calls.size() == 1 &&
+                          terminal.tool_calls.front().arguments_json ==
+                              (tolerant.tool_calls.empty() ? std::string{}
+                                                           : tolerant.tool_calls.front().arguments_json),
+                      "bytewise literal-marker payload changed the terminal call");
+
+    // A value cut mid-way (an unclosed `<parameter=` name with no delimiter) stays a
+    // structural failure in both modes: there is no name/value boundary to recover.
+    const std::string cut = "<tool_call>\n<function=write_file>\n"
+                            "<parameter=path>\n/tmp/out.txt\n</parameter>\n"
+                            "<parameter=conte";
+    const auto cut_tolerant = fi::parse_qwen_tool_call_output(cut, 64, *contract, /*tolerant*/ true);
+    const auto cut_strict   = fi::parse_qwen_tool_call_output(cut, 64, *contract, /*tolerant*/ false);
+    // Assert the behaviour the comment claims, on BOTH arms. The previous assertion
+    // (`tool_calls.size() <= 1`) was satisfied by zero calls and by one recovered call alike, so it
+    // never checked anything -- it read as if the claim had been avoided rather than tested.
+    // Verified behaviour of a cut parameter name: NEITHER mode produces a call, and neither is a
+    // tool-call response -- both are structural failures, which is what the comment above claims.
+    failures += check(!cut_tolerant.is_tool_call_response && cut_tolerant.tool_calls.empty(),
+                      "a cut parameter name produced a tolerant call");
+    failures += check(!cut_strict.is_tool_call_response && cut_strict.tool_calls.empty(),
+                      "a cut parameter name was not a structural failure in strict mode");
+    return failures;
+}
+
 int test_tolerant_truncated_final_call() {
     using Reason = ninfer::ToolCallParseFallbackReason;
     using Contract = fi::ToolCallOutputContract;
@@ -1000,6 +1099,8 @@ int main() {
     failures += test_incremental_fallback_preserves_bytes();
     failures += test_incremental_embedded_parameter_markup();
     failures += test_tolerant_recovery();
+    failures += test_tolerant_spurious_leading_marker();
+    failures += test_tolerant_literal_markers_in_value();
     failures += test_tolerant_truncated_final_call();
     failures += test_tolerant_missing_function_close_bracket();
     failures += test_tolerant_truncated_final_parameter_value();

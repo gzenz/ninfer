@@ -312,6 +312,21 @@ void HttpServer::run_stats_reporter() {
         }
 
         const ninfer::RuntimeStats current = service_->runtime_stats();
+        // PUBLISH WHAT /stats SERVES, and READ OUTSIDE THE LOCK. The first version called `memory_summary()`
+        // *while holding* `stats_mutex_` -- and `memory_summary` takes the engine's EXECUTION mutex, so the
+        // reporter blocked on a prefill with the snapshot lock held while `handle_stats` queued behind it:
+        // the blocking had been moved, not removed. Gathering first and locking only to assign is what makes
+        // the lock uncontended. (`runtime_stats()` alone never took the execution mutex; `memory_summary`
+        // always did, and E's original comment claimed otherwise.)
+        const ninfer::MemorySummary memory = service_->memory_summary();
+        const ninfer::LoadSummary load     = service_->load_summary();
+        {
+            std::lock_guard snapshot_lock(stats_mutex_);
+            stats_snapshot_        = current;
+            stats_snapshot_memory_ = memory;
+            stats_snapshot_load_   = load;
+            stats_snapshot_ready_  = true;
+        }
         const Clock::time_point now        = Clock::now();
         const ThroughputReport report      = make_throughput_report(
             previous, current, std::chrono::duration<double>(now - previous_time).count());
@@ -516,11 +531,31 @@ void HttpServer::handle_stats(const httplib::Request&, httplib::Response& res) c
         res.set_content(nlohmann::json{{"status", "unavailable"}}.dump(), "application/json");
         return;
     }
-    res.set_content(
-        format_stats_json(service_->runtime_stats(), service_->memory_summary(),
-                          service_->load_summary(), options_.context_cache,
-                          service_->in_flight(), service_->max_in_flight()),
-        "application/json");
+    // SERVE THE SNAPSHOT, NOT A LIVE READ. A live read takes the engine's EXECUTION mutex, so this endpoint
+    // blocked behind whatever prefill was in flight -- the opposite of what a reserved listener is for.
+    ninfer::RuntimeStats stats;
+    ninfer::MemorySummary memory;
+    ninfer::LoadSummary load;
+    bool have_snapshot = false;
+    {
+        std::lock_guard snapshot_lock(stats_mutex_);
+        have_snapshot = stats_snapshot_ready_;
+        if (have_snapshot) {
+            stats  = stats_snapshot_;
+            memory = stats_snapshot_memory_;
+            load   = stats_snapshot_load_;
+        }
+    }
+    if (!have_snapshot) {
+        // Before the reporter's first tick there is nothing cached; a live read is the only answer, and it is
+        // bounded by the first interval rather than by the load.
+        stats  = service_->runtime_stats();
+        memory = service_->memory_summary();
+        load   = service_->load_summary();
+    }
+    res.set_content(format_stats_json(stats, memory, load, options_.context_cache,
+                                      service_->in_flight(), service_->max_in_flight()),
+                    "application/json");
 }
 
 void HttpServer::handle_model(const httplib::Request& req, httplib::Response& res) const {

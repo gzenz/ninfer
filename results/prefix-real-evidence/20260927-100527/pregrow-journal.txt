@@ -1,0 +1,2 @@
+Sep 27 10:04:27 Strix bash[904113]: [engine] host state pool PRE-GROWN before planning: slots=17 occupied=16 grew=1 refused=0
+Sep 27 10:05:14 Strix bash[904113]: [engine] host state pool PRE-GROWN before planning: slots=18 occupied=17 grew=2 refused=0

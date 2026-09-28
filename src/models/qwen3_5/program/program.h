@@ -852,14 +852,20 @@ public:
 
     // Engine owns scheduling and logical residency policy. Program owns physical lanes, opaque
     // capabilities, model state and one immutable pending transaction at a time.
+    // `branch_anchor_frontier`: the depth at which to capture a checkpoint because this prompt matched stored
+    // content deeper than any checkpoint below it can resume from. It arrives HERE, with the plan build, so the
+    // group exists before the identity and pricing passes -- the two things a later injection misses.
     [[nodiscard]] RequestBasePlan plan_request(const PreparedPrompt& prompt,
-                                               const runtime::ResolvedExecutionOptions& options);
+                                               const runtime::ResolvedExecutionOptions& options,
+                                               std::optional<std::uint32_t> branch_anchor_frontier = std::nullopt);
     [[nodiscard]] std::vector<float> causal_score(PreparedPrompt&& prompt,
                                                   std::uint32_t first_target);
+
     [[nodiscard]] std::optional<AdmissionCandidate> inspect_admission(
         const PreparedPrompt& prompt, const RequestBasePlan& base, runtime::LaneId destination,
         const ContinuationHandle* source, const SharedPrefixHandle* shared_source,
         std::optional<runtime::CheckpointRef> checkpoint, bool must_retain_private_source);
+
     [[nodiscard]] std::optional<ResourcePlan> seal_identity(const AdmissionCandidate& candidate,
                                                             const PreparedPrompt& prompt,
                                                             runtime::FinalScheduleIntent intent);
@@ -890,7 +896,7 @@ public:
     inspect_capture(const CaptureOffer& offer, const SharedPrefixHandle* exact_shared,
                     const SharedPrefixHandle* replacement,
                     std::optional<runtime::CheckpointRef> private_replacement,
-                    bool permit_shared_publication) const;
+                    bool permit_shared_publication, const char* site) const;
     [[nodiscard]] std::vector<runtime::CheckpointRecoveryAlternativeWork>
     checkpoint_recovery_work(const ContinuationHandle& owner,
                              runtime::CheckpointRef checkpoint) const;
@@ -938,6 +944,46 @@ public:
     [[nodiscard]] ReleaseResult release_continuation(ContinuationHandle&& continuation) noexcept;
     [[nodiscard]] ReleaseResult release_shared_prefix(SharedPrefixHandle&& shared) noexcept;
     void fail_all_cleanup() noexcept;
+    void resource_census() const noexcept;
+    [[nodiscard]] std::uint64_t shared_replacements() const noexcept;
+    [[nodiscard]] std::uint64_t demotable_evictions() const noexcept;
+    [[nodiscard]] std::uint64_t evictions_with_victim_room() const noexcept;
+    [[nodiscard]] std::uint64_t demotable_eviction_checks() const noexcept;
+    [[nodiscard]] std::uint64_t pressure_options() const noexcept;
+    [[nodiscard]] std::uint64_t demote_options() const noexcept;
+    // The five capture-skip reasons. An optional capture that silently does not happen is indistinguishable
+    // from one that was never needed without these.
+    [[nodiscard]] std::uint64_t capture_skips(std::uint32_t reason) const noexcept;
+    // The private catalog: requests that LOST reuse to a missing cell, and the goal-probe denominator beside
+    // it. MUTATORS are needed because both are decided in `ResourceManager`'s planning, which holds only
+    // this façade -- every other counter in this block is incremented inside ProgramImpl's own TUs.
+    [[nodiscard]] std::uint64_t note_publication_cell_loss() noexcept;
+    [[nodiscard]] std::uint64_t note_publication_cell_at_risk() noexcept;
+    void add_publication_cell_at_risk(std::uint32_t at_risk, std::uint32_t goals, std::uint32_t other,
+                                      std::uint32_t reuse) noexcept;
+    [[nodiscard]] std::uint64_t publication_cell_at_risk_runs() const noexcept;
+    [[nodiscard]] std::uint64_t publication_cell_veto_goals() const noexcept;
+    [[nodiscard]] std::uint64_t publication_cell_veto_other() const noexcept;
+    [[nodiscard]] std::uint64_t publication_cell_veto_reuse() const noexcept;
+    void add_publication_cell_probes(std::uint64_t count) noexcept;
+    struct PrefixSplit {
+        std::uint32_t tokens      = 0;
+        std::uint32_t restorable  = 0;
+        bool          identity_ok = false;
+        std::uint8_t  match_end   = 0;  // 0 = diverged, 1 = the stored ledger ended, 2 = the prompt ended
+        std::uint32_t stored      = 0;  // THIS entry's ledger length: the denominator `match_end` needs
+        std::uint32_t probe_index = 0;  // where the match stopped; 0 unless it diverged
+    };
+    // Takes the PROMPT, not a token span: reading the prompt's tokens requires the frontend's
+    // `PreparedPromptAccess`, and doing that in the caller forced the model-agnostic `ResourceManager` to
+    // include a qwen3_5 header -- which broke `ninfer_resource_manager_test`'s ability to compile against a
+    // fake prompt at all. The view happens here, in the model layer.
+    [[nodiscard]] PrefixSplit prefix_split(const ContinuationHandle& owner,
+                                           const PreparedPrompt& prompt) const;
+    [[nodiscard]] PrefixSplit prefix_split(const SharedPrefixHandle& owner,
+                                           const PreparedPrompt& prompt) const;
+    [[nodiscard]] std::uint64_t publication_cell_losses() const noexcept;
+    [[nodiscard]] std::uint64_t publication_cell_probes() const noexcept;
 
     [[nodiscard]] bool isolated_request_feasible(const RequestBasePlan& base) const noexcept;
     [[nodiscard]] runtime::ProgramResourceRevision resource_revision() const noexcept;

@@ -1,0 +1,5 @@
+binary: ecf7fdec7efd78af1b305b5981813f384a04f787b44ccc4242f6cf82e54e73d1  ./build-diag/tests/ninfer_qwen3_5_prefix_real_test
+git-diff: dea769b5b1e88d28cdc6452af047b66bc5283ba5e01666c530326d3c1d2753ca  -
+git-head: d4cd4d67713aefdf031b849f9a9c63c147be3da2
+artifact: /home/zenz/ninfer-models/swift15/qwen3_8_27b_nvfp4swift15.ninfer
+assessments-total: 184

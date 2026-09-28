@@ -28,6 +28,10 @@ public:
     DeviceBuffer& operator=(DeviceBuffer&& other) noexcept;
 
     void fill(int byte_value = 0);
+
+    // Raw device pointer for callers that must issue their own Device-to-Device copy (auditing
+    // probes that sample a buffer at the moment the kernels read it). Read-only.
+    [[nodiscard]] void* data() const noexcept { return p; }
     // Completes the upload before returning. Callers must first order any prior device
     // accesses to the destination range.
     void copy_from_host(const void* source, std::size_t count, std::size_t byte_offset = 0);
@@ -89,6 +93,15 @@ private:
     std::size_t peak_ = 0;
     bool owns_        = true;
 };
+
+// Pin `bytes` of host memory (cudaMallocHost) and release it. Exported because the elastic pinned pool's
+// production chunk source needs exactly these, and a second pinning path with its own error reporting is
+// how two instruments end up disagreeing about the same failure.
+//
+// `pin_host_memory` returns nullptr instead of throwing: a failed pin is a REFUSAL TO GROW for the pool, a
+// policy outcome it counts and carries on from, not an exception that unwinds a request.
+[[nodiscard]] void* pin_host_memory(std::size_t bytes) noexcept;
+void free_host_memory(void* base) noexcept;
 
 class PinnedHostBuffer {
 public:

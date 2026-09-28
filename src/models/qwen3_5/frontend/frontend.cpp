@@ -538,9 +538,19 @@ PreparedContextCache prepare_context_cache(
                             SharedCandidateEvidence::EngineStructural,
                             *message_boundaries[*leading_boundary], engine_order++);
         }
-        add_opportunity(PromptCacheMarkerKind::SharedStablePrefix,
-                        SharedCandidateEvidence::EngineObserved, full_prompt_frontier,
-                        engine_order);
+        // NOT the full prompt. This line published the session's whole prompt -- its private document
+        // and tail included -- as a SHARED stable prefix, i.e. as something other sessions may fork
+        // from, with only `EngineObserved` evidence behind it. A per-session prompt tail is not a
+        // stable prefix: it is exactly what private checkpoints are for. The two structural
+        // boundaries above (the tool marker and the leading instruction boundary) stay, because those
+        // are shared by construction rather than by observation. This is candidate fix (a) from
+        // 2026-09-24's root-cause analysis, never tried until now; D2's symptom is a lane continuing
+        // with another session's private content, and this is the only place a private tail is
+        // offered as shared.
+        //
+        // The frontier is still used for the *identity* of the prompt; it is simply no longer offered
+        // as a shared-prefix opportunity.
+        (void)full_prompt_frontier;
     }
     return out;
 }

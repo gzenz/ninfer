@@ -1,5 +1,7 @@
 #include "models/qwen3_5/program/program_impl.h"
 #include "models/qwen3_5/program/context_work.h"
+
+#include <string>
 #include "models/qwen3_5/program/context.h"
 #include "models/qwen3_5/program/planning/rebuild_work.h"
 
@@ -211,6 +213,40 @@ detail::PhysicalResources checked_resource_sum(detail::PhysicalResources left,
     };
 }
 
+namespace {
+// Which resource underflowed, and by how much. The original message said only that something did, so a
+// live `WORKER RECOVER: Qwen3.5 resource subtraction underflow` on prod (2026-09-25 10:13, under load,
+// once in the day) could not be attributed to a counter -- and attribution is the whole value of the
+// check. Each branch reports the field, its value and the amount being removed.
+[[nodiscard]] std::string resource_underflow_detail(const detail::PhysicalResources& value,
+                                                    const detail::PhysicalResources& removed) {
+    const auto pair = [](const char* name, std::uint64_t have, std::uint64_t want) {
+        return std::string(name) + ": have " + std::to_string(have) + ", removing " +
+               std::to_string(want);
+    };
+    if (removed.device.active_lanes > value.device.active_lanes) {
+        return pair("device.active_lanes", value.device.active_lanes, removed.device.active_lanes);
+    }
+    if (removed.device.state_slots > value.device.state_slots) {
+        return pair("device.state_slots", value.device.state_slots, removed.device.state_slots);
+    }
+    if (removed.device.main_kv_pages > value.device.main_kv_pages) {
+        return pair("device.main_kv_pages", value.device.main_kv_pages, removed.device.main_kv_pages);
+    }
+    if (removed.device.backend_kv_pages > value.device.backend_kv_pages) {
+        return pair("device.backend_kv_pages", value.device.backend_kv_pages,
+                    removed.device.backend_kv_pages);
+    }
+    if (removed.host.state_slots > value.host.state_slots) {
+        return pair("host.state_slots", value.host.state_slots, removed.host.state_slots);
+    }
+    if (removed.host.kv_bytes > value.host.kv_bytes) {
+        return pair("host.kv_bytes", value.host.kv_bytes, removed.host.kv_bytes);
+    }
+    return "none";
+}
+} // namespace
+
 detail::PhysicalResources checked_resource_difference(detail::PhysicalResources value,
                                                       detail::PhysicalResources removed) {
     if (removed.device.active_lanes > value.device.active_lanes ||
@@ -219,7 +255,8 @@ detail::PhysicalResources checked_resource_difference(detail::PhysicalResources 
         removed.device.backend_kv_pages > value.device.backend_kv_pages ||
         removed.host.state_slots > value.host.state_slots ||
         removed.host.kv_bytes > value.host.kv_bytes) {
-        throw std::logic_error("Qwen3.5 resource subtraction underflow");
+        throw std::logic_error("Qwen3.5 resource subtraction underflow [" +
+                               resource_underflow_detail(value, removed) + "]");
     }
     return detail::PhysicalResources{
         .device =

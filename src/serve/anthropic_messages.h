@@ -21,6 +21,13 @@ struct AnthropicMessagesRequest {
     GenerationRequest generation;
     bool stream                 = false;
     bool output_tokens_explicit = false;
+    // THE CLIENT'S OWN SESSION ID, if it sends one (`metadata.user_id`). The parser dropped the `metadata`
+    // field entirely -- `grep -n metadata anthropic_messages_request.cpp` found nothing -- which is how a
+    // client-supplied identity came to be ignored while we derived an FNV hash from the conversation's opening
+    // text, a preimage that a client's CONCURRENT SIBLING requests share. This carries a HASH of it, not the
+    // value: the first step is to learn whether it is present and stable in traffic, not to consume an
+    // identifier we have not seen.
+    std::optional<std::string> metadata_session_hash;
 };
 
 struct AnthropicCountTokensRequest {

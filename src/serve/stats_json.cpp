@@ -99,9 +99,30 @@ std::string format_stats_json(const ninfer::RuntimeStats& s, const ninfer::Memor
         {"partial_tail_cow_pages", s.partial_tail_cow_pages},
         {"private_owners_degraded", s.pressure_private_owners_degraded},
         {"private_owners_demoted", s.pressure_private_owners_demoted},
+        {"private_owners_demoted_kv", s.pressure_private_owners_demoted_kv},
+        {"private_owners_demoted_kv_only", s.pressure_private_owners_demoted_kv_only},
         {"private_owners_evicted", s.pressure_private_owners_evicted},
         {"shared_owners_degraded", s.pressure_shared_owners_degraded},
         {"shared_owners_evicted", s.pressure_shared_owners_evicted},
+        {"shared_owners_replaced", s.pressure_shared_owners_replaced},
+        {"private_evictions_demotable", s.pressure_private_evictions_demotable},
+        {"evictions_with_victim_room", s.pressure_evictions_with_victim_room},
+        {"private_eviction_checks", s.pressure_private_eviction_checks},
+        {"options", s.pressure_options},
+        {"demote_options", s.pressure_demote_options},
+        {"capture_skips_transaction_or_fork", s.capture_skips_transaction_or_fork},
+        {"capture_skips_cancelled", s.capture_skips_cancelled},
+        {"capture_skips_nothing_to_publish", s.capture_skips_nothing_to_publish},
+        {"capture_skips_stale_pressure_plan", s.capture_skips_stale_pressure_plan},
+        {"capture_skips_not_feasible_no_pressure", s.capture_skips_not_feasible_no_pressure},
+        {"publication_cell_losses", s.pressure_publication_cell_losses},
+        // The denominator beside it: goal-probe calls, not an outcome. See the RuntimeStats comment.
+        {"publication_cell_probes", s.pressure_publication_cell_probes},
+        // Uncapped, because the journal line that reports these is rate-limited to 8 then every 512th.
+        {"publication_cell_at_risk_runs", s.pressure_publication_cell_at_risk_runs},
+        {"publication_cell_veto_goals", s.pressure_publication_cell_veto_goals},
+        {"publication_cell_veto_other", s.pressure_publication_cell_veto_other},
+        {"publication_cell_veto_reuse", s.pressure_publication_cell_veto_reuse},
         {"checkpoints_dropped", s.pressure_checkpoints_dropped},
         {"searches", s.pressure_searches},
         {"search_budget_exhaustions", s.pressure_search_budget_exhaustions},
@@ -124,6 +145,32 @@ std::string format_stats_json(const ninfer::RuntimeStats& s, const ninfer::Memor
         {"host_kv_capacity_bytes", m.host_kv_capacity_bytes},
         {"host_kv_occupied_bytes", m.host_kv_occupied_bytes},
         {"host_state_capacity_slots", m.host_state_capacity_slots},
+        // From `s`, not `m`: the catalog lives in the ResourceManager (runtime) and the MemorySummary is
+        // assembled by ProgramImpl, which cannot see it. Kept in this block anyway so the capacity/occupancy
+        // pairs read together.
+        {"private_catalog_capacity_cells", s.private_catalog_capacity_cells},
+        {"catalog_cell_clears_terminal", s.catalog_cell_clears_terminal},
+        {"catalog_cell_clears_action", s.catalog_cell_clears_action},
+        {"catalog_cell_clears_cancelled", s.catalog_cell_clears_cancelled},
+        {"catalog_cell_clears_cleanup", s.catalog_cell_clears_cleanup},
+        {"catalog_cell_clears_rollback", s.catalog_cell_clears_rollback},
+        {"session_erasures_eviction", s.session_erasures_eviction},
+        {"session_erasures_consume", s.session_erasures_consume},
+        {"session_index_capacity_cells", s.session_index_capacity_cells},
+        {"session_index_occupied_cells", s.session_index_occupied_cells},
+        {"host_state_checkpoints_reachable", s.host_state_checkpoints_reachable},
+        {"host_state_checkpoints_unanchored", s.host_state_checkpoints_unanchored},
+        {"private_catalog_occupied_cells", s.private_catalog_occupied_cells},
+        {"host_pinned_capacity_bytes", m.host_pinned_capacity_bytes},
+        {"host_pinned_free_bytes", m.host_pinned_free_bytes},
+        {"host_pinned_chunks", m.host_pinned_chunks},
+        {"host_pinned_grows", m.host_pinned_grows},
+        {"host_pinned_grow_refusals", m.host_pinned_grow_refusals},
+        {"host_state_pregrow_attempts", m.host_state_pregrow_attempts},
+        {"host_state_pregrows", m.host_state_pregrows},
+        {"host_state_pregrow_refusals", m.host_state_pregrow_refusals},
+        {"host_kv_grows", m.host_kv_grows},
+        {"host_kv_grow_refusals", m.host_kv_grow_refusals},
         {"host_state_occupied_slots", m.host_state_occupied_slots},
         {"weights_bytes", m.weights.used_bytes},
         {"sequence_bytes", m.sequence.used_bytes},
@@ -135,7 +182,22 @@ std::string format_stats_json(const ninfer::RuntimeStats& s, const ninfer::Memor
     // (superseded/evictions/compactions/single_alloc_failures/net_state_bytes) as
     // zero, plus the tier census (all-zero) and empty top_units — so a net-less
     // build renders an honest "safety net: 0 entries" panel instead of missing keys.
+    //
+    // The zeros are placeholders, not measurements, and in a block named `tier_census` they read as
+    // "host KV is empty". It is not: `host_kv_occupied_bytes` and `pressure.spill_pages` are the real
+    // numbers, and a live run showed 1.06 GB occupied against an all-zero census. So the block now
+    // says it is a placeholder, and carries the residency the engine actually knows beside it.
     j["host_kv"] = {
+        {"net_present", false},
+        {"net_absent_reason",
+         "this build has no host-KV safety net; the flat counters and tier_census below are "
+         "placeholders — read memory.host_kv_occupied_bytes and pressure.spill_pages instead"},
+        {"residency",
+         {{"occupied_bytes", m.host_kv_occupied_bytes},
+          {"capacity_bytes", m.host_kv_capacity_bytes},
+          {"spilled_pages", s.pressure_spill_pages},
+          {"owners_demoted_kv", s.pressure_private_owners_demoted_kv},
+          {"owners_demoted_kv_only", s.pressure_private_owners_demoted_kv_only}}},
         {"net_entries", 0},
         {"net_state_bytes", 0},
         {"superseded", 0},

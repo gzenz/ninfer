@@ -5,8 +5,12 @@
 
 #include <atomic>
 #include <cstddef>
+#include <cstdlib>
+#include <ctime>
 #include <cstdint>
+#include <cstdio>
 #include <exception>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <utility>
@@ -60,15 +64,32 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
     }
 
     const std::uint64_t req_id = ++request_seq_;
-    const RequestLogMetadata metadata{.model                  = request.model,
-                                      .stream                 = request.stream,
-                                      .output_tokens_explicit = request.output_tokens_explicit};
+    // DERIVED BEFORE THE METADATA IS BUILT, so the key the engine is handed and the key the log records cannot
+    // disagree. THE V2 SESSION-KEY PORT (613171bd): the Messages path carries no session key, so derive one
+    // from the conversation's own first turn. Without it every request landed in its own reuse domain
+    // (`reuse_domain` falls back to the per-request publication_order) and retention stayed RecentPrivate,
+    // which is the condition V2 describes as units that "classify dead forever".
+    ContextCacheHints cache_hints;
+    cache_hints.session_key = derive_session_key(request.generation.messages);
+    RequestLogMetadata metadata{.model                  = request.model,
+                                .stream                 = request.stream,
+                                .output_tokens_explicit = request.output_tokens_explicit,
+                                .session_key            = cache_hints.session_key,
+                                .client_session_id      = request.metadata_session_hash};
+    // The join key with the engine's eviction line (`session=%016llx`): the SAME hash over the SAME bytes that
+    // `prefill.cpp` puts on the sequence, so an eviction can be matched to the request whose state it destroyed.
+    if (cache_hints.session_key) {
+        char hex[24];
+        std::snprintf(hex, sizeof(hex), "%016llx",
+                      static_cast<unsigned long long>(session_key_hash_of(*cache_hints.session_key)));
+        metadata.session_key_hash = std::string(hex);
+    }
     PreparedRequest prepared;
     try {
         prepared = service_->prepare(request.generation,
                                      request.stream ? GenerationConsumerMode::Streaming
                                                     : GenerationConsumerMode::Aggregate,
-                                     {}, [&req] { return client_disconnected(req); });
+                                     {}, [&req] { return client_disconnected(req); }, cache_hints);
     } catch (const ApiException& exception) {
         const ApiError error = normalize_anthropic_error(exception.error());
         record_request_rejected(make_request_rejection_log_context(
@@ -112,6 +133,30 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
             return;
         }
         lifecycle->done(outcome);
+        // Response provenance (NINFER_RESP_PROBE=1). Every engine-internal per-lane binding is
+        // verified clean, so the remaining question is whether a foreign reply is *produced* for
+        // this prompt or *delivered* to the wrong client. Printing the canary found in the
+        // request text next to the one found in the reply settles it: prompt=S1/reply=S0 is
+        // content corruption; prompt=S1/reply=S1 while the client received S0's text is routing.
+        if (std::getenv("NINFER_RESP_PROBE") != nullptr) {
+            const auto canary_of = [](const std::string& text) -> std::string {
+                const std::size_t at = text.find("CANARY-");
+                if (at == std::string::npos) { return {}; }
+                return text.substr(at, std::min<std::size_t>(text.size() - at, 20));
+            };
+            std::string prompt_text;
+            for (const ChatTurn& turn : request.generation.messages) {
+                for (const ContentPart& part : turn.content) { prompt_text += part.text; }
+            }
+            const std::string reply_text = outcome.text + outcome.reasoning;
+            std::fprintf(stderr,
+                         "[resp-probe] rid=%s prompt_tokens=%d completion=%d prompt_canary=%s "
+                         "reply_canary=%s reply_bytes=%zu\n",
+                         request_id.c_str(), input_tokens, outcome.completion_tokens,
+                         canary_of(prompt_text).c_str(), canary_of(reply_text).c_str(),
+                         reply_text.size());
+            std::fflush(stderr);
+        }
         try {
             set_owned_json_content(res, make_anthropic_messages_response(identity, outcome),
                                    prepared.lifetime);

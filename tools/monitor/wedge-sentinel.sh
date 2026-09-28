@@ -74,6 +74,43 @@ STATS_PORT=8081   # dedicated single-thread /stats server (--stats-port); never
                   # fallback (old binaries without --stats-port).
 if [ "$(id -u)" != "0" ]; then JC="sudo -n journalctl"; else JC="journalctl"; fi
 
+# Capture what the restart is about to destroy. A wedged engine cannot run its OWN shutdown path -- the
+# shutdown needs the lock the wedge holds -- so a stack taken here is the entire forensics, and the restart
+# is the last moment it exists. On 2026-09-26 a live wedge was restarted with no capture; the only stack that
+# survives came from a manual gdb attach 20s before systemd's SIGKILL, and even that could not name the
+# caller because the release binary carries no symbols.
+#
+# Two outputs, because one of them works without symbols:
+#   *.waits - per-thread state and wchan. On 2026-09-26 this is what characterised the wedge: 21 of 25
+#             threads on futex_do_wait (five on one condvar) with ONE thread spinning in sched_yield.
+#   *.bt    - the backtrace. Best effort: bounded, non-fatal, and on a symbol-less build only the
+#             innermost frame resolves. That frame is still worth having -- it names the primitive.
+capture_wedge_state() {
+  local pid dir out
+  # Overridable so this can be TESTED against a scratch process -- an untested capture would be an
+  # instrument that may measure nothing, which is the failure this repo keeps recording.
+  pid="${WEDGE_CAPTURE_PID:-$(systemctl show -p MainPID --value ninfer.service 2>/dev/null)}"
+  if [ -z "$pid" ] || [ "$pid" = "0" ] || [ ! -d "/proc/$pid" ]; then
+    echo "WEDGE-CAPTURE: no MainPID to capture"
+    return 0
+  fi
+  dir="${WEDGE_CAPTURE_DIR:-$HOME/ninfer-watch}"
+  mkdir -p "$dir" 2>/dev/null || true
+  out="$dir/wedge-$(date +%Y%m%d-%H%M%S)"
+  {
+    echo "pid=$pid captured=$(date -Is) exe=$(readlink "/proc/$pid/exe" 2>/dev/null)"
+    for t in /proc/"$pid"/task/*; do
+      [ -d "$t" ] || continue
+      printf '%s state=%s wchan=%s\n' "$(basename "$t")" \
+        "$(awk '{print $3}' "$t/stat" 2>/dev/null)" "$(cat "$t/wchan" 2>/dev/null)"
+    done
+  } >"$out.waits" 2>&1 || true
+  timeout 20 sudo -n gdb -p "$pid" -batch -ex 'set pagination off' -ex 'thread apply all bt 8' \
+    >"$out.bt" 2>&1 || true
+  echo "WEDGE-CAPTURE: $out.waits (thread waits) and $out.bt (backtrace, best effort)"
+  return 0
+}
+
 poll_stats() {
   # prints "r p d w m counters_sum" or nothing. Tries the dedicated stats
   # port first: a /stats poll on the main port can time out while the shared
@@ -240,6 +277,8 @@ while true; do
     else
       [ "$ab_due" = "1" ] && echo "WEDGE (A/B): engine idle with work pending $((now - armed_since))s — restarting ninfer (restart #$restart_count)"
       [ "$cd_due" = "1" ] && echo "WEDGE-C: no engine progress with work in flight — restarting ninfer (restart #$restart_count)"
+      # BEFORE the restart, not after: this is the only moment the evidence exists.
+      capture_wedge_state
       sudo -n systemctl restart ninfer.service 2>/dev/null || systemctl restart ninfer.service
       armed_since=0; c_armed_since=0
       c_last_advance=0; last_progress=-1

@@ -209,22 +209,78 @@ TransferWork dflash_local_transfer_work(const StateImageHostLayout& layout) {
                         .copy_operations = static_cast<std::uint32_t>(operations)};
 }
 
-HostStatePool::HostStatePool(StateImageHostLayout layout, std::uint32_t capacity)
-    : layout_(std::move(layout)), slots_(capacity), free_slots_(capacity), free_count_(capacity) {
+HostStatePool::HostStatePool(StateImageHostLayout layout, PinnedHostPool& pool)
+    : layout_(std::move(layout)), pool_(&pool) {
     if (!same_host_layout(layout_, plan_host_state_image(layout_.spec))) {
         throw std::invalid_argument("HostStatePool image layout is invalid");
     }
-    const std::size_t bytes =
-        checked_mul(layout_.image_bytes, capacity, "HostStatePool backing size overflow");
-    if (bytes != 0) { backing_.emplace(bytes); }
-    for (std::uint32_t index = 0; index < capacity; ++index) {
-        free_slots_[index] = capacity - 1U - index;
+    // No backing buffer and no slots: the pool starts empty and pins on demand. A caller that wants an
+    // initial reservation calls `reserve_slots()`, which grows through `grow_slot()` and leaves the slots
+    // FREE. Not `allocate_growing()`: that one pins AND OCCUPIES, so N calls would leave N slots held.
+}
+
+bool HostStatePool::grow_slot() noexcept {
+    if (pool_ == nullptr) {
+        ++growth_refusals_;
+        return false;
     }
+    auto allocation = pool_->allocate(layout_.image_bytes);
+    if (!allocation) {
+        ++growth_refusals_;
+        return false;
+    }
+    slots_.push_back(Slot{});
+    Slot& slot      = slots_.back();
+    slot.allocation = *allocation;
+    slot.generation = 1;
+    slot.occupied   = false;
+    free_slots_.push_back(static_cast<std::uint32_t>(slots_.size() - 1U));
+    ++growth_count_;
+    return true;
+}
+
+std::uint32_t HostStatePool::trim_idle_slots(std::uint32_t keep) noexcept {
+    std::uint32_t given_back = 0U;
+    while (slots_.size() > keep && !slots_.empty() && !slots_.back().occupied) {
+        const PinnedHostPool::Handle allocation = slots_.back().allocation;
+        if (pool_ != nullptr) { (void)pool_->release(allocation); }
+        // The index is the last one, so it is also the top of the free list: drop it from both.
+        for (std::size_t i = 0; i < free_slots_.size(); ++i) {
+            if (free_slots_[i] == slots_.size() - 1U) {
+                free_slots_.erase(free_slots_.begin() + static_cast<std::ptrdiff_t>(i));
+                break;
+            }
+        }
+        slots_.pop_back();
+        ++given_back;
+    }
+    return given_back;
+}
+
+std::uint32_t HostStatePool::reserve_slots(std::uint32_t count) noexcept {
+    std::uint32_t created = 0U;
+    for (std::uint32_t i = 0; i < count; ++i) {
+        if (!grow_slot()) { break; }
+        ++created;
+    }
+    return created;
+}
+
+std::optional<HostStateSlotHandle> HostStatePool::allocate_growing() noexcept {
+    if (auto handle = allocate(); handle) { return handle; }
+    if (!grow_slot()) { return std::nullopt; }
+    return allocate();
 }
 
 std::optional<HostStateSlotHandle> HostStatePool::allocate() noexcept {
-    if (free_count_ == 0) { return std::nullopt; }
-    const std::uint32_t index = free_slots_[--free_count_];
+    // A stack, maintained with push_back/pop_back throughout. It used to be a pre-sized array written by
+    // index (`free_slots_[free_count_++] = ...`), and when the container became dynamically populated that
+    // indexing wrote PAST the end of an empty vector: slot 0 ended up on the free list twice and
+    // `allocate_growing` handed out a slot that was already occupied. The test caught it as two handles
+    // with the same index and generation.
+    if (free_slots_.empty()) { return std::nullopt; }
+    const std::uint32_t index = free_slots_.back();
+    free_slots_.pop_back();
     Slot& slot                = slots_[index];
     slot.occupied             = true;
     ++occupied_;
@@ -236,7 +292,7 @@ bool HostStatePool::release(HostStateSlotHandle handle) noexcept {
     Slot& slot    = slots_[handle.index];
     slot.occupied = false;
     if (++slot.generation == 0) { ++slot.generation; }
-    free_slots_[free_count_++] = handle.index;
+    free_slots_.push_back(handle.index);
     --occupied_;
     return true;
 }
@@ -261,8 +317,10 @@ bool HostStatePool::valid(HostStateSlotHandle handle) const noexcept {
 }
 
 std::byte* HostStatePool::slot_data(std::uint32_t index) const noexcept {
-    return static_cast<std::byte*>(backing_->data()) +
-           static_cast<std::size_t>(index) * layout_.image_bytes;
+    if (pool_ == nullptr || index >= slots_.size()) { return nullptr; }
+    // The address comes from the pool and NEVER moves: this is why the pool grows by adding chunks rather
+    // than reallocating, since views into these bytes are held across in-flight H2D/D2H copies.
+    return pool_->data(slots_[index].allocation);
 }
 
 StateImageDevicePool::StateImageDevicePool(DeviceSpan backing, const StateImageDeviceLayout& layout)
@@ -455,6 +513,15 @@ void StateImageDevicePool::copy_from_host(HostStateImageConstView source, std::i
                 v.bytes(), cudaMemcpyHostToDevice, stream));
         }
     }
+}
+
+HostStatePreGrow pre_grow_host_state_pool(HostStatePool& pool) noexcept {
+    const std::uint32_t capacity = pool.capacity();
+    if (capacity == 0U) { return HostStatePreGrow::Disabled; }
+    if (pool.occupied() < capacity) { return HostStatePreGrow::NotFull; }
+    // ADDS, so the argument is the number of NEW slots and must be 1. See the unit test.
+    return pool.reserve_slots(HOST_STATE_PREGROW_SLOTS) == 0U ? HostStatePreGrow::Refused
+                                                              : HostStatePreGrow::Grew;
 }
 
 } // namespace ninfer::models::qwen3_5

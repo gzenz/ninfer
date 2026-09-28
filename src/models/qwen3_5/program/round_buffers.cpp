@@ -110,6 +110,7 @@ OrdinaryDecodeState::OrdinaryDecodeState(DeviceSpan backing,
         ingress_tensor(offsetof(OrdinaryDecodeIngress, state_source_slots), DType::I32);
     state_destination_slots =
         ingress_tensor(offsetof(OrdinaryDecodeIngress, state_destination_slots), DType::I32);
+    valid_columns = ingress_tensor(offsetof(OrdinaryDecodeIngress, valid_columns), DType::I32);
     sampling = reinterpret_cast<const ops::SamplingConfig*>(
         static_cast<const unsigned char*>(ingress.data) +
         offsetof(OrdinaryDecodeIngress, sampling));

@@ -43,6 +43,10 @@ PressurePlanningSessionImpl::PressurePlanningSessionImpl(
         throw std::logic_error("pressure planning session cannot start in the current state");
     }
 
+    // BEFORE any candidate is priced: if the host state pool is full, grow it by one slot so the demote
+    // options the search is about to assess can be affordable at all. See ensure_host_state_headroom.
+    program->ensure_host_state_headroom();
+
     candidates.assign(physical_candidates.begin(), physical_candidates.end());
     candidate_ids.assign(admission_candidate_ids.begin(), admission_candidate_ids.end());
     for (std::size_t index = 0; index < candidate_ids.size(); ++index) {
@@ -318,11 +322,59 @@ std::uint32_t PressurePlanningSessionImpl::intern_target(std::uint32_t selected_
         return static_cast<std::uint32_t>(existing - targets.data());
     }
     const std::size_t maximum = candidates.size() + 1U + planning_detail::kOptionalTargetCapacity;
+    // WHICH ARENA, WITH ITS NUMBERS. This throw reaches the journal as `WORKER RECOVER: <what()>`, and the
+    // bare message made four different conditions indistinguishable -- so an occurrence said only that "the
+    // pressure target arena is full", while the useful facts are WHICH bound was hit and how close the others
+    // were. Prod hit this once on 2026-09-27, 12 s after eight restorable victims were evicted, and the
+    // hypothesis that the search was truncated before it could price a demote could not be tested against a
+    // message that carries no counters. The three candidate bounds:
+    //   * `targets` -- the target nodes, reserved to candidates + 1 + kOptionalTargetCapacity (4096);
+    //   * `target_choice_arena` -- the victim choices, reserved to owners * (11 + long anchors); the throw's
+    //     third condition is a REMAINING-capacity test, i.e. an incoming choice set that does not fit;
+    //   * the two uint32 casts, which are overflow guards and should never fire.
     if (targets.size() >= maximum || targets.size() == targets.capacity() ||
         choices.size() > target_choice_arena.capacity() - target_choice_arena.size() ||
         target_choice_arena.size() > std::numeric_limits<std::uint32_t>::max() ||
         choices.size() > std::numeric_limits<std::uint32_t>::max()) {
-        throw std::length_error("pressure target arena is full");
+        const char* which = targets.size() >= maximum
+                                ? "target-count"
+                                : (targets.size() == targets.capacity()
+                                       ? "target-capacity"
+                                       : (choices.size() > target_choice_arena.capacity() -
+                                                                 target_choice_arena.size()
+                                              ? "choice-arena"
+                                              : "uint32-overflow"));
+        char detail[320];
+        std::snprintf(detail, sizeof(detail),
+                      "pressure target arena is full [%s]: targets=%zu/%zu (maximum=%zu) "
+                      "choice_arena=%zu/%zu incoming_choices=%zu owners=%zu candidates=%zu",
+                      which, targets.size(), targets.capacity(), maximum, target_choice_arena.size(),
+                      target_choice_arena.capacity(), choices.size(), owners.size(), candidates.size());
+        throw std::length_error(detail);
+    }
+    // NEAR-FULL, BEFORE IT THROWS. The throw above is rare; whether it is *APPROACHED* on every pressured
+    // request is the question that decides whether the evictions are search truncation. Reported at 7/8 of
+    // either bound and rate-limited like the eviction print (first 8, then every 512th), so a saturated
+    // planner is visible on the requests that SURVIVE as well as the one that dies -- a print that fires only
+    // on the throw would leave "not saturated" and "never near" indistinguishable.
+    {
+        static std::uint64_t near_full_seen = 0;
+        const std::size_t choice_remaining = target_choice_arena.capacity() - target_choice_arena.size();
+        const bool near_targets = targets.size() * 8U >= maximum * 7U;
+        const bool near_choices = choices.size() * 8U >= choice_remaining * 7U;
+        if (near_targets || near_choices) {
+            ++near_full_seen;
+            if (near_full_seen <= 8U || near_full_seen % 512U == 0U) {
+                std::fprintf(stderr,
+                             "[engine] pressure arena near-full: targets=%zu/%zu (maximum=%zu) "
+                             "choice_arena=%zu/%zu incoming_choices=%zu near=%s seen=%llu\n",
+                             targets.size(), targets.capacity(), maximum, target_choice_arena.size(),
+                             target_choice_arena.capacity(), choices.size(),
+                             near_targets ? (near_choices ? "both" : "targets") : "choices",
+                             static_cast<unsigned long long>(near_full_seen));
+                std::fflush(stderr);
+            }
+        }
     }
     const std::uint32_t offset = static_cast<std::uint32_t>(target_choice_arena.size());
     target_choice_arena.insert(target_choice_arena.end(), choices.begin(), choices.end());
@@ -437,10 +489,29 @@ void PressurePlanningSessionImpl::populate_options(std::uint32_t selected_candid
                 const auto& sequence =
                     program->continuation_states[PlanningContractAccess::index(*owner.private_handle)];
                 const qwen3_5::ContinuationSummary summary = program->continuation_summary(sequence);
-                if (summary.endpoint) {
-                    const auto& work = summary.endpoint->rebuild_work;
-                    planning_saturating_add(cost, work.tokens);
-                    planning_saturating_add(cost, work.attention_pairs);
+                // Price the BEST restorable checkpoint this victim holds, not the endpoint alone.
+                // Pricing only `summary.endpoint` gave rebuild cost 0 to any victim whose only
+                // restorable checkpoint is a rewrite. `value_weights_for_victims` sorts ascending and
+                // assigns weight = rank, so cost 0 means the LOWEST weight -- and the eviction charge
+                // is `degradation_units + value_weight` (below), so dropping such a victim was
+                // effectively free. The search then evicted exactly the victims this ranking exists to
+                // protect. Measured on prod 2026-09-26: seven of the eight victims evicted with host
+                // state slots AND host KV free read `endpoint=0 rewrite=1` with frontiers of
+                // 52k-77k tokens. All three checkpoint inventories are the same type
+                // (`CheckpointSummary`), so the rewrite's rebuild work was available and unread.
+                const qwen3_5::CheckpointSummary* best = nullptr;
+                const auto consider = [&best](const qwen3_5::CheckpointSummary& candidate) {
+                    if (best == nullptr ||
+                        candidate.rebuild_work.tokens > best->rebuild_work.tokens) {
+                        best = &candidate;
+                    }
+                };
+                if (summary.endpoint) { consider(*summary.endpoint); }
+                if (summary.rewrite) { consider(*summary.rewrite); }
+                for (const auto& anchor : summary.long_anchors) { consider(anchor); }
+                if (best != nullptr) {
+                    planning_saturating_add(cost, best->rebuild_work.tokens);
+                    planning_saturating_add(cost, best->rebuild_work.attention_pairs);
                 }
             }
             rebuild_cost.push_back(cost);

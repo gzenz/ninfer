@@ -9,6 +9,7 @@
 
 #include <array>
 #include <cstdint>
+#include <cstdlib>
 #include <exception>
 #include <iostream>
 #include <new>
@@ -63,7 +64,15 @@ void test_state_store(ninfer::DeviceContext& device) {
     const q36::StateImageDeviceLayout layout = q36::plan_state_image_device_pool(builder, spec);
     ninfer::DeviceArena arena(builder.finish(256));
     q36::StateImageDevicePool physical({arena.base(), arena.capacity()}, layout);
-    q36::HostStatePool host(layout.host, 2);
+    // The host slots come from the SHARED pinned budget now; the two slots this test needs are an initial
+    // reservation. A CPU-only chunk source keeps this test's pool bookkeeping independent of whether the
+    // machine has a GPU -- the test itself still needs one for the device pool.
+    ninfer::PinnedHostPool host_pool(
+        ninfer::PinnedHostPool::Config{/*chunk_bytes=*/layout.host.image_bytes * 2U, /*alignment=*/256U},
+        [](std::size_t bytes) { return std::malloc(bytes); },
+        [](void* base) { std::free(base); });
+    q36::HostStatePool host(layout.host, host_pool);
+    expect(host.reserve_slots(2) == 2U, "host slots reserved from the shared pool");
     store::StateImageStore images(
         physical, &host, static_cast<std::uint32_t>(physical.slot_count()) + host.capacity());
 
@@ -113,6 +122,47 @@ void test_state_store(ninfer::DeviceContext& device) {
     expect(images.content_epoch(*source) == rewrite_epoch &&
                images.checkpoint_references(*source) == 1,
            "aborted rewrite rotation restores the prior checkpoint identity");
+
+    // #11(b): `complete()` is the StateImage half of invariant #6 -- the KV side walks every required
+    // page and throws, and this expresses "there is a settled replica to restore from". Its first version
+    // returned false for any image with a pending replica, which includes an IN-FLIGHT Host-to-Device
+    // restore (`begin_host_to_device` sets `pending_device_slot`, `transfer_id` and `destination_pinned`
+    // while the host replica is settled) -- a false positive that would have failed pricing for a whole
+    // owner on healthy traffic, and the reason the condition now tests the settled slots instead. This
+    // case pins that: an image mid-restore IS complete, because its host replica is there.
+    const auto demoted = images.reserve_reset(device.stream);
+    expect(demoted.has_value(), "completeness case could reserve an image");
+    if (demoted.has_value()) {
+        images.freeze(*demoted);
+        expect(images.role(*demoted) == store::StateImageRole::CheckpointImmutable,
+               "completeness case froze its image into a checkpoint");
+        auto to_host = images.reserve_device_to_host(*demoted);
+        expect(to_host.has_value(), "completeness case could start a Device-to-Host demotion");
+        if (to_host.has_value()) {
+            images.enqueue_device_to_host(*to_host, device.stream);
+            images.publish_transfer(std::move(*to_host), false);
+            expect(images.complete(*demoted),
+                   "a checkpoint with a settled Host replica is complete");
+            auto to_device = images.begin_host_to_device(*demoted, device.stream);
+            expect(to_device.has_value(),
+                   "completeness case could start a Host-to-Device restore");
+            if (to_device.has_value()) {
+                expect(images.complete(*demoted),
+                       "a checkpoint mid-RESTORE is complete: its Host replica is settled, so an "
+                       "in-flight Device replica must not be read as incompleteness");
+                images.abort_transfer(std::move(*to_device));
+                expect(images.complete(*demoted),
+                       "aborting the restore leaves the checkpoint complete on its Host replica");
+            }
+        }
+        // Release what this case created, or the store's ownership-closure check at the end of this
+        // function fails -- which is exactly what the first version of this case did: two teardown
+        // failures ("rotated state image ownership closes after release" among them) that had nothing to
+        // do with `complete()` and everything to do with a leaked image.
+        expect(images.release(*demoted), "completeness case released the image it created");
+    }
+    expect(!images.complete(store::StateImageHandle{}),
+           "an invalid handle is not a complete checkpoint");
 
     images.freeze(*destination);
     (void)images.recycle_checkpoint_destination(*source);
@@ -189,7 +239,12 @@ void test_kv_store(ninfer::DeviceContext& device) {
     const ninfer::HostKVPageLayout host_layout =
         ninfer::plan_host_kv_page_layout(physical_pages.geometry());
     const std::array host_layouts{host_layout};
-    ninfer::HostKVArena host_arena(host_layout.page_stride * 8, host_layouts);
+    ninfer::PinnedHostPool kv_pool(  // CPU-only source: this suite checks allocation, not pinning
+        ninfer::PinnedHostPool::Config{host_layout.page_stride * 8U, 256U},
+        [](std::size_t bytes) { return std::malloc(bytes); },
+        [](void* base) { std::free(base); });
+    ninfer::HostKVArena host_arena(kv_pool, host_layout.page_stride * 8, host_layout.page_stride * 8,
+                                   host_layouts);
     store::LogicalKVPageStore pages(physical_pages, physical_pages.capacity_pages() + 8U);
     store::HostKVExtentStore extents(host_arena, 8);
     store::KVAddressSpaceStore addresses(pages, physical_tables, 4, 4);

@@ -32,7 +32,20 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 # healthy. Use a generous poll timeout and only declare the server down when
 # the last *successful* poll is this old - a few failed polls must not flap
 # the "unreachable" banner.
-POLL_TIMEOUT_S = 15
+# /stats takes the engine's execution mutex, so a contended read waits for whatever prefill holds it:
+# measured 19.5 s and 27 s on 2026-09-27 with prod under an agentic load, against 0.0003 s for /health,
+# which does not take it. At the old 15 s EVERY poll timed out during that load, so `last_stats_unix_ms`
+# went stale, the heartbeat fallback was itself broken (below), and the dashboard reported a healthy
+# server as DOWN. 45 s covers the measured range with margin; the liveness decision still requires
+# staleness beyond STALE_AFTER_MS, so a slow-but-alive server reads as up and a dead one still flips.
+POLL_TIMEOUT_S = 45
+
+def _heartbeat_in(text, binary: bool = False) -> bool:
+    """Is a fresh engine throughput line present? Two spellings, because the engine's own line changed and
+    the check silently stopped matching -- a fallback that cannot match reads exactly like a dead server."""
+    if binary:
+        return (b"throughput |" in text) or (b"throughput interval=" in text)
+    return ("throughput |" in text) or ("throughput interval=" in text)
 STALE_AFTER_MS = 60_000
 
 # 12VHPWR connector temperature. The sensor lives on the GPU box's Windows
@@ -415,10 +428,21 @@ class Monitor:
         last = self.server_info.get("last_stats_unix_ms")
         now_ms = int(time.time() * 1000)
         # /stats takes the engine's execution mutex and can lag for tens of
-        # seconds under load (measured 3.7s at C=2 with a full queue). Fall
-        # back to the serve-log heartbeat: fresh "throughput interval=" lines
-        # prove the engine loop is alive even when /stats is starved.
+        # seconds under load (measured 3.7s at C=2 with a full queue, 19.5-27 s
+        # on 2026-09-27). Fall back to the engine's own heartbeat: a fresh
+        # throughput line proves the loop is alive even when /stats is starved.
+        # THE PATTERN WAS STALE: it looked for "throughput interval=", which
+        # this engine has never printed -- its line reads
+        # `INFO  throughput | 5.0s | prefill 2.86k tok/s (14,336 tok) | running 1`
+        # -- so the fallback could not fire for prod at all. Both spellings are
+        # accepted now, so a future rename degrades to "one of them matches"
+        # rather than to silence.
         log_alive = False
+        # PROD'S HEARTBEAT IS IN THE JOURNAL, and this used to read the file the unit happens to point at
+        # -- a file only the TEST server writes (its last line is `NINFER_EXIT=0`). So the fallback was
+        # dead for prod twice over: wrong source and a stale pattern. In file mode, fall back to the
+        # journal when the file tail shows no heartbeat, which keeps the check working whatever the unit
+        # is configured with.
         if self.cfg.log_source == "journal":
             try:
                 out = subprocess.run(
@@ -426,19 +450,37 @@ class Monitor:
                      "-o", "cat", "-n", "50"],
                     capture_output=True, text=True, timeout=10,
                 )
-                log_alive = "throughput interval=" in out.stdout
+                log_alive = _heartbeat_in(out.stdout)
             except (OSError, subprocess.SubprocessError):
                 pass
         else:
             try:
+                # 64 KiB rather than 4: the same high-rate pricing line drowns a small tail (see the
+                # journal branch above for the measurement that caught this).
                 with open(self.cfg.serve_log, "rb") as f:
                     f.seek(0, os.SEEK_END)
                     size = f.tell()
-                    f.seek(max(0, size - 4096))
-                    tail = f.read(4096)
-                log_alive = b"throughput interval=" in tail
+                    f.seek(max(0, size - 65536))
+                    tail = f.read(65536)
+                log_alive = _heartbeat_in(tail, binary=True)
             except OSError:
                 pass
+            if not log_alive:
+                try:
+                    # BY TIME, NOT BY LINE COUNT. `-n 50` looked reasonable and was useless under load:
+                    # prod prints hundreds of `checkpoint StateImage priced:` lines per second, so the last
+                    # 50 lines contain none of the once-per-5s throughput lines -- measured 0 matches in the
+                    # last 50 lines against 37 in the last 3 minutes, while the engine was demonstrably
+                    # alive. A fallback that searches where the heartbeat cannot appear is a fallback that
+                    # reports a healthy server as dead.
+                    out = subprocess.run(
+                        ["journalctl", "-u", self.cfg.journal_unit, "--no-pager",
+                         "-o", "cat", "--since", "-120s"],
+                        capture_output=True, text=True, timeout=20,
+                    )
+                    log_alive = _heartbeat_in(out.stdout)
+                except (OSError, subprocess.SubprocessError):
+                    pass
         self.server_info["up"] = (
             (last is not None and now_ms - last <= STALE_AFTER_MS) or log_alive
         )
@@ -1196,6 +1238,26 @@ function renderKvBars(latest){
     h+=bar([{pct:usedPct,color:C.kv[2],label:'used'},{pct:100-usedPct,color:'#30363d',label:'free'}]);
   } else {
     h+='<div class="empty">host KV cache disabled</div>';
+  }
+  // THE SHARED PINNED POOL: host KV and host state slots come out of ONE elastic pile, so this panel says
+  // whether it is working -- `grows` moving means the engine took room on demand instead of failing the
+  // plan; `refusals` moving means it wanted room and could not have it; the demotable ratio says whether
+  // demotion is winning over eviction.
+  //
+  // THESE COMMENT LINES WERE THE BUG. They were inserted as PYTHON comments INSIDE this JavaScript string
+  // literal, so the string never closed, the whole script failed to parse ("Invalid or unexpected token")
+  // and NOTHING on the page ran -- no fetch, no tiles, every card empty, for every viewer. The page is a
+  // JS template inside a Python file, so a mistake here is invisible until a browser parses it: see
+  // tools/monitor/check-dashboard-js.sh, which extracts the script and runs `node --check`.
+  h+='<div style="font-size:12px;color:var(--muted);margin:6px 0 2px">shared pinned pool</div>';
+  const poolCap=mem.host_pinned_capacity_bytes||0,poolFree=mem.host_pinned_free_bytes||0;
+  const poolUsed=Math.max(0,poolCap-poolFree);
+  const poolPct=poolCap?poolUsed/poolCap*100:0;
+  if(poolCap>0){
+    h+='<div style="font-size:12px;color:var(--muted);margin:6px 0 2px">pinned pool: '+gb(poolUsed)+' / '+gb(poolCap)+' ('+poolPct.toFixed(0)+'%) · chunks '+(mem.host_pinned_chunks||0)+'</div>';
+    h+=bar([{pct:poolPct,color:C.kv[2],label:'used'},{pct:100-poolPct,color:'#30363d',label:'free'}]);
+    h+='<div style="font-size:12px;color:var(--muted);margin:2px 0 2px">growth: state '+(mem.host_pinned_grows||0)+' · kv '+(mem.host_kv_grows||0)+' · refusals '+(mem.host_pinned_grow_refusals||0)+'/'+(mem.host_kv_grow_refusals||0)+'</div>';
+    h+='<div style="font-size:12px;color:var(--muted);margin:2px 0 2px">demotable evictions '+(pstats.private_evictions_demotable||0)+' / '+(pstats.private_eviction_checks||0)+' checked · maximal fallback '+(pstats.maximal_fallback_selections||0)+'</div>';
   }
   h+='<div style="font-size:12px;color:var(--muted);margin:6px 0 2px">pressure (cum): evict '+evict+' · demote '+demoted+' · spill '+spill+' · ckpt_drop '+ckptDrop+'</div>';
   $('kvbars').innerHTML=h;

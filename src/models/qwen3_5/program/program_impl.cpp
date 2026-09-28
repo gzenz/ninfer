@@ -107,8 +107,16 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     const auto address_capacity      = static_cast<std::uint32_t>(address_capacity64 + 1U);
     const auto logical_page_capacity = [&](const DeviceKVPagePool& pool) {
         const HostKVPageLayout host_layout = plan_host_kv_page_layout(pool.geometry());
-        const std::uint64_t host_pages =
-            plan.context_cache.host_kv_capacity_bytes / host_layout.page_stride;
+        // SIZED FROM THE CEILING, NOT THE ARENA'S INITIAL SPAN (2026-09-28). `host_kv_capacity_bytes` became
+        // the span the arena *starts* at, and this table cannot resize (`LogicalKVPageStore` has no growth
+        // path at all), so sizing it from the span silently capped host-only logical pages at the span: past
+        // it, `materialize` throws `logic_error("logical KV descriptors exhausted before physical capacity")`
+        // -> WORKER RECOVER. The ceiling is what the arena may actually reach.
+        const std::uint64_t host_budget_bytes =
+            plan.context_cache.host_pinned_max_bytes != 0
+                ? static_cast<std::uint64_t>(plan.context_cache.host_pinned_max_bytes)
+                : static_cast<std::uint64_t>(plan.context_cache.host_kv_capacity_bytes);
+        const std::uint64_t host_pages = host_budget_bytes / host_layout.page_stride;
         const std::uint64_t total = static_cast<std::uint64_t>(pool.capacity_pages()) + host_pages;
         if (total > std::numeric_limits<std::uint32_t>::max()) {
             throw std::overflow_error("Qwen3.5 logical KV page capacity exceeds uint32");
@@ -234,8 +242,15 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         for (const HostKVPageLayout& layout : layouts) {
             minimum_stride = std::min(minimum_stride, layout.page_stride);
         }
-        const std::size_t extent_capacity =
-            plan.context_cache.host_kv_capacity_bytes / minimum_stride;
+        // ...and the same reason as `logical_page_capacity` above: this store's capacity grows only through
+        // `ensure_capacity_for`, which sizes from the arena's CURRENT capacity, so starting it at the span
+        // left it able to grow -- but sizing it from the span made the first growth the only thing standing
+        // between a demote and a refusal. Size it from the ceiling so the tables match what can be pinned.
+        const std::size_t extent_budget_bytes =
+            plan.context_cache.host_pinned_max_bytes != 0
+                ? static_cast<std::size_t>(plan.context_cache.host_pinned_max_bytes)
+                : static_cast<std::size_t>(plan.context_cache.host_kv_capacity_bytes);
+        const std::size_t extent_capacity = extent_budget_bytes / minimum_stride;
         if (extent_capacity > std::numeric_limits<std::uint32_t>::max()) {
             throw std::overflow_error("Qwen3.5 Host KV extent capacity exceeds uint32");
         }

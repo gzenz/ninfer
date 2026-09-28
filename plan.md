@@ -91,7 +91,7 @@ correction history lives *there*, not here — this section states what is true 
   `journalctl -f`'s tail replay, and the manifest's missing `tree.diff` are all fixed in the same commit -- with one caveat stated where the fix is: the script now WRITES `tree_diff_sha256`/`git_status_sha256`/`untracked_sha256`, but NO RUN HAS PRODUCED THEM YET, so the committed manifests still carry the old fields.
   **Convergence requires a fresh pass with zero actionable defects** (`CLAUDE.md`, Commits) -- not this
   list of repairs.
-- **Prod**: `:8080` (`:8081` stats), **running the current build** -- restarted 2026-09-26 17:35, running
+- **QA**: `:8080` (`:8081` stats), **running the current build** -- restarted 2026-09-26 17:35, running
   exe `e706e96090bd199d` == `build/apps/ninfer-serve` rebuilt from this tree, verified by hashing
   `/proc/767167/exe` AND by serving (`/v1/messages` 200 with a well-formed reply, `/stats` answering).
   Before that it ran `0634afb8…`, which **predated the census null-check committed in `ee4c4748`** --
@@ -102,7 +102,7 @@ correction history lives *there*, not here — this section states what is true 
   `~/ninfer-watch/latest.log`, whose first line records the running exe's sha256. Validated twice over,
   because a filter that matches nothing reads exactly like a quiet system: by
   `tools/ops/ninfer-watch-test.sh` (exact alert set from a synthetic journal -- **10 of 16 lines**, run
-  twice, identical) and live, by driving prod and watching the log grow with
+  twice, identical) and live, by driving QA and watching the log grow with
   `checkpoint StateImage priced` (3 -> 6 lines on one request).
   Its rule, corrected on the third pass: **a non-zero residual ALERTS whatever its prefix, an all-zero one
   is log-only**; `WORKER OOM` alerts explicitly; and `private victim evicted: demotable=1` is an ALERT
@@ -120,11 +120,11 @@ correction history lives *there*, not here — this section states what is true 
   only an artifact whose `build_id` equals the running exe describes it. **Identify the running
   binary by hash of `/proc/$(ss -ltnp | grep :8080 | grep -oP 'pid=\K[0-9]+')/exe`, never by
   `build/apps/ninfer-serve`** -- the build directory is replaced by the next rebuild (it already has
-  been: the build now hashes `e706e96090bd199d`, which is also the running exe as §0's Prod bullet says), so that rule breaks the moment anything is compiled. The
+  been: the build now hashes `e706e96090bd199d`, which is also the running exe as §0's QA bullet says), so that rule breaks the moment anything is compiled. The
   artifact's `build_id` must equal the *running* exe's hash. **Corrected 2026-09-26:** the sentence that
-  stood here said prod's exe was "an unlinked `(deleted)` inode from a 17:39 build" -- it is neither:
+  stood here said QA's exe was "an unlinked `(deleted)` inode from a 17:39 build" -- it is neither:
   `ls -l /proc/767167/exe` -> `build/apps/ninfer-serve`, not deleted, from the 17:35 restart whose exe
-  `e706e96090bd199d` is this tree (§0's Prod bullet). State which commit an exe corresponds to, not only
+  `e706e96090bd199d` is this tree (§0's QA bullet). State which commit an exe corresponds to, not only
   its id.
 - **This file is the single record** since 2026-09-25: `results/HANDOFF.md` was merged into it and
   deleted, and `~/.claude/plans/ticklish-sniffing-wadler.md` is a superseded duplicate. Read and edit
@@ -177,7 +177,7 @@ current ids.
 |---|---|---|
 | **D1 cache collapse** — the materialization search's window was a flat 5 ms that denied its own first step | `dc82de74` | prod4 gate PASS on the **current** revision, `808e73cc480e@1790355322` (artifact `/tmp/ninfer-cmp-build-gracefix.json`), identity checked by hashing the running `/proc/<pid>/exe`: reuse `{root: 4, private_endpoint: 11, private_turn_closure: 1}`, hits 1,856,250, `n_errors 0`, and **0** `unsatisfiable` / `admission rejected` / `admission stalled` — the new refusal paths do not fire on healthy traffic. **`searches` is not a stable acceptance field**: 14 on `6996c7f41b29`, 15 on this build and on `b60776e8d8f6`. Quote it with its run, never as a property of a build. Earlier PASSes on superseded builds: `d7cb4b4098b6` (13:57), `d329983cfd00` (14:27), `b60776e8d8f6` (15:58), `d01413465313` (17:04), `f75a7ff11734` (17:12), `8b85c0213919` (17:34), `6996c7f41b29` (18:34, `/tmp/ninfer-cmp-build-posthold.json`) |
 | **D2 cross-session contamination** — the carrier was the prefill's KV **row selector**: nothing re-bound it during a prefill, so a lane's remaining chunks wrote and attended through the newly admitted lane's row | `479c92c4` | re-verified on the **13:36 build**, two canary runs, `rc=0`, `bleed=0 partial_foreign=0`, agreeing exactly. **Not re-run on `6996c7f41b29`** (the prod4 gate is serialised and says nothing about D2). Limit: `missed_own=8/8`, so "no bleed" rests on a short prefix |
-| **DFlash prefill sink** — same class, on prod's backend | `479c92c4`, then `4bc421a6` | the first version re-published only at materialization while its message claimed every step; now one helper called from every prefill step. Verified `rc=0`, `bleed=0` on dflash2 |
+| **DFlash prefill sink** — same class, on QA's backend | `479c92c4`, then `4bc421a6` | the first version re-published only at materialization while its message claimed every step; now one helper called from every prefill step. Verified `rc=0`, `bleed=0` on dflash2 |
 | **frontend private tail** — a session's private tail offered as a shared prefix | `2f8eea39` | kept although it **fixed nothing**; the commit says so |
 | **D3 tool-call markup leak** | `8bef9ee2` | `ninfer_tool_call_parser_test` rc=0; the served-path run leaves `literal_close_tag` INCONCLUSIVE, so the unit test is the real evidence |
 | **degrade instead of 500** | `9a8f3af4` | four concurrent sessions got 500s before, none after |
@@ -191,8 +191,8 @@ current ids.
 | **checkpoint state↔epoch binding** — W1's plan form: the state's content epoch recorded where each checkpoint is installed, compared at selection | `ff6ea1f4` | measured `recorded=16 live=16 mismatches=0/1 unrecorded=3`; selections with no record count as unrecorded rather than as agreement |
 | **idle-block grace + unsatisfiable refusal** | `6380bbdc` | see #10: the first version could not fire (a review caught it); now unit-tested, with the test failing against the shipped form |
 | **N1 "nondeterminism"** | — | withdrawn: three instrument errors, not an engine defect |
-| **the private catalog: LOST REUSE is now visible, and the capacity is raised** — `memory.private_catalog_{capacity,occupied}_cells` (as of the stats publication, 5 s on prod), `pressure.publication_cell_losses` with its denominator `pressure.publication_cell_probes`, and `[engine] catalog cell blocked reuse: occupied=%u/%u candidates=%u best_blocked_reuse=%u chosen_reuse=%u probes=%llu losses=%llu` in the alert set | unpushed (ids in §1d) | **It had NEITHER half of a capacity/occupancy pair** — host state slots, host KV and the pinned pool each report both plus a growth-refusal counter; the catalog reported nothing, and its failure was a bare `return std::nullopt` (now `resource_manager.h:2223`; a backfill run can inspect the same request repeatedly, so its unit is a successful planning run, not a request). **Not the only pool in that state**: the shared-prefix pool has neither half either, and `device-state-slots` has occupancy without a capacity (§4). **The first version of this instrument WAS WRONG and the review caught it (see §1e)**: it counted the goal builder's cell-free PROBES — 108,544 across 24 requests, of which the rate-limited print showed 220 lines, so "refusals=1…220" was the LINE count and never the counter — and the planner makes those probes from five call sites on its way to an ordinary eviction-to-publish. That number goes nonzero whenever retention fills the catalog, so it could not falsify the raise, and as an alert it fires on healthy traffic: a run with 97 such probes had four requests at **99.9% turn-closure reuse**. The event is now decided ONCE per planning run — a candidate whose every probe failed on the cell AND on nothing else, never produced a goal, and would have reused strictly more than the winner — and it is asserted by `ninfer_publication_cell_loss_test` (18 checks, mutation-checked, green control first). **It is NOT a general "the catalog is exhausted" signal, and the first version of this row overclaimed that**: what it detects is NO ADOPTABLE ROUTE AT ALL, and the case it was first named for — a candidate that RETAINS its source while a full catalog forces consumption or eviction — is excluded by construction, since consuming a private source publishes into that source's own cell and can never be a cell-only failure. The catalog's cost there is future reuse, invisible here (§4) |
-| **`--max-private-continuations` 18 → 32** | `~/.config/ninfer.conf:3` + `~/ninfer-ensure.sh:53` (the `swift` profile; both edited so the idempotent script does not revert it, and `--quasar`'s profile line 38 left at 18 deliberately) | capacity read-back 32 on the running prod exe |
+| **the private catalog: LOST REUSE is now visible, and the capacity is raised** — `memory.private_catalog_{capacity,occupied}_cells` (as of the stats publication, 5 s on QA), `pressure.publication_cell_losses` with its denominator `pressure.publication_cell_probes`, and `[engine] catalog cell blocked reuse: occupied=%u/%u candidates=%u best_blocked_reuse=%u chosen_reuse=%u probes=%llu losses=%llu` in the alert set | unpushed (ids in §1d) | **It had NEITHER half of a capacity/occupancy pair** — host state slots, host KV and the pinned pool each report both plus a growth-refusal counter; the catalog reported nothing, and its failure was a bare `return std::nullopt` (now `resource_manager.h:2223`; a backfill run can inspect the same request repeatedly, so its unit is a successful planning run, not a request). **Not the only pool in that state**: the shared-prefix pool has neither half either, and `device-state-slots` has occupancy without a capacity (§4). **The first version of this instrument WAS WRONG and the review caught it (see §1e)**: it counted the goal builder's cell-free PROBES — 108,544 across 24 requests, of which the rate-limited print showed 220 lines, so "refusals=1…220" was the LINE count and never the counter — and the planner makes those probes from five call sites on its way to an ordinary eviction-to-publish. That number goes nonzero whenever retention fills the catalog, so it could not falsify the raise, and as an alert it fires on healthy traffic: a run with 97 such probes had four requests at **99.9% turn-closure reuse**. The event is now decided ONCE per planning run — a candidate whose every probe failed on the cell AND on nothing else, never produced a goal, and would have reused strictly more than the winner — and it is asserted by `ninfer_publication_cell_loss_test` (18 checks, mutation-checked, green control first). **It is NOT a general "the catalog is exhausted" signal, and the first version of this row overclaimed that**: what it detects is NO ADOPTABLE ROUTE AT ALL, and the case it was first named for — a candidate that RETAINS its source while a full catalog forces consumption or eviction — is excluded by construction, since consuming a private source publishes into that source's own cell and can never be a cell-only failure. The catalog's cost there is future reuse, invisible here (§4) |
+| **`--max-private-continuations` 18 → 32** | `~/.config/ninfer.conf:3` + `~/ninfer-ensure.sh:53` (the `swift` profile; both edited so the idempotent script does not revert it, and `--quasar`'s profile line 38 left at 18 deliberately) | capacity read-back 32 on the running QA exe |
 | **elastic pinned host budget** — one `PinnedHostPool` + `HostMemoryBudget`, drawn on by host KV (through spans) and host state slots | the unpushed commit whose subject is `feat(engine): one elastic pinned host budget, shared by host KV and host state slots` (id at push time: see §1b) | `pinned_host_pool` 90 / `host_memory_budget` 29 checks; `kv_cache` multi-span now carries THREE added cases: one per user of the span-keyed helper (`can_allocate_after_suballocation_releases`, `plan_after_releases`, and the REAL free list via `insert_free_extent`) (**mutation-checked, two runs each, ONE MUTANT PER CASE**: `m1` fails only the split case, `m2`/`m3`/`m4` only their own; unmutated gives `failures=0`. `m2`, `m3` and `m4` each passed the whole suite before their case existed); e2e phase 11 PASS on the repaired build (`spill=1053 h2d=1538`, 0 cold-starts, log `/tmp/ninfer-e2e-run-1790455115.log`; **no binary sha256 recorded — the "mtime 22:37:46" that stood here describes a binary that has since been relinked**), 11-14 = 11 PASS/6 WARN/1 FAIL (that 11/6/1 is phases 11-14; 12-14 alone are 8 PASS), where the state-pool checks WARNed rather than passed (see §4). **Its reachability limit is §3 item 6 — this is NOT a fix for eviction, and the first version of the commit message claimed it was** |
 
 ### 1b. Commit id map for the elastic-pool change (history was rebuilt)
@@ -237,7 +237,7 @@ Kept as the record of what a review pass named, and of what closed each item. No
 
 **What is still open, and it is NOT in this section** (see §2 and §3): the planner-level counter for #6
 ("a restorable victim was evicted while a FEASIBLE preserving alternative existed"), and the two items that
-genuinely need prod traffic -- #2's underflow and #9's wedge.
+genuinely need QA traffic -- #2's underflow and #9's wedge.
 
 ### 1d. The catalog-instrument commits — **unpushed, so their own ids belong here and nowhere else**
 
@@ -261,7 +261,7 @@ it was mine and all of it is now fixed; the list is kept because each item is a 
 | 3 | The "negative control" in the message and §1 **was never read** (`/tmp/catalog-instrument-exp.log` shows `CONTROL (before load, same process):` empty) | the claim is withdrawn; the probe's failure is recorded in §4 and the harness given `STATS_PORT` so it cannot recur |
 | 4 | "refusals=1…220" and "the counter advancing 1…220" are wrong: 220 is the PRINTED LINE count, the counter reached 108,544 | corrected in §1 and §4, with both numbers stated |
 | 5 | The explanation for run 1's zeros ("never contended") was invented and survived the death of its premise — run 1 had 97 refusals and 8 evictions | withdrawn. **The artifact is DESTROYED**: `~/ninfer-serve.log.prev` was rotated past by the later control window and is now case (b)'s log (0 `catalog full` lines). 220 = 8 + 108544/512 is consistent with the print's rate limit and nothing more can be checked |
-| 6 | The prod zero proves the capacity read-back only, not the loss wiring | stated as such in §4 |
+| 6 | The QA zero proves the capacity read-back only, not the loss wiring | stated as such in §4 |
 | 7 | "16 retained + 4 active > 18" is circular: retained is bounded by the catalog itself, so at most `capacity − lanes` | replaced with that bound; "structurally too small" is now labelled a workload claim |
 | 7b | **Second pass, 2026-09-27**: the bounds case (9) COULD NOT FAIL — removing the `std::min` passed rc=0 and only aborts under `-D_GLIBCXX_ASSERTIONS` (verified both ways) | the test target now sets that flag; the flag is checked present in `flags.make` |
 | 7c | The `probes == 0` conjunct had no test (a mutant removing it passed every check then existing) | DELETED as provably redundant: every tallied probe increments exactly one class, so `cell_only > 0` implies `probes > 0` |
@@ -300,14 +300,14 @@ revision check that returns `Stale` first, so it is the loud WORKER path, not a 
    **WITHDRAWN 2026-09-26 10:32: the "17 recoveries" claim was FALSE, and it was caught by a review
    pass, not by me.** I wrote here that today's `post-recovery residual (fail-all)` lines were real
    recoveries of test binaries; the review checked the lines' neighbourhood instead of counting them and
-   showed every one is a **prod shutdown**. Verified myself, counts taken from a journal snapshot:
+   showed every one is a **QA shutdown**. Verified myself, counts taken from a journal snapshot:
    `post-recovery residual` = 19, `server stopped` = 19, `Stopping ninfer.service` = 19,
    `WORKER RECOVER` = **0**, and `continuations-live=0` in 19 of 19 (the "3 live continuations" I
    quoted never appears). `fail_all_locked` (`engine_core.h:2170-2196`) runs on the **shutdown** path,
    which is why it logs a residual at all; the lines are teardowns of an empty engine, caused by my own
-   GPU windows (19 stop/starts today, ~23 min of prod downtime), and they carry **zero** evidential
+   GPU windows (19 stop/starts today, ~23 min of QA downtime), and they carry **zero** evidential
    weight about whether a recovery leaks. Two consequences worth more than the retraction:
-   * the monitor's `post-recovery residual` token fires on every clean prod stop, so a *zero* line there
+   * the monitor's `post-recovery residual` token fires on every clean QA stop, so a *zero* line there
      means nothing on its own -- what makes it evidence is a NON-ZERO AMOUNT, whatever produced it (see
      §0's monitor bullet). The clause that stood here, "only evidence when a `WORKER RECOVER`/`WORKER
      CRASH` precedes it", was wrong on two counts: it dropped the `WORKER OOM` path, and it would have
@@ -418,7 +418,7 @@ revision check that returns `Stale` first, so it is the loud WORKER path, not a 
      review pass read all 297 added lines to confirm that every source addition sits inside
      `if (std::getenv("NINFER_CAPTURE_PROBE") != nullptr)` — so no run result is affected; but the tie
      between the log and the exact committed source is now by inspection rather than by hash. A re-run
-     would restore it, at the cost of another prod window: a deliberate trade, not an oversight. (The
+     would restore it, at the cost of another QA window: a deliberate trade, not an oversight. (The
      hash is not quoted here: it moved once per comment fix, and a number that changes under the reader
      is worse than none. The manifest pins what it pinned; the delta is argued, not hashed.)
    **The sharper form of the result, and the one to quote:** across the **161** calls of the 10:33 run
@@ -649,7 +649,7 @@ revision check that returns `Stale` first, so it is the loud WORKER path, not a 
    complete; and an invalid handle is not. That case is the one that matters, because the alternative
    reading would have failed pricing for a whole owner on healthy traffic.
    **CONSTRUCTED SCENARIOS ALSO NEGATIVE (2026-09-25 23:26).** Five real-engine scenarios ran in GPU
-   windows via the new `tools/e2e/ninfer-gpu-window.sh`, each against prod's own artifact with every
+   windows via the new `tools/e2e/ninfer-gpu-window.sh`, each against QA's own artifact with every
    leak instrument enabled: `pressure-resume`, `private-checkpoint-pressure`,
    `source-pressure-protection`, `concurrent`, `shared-rewrite-materialization`. All five returned `ok`
    with **zero** firings -- no `post-recovery residual`, no `non-strict release REFUSED`, no
@@ -795,7 +795,7 @@ revision check that returns `Stale` first, so it is the loud WORKER path, not a 
      to name. All four affected scenarios pass again, `rc=0` with `ok`.
    * **Still open, stated plainly**: (1) a throw *inside* `reserve_device_replica` after it materializes
      the physical page would still leave an unrecorded pin -- unproven, and no fix is claimed; (2) that
-     prod's 2026-09-25 incident entered *this* window is not established, since the reproduction was
+     QA's 2026-09-25 incident entered *this* window is not established, since the reproduction was
      injected -- what is established is that the window exists and leaks.
    **SECOND RUN CONFIRMS IT (2026-09-26 13:04):** `results/n9-evidence/20260926-130452/` reproduces
    `main_kv_pages=117 ... host_kv_bytes=8454144`, `REFUSED (kv-text)` and the census line, and `diff`
@@ -805,13 +805,13 @@ revision check that returns `Stale` first, so it is the loud WORKER path, not a 
    output*, not read from their source. That is the same provenance gap in a smaller form, and it is why
    the script now saves the diff: a hash cannot be turned back into source, and where an injected fault
    sat is exactly what a reader needs.
-   **Prod's binary, checked rather than assumed (2026-09-26 13:10):** `ninfer.service` restarted at
+   **QA's binary, checked rather than assumed (2026-09-26 13:10):** `ninfer.service` restarted at
    13:06:12 and **already runs the two-print code** -- `grep -c -a 'checkpoint StateImage INCOMPLETE'
    /proc/$(systemctl show -p MainPID --value ninfer.service)/exe` gives 1, the intermediate build's
    `incomplete at pricing` string gives 0, and `StateImage priced` gives 1. The paragraph that stood here
-   said prod ran a 12:45 binary and told readers to ignore its pricing lines; that was false on both
+   said QA ran a 12:45 binary and told readers to ignore its pricing lines; that was false on both
    counts (the restart was later, and the binary already had the final counters), and an instruction to
-   distrust output that cannot occur is worse than no instruction. What is still unshown: prod's journal
+   distrust output that cannot occur is worse than no instruction. What is still unshown: QA's journal
    since 12:00 has **zero** `checkpoint StateImage priced` lines, so the denominator printing *on real
    traffic* remains to be seen -- the next pricing event should make
    `journalctl -u ninfer.service | grep -c 'checkpoint StateImage priced'` non-zero. (`build/apps/ninfer-serve`
@@ -827,7 +827,7 @@ revision check that returns `Stale` first, so it is the loud WORKER path, not a 
      `[engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=1..8)` -- the #11(b)
      counter printing **its denominator at zero**, which is the property that makes it an instrument.
    * `plain-pressure-resume.log`: the same counters with no probe variable set (they are ungated and
-     rate-limited), so the denominator is visible **in the scenario** -- not on real traffic: prod runs
+     rate-limited), so the denominator is visible **in the scenario** -- not on real traffic: QA runs
      whatever binary it was started with, and the tree's counters first appear there only after a deploy.
    **Note on the injected runs:** every `repro-*` log ends in `terminate called after throwing an instance
    of 'std::bad_alloc'` and a core dump. The readings above are printed BEFORE that, so they stand, but an
@@ -953,7 +953,7 @@ revision check that returns `Stale` first, so it is the loud WORKER path, not a 
    the protection is demonstrably incomplete -- and (b) needs a reason to believe it exists, which nothing
    I have read supplies. Recorded so the next person does not rebuild the same scenario expecting a
    different result.
-5. ~~**#7 — Swift-1.5**~~ — **done 2026-09-25**: prod runs `swift15` (verified by argv *and* a served
+5. ~~**#7 — Swift-1.5**~~ — **done 2026-09-25**: QA runs `swift15` (verified by argv *and* a served
    request, not by config text), the wiring is in `~/ninfer-ensure.sh` so it survives a reboot, and the
    old 22 GB artifact was referenced- or held-open-checked before deletion (`df`: 655 ->
    676 GB free).
@@ -984,7 +984,7 @@ revision check that returns `Stale` first, so it is the loud WORKER path, not a 
    the state axis, and the run says so twice, identically: `CROSS-SESSION-ADOPT lane=0
    source_owner=6ae578ca007f4575 consumer_owner=6ae575ca007f405c count=1 reuse=2`, then
    `state_h2d_delta=1 main_h2d_delta=3 backend_h2d_delta=2` (path=2, reused=305, outputs=5), `rc=0`, in a
-   GPU window of its own (the journal shows two stop/start cycles: these were two windows, not one), prod
+   GPU window of its own (the journal shows two stop/start cycles: these were two windows, not one), QA
    restored after each. **Evidence:** `results/prefix-real-evidence/20260926-231449/manifest` (the two
    hand-run windows; binary `2ec23c8e`, which predates the commit and so is NOT tied to the committed
    source) and `results/prefix-real-evidence/20260926-232403/manifest` (two full `all` runs, binary
@@ -1041,8 +1041,8 @@ task needs no re-derivation:
   lost reuse. **Scope, stated rather than implied:** that scenario is small (a handful of turns); the
   item's validation is root share UNDER LOAD, and a heavier run is what would test the cut-off claim.
   `pressure_searches`/`pressure_search_budget_exhaustions`/`root_selections` are all in `RuntimeStats` and
-  appear in `/stats`, so the load reading needs no new instrument -- only a suite heavy enough, or prod.
-  **MEASURED UNDER LOAD (2026-09-27, the 16-session prod run of §3 item 6's soak):**
+  appear in `/stats`, so the load reading needs no new instrument -- only a suite heavy enough, or QA.
+  **MEASURED UNDER LOAD (2026-09-27, the 16-session QA run of §3 item 6's soak):**
   `pressure.searches = 43`, `pressure.search_budget_exhaustions = 40`, `cache_reuse.root_selections = 12`.
   So the CUT-OFF DOES BITE HEAVILY UNDER LOAD -- 93% of searches ran out of budget, against 0% in the small
   scenario -- and that is the item's stated question answered in the direction the planner's own comment
@@ -1061,7 +1061,7 @@ task needs no re-derivation:
   the bound. That is the measurement the W5 residual asked for, at the one budget where it could be made
   cheaply; an agentic workload at 400 ms remains the unrun arm.
   traffic. **So this item is now: mechanism present, one scenario showing no starvation, the load case
-  untested** -- which is a prod-or-heavy-suite question rather than a port.
+  untested** -- which is a QA-or-heavy-suite question rather than a port.
 
 6. **#6 — W2's demote-for-evict-only victims. STATUS: THE RULING IS IMPLEMENTED AND VERIFIED AS FAR AS THIS
    WORKLOAD ALLOWS, and what remains is a workload, not code.** The operator's ruling, verbatim: "evicting a
@@ -1093,7 +1093,7 @@ task needs no re-derivation:
    with the identity deficit, which is not this target's residual -- produces an option whose numbers do
    not hold, and the failure surfaces only at execution. This is the "half-ported strategy" the W5 section
    warns about, caught by the run rather than by review.
-   **FIRST POST-FIX MEASUREMENT (2026-09-27, prod, the 16-session workload that produced the pre-fix
+   **FIRST POST-FIX MEASUREMENT (2026-09-27, QA, the 16-session workload that produced the pre-fix
    eviction this morning): ONE restorable victim was STILL evicted, and the line says why it is not
    evidence against the ordering:** `demotable=1 restorable=1 cont=11 frontier=158628 endpoint=1 rewrite=1
    victim_host_slots=1 victim_dev_slots=2 host_state_slots=17/18 host_kv=30269767680/32212254720` -- the
@@ -1112,13 +1112,13 @@ task needs no re-derivation:
    * `chosen_restorable_evictions` -- the adopted plan's own count, from the incumbent's `FoldedCost`.
    **The reading, and both halves are needed:** both >0 in one request = #6 SURVIVING (a preserving plan was
    available and a destroying one was taken); `chosen > 0` with the other 0 = nothing feasible preserved,
-   which is what the three post-fix prod evictions looked like at host KV 94%. `private_owners_evicted`
+   which is what the three post-fix QA evictions looked like at host KV 94%. `private_owners_evicted`
    could never separate those, and neither could the eviction line.
    Also landed with it: `victim_room=` on the eviction line and `pressure.evictions_with_victim_room` in
    `/stats` -- the room question asked PER VICTIM for state slots (the KV half stays pool-level, no
    per-sequence figure being reachable there), with `demotable` keeping its documented meaning because it is
    the monitor's alert token.
-   **THE CORRECTED FIRST READING (2026-09-27, prod, 16-session soak, request-log line 23998):
+   **THE CORRECTED FIRST READING (2026-09-27, QA, 16-session soak, request-log line 23998):
    `adoptable_preserving_alternatives=0` with `chosen_restorable_evictions=1`.** That is the answer this item
    needed: the adopted plan evicted a restorable victim, and NO ADOPTABLE PLAN preserved one -- so the
    eviction is not the ordering letting a preserving plan through, there was nothing feasible to prefer. It
@@ -1200,7 +1200,7 @@ task needs no re-derivation:
    rather than diagnosed here.
    **THE SAME CONTROL IS NOW RUNNING ON REAL TRAFFIC (2026-09-27, operator-authorized).** A systemd drop-in
    `/etc/systemd/system/ninfer.service.d/zz-search-ms-experiment.conf` sets `Environment=NINFER_SEARCH_MS=2000`
-   on `ninfer.service`, verified present in the running process's `/proc/<pid>/environ`; prod runs the same
+   on `ninfer.service`, verified present in the running process's `/proc/<pid>/environ`; QA runs the same
    binary (`6197549f`) with health 200 and the sentinel active. **THIS IS TEMPORARY AND TRACKED AS TASK #21:
    remove the drop-in, daemon-reload, restart, and confirm the variable is gone from the process.**
    Why it is worth the interruption: on real traffic the eviction candidate at 12:54:45 (the one
@@ -1209,9 +1209,9 @@ task needs no re-derivation:
    adoptable preserving plans. So "infeasible for that victim" and "the 400 ms cap cut it off" are still
    distinguishable only by this run -- the synthetic 5x window weakened the starvation hypothesis, but a real
    request is the shape the question is actually about.
-   **THE 5x-BUDGET CONTROL RAN (2026-09-27, off-prod window: test server on :8085, `CTX=prod4` = prod's slot
-   shape, prod's artifact and spec, `NINFER_SEARCH_MS=2000`, verified present in the running server's
-   `/proc/<pid>/environ`; prod restored after, health 200 + sentinel active).** Result, against the
+   **THE 5x-BUDGET CONTROL RAN (2026-09-27, off-QA window: test server on :8085, `CTX=prod4` = QA's slot
+   shape, QA's artifact and spec, `NINFER_SEARCH_MS=2000`, verified present in the running server's
+   `/proc/<pid>/environ`; QA restored after, health 200 + sentinel active).** Result, against the
    default-budget records above:
 
    | | 400 ms | 2000 ms |
@@ -1231,7 +1231,7 @@ task needs no re-derivation:
    5x increase argues the preserving plan does not exist in those cases, i.e. the evictions are
    capacity-bound as the KV-94% and per-victim-room readings said.
    **THE A/B THAT WAS STILL MISSING, and it returns a NULL (`2026-09-27`): the ordering reverted, same
-   window shape, same budget.** Mutant built into `/tmp/ninfer-serve-mutant` (prod's binary untouched, and
+   window shape, same budget.** Mutant built into `/tmp/ninfer-serve-mutant` (QA's binary untouched, and
    verified by reading the RUNNING test server's `/proc/<pid>/exe` -- `e658e5e2`, not the correct build):
 
    | | fixed ordering | reverted (mutant) |
@@ -1311,11 +1311,11 @@ task needs no re-derivation:
    **State after the revert:** the tree is the known-good one -- battery `rc=0`, engine output
    byte-identical to the pre-change baseline (`results/prefix-real-evidence/20260927-101451/`).
    **The original #6 evidence follows, still standing.**
-   **LIVE PROD EVIDENCE, and the first of it (2026-09-26 18:13:09, three lines in one second, on real
+   **LIVE QA EVIDENCE, and the first of it (2026-09-26 18:13:09, three lines in one second, on real
    traffic):** the watcher alerts on `demotable=1` precisely for this item, and it fired with
    `frontier=69475 endpoint=1 rewrite=0 host_state_slots=11/16 host_kv=9089187840/32212254720`,
    `frontier=75778 endpoint=0 rewrite=1 host_state_slots=10/16 host_kv=9078571008/…` and
-   `frontier=65078 endpoint=1 rewrite=0 host_state_slots=9/16 host_kv=7684227072/…`. So on prod the
+   `frontier=65078 endpoint=1 rewrite=0 host_state_slots=9/16 host_kv=7684227072/…`. So on QA the
    victims being evicted hold **65k-76k-token frontiers** and an endpoint or rewrite checkpoint, while the
    host tier had **5-7 free state slots and ~23 GB of free host KV**. Unlike the earlier `vision` reading
    (frontier 190, under one prefill chunk, which the second pass correctly called overstated) the frontier
@@ -1331,7 +1331,7 @@ task needs no re-derivation:
      constraint is `host_state_slots`, and the 11 -> 10 -> 9 decrement across these three lines suggests
      the victims held slots of their own (`materialization.cpp:2140`: usage still includes the victim's own
      pages, so every "free" figure here is a lower bound).
-   **DECISIVE, 2026-09-26 18:30:34 (seven lines in one second, prod, the build that carries the eligibility
+   **DECISIVE, 2026-09-26 18:30:34 (seven lines in one second, QA, the build that carries the eligibility
    field but not yet the session id): every one read `demotable=1 restorable=1`.** Host STATE SLOTS were
    free (8/16 falling to 2/16), host KV was nearly empty (1.2-3.6 GB of 30 GiB), and each victim held a
    RESTORABLE state image (`state_store->complete`: immutable, settled replica, non-zero epoch) with
@@ -1356,7 +1356,7 @@ task needs no re-derivation:
      `demotable_evictions_` is not exported to `/stats` at all (`grep -rl demotable_evictions_ src/` finds
      only `program_impl.h` and `materialization.cpp`). So the watcher's silence on #6 from here means "not
      printed", NOT "not recurring". Un-mute it (export the counters, or change the limit) before reading
-     anything into the absence -- and "first live prod evidence" means first since this field existed, in
+     anything into the absence -- and "first live QA evidence" means first since this field existed, in
      this build (17:35), not first ever. It counts
    private victims committed as `Evicted` while the host tier still had room, with its denominator
    (`demotable_evictions_` / `demotable_eviction_checks_`, printed rate-limited); the census over the
@@ -1418,7 +1418,7 @@ task needs no re-derivation:
    state to be hostable. So 7 is an upper bound on "evictions that a demote-first policy could have
    converted", and the next question is whether either of those two scenarios' evictions *should* have
    been demoted -- which needs the victim's value and the host-placement cost, not just the free slots.
-   Note also these are test-scenario engines: prod runs with 112 host state slots, so the gate there is
+   Note also these are test-scenario engines: QA runs with 112 host state slots, so the gate there is
    far likelier to be true, and the counter is ungated and safe to deploy.
    **Not committed yet, deliberately:** these two files (`program_impl.h`, `materialization.cpp`) are
    excluded from the #11(a) commit because they landed mid-review; this is their own milestone and needs
@@ -1553,11 +1553,11 @@ the two are not ordered, and reading them as one sequence is what produced the w
 i.e. **exactly when the engine is in #9's incident state, which is the state the census exists to
 report.** So the bug did not merely risk a crash: it would have taken the process down at the moment of
 the observation, turning the one event this whole investigation is waiting for into a crash with no
-diagnosis. **URGENCY CORRECTED -- my first claim here was an over-claim.** I wrote that prod can segfault on a
+diagnosis. **URGENCY CORRECTED -- my first claim here was an over-claim.** I wrote that QA can segfault on a
 recovery with a non-zero residual. **It cannot, and the check took one read:** the backend store is
 created only under `if (qwen3_5::PagedKVCache* backend = backend_kv_cache())`
 (`program_impl.cpp:175-180`), i.e. when the engine HAS a backend KV cache -- which is what a speculative
-backend provides. Prod runs `--spec dflash2` (or `--spec mtp`), so it always has one and cannot reach the
+backend provides. QA runs `--spec dflash2` (or `--spec mtp`), so it always has one and cannot reach the
 null dereference. The crash is confined to **backend-less configurations** (`SpeculativeBackend::None`,
 e.g. `pressure_resume_engine_options`), which is where it was found. The fix is still right and still
 wanted -- a backend-less engine can crash on the recovery path -- but it is a test-configuration crash,
@@ -1579,7 +1579,7 @@ is refused in zero seconds. That is the #10 fix observed doing its job against a
 against a predicate argument, and `feasibility-orphan` (with the orphan it creates) is the reproduction.
 ### 2f. What other engines do (2026-09-26, sourced) — how reuse is keyed, and demote vs evict
 
-Asked because Claude Code sends no session id and cannot be patched, and because prod showed a request
+Asked because Claude Code sends no session id and cannot be patched, and because QA showed a request
 reusing only 23,706 of 66,700 tokens. Researched rather than re-derived, from branch heads read that day
 (vLLM `379e9a1e`, SGLang `cdbea5dc`, TensorRT-LLM `b88149e5`, llama.cpp `2145525a`, LMCache `dev`,
 Mooncake `main`; local copies in `/tmp/kvres/`).
@@ -1661,7 +1661,7 @@ second need a per-iteration budget, and any TTL/pinning value are measurements t
 
 ### 2h. CLOSED (2026-09-26): the shutdown `non-strict release REFUSED` is by design, NOT a leak
 
-`non-strict release REFUSED (state-rewrite)` fired on every graceful prod stop, and its message asserted "a
+`non-strict release REFUSED (state-rewrite)` fired on every graceful QA stop, and its message asserted "a
 leak of the #9 shape". That assertion was never established: `StateImageStore::can_release` refuses for five
 different reasons, and three of them mean the state image is still OWNED. The classifier added for this
 (`d8ccab41`) answered it on its first live occurrence, at the 19:38 shutdown:
@@ -1940,20 +1940,20 @@ it is an engine regression, which `git stash` settles in one run.
    engine produced nothing and lost nothing. **The 500 is a mislabel**: a client disconnect is reported as an
    internal error before the 499, which sends a reader hunting an engine bug that is not there. Small
    instrument defect, recorded rather than fixed here.
-   **And part of it was mine:** the batch sits at 13:25:53, just after the battery window restarted prod at
+   **And part of it was mine:** the batch sits at 13:25:53, just after the battery window restarted QA at
    13:25:10, so the client's in-flight requests were cancelled by that restart. The pre-fix window's 11 500s
    were mostly recovery casualties; these are cancellations.
-   **The lever that remains is the pool FLOOR**: `~/ninfer-ensure.sh` line 53 (the 262144 profile prod runs)
+   **The lever that remains is the pool FLOOR**: `~/ninfer-ensure.sh` line 53 (the 262144 profile QA runs)
    sets `--host-state-slots 16`; 32 would cost ~3 GiB pinned (against 14.5 GB available) and stop the pool
    saturating -- no saturation, no reclaim-evictions, and reuse could advance. It is the operator's file and
    their call.
 6. **Make host growth REACHABLE from planning — IMPLEMENTED (`d629061c`), CORRECTED (`cefa1b03`), and now
-   OBSERVED FIRING ON PROD (2026-09-27).** **What the soak shows, from two independent instruments that
+   OBSERVED FIRING ON QA (2026-09-27).** **What the soak shows, from two independent instruments that
    agree** (`results/prefix-real-evidence/20260927-100527/`: the journal lines, the `/stats` read, and a
    manifest whose binary hash equals the running exe's):
    `[engine] host state pool PRE-GROWN before planning: slots=17 occupied=16 grew=1 refused=0` then
    `slots=18 occupied=17 grew=2 refused=0`, with `/stats` at `state=16/18 attempts=2 grew=2 refused=0`.
-   The pool reached 16/16 under a 16-session load on prod, and the pre-grow grew it **by exactly ONE
+   The pool reached 16/16 under a 16-session load on QA, and the pre-grow grew it **by exactly ONE
    slot each time -- 16 -> 17 -> 18, not the 33/67 the doubling bug would have produced**, which is the
    fix confirmed in the real engine rather than only in the unit test. **This is also the first live
    growth of the elastic pool that is not the startup reservation** -- the reading retracted on
@@ -1979,7 +1979,7 @@ it is an engine regression, which `git stash` settles in one run.
    the decision so a host-only unit test asserts the capacity DIFFERENCE, mutation-checks it (the shipped
    form fails exactly the two assertions written for it), counts and exports refusals in `/stats`, and
    corrects the `capacity == 0` rationale (the pool is NULL with `--host-state-slots 0`, so the guard was
-   never what protected the disabled tier). **prod ran the doubling form for ~10 minutes** (pool 0/16, so
+   never what protected the disabled tier). **QA ran the doubling form for ~10 minutes** (pool 0/16, so
    it never fired; three restarts today -- 09:32:04, 09:40:18, 09:43:27, the last by the GPU window's
    restore rather than by hand, all ending on the same hash) and now runs the fixed build, verified by exe
    hash AND by grepping the running exe for the new instrument string.
@@ -2017,16 +2017,16 @@ it is an engine regression, which `git stash` settles in one run.
    stop appearing, and `host_pinned_grows`/`host_kv_grows` must be non-zero **on the state axis under real
    traffic**, which they never have been. **Two designs, and the choice is the work:** (a) pre-grow ONCE at
    admission, before the search, so the planner reads a capacity that includes the new bytes — planning
-   stays side-effect-free per candidate, but it pins on every admission and changes prod behaviour
+   stays side-effect-free per candidate, but it pins on every admission and changes QA behaviour
    materially; (b) leave growth execution-only and accept that the configured counts are the limits. The
    in-search pre-grow that was tried and removed (~1 s/GiB pinning plus a /proc/meminfo read per assessed
    node, inside a 400 ms p95 search) is neither. **Risk:** pricing a demote against headroom that then
    fails to pin converts a clean eviction into the `bad_alloc` → worker-recovery path the plan's §Risks 1
    names, so the growth must be taken BEFORE the plan is priced, not during execution.
 
-### 3b. THE ELASTIC POOL'S PROD ACCEPTANCE, CHECKED AT LAST (2026-09-27) — one of three is FAILING
+### 3b. THE ELASTIC POOL'S QA ACCEPTANCE, CHECKED AT LAST (2026-09-27) — one of three is FAILING
 
-The plan's Prod criterion was explicit: "`demotable` evictions should fall, `private_owners_demoted*` should
+The plan's QA criterion was explicit: "`demotable` evictions should fall, `private_owners_demoted*` should
 rise, and the request-log monitor leg's reuse fraction should improve". **I checked two of the three and
 never checked the third, while the watcher alerted on it for hours and I reclassified it as background
 noise.** Recorded here as a criterion, because that is what it is:
@@ -2053,8 +2053,8 @@ and nobody reads.
 - **`planner-latency` FAILS, and it is unattributed.** The suite counts materialization rows whose
   `stop_reason` is `expansion_capacity`/`target_budget` and fails on any non-zero count. This build:
   `budget_stops=39, n=95`; before the planner pre-grow was removed: `47, n=80` — different numbers, same
-  verdict, so the removal neither caused nor cured it. The pre-change prod binary DOES show the same stop
-  reason in its own traffic, but as a RATE, which the gate is not: over 17:36-20:07 on 2026-09-26 prod
+  verdict, so the removal neither caused nor cured it. The pre-change QA binary DOES show the same stop
+  reason in its own traffic, but as a RATE, which the gate is not: over 17:36-20:07 on 2026-09-26 QA
   logged **744 materialization rows, 22 budget stops** (18 `expansion_capacity` + 4 `target_budget`, 3.0%),
   on a workload nothing like the suite's. **The 7-of-11 (or 6-of-10) instance ratio quoted earlier had no
   reproducible denominator and is withdrawn.** The control that settles it — this phase against a
@@ -2078,10 +2078,10 @@ and nobody reads.
   oracle with the policy rather than by weakening the case.
 - Every e2e timing taken before 2026-09-25 evening ran with all `MAT_*` probes on (the start script
   exported empty names, and `getenv` is non-NULL for an empty string), so those numbers are conservative
-  against prod but not comparable with post-fix ones.
+  against QA but not comparable with post-fix ones.
 - **The catalog instrument (2026-09-27): the at-risk meter CONFIRMS the bound it was built to test. My first
   reading of it was BACKWARDS and the tree's own pre-registered rule is what catches that.** A review argued the
-  loss cannot be reached at a shape like prod's (a cell-only failure needs no free cell AND no evictable owner,
+  loss cannot be reached at a shape like QA's (a cell-only failure needs no free cell AND no evictable owner,
   and a cell is obtainable whenever an owner is evictable, so the event needs roughly `C <= 2L + Claimed`; at
   C=32/L=4 that is 8), and that what this instrument would fire on is search truncation. `materialization_budget.h`
   pre-registered the test: "if at_risk > 0 always comes with evictable_owners > 0, the review is right and the
@@ -2125,22 +2125,22 @@ and nobody reads.
 
 ### 5. Operating traps
 
-- **A killed swap leaves three things broken**: prod stopped, the **sentinel stopped** (it is re-armed
+- **A killed swap leaves three things broken**: QA stopped, the **sentinel stopped** (it is re-armed
   only on the swap's own restore path), and the test server orphaned on `:8085` still pinning 12 GiB
-  while a restart pins prod's 30 GiB. Recover by killing the orphan, `systemctl start ninfer.service`,
+  while a restart pins QA's 30 GiB. Recover by killing the orphan, `systemctl start ninfer.service`,
   **and** `systemctl start ninfer-wedge-sentinel.service` — neither `ninfer-ensure.sh` nor a restart
   re-arms the sentinel.
 - **Do not put `build/apps/ninfer-serve` in the command line of a call that runs `e2e-swap.sh`**: the
-  swap stops prod with `pkill -f` on that string, which matches the caller's own shell. And killing the
+  swap stops QA with `pkill -f` on that string, which matches the caller's own shell. And killing the
   tool call does not kill the swap — it survives holding the flock and later runs its exit trap, which
-  stops prod minutes later. Both cost outages on 2026-09-25.
+  stops QA minutes later. Both cost outages on 2026-09-25.
 - **The throughput line's `host N%` is a host-*time* share, not KV occupancy.** `host 13.7% (683 ms)`
   means 683 ms of that 5 s window was host-side work -- not that the host tier is 13.7% full. Occupancy
   comes from the request log's `occupancy` block (`host_state_slots`, `host_kv_bytes`,
-  `device_main_kv_pages`) or from `/stats` on prod's API port. Reading the time share as occupancy led
+  `device_main_kv_pages`) or from `/stats` on QA's API port. Reading the time share as occupancy led
   me to state that the L1 replay's saturation precondition was unmet, when the request log showed
   `host_state_slots 16/16` and `host_kv_bytes 29.6 GiB of 30` at that moment. Note also that the test
-  server serves **no** `/stats` (only prod's API port does), so during a swap the request log is the
+  server serves **no** `/stats` (only QA's API port does), so during a swap the request log is the
   only occupancy source.
 - **`gate_result` must be called on the artifact's `results[0]`**, not its top level, or it returns
   three false FAILs.
@@ -2178,7 +2178,7 @@ with its own stable key that recurs across requests -- `be536a59...` at 21/28/33
 - `split_probe_index` + 12-id windows either side of it, gated behind `NINFER_TOKEN_PROBE` because ids are
   content; the index itself is NOT gated.
 
-**The run, and the control that could have failed.** Prod was restarted on the built binary with the probe on,
+**The run, and the control that could have failed.** QA was restarted on the built binary with the probe on,
 traffic driven, the drop-in then removed. 12 records carried the new fields, `split_probe_enabled` took both
 values, and 9 diverged records showed the windows. **My first control was tautological** -- `probe_index ==
 best_tokens`, "12 and 12 ids" and "the first four agree" all follow from the producer's own arithmetic, so a
@@ -2211,6 +2211,76 @@ continuation) without explaining the production trigger, which still needs the p
 absence; **7 untested** (needs a second lane); 4 and 7 were the last two until this change added 4. The
 shared/private slot collision fix rests on code order and NO test -- a control was written, passed with the
 guard removed, and was withdrawn rather than shipped.
+
+## 2026-09-28 (later) — the shared host budget, the erased session cell, and three negative results
+
+**The instance is QA, not "QA".** The operator's correction: *"we should not call our ninfer instead QA
+anymore. it's QA, not QA."* Its purpose is to run these experiments and absorb their failures — a worker
+recovery there did its job, and treating it as an incident was my error, not the server's.
+
+### What was built
+
+- **Session-index erasure counters** (`session_erasures_eviction` / `_consume`, plus the index's own
+  capacity/occupancy pair). `erase_session_if_owner` is what makes a conversation's next turn read
+  `session_cell_frontier == 0` and fall back to the shared prefix, and it had **no counter at all** — the five
+  `catalog_cell_clears_*` counters cannot see it, because a *consume* erases the session entry without
+  touching the catalog cell. Measured: 8 session entries erased in one second while those read 0/2/0/0/1.
+- **`catalog_cell_clears_action` was wired to the wrong function** (shipped in `b34da38d`). Its only increment
+  sat in `clear_after_program_cleanup`, never in `apply_private_action`'s Evicted branch, so it read **0 through
+  51 evictions**. An earlier reading of mine — "action=0 against 14 evictions ⇒ evictions do not clear cells" —
+  was a conclusion drawn from a counter that could not fire. Fixed, and the comment that explained the gap as
+  "different routes" (also mine, also invented) is replaced.
+- **A reclaim census**: host-resident checkpoints split into `reachable` (a session cell or an active lane edge
+  can still reach them) and `orphaned`. It answers whether a reclaim policy has a population at all.
+- **`--host-kv-mib` is now the CEILING FOR ALL HOST CACHING**, not the KV arena's private span. The operator's
+  rationale: *"via host-kv-mib i want to specify how much host memory is used by ninfer for cacheing
+  purposes."* The arena starts at a quarter of it and grows on demand into the same pile the state slots draw
+  on. `docs/serving.md` said the old thing and is corrected in place.
+- **`/stats` serves a snapshot**: `handle_stats` called the engine live, taking the execution mutex, so the
+  endpoint built to be reachable while the server is busy blocked behind a prefill — measured under an 8-agent
+  load, a 90 s read timed out and a 240 s read returned. It now serves what `run_stats_reporter` publishes on
+  the `--log-stats-interval-ms` cadence.
+- **The token-window probe was removed** (2026-09-28). The 12-id windows answered their question and logged
+  user content; `split_probe_index` (a number) remains. The `/tmp` driver scripts are outside the tree.
+
+### What the load showed (8 parallel agents, deliberately over-subscribing)
+
+190 requests / 17 conversations: **0 recoveries, 0 `bad_alloc`, 0 OOMs**; **75%** of 9.26M prompt tokens
+reused; TTFT median 42.9 s / p90 81.4 s; 9 client cancellations. Heavy queueing, no lost work.
+
+The 23,353 pinning is **27%** and splits three ways: `no-cell` 63, `digest` 61, `OFFERED` 61. They need
+different fixes. `digest` is the largest single reason; the one instance decoded showed the replayed turn's
+structure differing from the stored ledger ~200 tokens before its end.
+
+### Three NEGATIVE results, recorded so they are not re-derived
+
+1. **"Stop evicting victims that could be demoted" would have measured NOTHING.** Across 25 requests that chose
+   a destroying plan, `feasible_preserving_alternatives == 0` in every one — there was no preserving plan to
+   prefer, and `FoldedCost::key()` already ranks `restorable_evictions` first. A hard constraint would have
+   found no substitute; with the chosen fallback it would have fallen back every time.
+2. **The reclaim population is small.** After a restart the census reads `reachable 10 / orphaned 11` — an hour
+   earlier it read 14/42, so the population is transient, and "orphaned" does not mean "unusable": the
+   cross-conversation reuse path (`other-private`) matches exactly those entries.
+3. **Pricing both host axes from the pool's growable headroom is UNSAFE and was reverted within minutes.** It
+   produced `WORKER OOM: std::bad_alloc ... mat=69` — a worker recovery. The growth gate's answer is a
+   statement about the FUTURE (`decide` compares a memory reading against a reserve), so a plan priced on it
+   can be executed against a worse reading. Only memory ALREADY PINNED cannot be taken away. The KV axis may
+   promise more because a failed KV growth returns `nullopt`; the state path threw. That asymmetry is now
+   documented at the call site rather than rediscovered.
+
+### Still open from this line of work
+
+- The `digest` population (61 of 190 under load): the production trigger is unidentified. The reproduced
+  instance was the harness's thinking-block artifact, and QA shows `model_thinking_tokens = 0`.
+- The host state axis is now bounded by a shared 30 GiB ceiling that is **enforced** where it previously was
+  not (unset `--host-pinned-max-bytes` let the pile reach 42 GiB). Whether 30 GiB is the right number for this
+  workload is the operator's call, not a bug.
+- `session_cell_skip` codes 4 and 7 remain untested (4 needs a fake identity-tag knob, 7 a second lane).
+- **THE `demotable` READING BROKE COMPARABILITY ON 2026-09-28.** The eviction line's `host_kv=` denominator is
+  `admission_capacity().host.kv_bytes`, which was the configured `--host-kv-mib` (30 GiB) and is now the KV
+  arena's initial span, a quarter of it (7.5 GiB), because the flag became the shared host-cache ceiling.
+  `demotable`'s KV half is a `<` test against that denominator, so the bar moved down by 4x: **`demotable`
+  counts before and after that date must not be compared.** The same applies to #6's earlier readings.
 
 ## #14/#9 wedge — reconstructed 2026-09-25 (narrative; state is in Current state §2)
 
@@ -2262,7 +2332,7 @@ the test port; use `CTX=prod4`, keep `HOST_STATE_SLOTS=16`/`DEVICE_STATE_SLOTS=4
    `--system-tokens` so no prompt is shared), and neither. Watch for `underflow [axis …]`,
    `historical_fork_hits`, `host_state_slots` reaching 16, and the L0 residual.
 4. **L1, faithful replay of process 407363, ~50 min** — the seven-run sequence from the incident, in one
-   process, `E2E_HOST_KV_MIB=30720` (matches prod; carries the WSL shmem risk). Expect the underflow
+   process, `E2E_HOST_KV_MIB=30720` (matches QA; carries the WSL shmem risk). Expect the underflow
    near step 7 round 2. Cannot replay the operator's own streamed traffic from 09:30-09:39.
 5. **L4, cancellation arm, ~10 min** — saturated host, ~80k lanes, SIGINT mid-prefill 3-5 times, no
    rewind; if a residual appears with no `WORKER RECOVER` the cause is an abort path, not recovery.
@@ -2324,7 +2394,7 @@ same owner.
   are what was observed, not a complete count.
 
 **#14 — L2 rewind arm run 2026-09-25 18:27: NEGATIVE, and the precondition was real** (`e2e rc=124`,
-the suite hit its 35-minute timeout during phase 3; prod restored, sentinel active).
+the suite hit its 35-minute timeout during phase 3; QA restored, sentinel active).
 
 The arm did what it was designed to do -- fill under a 6 GiB host KV (12 rounds, 48 requests, `ok=48`),
 then three identical runs each SIGINT'd mid-prefill (61 s, 60 s, 82 s), then a full run -- and the
@@ -2333,7 +2403,7 @@ rewind precondition is **confirmed by measurement, not assumed**: of the last 40
 really did rewind into earlier runs' cached sequences. Four lanes ran throughout.
 
 It did **not** trigger stage 1: **0** `resource subtraction underflow`, **0** `WORKER RECOVER`, and the
-only residual line in the run is prod's own all-zero shutdown fail-all. Consequences, stated plainly:
+only residual line in the run is QA's own all-zero shutdown fail-all. Consequences, stated plainly:
 - Host-KV saturation + rewinds + 4-lane concurrency is **not sufficient** over ~50 minutes. Either an
   ingredient is missing or the trigger is rarer than the reconstruction implies.
 - Because no recovery occurred, the leak-site counters and the residual instrument were never exercised
@@ -2350,7 +2420,7 @@ only residual line in the run is prod's own all-zero shutdown fail-all. Conseque
 
 ## Context
 
-On 2026-09-23 three defects reached production (prod = Swift Qwen3.8-27B on the v3
+On 2026-09-23 three defects reached production (QA = Swift Qwen3.8-27B on the v3
 engine, this WSL2 host):
 
 - **D1 Cache collapse** — under 4 concurrent heavy sessions every request re-prefilled
@@ -2374,14 +2444,14 @@ state↔KV↔ledger binding must be durable and checked.
 
 ## Constraints (apply to every workstream)
 
-- **e2e must run light.** Never run the 200k / 30 GiB prod-parity profile on this host:
+- **e2e must run light.** Never run the 200k / 30 GiB QA-parity profile on this host:
   it takes ages and OOM-crashes WSL (host pinned shmem; seen repeatedly). Use the
   32k profile (`ninfer-start-test-yarn.sh`, c=3, 12 GiB host KV) or lower
   (`E2E_HOST_KV_MIB=6144 HOST_STATE_SLOTS=32 SPEC=none`), and keep
   `e2e-swap-cmp.sh`'s shmem guard armed.
-- **Prod restarts are user-run:** `E2E_TIMEOUT=420 bash ~/ninfer-e2e/e2e-swap.sh`
+- **QA restarts are user-run:** `E2E_TIMEOUT=420 bash ~/ninfer-e2e/e2e-swap.sh`
   is ONE blocking foreground command (~8 min freeze). Never split or detach it.
-- Requests this session's own model depends on prod; batch service calls.
+- Requests this session's own model depends on QA; batch service calls.
 
 ---
 
@@ -2529,9 +2599,9 @@ run had **zero `shared_stable_prefix` reuses** (reuse paths: `root` ×2,
 turn in every run reused the shared prefix at 12,516 (`shared_stable_prefix`); turns
 using `root` or their own private prefix never bled.
 
-**Immediate mitigation (config, user decision):** prod runs `--max-shared-prefixes 6` in
+**Immediate mitigation (config, user decision):** QA runs `--max-shared-prefixes 6` in
 `~/.config/ninfer.conf`. Setting it to `0` removes the contamination vector outright
-(verified above) at the cost of shared-prefix reuse. Not changed here — it is a prod
+(verified above) at the cost of shared-prefix reuse. Not changed here — it is a QA
 config decision.
 
 **Page-level audit (10:00 run) — both page hypotheses REFUTED:**
@@ -3075,7 +3145,7 @@ Every shared adoption reads the entry (slot 3) and writes its **own** destinatio
 all distinct), with `base == cursor == 12516` and `reuse=5` (`SharedStablePrefix`). The last
 private-endpoint reuse is `base=32681 src=dst=4`. So the prefill-side binding is correct as well.
 
-**Also cleared (same session, each with a control, not an inference).** **CAVEAT:** every row below was measured on the **ordinary decode path (`SPEC=none`)**, which is *not* the path prod and the swap run (`dflash2`); the rows are conditional on that path and have not been re-measured on the production backend:
+**Also cleared (same session, each with a control, not an inference).** **CAVEAT:** every row below was measured on the **ordinary decode path (`SPEC=none`)**, which is *not* the path QA and the swap run (`dflash2`); the rows are conditional on that path and have not been re-measured on the production backend:
 
 | surface | instrument / control | result |
 |---|---|---|
@@ -3620,7 +3690,7 @@ a control must be re-derived** (in particular the "matched-batch" framing: the l
 therefore re-running with `NO_CUDA_GRAPH=1 NINFER_READ_PROBE=1` and **no** `NINFER_DECODE_BATCH=1`:
 if the queued half is clean there, `NO_CUDA_GRAPH` is exonerated and the comparison is valid.
 
-## D2 — 2026-09-24 16:05: the read probe was crashing the server, and prod went down with it
+## D2 — 2026-09-24 16:05: the read probe was crashing the server, and QA went down with it
 
 The last read-probe pair was not measuring the engine — it was measuring my own bug, and the cost was
 an outage:
@@ -3630,7 +3700,7 @@ an outage:
 [engine] WORKER CRASH: text/layers/48 verify columns=1: LinearAttentionStatePool conv_slot layer
                                                          out of range
 FATAL warmup failed  ->  test server never came up  ->  the swap aborted
-                     ->  prod and the wedge sentinel left DOWN for ~14 minutes (15:44–15:58)
+                     ->  QA and the wedge sentinel left DOWN for ~14 minutes (15:44–15:58)
 ```
 
 I passed the **text** layer index to `state_.conv_slot()`, but that pool is indexed by the **compact
@@ -3646,8 +3716,8 @@ correct, all of which I had already started to reason from:
    rule from the earlier `physical_slot` incident; the read probe broke it again. It now uses the
    compact index, is wrapped in `catch` with a printed `READ-FP-SKIP`, and skips out-of-range layers.
 
-Operationally: prod was restarted manually and is healthy (`health=200`), and the wedge sentinel is
-armed again. A swap that fails to bring up its test server exits **without** restoring prod, so the
+Operationally: QA was restarted manually and is healthy (`health=200`), and the wedge sentinel is
+armed again. A swap that fails to bring up its test server exits **without** restoring QA, so the
 sentinel's state must always be checked after a failed swap — the swap log's last line is the tell
 (`WARNING: test server did not become ready`).
 
@@ -3670,7 +3740,7 @@ counts and reduction order change the low bits in every row (including correct o
 logits-hash comparison showed earlier.
 
 Protocol checks that must pass before the result counts: the run log shows `e2e server up` for both
-arms (a failed start leaves prod down and the previous run log in place), the wall time is ~20 s (not
+arms (a failed start leaves QA down and the previous run log in place), the wall time is ~20 s (not
 ~90 s), and `bleed=0` on the queued arm (if it is not 0, the arm is not the reference).
 
 ## D2 — 2026-09-24 16:15: prefill-side, with an INTERNAL control (S3 is bit-identical across arms)
@@ -3680,7 +3750,7 @@ comparable, differing only in `MAX_CONCURRENCY`:
 
 ```
 queued     MAX_CONCURRENCY=1: 4 turns in 18s  bleed=0  missed_own=0   (reference, verified)
-concurrent MAX_CONCURRENCY=4: 4 turns in 16s  bleed=2  missed_own=3   (corrupt, and prod restored)
+concurrent MAX_CONCURRENCY=4: 4 turns in 16s  bleed=2  missed_own=3   (corrupt, and QA restored)
 ```
 
 Per-session alignment of the two arms' committed-token streams (frontier = absolute cache position,
@@ -3851,9 +3921,9 @@ that must exist per step has to be bound **before** the graph is captured (`grap
 
 **Operational trap, learned the hard way twice today:** `pgrep -f "e2e-swap.sh"` matches *the
 monitoring command's own string* when that string is passed as a shell argument, so a monitor built on
-it never fires; and a health check on :8080 cannot tell prod from the swap's test server. The reliable
-signals are the swap log's final line (`prod restored` / `FATAL: …`) and `systemctl is-active
-ninfer.service`. Prod is healthy and the sentinel active as of 16:24:30; the 15 minutes of "prod down"
+it never fires; and a health check on :8080 cannot tell QA from the swap's test server. The reliable
+signals are the swap log's final line (`QA restored` / `FATAL: …`) and `systemctl is-active
+ninfer.service`. QA is healthy and the sentinel active as of 16:24:30; the 15 minutes of "QA down"
 I reported were a monitor artifact, not an outage.
 
 ## N1 — 2026-09-24 16:50: the audit N1's fix needs, plus two real hazards found
@@ -3885,7 +3955,7 @@ unlocated" into a named buffer.
 
 `cudaMemcpyAsync` from a **stack local** returns immediately while the copy is still in flight; the
 frame is popped and the next call reuses that slot, so the device can receive the *next* request's
-value. Three sites, all on paths prod actually uses (`dflash2` / MTP bridges), now synchronous:
+value. Three sites, all on paths QA actually uses (`dflash2` / MTP bridges), now synchronous:
 
 - `prefill.cpp:118` — multimodal MTP bridge token (`&token`)
 - `prefill.cpp:158` — `sample_from_hidden` copying `&absolute_position` into the sampler's
@@ -3916,7 +3986,7 @@ Residual risk to state plainly: two of the remaining sites — `&request.samplin
 ingress — are members that are **rewritten per step**, so their exposure is *staleness* under
 overlap rather than lifetime. That is the N1 shape, and N1 is unfixed. Verified with a `SPEC=dflash2`
 canary run (the backend that exercises both bridge sites): `errors=0`, **no `WORKER CRASH` and no
-`FATAL`**, prod restored. It does not cure D2 — the same run still bled 2/4 — but it removes a real
+`FATAL`**, QA restored. It does not cure D2 — the same run still bled 2/4 — but it removes a real
 defect class rather than only recording it. The same run reproduced the ordering rule on this backend
 too (victims `S3 <- S2`, `S2 <- S1`: predecessor in arrival order).
 
@@ -4060,7 +4130,7 @@ Triage, per the project's commit workflow:
    names. `TABLE-MISMATCH-COUNT` is the pattern to copy. Until then, the plan's "0 mismatches in
    1,568 page pairs" must be **withdrawn**: that number cannot come from an instrument that caps
    output at 8 and never prints its denominator.
-8. **The audits in the cleared table ran on the ordinary decode path** (`SPEC=none`), which prod and
+8. **The audits in the cleared table ran on the ordinary decode path** (`SPEC=none`), which QA and
    the swap do not use (`dflash2`). The cleared rows are therefore conditional on a path that is not
    the production path.
 
@@ -4135,14 +4205,14 @@ Verdict from the third pass: **not converged.** Findings and disposition:
 | plan layer conclusion contradicted the paragraph above it | **restated** per the tool's peak-first output |
 | `analyze-layer.py` answered pass 2 cosmetically (hard-coded prompt lengths still, and a turn dropped silently) | **fourth pass showed the `--prompts=` fix was itself inert** (`main()` never forwarded argv, so two different values gave identical output). Now a module-level `PROMPT_LENGTHS` set from argv and consumed by the grouping, verified by the two-value test: `--prompts=999999,888888` → `unattributed positions=106 of 106`, real prompts → `3 of 106`. `rel_peak` decision and the unattributed line were genuinely present |
 | `SESSION-ADOPT-CROSS` was the one new print without a `NINFER_MAT_DEBUG` guard, and it reports rather than rejects | **gated**, and recorded as a detector whose non-firing needs a denominator before it is evidence |
-| commit hygiene: `Testing/` not ignored, a contradictory comment block in `anthropic_messages_http.cpp`, a stale "N1's fix … Verified" paragraph, an unreferenced 28 KB template fixture | `Testing/` **added to .gitignore**; both comment blocks **removed/corrected**; the template fixture is **kept deliberately** (the user asked for it to be restored; it is a copy of the prod template used by the swap, not a test fixture) and that decision is recorded here |
+| commit hygiene: `Testing/` not ignored, a contradictory comment block in `anthropic_messages_http.cpp`, a stale "N1's fix … Verified" paragraph, an unreferenced 28 KB template fixture | `Testing/` **added to .gitignore**; both comment blocks **removed/corrected**; the template fixture is **kept deliberately** (the user asked for it to be restored; it is a copy of the QA template used by the swap, not a test fixture) and that decision is recorded here |
 | behaviour changes bundled as instrumentation (`materialization_planner.h` throw→nullopt, `capture.cpp` throw→skip, the parser fix) | **must be split into their own commit** with the caller-handling argument and their own evidence — not yet done |
 
 ### Fourth pass (18:10) — two blockers, one of them crash-capable
 
 | finding | disposition |
 |---|---|
-| **`READ-FP` fprintf had 8 specifiers and 10 arguments** — `%s` consuming an `int` as a pointer, in the probe whose *earlier* crash took prod down ~14 min; reachable on the first GDN iteration | **fixed** and **verified under the failing condition**: args rebuilt to match, `-Wformat` on the real TU reports 0, and a canary with `NINFER_READ_PROBE=1` armed produced **22,464 READ-FP lines with 0 `WORKER CRASH`/`FATAL`/`core dumped`**, run completed, prod restored. The pass that added the try/catch for the first outage had introduced fresh UB in the same block |
+| **`READ-FP` fprintf had 8 specifiers and 10 arguments** — `%s` consuming an `int` as a pointer, in the probe whose *earlier* crash took QA down ~14 min; reachable on the first GDN iteration | **fixed** and **verified under the failing condition**: args rebuilt to match, `-Wformat` on the real TU reports 0, and a canary with `NINFER_READ_PROBE=1` armed produced **22,464 READ-FP lines with 0 `WORKER CRASH`/`FATAL`/`core dumped`**, run completed, QA restored. The pass that added the try/catch for the first outage had introduced fresh UB in the same block |
 | `--prompts=` was inert (main() never forwarded argv; two different values gave identical output) — and the plan claimed it as a "real fix" | **actually fixed** (module-level `PROMPT_LENGTHS`), verified by the two-value test: `999999` → 106/106 unattributed, real prompts → 3/106 |
 | mask retraction half-applied (`round_buffers.h`, `execution/text.cpp` still asserted it) | both corrected; `grep "attending past its own context"` now returns only the retraction site |
 | stale "N1's fix … Verified by the determinism test" in `prefill.cpp`, pointing at the stale repo-root `plan.md` | removed; the real record is named instead |
@@ -4470,7 +4540,7 @@ NO_CUDA_GRAPH=1 CANARY_HEX=32 CANARY_DETERMINISTIC=1 CANARY_ROUNDS=1 CANARY_STAG
 
 - *Foreign exact matches at 32 hex in a run with ≥2 lanes occupied* → the content is genuinely
   present; the recombination explanation is dead and the carrier is real. The next instrument is then
-  the prefill read content on the victim's first step (the 15:30 build, which crashed prod and was
+  the prefill read content on the victim's first step (the 15:30 build, which crashed QA and was
   never re-run on this path).
 - *Zero foreign matches, with `missed_own` still high and turns still dying* → the short-canary
   "bleed" counts were partly recombination artifacts, and the D2 record's headline numbers
@@ -4529,15 +4599,15 @@ Round 1 is the cold start (four 150k-token prompts, nothing reusable — the 143
 policy can remove, which is what the rounds-2+ scoping of the queue criterion exists for). Rounds 2-4:
 12 of 12 turns reuse via `private_endpoint`, queue waits ~8 s.
 
-**Harness hazards found and fixed on the way back (both cost prod time today):**
+**Harness hazards found and fixed on the way back (both cost QA time today):**
 
 - **Two swaps ran at once** (20:47 and 20:51): the second stopped the first's server, both wrote the
-  same log, and the run ended `rc=124` with **no "prod restored"** — prod and the sentinel were left
+  same log, and the run ended `rc=124` with **no "QA restored"** — QA and the sentinel were left
   down until 21:16 (found at 21:11, restored at 21:20). `e2e-swap.sh` now takes an exclusive
   `flock` on `/tmp/ninfer-e2e-swap.lock` and aborts if another swap holds it (verified: it aborts
-  without touching prod while the lock is held).
-- **Every abort path now restores prod.** The "test server did not come up" branch used to `exit 1`
-  with prod *and* the sentinel stopped; both it and the normal path now call one `restore_prod`
+  without touching QA while the lock is held).
+- **Every abort path now restores QA.** The "test server did not come up" branch used to `exit 1`
+  with QA *and* the sentinel stopped; both it and the normal path now call one `restore_prod`
   helper (verified by `bash -n`; the normal path is exercised by the 21:26 run above).
 - Operational: after a failed swap, always check `systemctl is-active ninfer.service
   ninfer-wedge-sentinel.service` — the swap log's last line is the tell.
@@ -4587,14 +4657,14 @@ current sources and is configuration-comparable. Dispositions:
 
 | # | finding | disposition |
 |---|---|---|
-| 1 | the swap fix is in `tools/e2e/e2e-swap.sh` but the operator runs `~/ninfer-e2e/e2e-swap.sh`, a **different, stale** file (no flock, no `restore_prod`, abort exits with prod down; stale `cmp-e2e.py` too) | **fixed**: the repo copies are installed over `~/ninfer-e2e/` (swap, cmp-e2e, ninfer-start-test, canary-e2e, toolcall-e2e, ninfer-e2e.py), md5-verified identical. The claim in the commit body is now about the command the operator runs |
-| 2 | no signal trap: a killed/timed-out swap still leaves prod + sentinel down | **fixed**: `trap 'restore_prod || true' EXIT INT TERM HUP` right after the lock; `restore_prod` is idempotent so the normal path's call wins |
-| 3 | the swap never verifies prod stopped or that the test server owns :8080 — `/health` cannot tell them apart, so a silently-failed `systemctl stop` runs the whole suite against prod | **fixed**: pre-start check that nothing listens on the port, post-start check that the listener pid equals the recorded test pid; `ninfer-start-test.sh` now records the **server's** pid (it recorded the wrapper's). Validated: the launcher pattern's recorded pid equals the process pid and differs from the wrapper's; `listener_pid` returns prod's 286588 against a stale recorded 286292 |
+| 1 | the swap fix is in `tools/e2e/e2e-swap.sh` but the operator runs `~/ninfer-e2e/e2e-swap.sh`, a **different, stale** file (no flock, no `restore_prod`, abort exits with QA down; stale `cmp-e2e.py` too) | **fixed**: the repo copies are installed over `~/ninfer-e2e/` (swap, cmp-e2e, ninfer-start-test, canary-e2e, toolcall-e2e, ninfer-e2e.py), md5-verified identical. The claim in the commit body is now about the command the operator runs |
+| 2 | no signal trap: a killed/timed-out swap still leaves QA + sentinel down | **fixed**: `trap 'restore_prod || true' EXIT INT TERM HUP` right after the lock; `restore_prod` is idempotent so the normal path's call wins |
+| 3 | the swap never verifies QA stopped or that the test server owns :8080 — `/health` cannot tell them apart, so a silently-failed `systemctl stop` runs the whole suite against QA | **fixed**: pre-start check that nothing listens on the port, post-start check that the listener pid equals the recorded test pid; `ninfer-start-test.sh` now records the **server's** pid (it recorded the wrapper's). Validated: the launcher pattern's recorded pid equals the process pid and differs from the wrapper's; `listener_pid` returns QA's 286588 against a stale recorded 286292 |
 | 4 | `capture.cpp` kept the same error string for a second, unfixed branch — so "that line no longer appears" cannot distinguish fixed from untriggered | **fixed**: distinct message ("capture offer is stale"), with the reason in the comment |
 | 5 | two shipped controls *can* harm (`NINFER_DECODE_BATCH` perturbs scheduler bookkeeping; `NINFER_FORK_ZERO` changes device state) | **fixed**: both compiled out unless the build defines `NINFER_ENABLE_HARMFUL_CONTROLS`; extended to `NINFER_FORK_COPY` as well, which the review did not flag but is the same class |
 | 6 | the 32 ms evidence is a byte-identical copy of the 800 ms result, and "round-1 turns 145 s → 225 s" is in no artifact | **fixed**: the sentence is withdrawn in the plan, the header comment and the commit split now state only what survives (1200 s cap, 22 turn errors, 0 hits) and record that the two arms are indistinguishable and the 800 ms failure unexplained. `RUN_LOG` is now per-run (with a stable symlink to the latest), so the raw stdout that could have separated them is not overwritten again |
 | 7 | both headers quote "15 of 16 … 10 `insufficient_expected_gain`, 5 `time_budget`", which no artifact contains | **fixed in place** in `materialization_budget.h`, `materialization_planner.h` and the plan: the artifact-backed reading is `{'no_pressure': 1, 'time_budget': 15}`, and the step "the search never began" is labelled **inference** |
-| 8 | `searches` in the result JSON is a per-window monotonic delta, so "the search never began" has no instrument | **fixed**: `cmp-e2e.py` now polls the cumulative `pressure.searches` / `search_budget_exhaustions` from `/stats` (validated against live prod; the counters read 0 there). The number itself needs the next prod4 run |
+| 8 | `searches` in the result JSON is a per-window monotonic delta, so "the search never began" has no instrument | **fixed**: `cmp-e2e.py` now polls the cumulative `pressure.searches` / `search_budget_exhaustions` from `/stats` (validated against live QA; the counters read 0 there). The number itself needs the next prod4 run |
 | 9 | "rounds 2-4 queue max ~8 s against ~145 s" compares a rounds-2+ figure with an all-rounds one (the baseline's per-round data is `null`) | **fixed**: the commit split quotes root share (100%→0%) and prefix hits (0→1,855,667), which are scoped identically in both artifacts, and records the baseline's per-round queue as unavailable |
 | 10 | 400 ms is presented as derived, and 800 ms fails in a way the stated mechanism cannot explain | **fixed**: both comments now say 400 ms is **tuned** — one passing value against two failing ones, difference not understood |
 | 11 | the round-1 bound (240 s) cannot be reached and its calibration story was wrong | **fixed**: the comment states the real basis (143-145 s in three runs) and that it is a gross-regression guard only |
@@ -4718,9 +4788,9 @@ post-fix run records the server). Dispositions, and where a claim of mine was si
 | 1 | `NINFER_FORK_COPY` was still live in the default build at `capture.cpp:709` — my helper was defined inside `prefill.cpp`, so no other translation unit could call it | **fixed**: the guard is now `ninfer::diagnostic_control_enabled` in a new `src/core/diagnostics.h`, used at every mutating site (`capture.cpp`, `prefill.cpp` ×5, `engine_core.h`, `decode.cpp`). The reviewer's root-cause reading was right: the guard was structurally unreachable from capture.cpp |
 | 2 | `NINFER_POISON_WORKSPACE` unguarded and mutating device memory before every prefill step | **fixed** (same guard). The full inventory is now: 15 `getenv("NINFER_…")` sites, every one read-only; five mutating controls behind the define |
 | 3 | the withdrawn "225 s / two client timeouts" sentence still lived in `tests/test_materialization_budget.cpp` | **fixed**: deleted; `grep -rn "225 s\|client timeout" tests/ src/ results/ tools/` returns nothing |
-| 4 | the signal trap restored prod but did **not** stop the script (bash resumes after INT/TERM), so a Ctrl-C in a ~40 s window could restore prod and then overwrite it with the test server, with the final restore a no-op | **fixed**: `trap … EXIT` plus `trap 'restore_prod \|\| true; exit 1' INT TERM HUP`. Reproduced with a mock first: the old form printed "body CONTINUED after the signal", the new form does not and exits 1 |
+| 4 | the signal trap restored QA but did **not** stop the script (bash resumes after INT/TERM), so a Ctrl-C in a ~40 s window could restore QA and then overwrite it with the test server, with the final restore a no-op | **fixed**: `trap … EXIT` plus `trap 'restore_prod \|\| true; exit 1' INT TERM HUP`. Reproduced with a mock first: the old form printed "body CONTINUED after the signal", the new form does not and exits 1 |
 | 5 | the flock can falsely abort: fd 9 was inherited by the launched server, so the lock outlived the swap | **fixed**: `9>&-` on the start script and on the suite; the abort message prints the holder. Validated twice — with a mock (no child holds the lock after exit) and live (after the 22:02 swap, `fuser` reports no holder) |
-| 6 | `restore_prod` declared success on `/health` alone, which the test server also satisfies | **fixed**: it now requires the port listener's pid to equal `systemctl show -p MainPID --value ninfer.service` and prints the pid it accepted — validated live on two swaps (`prod restored (pid 296553)`, `(pid 297380)`, each equal to MainPID) |
+| 6 | `restore_prod` declared success on `/health` alone, which the test server also satisfies | **fixed**: it now requires the port listener's pid to equal `systemctl show -p MainPID --value ninfer.service` and prints the pid it accepted — validated live on two swaps (`QA restored (pid 296553)`, `(pid 297380)`, each equal to MainPID) |
 | 7 | the 32 ms arm's evidence comes from the run in which two swaps overlapped, and no artifact records the arm (the file is tagged `build`) | **fixed in place** in both headers: the arm's **provenance is not established**, the artifact is not cited as evidence, and the "one passing value against two failing ones" phrasing is gone. 400 ms stays labelled tuned |
 | 8 | `results/commit-split.md` quoted a turn-wall baseline of 121.9 s that no artifact contains | **fixed**: 122.3 s (`/tmp/cmp-after.json`; its 121.34 is the ttft mean) |
 | 9 | the new cumulative counters could read as a clean zero if the poller collected nothing | **fixed**: `_poll_max` returns None unless a sample carries the key, `stats_poll_samples` is reported, and the rule was validated with four cases (empty→None, missing→None, values→15, zero→0) |
@@ -4832,7 +4902,7 @@ being genuinely cumulative while the request-log field is a delta, that gating c
 production path (zero `getenv` in the pre-change files, no test or config sets a gated variable), and
 that the budget test is a real detector rather than a rubber stamp.
 
-**Cost note the reviewer raised, and it is fair:** six swaps in thirty minutes (~20 minutes of prod
+**Cost note the reviewer raised, and it is fair:** six swaps in thirty minutes (~20 minutes of QA
 down) bought one arm pair that could not isolate its change and one configuration run twice against
 different builds. Future measurement passes get fewer, better-targeted arms — and now a `build_id` to
 compare them with.
@@ -4848,8 +4918,8 @@ collapse at a 5 ms window is the *dominant* path, not literally every turn -- th
 record" phrasing was too strong, and the three comment copies now carry the denominators.
 
 The same run also exercised the swap script's new paths under a failure: `e2e hit the 420s cap` →
-`prod restored (pid 308392)`, i.e. the `rc=124` path now restores and verifies against the unit's
-MainPID, and the sentinel came back. That is the case that left prod down this morning.
+`QA restored (pid 308392)`, i.e. the `rc=124` path now restores and verifies against the unit's
+MainPID, and the sentinel came back. That is the case that left QA down this morning.
 
 ## D2 — 2026-09-24 22:52: the KV digest cross-tabulation — a bounded NEGATIVE, with its coverage
 
@@ -4944,7 +5014,7 @@ both phases, and their counterfactual fix is the one shipped.
 | 3 | the canary evidence doc says "content flow, full stop" while the deciding probe has not been run | **fixed**: the claim is now "the reply text carries another lane's 32-hex canary; the carrier is not located", with the server-side record of that run (all four lanes `shared_stable_prefix`, no private reuse — consistent with the cache-free reproducer) and an explicit "the probe that would locate it has not been run" |
 | 4 | citations drifted again (`e2e-swap.sh:93`), "28-file" was wrong, and a hit-count was cited via a file that gets overwritten | **fixed**: symbol-based citation, 31 files, and the hit count cited by instance id (`serve-286295`) with the overwrite hazard named |
 | 5 | the diagnostics warning was once per process, so a second gated variable was ignored in silence | **fixed**: now once per **name** (validated with a tuple: three variables set → three lines) |
-| 6 | the port consolidation was incomplete: prod binds 8080 but the restore probed the swap's port, so `E2E_PORT≠8080` would FATAL-restore a healthy prod and leave the sentinel stopped | **fixed**: `PROD_PORT` for the restore probes, `PORT` for the test server, `--port "$PORT"` forwarded to the suite (all four suites accept it) |
+| 6 | the port consolidation was incomplete: QA binds 8080 but the restore probed the swap's port, so `E2E_PORT≠8080` would FATAL-restore a healthy QA and leave the sentinel stopped | **fixed**: `PROD_PORT` for the restore probes, `PORT` for the test server, `--port "$PORT"` forwarded to the suite (all four suites accept it) |
 | 7 | the stats poller collected 10 of ~45 samples and swallowed the failures, so `poll_max` was a biased lower bound | **fixed**: `stats_poll_attempts` / `stats_poll_skipped` are reported (validated against a live and a dead port), and the `_stop` attribute that shadowed `Thread._stop()` — which made `join()` raise — is renamed |
 
 **Also from this pass:** artifacts now carry the arm itself (`search_ms`, `ctx`, `spec`) and a per-arm
@@ -4980,7 +5050,7 @@ convergence pass. It also re-derived every number in one command, which is how I
 
 **What the reviewer verified as good, which is the other half of the answer:** the `on_signal` fix works
 against its own extraction of the shipped handlers (signal inside the in-flight restore → sentinel
-started, prod restored, rc=0); the diagnostics guard is thread-safe and allocation-free; both test
+started, QA restored, rc=0); the diagnostics guard is thread-safe and allocation-free; both test
 binaries pass; and most of the A/B paragraph was already right (400 ms arm 16/16 completed,
 `{root:4, private_endpoint:12}`, stops `{no_pressure:1, queue_exhausted:1, time_budget:14}`,
 `first_improvement_ns` 95.541 ms on serve-292073 req 16, 22:16 arm 8.2-166.2 ms, earlier runs
@@ -5193,11 +5263,11 @@ foreign-content leak that only appears under concurrent load, in lanes whose KV 
 restored, is exactly the shape of a host-side arena or extent-mapping defect, and the device-side audits
 (bindings, tables, page identity) would all read clean through it.
 
-## LOAD — 2026-09-25 10:13: prod produced a real accounting defect under the load
+## LOAD — 2026-09-25 10:13: QA produced a real accounting defect under the load
 
 The journal watch — the one I had been re-arming for hours over an idle server — caught this the moment
-there was load to catch: **`[engine] WORKER RECOVER: Qwen3.5 resource subtraction underflow`**, prod
-pid 407363, once in the day. Prod recovered on its own and stayed healthy (`/health` 200, service
+there was load to catch: **`[engine] WORKER RECOVER: Qwen3.5 resource subtraction underflow`**, QA
+pid 407363, once in the day. QA recovered on its own and stayed healthy (`/health` 200, service
 active).
 
 **What it is.** `src/models/qwen3_5/program/context_work.cpp`'s `checked_resource_difference` throws when
@@ -5210,7 +5280,7 @@ earlier, and it is the class that silently corrupts selection decisions.
 **Fixed on the spot (not deployed):** the message now names the resource and both numbers —
 `... underflow [device.state_slots: have X, removing Y]`. The original said only that *something*
 underflowed, so a live event could not be attributed to a counter, which is the entire value of the
-check. Built clean; **prod still runs the pre-fix binary**, so the next occurrence will be
+check. Built clean; **QA still runs the pre-fix binary**, so the next occurrence will be
 unattributed until a deploy.
 
 **Why it matters for D2.** The condition appeared under the load that had just driven the demote/spill
@@ -5250,7 +5320,7 @@ the head request is neither `Ready` nor `NeedsTransfer`, and the active admissio
 engine throws rather than looping. Nine occurrences in one second means nine requests hit it at once --
 and this is the family the 2026-09-14 fit-gate defer livelock belonged to.
 
-## D2 — 2026-09-25 11:45: a 64-bit foreign marker, live on prod, with the harness provably clean
+## D2 — 2026-09-25 11:45: a 64-bit foreign marker, live on QA, with the harness provably clean
 
 The neutral load client now carries a per-session marker (`MARKER-S<i>-<16 hex>`) and reports, with a
 denominator, whether any reply carries **another client's full marker**. Short validation run, 4 lanes x
@@ -5283,7 +5353,7 @@ Why this is the strongest D2 evidence in the record, and why it is not yet a clo
   To close it: capture the reply text and the exact prompt for the matching turns, and the engine's own
   committed tokens for that lane, in one run -- the marker makes each of those a decisive comparison.
 
-**Practical consequence, stated plainly:** prod serves foreign session content at a measurable rate
+**Practical consequence, stated plainly:** QA serves foreign session content at a measurable rate
 under concurrency (~7-8% of turns in these runs), and the mechanism is in the engine's context assembly,
 not the harness, not the serve layer (the earlier RESP-PROBE already showed the engine produces the
 foreign text). It is the same defect the 32-hex canary showed; the marker only makes the needle
@@ -5545,7 +5615,7 @@ and then overwritten by **every dflash decode round of any lane**, so a prefill 
 lanes' decode rounds appended drafter context into another lane's dflash KV and consumed another lane's
 destination slot. `advance_prefill` now re-derives and re-uploads this lane's own values (lane, source and
 destination slots, backend row) at each step, next to the `bind_sequence_kv` call. Verified on **dflash2**,
-which is prod's backend and the one this concerns: two consecutive runs, `rc=0`, `bleed=0`,
+which is QA's backend and the one this concerns: two consecutive runs, `rc=0`, `bleed=0`,
 `partial_foreign=0`, each lane emitting its own canary (`S0->CANARY-S0-2`, `S1->CANARY-S1-37b520`,
 `S3->CANARY-S3-3b26feb`).
 
@@ -5553,7 +5623,7 @@ which is prod's backend and the one this concerns: two consecutive runs, `rc=0`,
 1. `make_dflash_prefill_sink` reads `frame.dflash_kv_table_rows[0]` / `state_destination_slots[0]` from
    `io.dflash_decode->ingress` (`prefill.cpp:36-38`), which every dflash decode round overwrites -- so a
    prefill interleaved with other lanes' decode rounds appends drafter context into another lane's dflash
-   KV. **Prod runs dflash2**, so this is a live acceptance/correctness candidate, not cosmetic.
+   KV. **QA runs dflash2**, so this is a live acceptance/correctness candidate, not cosmetic.
 2. The forced-continuation prefill in `transactions/commit.cpp` (~325-390) binds its own path separately.
 3. The causal-scoring prefill (`program_impl.cpp` ~375-437) requires row 0 but never resets the io scalar.
 4. **[DONE 2026-09-25: corrected in place in `044c5b4d`.]** A contradiction to correct in place: the `prefill.cpp` comment beside `NINFER_FORK_COPY` says FORK_ZERO
@@ -5561,7 +5631,7 @@ which is prod's backend and the one this concerns: two consecutive runs, `rc=0`,
 
 **Goal state: MET for the e2e gate** -- `canary-e2e.py` passes with its control arm intact, three times,
 and the mechanism's own diagnostic signature is gone. Follow-ups 1-3 should be fixed before this is called
-closed, since prod's backend is the one follow-up 1 concerns.
+closed, since QA's backend is the one follow-up 1 concerns.
 
 ## W0.15 — seventeenth review pass triaged (2026-09-25 01:45), and the REVIEW LOOP STOPS HERE
 
@@ -5752,7 +5822,7 @@ evidence about demotion.
   `src/targets/qwen3_6/...` paths) — port the idea, not the diff.
 
 **Do:**
-1. **Reproduce first — W4 (b)** (4 sessions × heavy prompts, prod-parity *slot* shape,
+1. **Reproduce first — W4 (b)** (4 sessions × heavy prompts, QA-parity *slot* shape,
    light host KV) with hard failure gates.
 2. Try `guided_closure`-before-`root_maximal`; measure root share under that load.
 3. Restore a demote-not-drop path for private/shared victims that today only evict —
@@ -5909,7 +5979,7 @@ sessions`, shared prefix + distinct suffixes, interleaved; replay each with
 `allow_prefix_reuse=false` and assert `generated_token_ids` are **identical**
 (server-level equivalent: `--no-prefix-reuse`).
 
-**(b) D1 collapse — prod-shape slots, light KV**
+**(b) D1 collapse — QA-shape slots, light KV**
 New gated `prod4` profile in `cmp-e2e.py`: 4 sessions × ~150k seed + 2k/turn × 4 rounds,
 `MAX_CONCURRENCY=4 DEVICE_STATE_SLOTS=4 HOST_STATE_SLOTS=16 HOST_KV_MIB=12288` (never
 30720). Hard-fail from round 2 on: root share > 25%; max `queue_wait_s` > 60 s;
@@ -5975,7 +6045,7 @@ Deploy only when user-directed (`E2E_TIMEOUT=420 bash ~/ninfer-e2e/e2e-swap.sh`)
   (14.9 GB D2H, `main_kv_h2d=0`), `host_kv_occupied_bytes=2.05/30 GB`,
   `host_state_occupied_slots=0`, `device_state_occupied_slots=4/4`,
   `maximal_fallback_selections=5`, `search_budget_exhaustions=5`.
-- Prod config: `--max-concurrency 4 --device-state-slots 4 --host-state-slots 16
+- QA config: `--max-concurrency 4 --device-state-slots 4 --host-state-slots 16
   --host-kv-mib 30720 --kv-capacity 262144 --max-shared-prefixes 6
   --max-private-continuations 18 --tolerant-tool-calls`.
 - Recorded design: `docs/maintainer/resource-scheduling-and-context-cache.md`
@@ -6087,7 +6157,7 @@ The `swift_nvfp4.py` recipe file is in the repo (graft reference).
 → ~+36–40k tokens of KV pool headroom at nvfp4 KV, or prefill-scratch
 headroom. Expectation: 350k pool comfortable in MTP mode; dflash2@350k
 (previously OOM on the official artifact) may now fit — verify in a ceiling
-window. If still short: a quasar-style recipe (prod QUASAR = 16.3 GiB file)
+window. If still short: a quasar-style recipe (QA QUASAR = 16.3 GiB file)
 is the next lever — "quantize more closely to quasar".
 
 **Steps:**
@@ -6124,12 +6194,12 @@ is the next lever — "quantize more closely to quasar".
    `max_position_embeddings`; with YaRN x2 + reduced media arena, vision
    fits 350k on both specs. Recall intact at 350k on both specs (attention
    machinery intact; the macro-stuck symptom is behavioral, not attention).
-   **Swift is a validated 350k prod candidate on either spec.**
+   **Swift is a validated 350k QA candidate on either spec.**
 3. Serve smoke (window-A focused profile) on the fitted ctx.
 4. Only if we want >350k or 350k+vision (both short on VRAM): build our own
    image — `tools/convert/qwen3_8_27b` + the ukisai NVFP4 partner + z-lab
    DFlash2 graft, quasar-style recipe (target ≤ 18 GiB in-VRAM in dflash2
    mode).
-5. Prod candidate: Swift image (+ retention fix if §5 still needed). Swift
+5. QA candidate: Swift image (+ retention fix if §5 still needed). Swift
    also cuts thinking tokens 58% → less reasoning KV for the GDN lever to
    shed and less decode time per turn.

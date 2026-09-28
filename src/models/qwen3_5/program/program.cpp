@@ -515,9 +515,7 @@ Program::PrefixSplit Program::prefix_split(const ContinuationHandle& owner,
     return PrefixSplit{.tokens = split.tokens, .restorable = split.restorable,
                        .identity_ok = split.identity_ok, .match_end = split.match_end,
                        .stored = split.stored,
-                       .probe_index = split.probe_index, .probe_count = split.probe_count,
-                       .probe_enabled = split.probe_enabled,
-                       .probe_stored = split.probe_stored, .probe_prompt = split.probe_prompt};
+                       .probe_index = split.probe_index};
 }
 Program::PrefixSplit Program::prefix_split(const SharedPrefixHandle& owner,
                                           const PreparedPrompt& prompt) const {
@@ -526,9 +524,7 @@ Program::PrefixSplit Program::prefix_split(const SharedPrefixHandle& owner,
     return PrefixSplit{.tokens = split.tokens, .restorable = split.restorable,
                        .identity_ok = split.identity_ok, .match_end = split.match_end,
                        .stored = split.stored,
-                       .probe_index = split.probe_index, .probe_count = split.probe_count,
-                       .probe_enabled = split.probe_enabled,
-                       .probe_stored = split.probe_stored, .probe_prompt = split.probe_prompt};
+                       .probe_index = split.probe_index};
 }
 std::uint64_t Program::publication_cell_losses() const noexcept {
     return impl_->publication_cell_losses();

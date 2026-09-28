@@ -758,10 +758,6 @@ public:
         std::uint8_t  match_end   = 0;
         std::uint32_t stored      = 0;
         std::uint32_t probe_index = 0;
-        std::uint8_t  probe_count = 0;
-        bool          probe_enabled = false;
-        std::array<std::uint32_t, ninfer::kTokenProbeWindow> probe_stored{};
-        std::array<std::uint32_t, ninfer::kTokenProbeWindow> probe_prompt{};
     };
     [[nodiscard]] PrefixSplit prefix_split(const FakeContinuationHandle& owner,
                                            const FakePreparedPrompt& prompt) const {
@@ -770,9 +766,6 @@ public:
         if (owner.id == 0 || found == private_ledgers_.end()) { return {}; }
         const PrivateLedger& ledger = found->second;
         PrefixSplit split;
-        // Above the no-match return, exactly as the real `fill_token_probe` sets it: the flag says the probe
-        // is ON, which is not a property of whether this entry matched.
-        split.probe_enabled = true;
         split.tokens = ledger.content_key == prompt.content_key ? ledger.length : 0U;
         if (prompt.match_limit != 0U && split.tokens > prompt.match_limit) { split.tokens = prompt.match_limit; }
         if (split.tokens == 0U) { return split; }
@@ -783,16 +776,7 @@ public:
         // PromptEnded; `probe_index` follows the real rule (set whenever diverged, gate or no gate).
         split.stored     = ledger.length;
         split.match_end  = split.tokens >= ledger.length ? 1U /*StoredEnded*/ : 0U /*Diverged*/;
-        if (split.match_end == 0U) {
-            split.probe_index = split.tokens;
-            // A short window with distinctive ids, so the count and the arrays are assertable: all four
-            // manager-side copies of the probe fields survived every mutant until the fake filled them.
-            split.probe_count     = 2;
-            split.probe_stored[0] = 7001;
-            split.probe_stored[1] = 7002;
-            split.probe_prompt[0] = 7101;
-            split.probe_prompt[1] = 7102;
-        }
+        if (split.match_end == 0U) { split.probe_index = split.tokens; }
         split.identity_ok = true;
         const auto consider = [&](const std::optional<FakeCheckpointSummary>& checkpoint) {
             if (checkpoint && checkpoint->ref.frontier <= split.tokens) {
@@ -1294,6 +1278,10 @@ public:
         result.disposition      = FinishDisposition::Catalogued;
         const std::uint32_t key = sequence_content_keys_[sequence.id];
         result.summary.endpoint = endpoint(key, finish_frontier);
+        // THE CENSUS READS `state_residency`, and `endpoint()` builds every checkpoint DeviceOnly -- so without
+        // this knob no fixture could produce a host-resident checkpoint and `host_state_checkpoints_*` had
+        // nothing to count (two of its mutants survived on that).
+        if (host_residency != std::nullopt) { result.summary.endpoint->state_residency = *host_residency; }
         if (finish_with_rewrite) {
             result.summary.rewrite = rewrite_checkpoint(key, finish_frontier - 1U);
         }
@@ -1351,6 +1339,8 @@ public:
     bool finish_fail_next                                = false;
     bool finish_release                                  = false;
     bool finish_with_rewrite                             = false;
+    // When set, published endpoints report this residency. Only the census consumes it.
+    std::optional<ninfer::runtime::ReplicaResidency> host_residency;
     bool abort_capture_start                             = false;
     bool report_shared_source_summary                    = false;
     bool change_shared_source_residency_on_second_report = false;
@@ -2661,6 +2651,162 @@ void test_root_lifecycle_and_prefix_reuse() {
 //   * `session_cell_skip`'s offered-is-sticky rule. An endpoint that was offered followed by a refused
 //     rewrite must still read 1: the cell DID produce a candidate. Without the rule it reports the rewrite's
 //     refusal instead, which is the confusion the field exists to remove.
+// THE ERASURE COUNTERS MUST BE WIRED, not merely present -- the cell-clear counters once shipped incrementing
+// at nine sites and never copying out, so `/stats` served a hardcoded zero that read like a clean finding. This
+// drives the ordinary consume path and requires the counter to move, and pins the occupancy/capacity pair.
+void test_session_erase_counters_are_wired() {
+    FakeManager manager = make_manager(1, 4);
+    FakeProgram program;
+    const FakeCacheSessionKey session{21};
+    const auto materialize = [&](std::uint64_t order) {
+        FakeRequestBasePlan base = make_base(21, session, RetentionClass::LiveSession);
+        auto inspection = manager.inspect(program, FakePreparedPrompt{21}, base, order);
+        require(inspection.choice.has_value(), "erase fixture produced no choice");
+        const LaneId lane = inspection.choice->destination();
+        require(manager.reserve_materialization(program, std::move(*inspection.choice),
+                                                FakePreparedPrompt{21}, {}) ==
+                    FakeManager::MaterializationReserveResult::Reserved,
+                "erase fixture was not reserved");
+        auto outcome = [&]() -> FakeManager::MaterializationOutcome {
+            auto progress = manager.progress_context_transaction(program, {});
+            if (!std::holds_alternative<ContextTransactionInProgress>(progress)) {
+                return std::get<FakeManager::MaterializationOutcome>(std::move(progress));
+            }
+            auto completed = manager.progress_context_transaction(program, {});
+            return std::get<FakeManager::MaterializationOutcome>(std::move(completed));
+        }();
+        require(outcome.status == ContextTransactionStatus::Published && outcome.activation,
+                "erase fixture did not publish");
+        auto activation                   = std::move(*outcome.activation);
+        const FakeSequenceHandle sequence = activation.sequence();
+        manager.adopt(program, std::move(activation));
+        return ActiveRequest{.lane = lane, .sequence = sequence};
+    };
+
+    const ActiveRequest seed = materialize(1);
+    (void)finish_active(manager, program, seed, 16);
+    RuntimeStats before;
+    manager.populate_runtime_stats(program, before);
+    require(before.session_index_capacity_cells == 4,
+            "the session index must report its capacity, or a full index is indistinguishable from an empty one");
+    // EXACTLY ONE, not "at least one": `occupied := capacity` was a surviving mutant, and a >= test cannot
+    // see it. The conversation has published one continuation into an index of four.
+    require(before.session_index_occupied_cells == 1,
+            "one published continuation must occupy exactly one session index entry of the four");
+
+    // The conversation's next turn: same key, matching digest, so the source is CONSUMED as the active source.
+    const ActiveRequest next = materialize(2);
+    (void)next;
+    RuntimeStats after;
+    manager.populate_runtime_stats(program, after);
+    require(after.session_erasures_consume > before.session_erasures_consume,
+            "consuming a session's own continuation must count as a session-index erasure: this is the path "
+            "that leaves the next turn with no cell and a 23k-token re-prefill");
+    require(after.session_erasures_eviction == before.session_erasures_eviction,
+            "a consume must not be counted as an eviction -- the two have different fixes");
+}
+
+// M2: THE EVICTION PATH MUST COUNT AS AN EVICTION, not as a consume. The split between the two erasure
+// reasons is the whole point of the pair (an eviction is the route that leaves a conversation with no cell;
+// a consume is the ordinary path that then republishes), and until this test the Eviction site had NO
+// coverage at all -- swapping it to Consume survived every other case, because nothing drove an eviction
+// through the manager. `require_evictions` forces a plan whose every alternative evicts.
+void test_session_erase_counts_an_eviction_as_eviction() {
+    FakeManager manager = make_manager(1, 3);
+    FakeProgram program;
+    const FakeCacheSessionKey victim_session{31};
+    const FakeCacheSessionKey keeper_session{32};
+    const ActiveRequest victim = start_active(
+        manager, program, 31, make_base(31, victim_session, RetentionClass::LiveSession), 1);
+    (void)finish_active(manager, program, victim, 16);
+    const ActiveRequest keeper = start_active(
+        manager, program, 32, make_base(32, keeper_session, RetentionClass::LiveSession), 2);
+    (void)finish_active(manager, program, keeper, 16);
+
+    RuntimeStats before;
+    manager.populate_runtime_stats(program, before);
+    require(before.session_erasures_eviction == 0 && before.session_erasures_consume == 0,
+            "the fixture erased a session entry before any pressure was applied");
+
+    program.required_pressure_actions = 1;
+    program.require_evictions         = true;
+    auto inspection = manager.inspect(
+        program, FakePreparedPrompt{33},
+        make_base(33, FakeCacheSessionKey{33}, RetentionClass::LiveSession), 3);
+    require(inspection.choice.has_value(), "the eviction fixture produced no choice");
+    require(manager.reserve_materialization(program, std::move(*inspection.choice),
+                                            FakePreparedPrompt{33}, {}) ==
+                FakeManager::MaterializationReserveResult::Reserved,
+            "the eviction fixture was not reserved");
+    auto outcome = [&]() -> FakeManager::MaterializationOutcome {
+        auto progress = manager.progress_context_transaction(program, {});
+        if (!std::holds_alternative<ContextTransactionInProgress>(progress)) {
+            return std::get<FakeManager::MaterializationOutcome>(std::move(progress));
+        }
+        auto completed = manager.progress_context_transaction(program, {});
+        return std::get<FakeManager::MaterializationOutcome>(std::move(completed));
+    }();
+    require(outcome.status == ContextTransactionStatus::Published && outcome.activation,
+            "the eviction fixture did not publish");
+    auto activation                   = std::move(*outcome.activation);
+    const FakeSequenceHandle sequence = activation.sequence();
+    manager.adopt(program, std::move(activation));
+
+    RuntimeStats after;
+    manager.populate_runtime_stats(program, after);
+    require(after.session_erasures_eviction > before.session_erasures_eviction,
+            "an eviction erased a session entry and was not counted as an Eviction: swapping the two reasons "
+            "at the Evicted call site must fail here");
+    require(after.session_erasures_consume == before.session_erasures_consume,
+            "an eviction was counted as a Consume -- the two reasons have different fixes and must not mix");
+    require(manager.catalog_state(0) == FakeManager::CatalogState::Vacant,
+            "the eviction fixture did not evict the victim, so it proves nothing about that path");
+    (void)keeper;
+    (void)sequence;
+}
+
+// M4/M5: THE CENSUS MUST COUNT WHAT IT CLAIMS. `host_state_checkpoints_*` splits host-resident checkpoints
+// by whether a session cell or an active lane edge can still reach them, and it is the measurement that
+// decides whether a reclaim policy has a population at all. It had NO test: swapping the two counts, or
+// hard-coding `orphaned` to 0, both survived.
+//
+// The shape is deliberately ASYMMETRIC -- one anchored against two unanchored -- because a 1/1 fixture would
+// pass under the swap as well. Three continuations for ONE conversation, published in order: its cell holds
+// the newest, and the two it superseded stay Catalogued as anonymous cache.
+void test_host_state_census_counts_unanchored_checkpoints() {
+    FakeManager manager = make_manager(1, 4);
+    FakeProgram program;
+    program.host_residency = ninfer::runtime::ReplicaResidency::HostOnly;
+    const FakeCacheSessionKey session{41};
+    for (std::uint32_t i = 0; i < 3; ++i) {
+        const ActiveRequest turn = start_active(
+            manager, program, 41 + i, make_base(41 + i, session, RetentionClass::LiveSession), 1 + i);
+        (void)finish_active(manager, program, turn, 16 + i);
+    }
+    RuntimeStats stats;
+    manager.populate_runtime_stats(program, stats);
+    require(stats.host_state_checkpoints_reachable == 1,
+            "exactly one host-resident checkpoint is the conversation's cell; the census must count it once");
+    require(stats.host_state_checkpoints_unanchored == 2,
+            "the two superseded continuations are host-resident and unanchored; counting them as 0 (or as "
+            "reachable) is the mutant this catches");
+    // CONTROL: with residency DeviceOnly the same three continuations hold nothing on host, so both counts
+    // must be zero -- otherwise the numbers above could come from the catalog rather than from residency.
+    FakeProgram cold;
+    cold.host_residency = ninfer::runtime::ReplicaResidency::DeviceOnly;
+    FakeManager cold_manager = make_manager(1, 4);
+    for (std::uint32_t i = 0; i < 3; ++i) {
+        const ActiveRequest turn = start_active(
+            cold_manager, cold, 41 + i, make_base(41 + i, session, RetentionClass::LiveSession), 1 + i);
+        (void)finish_active(cold_manager, cold, turn, 16 + i);
+    }
+    RuntimeStats cold_stats;
+    cold_manager.populate_runtime_stats(cold, cold_stats);
+    require(cold_stats.host_state_checkpoints_reachable == 0 &&
+                cold_stats.host_state_checkpoints_unanchored == 0,
+            "device-only checkpoints must count zero: the census measures residency, not catalog size");
+}
+
 void test_session_endpoint_reason_is_per_frontier() {
     const auto refusal_diagnostics = [](std::uint32_t refuse_frontier, bool allow_shortlist,
                                         std::uint32_t prompt_key, std::uint32_t identity_tag = 0) {
@@ -2808,6 +2954,10 @@ void test_prefix_split_diagnostics_follow_catalog() {
     // be dropped and nothing would fail.
     require(related.split_best_stored == 16 && related.split_ended_by == 1,
             "the manager did not carry the deepest entry's ledger length and match-end discriminator");
+    // WHICH LEDGER. This request carries no session key, so a private entry is ANOTHER session's (2) -- and
+    // without the tag a divergence window cannot be attributed to the entry whose refusal is the question.
+    require(related.split_best_source == 2 && related.split_best_frontier == 16,
+            "the deepest match must name its ledger (2 = another session's here) and that entry's resume point");
     // `third` is left unfinished by the block above; the lane has to come back before anything else can be
     // admitted, since this fixture has exactly one.
     (void)finish_active(manager, program, third, 32);
@@ -2824,6 +2974,8 @@ void test_prefix_split_diagnostics_follow_catalog() {
 
     auto [reuse, reuse_diagnostics] = materialize_with(
         FakePreparedPrompt{11}, make_base(11, session, RetentionClass::LiveSession), 5);
+    require(reuse_diagnostics.split_best_source == 1,
+            "a session-keyed request's own continuation must be tagged as its own ledger (1)");
     require(reuse_diagnostics.session_cell_offered && reuse_diagnostics.session_cell_skip == 1 &&
                 reuse_diagnostics.session_endpoint_skip == 1 && reuse_diagnostics.session_cell_frontier == 16,
             "a same-session reuse must read offered=1 in BOTH session fields, with the cell's frontier -- "
@@ -2844,11 +2996,7 @@ void test_prefix_split_diagnostics_follow_catalog() {
     require(diverged_diagnostics.split_ended_by == 0 && diverged_diagnostics.split_probe_index == 8 &&
                 diverged_diagnostics.split_best_stored == 16,
             "a capped match must report Diverged, the probe index at the stop, and the entry's own ledger");
-    require(diverged_diagnostics.split_probe_enabled && diverged_diagnostics.split_probe_count == 2 &&
-                diverged_diagnostics.split_probe_stored[0] == 7001 &&
-                diverged_diagnostics.split_probe_prompt[1] == 7102,
-            "the manager must carry the probe flag, the count and both id windows: each is a separate copy, "
-            "and all four survived every mutant until the fake reported them");
+
     (void)diverged;
 }
 
@@ -4226,6 +4374,11 @@ int main() {
     run_test("dominating identity fast path",
              test_dominating_identity_does_not_build_pressure_graph);
     run_test("root lifecycle and prefix reuse", test_root_lifecycle_and_prefix_reuse);
+    run_test("session erase counters are wired", test_session_erase_counters_are_wired);
+    run_test("session erase counts an eviction as eviction",
+             test_session_erase_counts_an_eviction_as_eviction);
+    run_test("host state census counts unanchored checkpoints",
+             test_host_state_census_counts_unanchored_checkpoints);
     run_test("session endpoint reason is per frontier", test_session_endpoint_reason_is_per_frontier);
     run_test("prefix split diagnostics follow the catalog",
              test_prefix_split_diagnostics_follow_catalog);

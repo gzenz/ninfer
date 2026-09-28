@@ -20,14 +20,6 @@ using TokenId = std::int32_t;
 inline constexpr std::uint32_t kMaximumConcurrency               = 8;
 inline constexpr std::size_t kMaximumContextCacheSessionKeyBytes = 256;
 inline constexpr std::size_t kMaximumExplicitPromptCacheMarkers  = 4;
-// THE DIVERGENCE PROBE'S WINDOW. When the deepest match against a stored ledger stops because the tokens
-// differ, the two id windows either side of that index are the only thing that says WHY -- a missing
-// end-of-turn token, a different tokenization of the same text, a rewind, or a thinking block. The ids are
-// CONTENT (decodable with the tokenizer), so the window is filled only behind `NINFER_TOKEN_PROBE`; the INDEX
-// is a plain number and is always recorded. `kTokenProbeLead` ids before the divergence are included because
-// the divergence itself is often the first token of a structural marker.
-inline constexpr std::size_t kTokenProbeWindow = 12;
-inline constexpr std::size_t kTokenProbeLead   = 4;
 // Aggregate encoded image/video payload retained by one prompt, independent of item count.
 inline constexpr std::size_t kMaximumPromptMediaBytes    = 256ULL << 20;
 inline constexpr std::size_t kDefaultMediaCacheBytes     = 1ULL << 30;
@@ -914,24 +906,19 @@ struct MaterializationDiagnostics {
     // and can no longer say why the endpoint was lost -- which is the question. Same codes; 0 = the loop never
     // met an entry that is this slot's endpoint.
     std::uint8_t  session_endpoint_skip = 0;
-    // THE EXACT DIVERGENCE (see `kTokenProbeWindow`). `split_probe_index` is the first token index at which
-    // the deepest entry's ledger and this prompt differ -- equal to `split_best_tokens` when `split_ended_by`
-    // is 0, and 0 otherwise, so it is meaningful only beside that discriminator. The windows are empty unless
-    // the probe is enabled, and they are the difference between "the tokens differ" and knowing which token
-    // and of what kind: the alternative was inferring a cause from aggregate counters, which produced three
-    // wrong mechanisms in one day before controls caught them.
-    // SET WHENEVER THE DEEPEST MATCH DIVERGED, gate or no gate: the index is a number, not content, and a
-    // field that reads 0 on the default path while its own comments call it unconditional is an instrument
-    // that cannot fire exactly where production runs. Only the WINDOWS below are opt-in.
+    // WHERE THE DEEPEST MATCH STOPPED, as an index: equal to `split_best_tokens` when `split_ended_by` is 0,
+    // and 0 otherwise, so it is meaningful only beside that discriminator. Unconditional -- the id windows it
+    // once accompanied were removed 2026-09-28 (they had answered, and they logged content).
+    // WHICH LEDGER the deepest match came from -- 1 = the session cell THIS request's key resolves to,
+    // 2 = any other private entry, 3 = shared, 0 = no entry matched any token. The divergence is only
+    // interpretable beside this: the deepest match across the catalog is frequently another conversation's
+    // ledger, whose divergence says nothing about why this conversation's own entry was refused.
+    // 2 includes this conversation's SUPERSEDED ledgers: replacement drops their session marker, so they are
+    // no longer its cell. `split_best_frontier` is that entry's own restorable point at or below its match --
+    // NOT a resume point, and not comparable to `session_cell_frontier`.
+    std::uint8_t  split_best_source     = 0;
+    std::uint32_t split_best_frontier   = 0;
     std::uint32_t split_probe_index     = 0;
-    std::uint8_t  split_probe_count     = 0;
-    // WHETHER THE PROBE WAS ON for this request. An empty array otherwise reads the same whether the probe is
-    // off or the wiring is broken, and the record must say which -- so this is an OR across every scanned
-    // entry, not a property of the winning one. It is FALSE on a request with NO scanned entries (an empty
-    // catalog) even with the probe running: read it together with `split_entries == 0`.
-    bool          split_probe_enabled   = false;
-    std::array<std::uint32_t, kTokenProbeWindow> split_probe_stored{};
-    std::array<std::uint32_t, kTokenProbeWindow> split_probe_prompt{};
     // THE SIBLING CONDITION AND THE RETAIN DECISION, counted even while the behaviour is off (2026-09-27).
     // `sibling_candidates` is how often a private source was found whose own endpoint lies BEYOND this
     // request's prompt -- a request that cannot reach the endpoint it is about to consume -- and
@@ -1190,6 +1177,23 @@ struct RuntimeStats {
     std::uint64_t catalog_cell_clears_cancelled        = 0;
     std::uint64_t catalog_cell_clears_cleanup          = 0;
     std::uint64_t catalog_cell_clears_rollback         = 0;
+    // THE SESSION INDEX'S ERASURES, AND ITS OWN CAPACITY/OCCUPANCY PAIR. `erase_session_if_owner` is what makes
+    // a conversation's next turn find no cell and fall back to the shared prefix (23,353 tokens). It had no
+    // counter at all, and the cell-clear counters above cannot see it: measured 2026-09-28, 8 session entries
+    // erased in one second while those read 0/2/0/0/1 -- different routes clear the session entry and the
+    // catalog cell. The reason split is the point: an EVICTION is #6's defect reaching the session index, a
+    // CONSUME is the ordinary path taking the endpoint with it. The occupancy pair answers what
+    // `session_cell_frontier == 0` cannot: no cell because the index is full, empty, or the entry was erased.
+    std::uint64_t session_erasures_eviction            = 0;
+    std::uint64_t session_erasures_consume             = 0;
+    std::uint32_t session_index_capacity_cells         = 0;
+    std::uint32_t session_index_occupied_cells         = 0;
+    // Host-resident CHECKPOINTS (a proxy for host state slots) split by whether a session cell or an active
+    // lane edge ANCHORS them. NOT a reclaim population: an unanchored entry is still matchable by any future
+    // request whose prefix it shares (measured: 76 request-log records reused a private entry that was not
+    // their own cell), so reclaiming one costs a rebuild rather than freeing something unused.
+    std::uint32_t host_state_checkpoints_reachable      = 0;
+    std::uint32_t host_state_checkpoints_unanchored       = 0;
     std::uint32_t private_catalog_occupied_cells       = 0;
     std::uint64_t pressure_private_owners_degraded     = 0;
     std::uint64_t pressure_private_owners_demoted      = 0;

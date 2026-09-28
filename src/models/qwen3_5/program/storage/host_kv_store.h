@@ -140,9 +140,7 @@ public:
 
     [[nodiscard]] std::optional<HostKVExtentReservation>
     prepare(LogicalKVPageStore& pages, std::span<const LogicalKVPageHandle> membership) {
-        if (membership.empty() || free_.empty() || membership.size() > free_memberships_.size()) {
-            return std::nullopt;
-        }
+        if (membership.empty() || free_.empty()) { return std::nullopt; }
         for (const LogicalKVPageHandle page : membership) {
             if (!pages.can_pin_source(page) || pages.host_resident(page)) { return std::nullopt; }
         }
@@ -162,6 +160,10 @@ public:
             allocation = arena_->allocate(layout, static_cast<std::uint32_t>(membership.size()));
             if (!allocation) { return std::nullopt; }
         }
+        // THE MEMBERSHIP CHECK COMES AFTER THE GROWTH ATTEMPT, not before it. It used to be the first line,
+        // where it refused a demote that `grow_for`/`ensure_capacity_for` below would have accommodated --
+        // so the store could decline for lack of descriptor room it was about to allocate.
+        if (membership.size() > free_memberships_.size()) { return std::nullopt; }
 
         const std::uint32_t descriptor = free_.back();
         free_.pop_back();

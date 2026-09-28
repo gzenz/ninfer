@@ -2222,6 +2222,13 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
                     const bool victim_room =
                         usage.host_state_slots + victim_host_slots <= room.host.state_slots &&
                         usage.host_kv_bytes < room.host.kv_bytes;
+                    // COMPARABILITY BREAK, 2026-09-28: the `host_kv=` DENOMINATOR below is
+                    // `admission_capacity().host.kv_bytes`, and that changed from the configured
+                    // `--host-kv-mib` (30 GiB) to the KV arena's initial span, a QUARTER of it (7.5 GiB),
+                    // when the flag became the shared host-cache ceiling. `demotable`'s KV half is
+                    // `usage.host_kv_bytes < room.host.kv_bytes`, so `demotable` readings taken after that
+                    // change are NOT comparable with earlier ones -- the bar moved down by 4x. Compare
+                    // against the denominator printed on the line itself, never across the change.
                     if (demotable) { ++demotable_evictions_; }
                     if (victim_room && state_restorable) { ++evictions_with_victim_room_; }
                     ++demotable_eviction_checks_;

@@ -972,12 +972,7 @@ public:
         bool          identity_ok = false;
         std::uint8_t  match_end   = 0;  // 0 = diverged, 1 = the stored ledger ended, 2 = the prompt ended
         std::uint32_t stored      = 0;  // THIS entry's ledger length: the denominator `match_end` needs
-        // The divergence probe's windows (see `kTokenProbeWindow`); empty unless NINFER_TOKEN_PROBE is set.
-        std::uint32_t probe_index = 0;
-        std::uint8_t  probe_count = 0;
-        bool          probe_enabled = false;
-        std::array<std::uint32_t, kTokenProbeWindow> probe_stored{};
-        std::array<std::uint32_t, kTokenProbeWindow> probe_prompt{};
+        std::uint32_t probe_index = 0;  // where the match stopped; 0 unless it diverged
     };
     // Takes the PROMPT, not a token span: reading the prompt's tokens requires the frontend's
     // `PreparedPromptAccess`, and doing that in the caller forced the model-agnostic `ResourceManager` to

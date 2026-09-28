@@ -1403,7 +1403,63 @@ public:
         out.catalog_cell_clears_cancelled = cell_clears_[static_cast<std::size_t>(CellClearReason::Cancelled)];
         out.catalog_cell_clears_cleanup   = cell_clears_[static_cast<std::size_t>(CellClearReason::Cleanup)];
         out.catalog_cell_clears_rollback  = cell_clears_[static_cast<std::size_t>(CellClearReason::Rollback)];
+        out.session_erasures_eviction = session_erases_[static_cast<std::size_t>(SessionEraseReason::Eviction)];
+        out.session_erasures_consume  = session_erases_[static_cast<std::size_t>(SessionEraseReason::Consume)];
+        // The session index's own capacity/occupancy pair. It had NEITHER, which is the same blindness the
+        // private catalog had before it got one: `session_cell_frontier == 0` says "no cell" without saying
+        // whether the index is full, empty, or the entry was erased.
+        out.session_index_capacity_cells = static_cast<std::uint32_t>(session_index_.size());
+        out.session_index_occupied_cells = static_cast<std::uint32_t>(
+            std::count_if(session_index_.begin(), session_index_.end(),
+                          [](const SessionIndexEntry& e) { return e.state == SessionIndexState::Occupied; }));
         out.private_catalog_occupied_cells      = catalog_occupied_cells();
+        // HOW MUCH OF THE SCARCE AXIS IS HELD BY CONTINUATIONS NOTHING IS ANCHORED TO. "Unanchored" is the
+        // whole of the claim and it is NOT "reclaimable": candidate scans run over the entire catalog, so an
+        // unanchored entry is still matchable -- measured, 76 request-log records reused a private entry that
+        // was not their own session cell. So this counts what is not pinned by a cell or an edge, which is the
+        // denominator a reclaim policy would have to reason about, not a population it could free.
+        //
+        // The forced evictions of
+        // 2026-09-28 were all `demote_refusal=already-on-host` with `victim_host_slots=2..3`: the plan was
+        // short on HOST STATE SLOTS and the only way to close a host-state deficit is to drop something that
+        // HOLDS host state -- a demote moves state onto the scarce axis, it cannot relieve it. So before any
+        // reclaim policy can be aimed, the population has to exist and be countable: per catalogued
+        // continuation, how many of its checkpoints sit on host (`CheckpointSummary.state_residency`, which
+        // the store maintains at publish), split by whether anything can still reach it -- the session cell
+        // this key resolves to, or an active lane edge. A checkpoint is a proxy for a slot, not a slot count:
+        // the per-victim tallies showed 2-3 per victim (endpoint + rewrite + anchors), which is this number.
+        {
+            std::uint32_t reachable = 0;
+            std::uint32_t orphaned  = 0;
+            // Generic, because the checkpoint type is a ModelContract alias and naming it here would couple
+            // this model-agnostic file to one model's names.
+            const auto hosts = [](const auto& summary) -> std::uint32_t {
+                const auto on_host = [](const auto& checkpoint) -> std::uint32_t {
+                    return checkpoint.state_residency != ReplicaResidency::DeviceOnly ? 1U : 0U;
+                };
+                std::uint32_t n = 0;
+                if (summary.endpoint) { n += on_host(*summary.endpoint); }
+                if (summary.rewrite) { n += on_host(*summary.rewrite); }
+                for (const auto& anchor : summary.long_anchors) { n += on_host(anchor); }
+                return n;
+            };
+            for (std::uint32_t slot = 0; slot < catalog_count_; ++slot) {
+                const CatalogEntry& entry = catalog_[slot];
+                if (entry.state != CatalogState::Catalogued || !entry.handle) { continue; }
+                const std::uint32_t n = hosts(entry.summary);
+                if (n == 0) { continue; }
+                bool held = private_has_active_edge(slot);
+                if (!held) {
+                    for (std::size_t cell = 0; cell < session_index_.size(); ++cell) {
+                        if (session_index_[cell].state == SessionIndexState::Occupied &&
+                            session_index_[cell].slot == slot) { held = true; break; }
+                    }
+                }
+                (held ? reachable : orphaned) += n;
+            }
+            out.host_state_checkpoints_reachable = reachable;
+            out.host_state_checkpoints_unanchored  = orphaned;
+        }
         out.pressure_publication_cell_losses    = program.publication_cell_losses();
         out.pressure_publication_cell_probes    = program.publication_cell_probes();
         out.pressure_publication_cell_at_risk_runs = program.publication_cell_at_risk_runs();
@@ -1446,9 +1502,15 @@ public:
     void clear_after_program_cleanup() noexcept {
         transaction_.template emplace<std::monostate>();
         for (CatalogEntry& entry : catalog_) {
+            // COUNTED ONLY WHEN THE SLOT HELD SOMETHING, and Action is NOT counted here at all.
+            // This loop walks the whole array, so incrementing per slot made `cleanup` a count of the catalog
+            // SIZE after any recovery rather than of cells that were cleared -- and it incremented `action`
+            // too, for vacant slots, on top of the Evicted branch's own count. So `action` jumped by 64 on the
+            // first recovery and `action == private_owners_evicted` (which held all day) would have broken
+            // there without anything recording it. `action` now means one thing: a private owner evicted.
+            const bool held = entry.state != CatalogState::Vacant || entry.handle.has_value();
             entry.handle.reset();
-            note_cell_clear(CellClearReason::Cleanup);
-            note_cell_clear(CellClearReason::Action);
+            if (held) { note_cell_clear(CellClearReason::Cleanup); }
             clear_catalog_entry(entry);
         }
         for (SharedCatalogEntry& entry : shared_catalog_) {
@@ -1923,6 +1985,20 @@ private:
     void note_cell_clear(CellClearReason reason) noexcept {
         ++cell_clears_[static_cast<std::size_t>(reason)];
     }
+
+    // WHY A SESSION ENTRY WAS ERASED -- a separate axis from the cell clears above, and it had NO counter at
+    // all until 2026-09-28. `erase_session_if_owner` is what makes `session_cell_frontier` read 0, i.e. what
+    // turns a conversation's next turn into a 23k-token re-prefill, and it is called from two unrelated places:
+    // an EVICTION of the owner, and a request CONSUMING the endpoint as its active source. It is a SEPARATE
+    // axis because a consume erases the session entry WITHOUT clearing the cell at all -- not because an
+    // eviction's two clears take different routes, which is what this comment wrongly said first (they are
+    // adjacent lines; the cell clear there simply was not counted, see the Evicted branch).
+    enum class SessionEraseReason : std::uint8_t {
+        Eviction,  // apply_private_action, VictimDisposition::Evicted
+        Consume,   // the source was taken as an active source (ConsumeToActive)
+        Count,
+    };
+    std::array<std::uint64_t, static_cast<std::size_t>(SessionEraseReason::Count)> session_erases_{};
 
     void clear_catalog_entry(CatalogEntry& entry) noexcept {
         entry.state = CatalogState::Vacant;
@@ -2739,27 +2815,50 @@ private:
             }
             std::vector<PrefixSplitSample> samples;
             samples.reserve(static_cast<std::size_t>(catalog_count_) + shared_catalog_count_);
-            const auto consider = [&](const Program::PrefixSplit& split) {
+            // `source` says WHOSE ledger this sample is. It is taken from the SESSION INDEX -- the cell this
+            // request's key resolves to -- and NOT from `entry.session`, which is the wrong field and was the
+            // first version of this: `demote_replaced_session` does `prior.session.reset()` every time a newer
+            // continuation publishes, so this conversation's own SUPERSEDED ledgers carry no session marker and
+            // were being labelled "another session's". That inflates the very population this tag exists to
+            // measure. 1 = the cell this request's key resolves to, 2 = any other private entry (which
+            // includes this conversation's superseded ones -- they are no longer its cell), 3 = shared.
+            const std::uint32_t own_cell_slot = [&]() -> std::uint32_t {
+                if (!cache_enabled_ || !base.context_cache().session_key) {
+                    return kInvalidCatalogSlot;
+                }
+                const std::optional<std::size_t> cell =
+                    find_session_cell(*base.context_cache().session_key);
+                return cell && session_index_[*cell].slot < catalog_count_
+                           ? session_index_[*cell].slot
+                           : kInvalidCatalogSlot;
+            }();
+            const auto consider = [&](const Program::PrefixSplit& split, std::uint8_t source) {
                 samples.push_back(PrefixSplitSample{.tokens      = split.tokens,
                                                     .restorable  = split.restorable,
                                                     .identity_ok = split.identity_ok,
                                                     .match_end   = split.match_end,
                                                     .stored      = split.stored,
+                                                    .source      = source,
+                                                    // THIS entry's own restorable point at or below its match --
+                                                    // NOT the resume point and NOT comparable to
+                                                    // `session_cell_frontier`. `prefix_split` skips any
+                                                    // checkpoint whose frontier exceeds the match, so this is
+                                                    // <= match <= the prompt by construction: "a frontier beyond
+                                                    // the prompt" is impossible here, although the first
+                                                    // comment on this field claimed it could be read that way.
+                                                    .frontier    = split.restorable,
                                                     .probe_index = split.probe_index,
-                                                    .probe_count = split.probe_count,
-                                                    .probe_enabled = split.probe_enabled,
-                                                    .probe_stored = split.probe_stored,
-                                                    .probe_prompt = split.probe_prompt});
+});
             };
             for (std::uint32_t slot = 0; slot < catalog_count_; ++slot) {
                 const CatalogEntry& entry = catalog_[slot];
                 if (entry.state != CatalogState::Catalogued || !entry.handle) { continue; }
-                consider(program.prefix_split(*entry.handle, prompt));
+                consider(program.prefix_split(*entry.handle, prompt), slot == own_cell_slot ? 1U : 2U);
             }
             for (std::uint32_t slot = 0; slot < shared_catalog_count_; ++slot) {
                 const SharedCatalogEntry& entry = shared_catalog_[slot];
                 if (entry.state != SharedCatalogState::Catalogued || !entry.handle) { continue; }
-                consider(program.prefix_split(*entry.handle, prompt));
+                consider(program.prefix_split(*entry.handle, prompt), 3U);
             }
             const PrefixSplitBest best = best_prefix_split(samples);
             choice.diagnostics_.split_best_tokens     = best.tokens;
@@ -2771,11 +2870,9 @@ private:
             // they should share", when nearly every case was a ledger ending or a missing entry.
             choice.diagnostics_.split_ended_by         = best.match_end;
             choice.diagnostics_.split_best_stored      = best.stored;
+            choice.diagnostics_.split_best_source      = best.source;
+            choice.diagnostics_.split_best_frontier    = best.frontier;
             choice.diagnostics_.split_probe_index      = best.probe_index;
-            choice.diagnostics_.split_probe_count      = best.probe_count;
-            choice.diagnostics_.split_probe_enabled    = best.probe_enabled;
-            choice.diagnostics_.split_probe_stored     = best.probe_stored;
-            choice.diagnostics_.split_probe_prompt     = best.probe_prompt;
             choice.diagnostics_.session_cell_frontier = session_cell_frontier;
             choice.diagnostics_.session_cell_offered  = session_cell_offered;
             choice.diagnostics_.session_cell_skip     = candidate_counters.session_cell_skip;
@@ -3274,8 +3371,14 @@ private:
         const std::uint32_t dropped =
             dropped_checkpoint_count(entry.summary, result.final_summary, result.disposition);
         if (result.disposition == VictimDisposition::Evicted) {
-            erase_session_if_owner(claim.capability.owner.id);
+            erase_session_if_owner(claim.capability.owner.id, SessionEraseReason::Eviction);
             clear_catalog_entry(entry);
+            // THE CELL CLEAR ON THE PRESSURE PATH. This increment lived only in `clear_after_program_cleanup`,
+            // beside Cleanup, so `catalog_cell_clears_action` read 0 no matter how many owners were evicted --
+            // and a reader comparing it against `pressure_private_owners_evicted` (live: 65) read the
+            // miswiring as the finding "evictions do not clear cells". They do; it was not counted. The
+            // previous comment here explained the gap as "different routes", which was invented.
+            note_cell_clear(CellClearReason::Action);
             saturating_increment(context_stats_.pressure_private_owners_evicted);
             record_checkpoint_drops(context_stats_, dropped);
             return;
@@ -3552,7 +3655,7 @@ private:
                 source.state            = CatalogState::Catalogued;
                 retained_private_source = result.status == ContextTransactionStatus::Published;
             } else if (result.source->mode == PrivateSourceMode::ConsumeToActive) {
-                erase_session_if_owner(source.id);
+                erase_session_if_owner(source.id, SessionEraseReason::Consume);
                 source.handle.reset();
                 source.summary.endpoint.reset();
                 source.summary.rewrite.reset();
@@ -3897,7 +4000,7 @@ private:
         throw std::logic_error("session index is full");
     }
 
-    void erase_session_if_owner(std::uint64_t owner_id) noexcept {
+    void erase_session_if_owner(std::uint64_t owner_id, SessionEraseReason reason) noexcept {
         if (owner_id == 0) { return; }
         for (SessionIndexEntry& entry : session_index_) {
             if (entry.state == SessionIndexState::Occupied && entry.owner_id == owner_id) {
@@ -3906,6 +4009,7 @@ private:
                 entry.owner_id          = 0;
                 entry.revision          = 0;
                 entry.publication_order = 0;
+                ++session_erases_[static_cast<std::size_t>(reason)];
             }
         }
     }

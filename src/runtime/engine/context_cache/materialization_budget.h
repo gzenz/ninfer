@@ -110,11 +110,19 @@ struct PrefixSplitSample {
     bool          identity_ok = false;  // did the identity chain agree AT that match (stricter than tokens)
     std::uint8_t  match_end   = 0;      // 0 = diverged, 1 = the stored ledger ended, 2 = the prompt ended
     std::uint32_t stored      = 0;      // this entry's own ledger length -- the denominator `match_end` needs
-    std::uint32_t probe_index = 0;      // first differing token index (see `kTokenProbeWindow`)
-    std::uint8_t  probe_count = 0;      // 0 when the probe is off
-    bool          probe_enabled = false;
-    std::array<std::uint32_t, kTokenProbeWindow> probe_stored{};
-    std::array<std::uint32_t, kTokenProbeWindow> probe_prompt{};
+    // WHICH LEDGER THE MATCH CAME FROM. Without it a divergence window cannot be attributed: the deepest match
+    // over the whole catalog is often ANOTHER conversation's ledger (all of them share the 23k system prompt
+    // and open with similar phrasing), so its window describes why that match stopped and says nothing about
+    // why this conversation's OWN entry was refused -- which is the question. 0 = unknown, 1 = this request's
+    // own session's CURRENT CELL, 2 = any other private entry (including this conversation's superseded
+    // ledgers, which lose their session marker on replacement), 3 = a shared entry. `frontier` is that entry's
+    // own restorable point AT OR BELOW its match -- not a resume point beyond the prompt, which cannot occur.
+    std::uint8_t  source      = 0;
+    std::uint32_t frontier    = 0;
+    // WHERE the match stopped, as an index. The id windows that used to sit here were removed 2026-09-28:
+    // they answered their question (the replayed turn's structure diverging from the stored ledger) and they
+    // logged content, which an instrument should not keep doing once the question is answered.
+    std::uint32_t probe_index = 0;
 };
 
 struct PrefixSplitBest {
@@ -129,11 +137,9 @@ struct PrefixSplitBest {
     std::uint32_t identity_checked  = 0;
     std::uint8_t  match_end         = 0;  // from the deepest-matching entry, like identity_ok
     std::uint32_t stored            = 0;  // from the deepest-matching entry, like identity_ok
-    std::uint32_t probe_index       = 0;  // ...and these too: a shallower entry's divergence is not this one's
-    std::uint8_t  probe_count       = 0;
-    bool          probe_enabled     = false;
-    std::array<std::uint32_t, kTokenProbeWindow> probe_stored{};
-    std::array<std::uint32_t, kTokenProbeWindow> probe_prompt{};
+    std::uint8_t  source            = 0;  // ...and these: a shallower entry's ledger is not this one's
+    std::uint32_t frontier          = 0;
+    std::uint32_t probe_index       = 0;  // ...and this too: a shallower entry's divergence is not this one's
 };
 
 [[nodiscard]] inline PrefixSplitBest best_prefix_split(std::span<const PrefixSplitSample> samples) noexcept {
@@ -146,19 +152,11 @@ struct PrefixSplitBest {
             best.identity_ok = sample.identity_ok;
             best.match_end   = sample.match_end;
             best.stored      = sample.stored;
+            best.source      = sample.source;
+            best.frontier    = sample.frontier;
             best.probe_index = sample.probe_index;
-            best.probe_count = sample.probe_count;
-            best.probe_stored = sample.probe_stored;
-            best.probe_prompt = sample.probe_prompt;
         }
         best.restorable = std::max(best.restorable, sample.restorable);
-        // OR ACROSS EVERY SAMPLE, not taken from the deepest one. Inside the depth branch it inherited "the
-        // deepest entry diverged", so a record whose match never ran reported the probe as OFF while it was
-        // running -- and the first turn of every conversation is such a record. This is a property of the
-        // REQUEST, not of the winning entry.
-        // WHAT IT DOES NOT COVER: an EMPTY CATALOG, where the loop below never runs and this stays false with
-        // the probe on. `split_entries == 0` is the discriminator a reader has; recorded rather than implied.
-        best.probe_enabled = best.probe_enabled || sample.probe_enabled;
     }
     return best;
 }

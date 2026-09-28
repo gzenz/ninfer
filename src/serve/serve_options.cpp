@@ -141,6 +141,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     bool default_max_tokens_explicit = false;
     bool kv_capacity_explicit        = false;
     bool context_capacity_explicit   = false;
+    // SEPARATE FROM `context_capacity_explicit`, which --host-state-slots also sets: only this one means
+    // "the operator chose a host-cache budget", and only that may change what --host-kv-mib means.
+    bool host_kv_budget_explicit     = false;
     if (argc >= 2 && (std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h")) {
         options.help_requested = true;
         return options;
@@ -237,6 +240,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             }
             options.context_cache.host_kv_capacity_bytes = static_cast<std::size_t>(mib << 20);
             context_capacity_explicit                    = true;
+            host_kv_budget_explicit                      = true;
         } else if (arg == "--host-ram-reserve-mib") {
             const std::uint64_t mib = parse_u64(require_value("--host-ram-reserve-mib"), "host-ram-reserve-mib");
             if (mib > std::numeric_limits<std::size_t>::max() / (1ULL << 20)) {
@@ -368,6 +372,27 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     }
     if (!kv_capacity_explicit) {
         options.kv_capacity = KvCapacityPolicy::explicit_capacity(options.max_context);
+    }
+    // `--host-kv-mib` IS THE HOST-CACHE BUDGET, NOT THE KV ARENA'S PRIVATE SPAN (2026-09-28). The operator's
+    // rationale: "via host-kv-mib i want to specify how much host memory is used by ninfer for cacheing
+    // purposes". It used to size ONLY the arena's span, so the arena carved the whole budget at startup and
+    // the state axis could not grow into it -- measured: 60/60 state slots with 1,254 growth refusals while
+    // host KV sat at 8.6 GiB of its 30 GiB span, and forced evictions of restorable victims as the result.
+    //
+    // Now the flag is the CEILING FOR ALL HOST CACHING (the pool's max), and the arena starts at a QUARTER of
+    // it and grows on demand into the same pile the state slots draw on. The quarter is a STARTING SPLIT, not
+    // a partition: the arena's growth path takes more when KV needs it, and a failed growth there returns
+    // `nullopt` and falls back rather than throwing, so it cannot over-promise the way the state path did.
+    // GATED ON THE FLAG BEING GIVEN, not on the value being non-zero: `host_kv_capacity_bytes` has a DEFAULT
+    // (`kDefaultHostKvCapacityBytes`), so an unflagged server would otherwise silently acquire a pinned
+    // ceiling it never had -- and it did, until `ninfer_serve_options_test` caught it. Only an explicit
+    // `--host-kv-mib` changes what the flag means.
+    if (host_kv_budget_explicit) {
+        const std::size_t budget = options.context_cache.host_kv_capacity_bytes;
+        if (options.context_cache.host_pinned_max_bytes == 0) {
+            options.context_cache.host_pinned_max_bytes = budget;
+        }
+        options.context_cache.host_kv_capacity_bytes = budget / 4;
     }
     if (!options.allow_prefix_reuse) {
         if (context_capacity_explicit) {

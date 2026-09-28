@@ -196,45 +196,17 @@ int main() {
     // reverse order a last-wins mutant passes, which is how the previous case in this file was written wrong
     // the first time.)
     {
-        // THREE samples, all with windows, and the shallow FIRST one carries the LARGEST count. The previous
-        // version of this case had one shallow sample with a smaller count, which left three mutant classes
-        // alive: first-sample-wins, first-nonempty-wins and max-count all survived it. The counts here are
-        // 5 / 3 / 4 so that only "the deepest entry's own window" produces 3.
-        ninfer::runtime::PrefixSplitSample head{.tokens = 100, .stored = 200, .probe_index = 100,
-                                                .probe_count = 5};
-        head.probe_stored = {1, 2, 3, 4, 5};
-        head.probe_prompt = {6, 7, 8, 9, 10};
-        ninfer::runtime::PrefixSplitSample deep{.tokens = 900, .stored = 1000, .probe_index = 900,
-                                                .probe_count = 3};
-        deep.probe_stored = {11, 22, 33};
-        deep.probe_prompt = {44, 55, 66};
-        ninfer::runtime::PrefixSplitSample tail{.tokens = 300, .stored = 400, .probe_index = 300,
-                                                .probe_count = 4};
-        tail.probe_stored = {70, 71, 72, 73};
-        tail.probe_prompt = {80, 81, 82, 83};
+        // THREE samples, the deepest LAST so that a "last sample wins" mutant fails. (The counts that used to
+        // distinguish more mutant classes went with the id windows in the 2026-09-28 cleanup.)
+        ninfer::runtime::PrefixSplitSample head{.tokens = 100, .stored = 200, .probe_index = 100};
+        ninfer::runtime::PrefixSplitSample deep{.tokens = 900, .stored = 1000, .probe_index = 900};
+        ninfer::runtime::PrefixSplitSample tail{.tokens = 300, .stored = 400, .probe_index = 300};
         const std::array samples{head, deep, tail};
         const ninfer::runtime::PrefixSplitBest best = ninfer::runtime::best_prefix_split(samples);
-        if (best.probe_index != 900 || best.probe_count != 3 || best.probe_stored[0] != 11 ||
-            best.probe_prompt[0] != 44 || best.probe_stored[2] != 33) {
+        if (best.probe_index != 900) {
             std::cerr << "the divergence window must come from the DEEPEST entry: a shallow entry's tokens "
                          "are not the ones that stopped this match, and reading them would name the wrong "
                          "token as the cause\n";
-            return 1;
-        }
-    }
-    // `probe_enabled` IS A PROPERTY OF THE REQUEST, not of the winning entry. Taken from the deepest sample it
-    // read `false` on every record whose match never ran -- an empty catalog, and the first turn of every
-    // conversation -- while the probe was on, which is the same "reads the same whether it works or not"
-    // shape as the index that was gated behind its own gate.
-    {
-        ninfer::runtime::PrefixSplitSample a{.tokens = 0, .probe_enabled = true};
-        ninfer::runtime::PrefixSplitSample b{.tokens = 0, .probe_enabled = true};
-        const std::array samples{a, b};
-        const ninfer::runtime::PrefixSplitBest best = ninfer::runtime::best_prefix_split(samples);
-        if (!best.probe_enabled) {
-            std::cerr << "probe_enabled must be an OR across samples: with no matching entry the deepest-taken "
-                         "value is the default, so the first turn of every conversation would report the probe "
-                         "as off while it is running\n";
             return 1;
         }
     }

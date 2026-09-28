@@ -2591,6 +2591,21 @@ ProgramImpl::revalidate_materialization(const AdmissionCandidate& plan,
 
 detail::PhysicalResources ProgramImpl::admission_capacity() const noexcept {
     const qwen3_5::PagedKVCache* backend = backend_kv_cache();
+    // THE TWO HOST AXES ARE PRICED ON DIFFERENT BASES, AND THIS FILE CANNOT FIX THAT BY ARITHMETIC.
+    // `state_slots` reports what EXISTS (so a full state pool reads full) while `kv_bytes` reports what is
+    // RESERVED (the arena's 30 GiB span, so it reads roomy with only 8.6 GiB used) -- one shared pile read two
+    // ways, which is what starves the state axis and forced the evictions of 2026-09-28.
+    //
+    // PRICING BOTH FROM THE POOL'S GROWABLE HEADROOM WAS TRIED AND REVERTED THE SAME DAY. It is the obvious
+    // fix and it is unsafe: the growth gate's answer is a statement about the FUTURE -- `decide` compares a
+    // memory reading against the reserve -- so a plan priced from it can be executed minutes later against a
+    // worse reading. That is what happened: `WORKER OOM: std::bad_alloc ... mat=69`, a worker recovery,
+    // within minutes of the change running. The only host memory that cannot be taken away between planning
+    // and allocation is memory ALREADY PINNED, and that is mostly locked inside the KV arena's reservation --
+    // which is the thing that has to change for these two axes to share a pile.
+    // When it does: report the shared pinned pile for BOTH fields, and re-arm the cross-dimension sum check
+    // in `physical_peak_fits` in the same change, because once the two limits are the same number
+    // `o_s + p_s <= L_s && o_k + p_k <= L_k` no longer implies the sum.
     return detail::PhysicalResources{
         .device =
             {
@@ -2601,8 +2616,17 @@ detail::PhysicalResources ProgramImpl::admission_capacity() const noexcept {
             },
         .host =
             {
+                // THE STATE AXIS PROMISES ONLY WHAT IS PINNED. `capacity()` is slots the pool has actually
+                // allocated, so pricing against it cannot over-promise -- and it is the axis that threw
+                // `bad_alloc` (worker recovery, 2026-09-28) when it was priced on growth that later failed.
                 .state_slots = host_state_images ? host_state_images->capacity() : 0U,
-                .kv_bytes    = host_kv_arena ? host_kv_arena->capacity_bytes() : 0U,
+                // PINNED ONLY, for the same reason the state axis is (2026-09-28, and the first version of
+                // this line got it wrong): BOTH callers of the KV demote path turn a failed growth into
+                // `throw std::bad_alloc` (`materialization.cpp:1137-1138` and `:1771-1772`), so reporting the
+                // shared ceiling here would not "cost a declined demote" -- it would produce the same worker
+                // recovery the state axis produced. `host_kv_store.h:158` returning `nullopt` is necessary but
+                // not sufficient; the callers decide, and they throw.
+                .kv_bytes = host_kv_arena ? host_kv_arena->capacity_bytes() : 0U,
             },
     };
 }

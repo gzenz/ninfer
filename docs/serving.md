@@ -786,7 +786,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--no-prefix-reuse` | disable compatible-prefix caching | prefix reuse on |
 | `--device-state-slots N` | extra Device checkpoint StateImages beyond the active-lane guarantee | `max-concurrency` |
 | `--host-state-slots N` | pinned Host StateImage capacity | `8` |
-| `--host-kv-mib N` | shared pinned Host Main/Backend KV byte capacity in MiB | `8192` |
+| `--host-kv-mib N` | ceiling for ALL pinned host caching in MiB -- the KV arena and the host state slots share it | `8192` |
 | `--max-private-continuations N` | private continuation descriptor capacity | `2 * max-concurrency` |
 | `--max-shared-prefixes N` | Engine-wide shared stable-prefix descriptor capacity | `max(max-concurrency, 4)` |
 | `--max-long-anchors-per-continuation N` | private long-anchor limit per continuation | `2` |
@@ -828,12 +828,20 @@ request fields override process flags, and `--greedy` finally forces temperature
 For `C=--max-concurrency` and `H=--device-state-slots`, total Device StateImage capacity is `C+H`:
 `C` slots guarantee active requests and `H` is a global checkpoint pool. Host State and Host KV are both
 drawn from ONE shared elastic pinned-memory budget (`PinnedHostPool` + `HostMemoryBudget`, 2026-09-26),
-split on demand and bounded by the host's own RAM minus a reserve. **The growth is not yet reachable from
-the planner**: `admission_capacity()` reports the capacity that exists NOW, and every demote option is
-priced against it, so a plan that passes feasibility already has room and nothing asks the pool to grow.
-`--host-state-slots` and the KV arena's initial size therefore still bound what the planner will plan,
-and the elastic headroom is real but unspent until a caller plans against it -- do not read this
-paragraph as "the limits are gone". Host KV is shared by Main and the selected
+split on demand and bounded by `--host-kv-mib` (the ceiling for all host caching) and the host's own RAM
+minus a reserve.
+
+**What the two axes report to the planner is deliberately NOT symmetric (2026-09-28):**
+* the **KV** axis reports the ceiling, because a KV demote whose growth fails returns `nullopt` and the
+  caller falls back (`host_kv_store.h`) -- an over-stated ceiling costs a declined demote, not an error;
+* the **state** axis reports only what is PINNED (`HostStatePool::capacity()`), because the state path
+  threw `bad_alloc` and recovered a worker when it was priced on growth that later failed. Memory that is
+  already pinned cannot be taken away between planning and allocation; a memory *reading* can.
+* `--host-kv-mib` sets the shared ceiling and the KV arena starts at a quarter of it, growing on demand.
+  `--host-state-slots` remains a floor the pool grows above.
+
+Do not read this as "the limits are gone": the ceiling is real and enforced, and it is now enforced for
+the *cache as a whole* rather than only for the KV arena. Host KV is shared by Main and the selected
 Backend pool and is consumed in physical page extents. `--no-prefix-reuse` selects root-only Engine
 mode and cannot be combined with any of the seven explicit context-cache capacity flags, including
 zero-valued flags.

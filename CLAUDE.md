@@ -1,10 +1,10 @@
 # NInfer — ops rules
 
-Prod = the local server on this WSL2 host (`ninfer.service`, Qwen3.8-27B on the
+QA = the local server on this WSL2 host (`ninfer.service`, Qwen3.8-27B on the
 v3 engine). It serves the user's local Claude Code sessions and the Bash
 classifier — which session runs through it is not fixed: read
 `env ANTHROPIC_BASE_URL` rather than assuming. A deploy/restart interrupts
-whatever prod is serving, including this session while its base URL points at
+whatever QA is serving, including this session while its base URL points at
 `127.0.0.1:8080`.
 
 Current state lives in `plan.md` at the repo root -- read its **Current state**
@@ -19,7 +19,7 @@ merged into it and deleted, and `~/.claude/plans/ticklish-sniffing-wadler.md` is
 a superseded duplicate kept only for the session that produced it.
 
 ## Monitoring
-- Keep a monitor armed during a soak/prod. It expires at 30 min — re-arm on expiry and after any stop.
+- Keep a monitor armed during a soak/QA. It expires at 30 min — re-arm on expiry and after any stop.
 - **Arm `tools/ops/ninfer-watch.sh`.** It is the monitor: it carries state (a regex cannot express the
   rules below), polls `/health` and reports transitions, and splits one pass over the journal into an
   alert stream and a full-fidelity log at `~/ninfer-watch/latest.log`. **Its alert set is
@@ -62,7 +62,7 @@ a superseded duplicate kept only for the session that produced it.
   (`WEDGE`, `planner-no-plan`, `relief-shared`, `host-state-pool`) were carried here for weeks.
 - **The watcher follows TWO units: `ninfer.service` and `ninfer-wedge-sentinel.service`.** The wedge is
   announced by the SENTINEL (`WEDGE (A/B): engine idle with work pending Ns -- restarting ninfer`), so
-  watching one unit means the event that explains a dead prod is invisible -- observed 2026-09-26: a live
+  watching one unit means the event that explains a dead QA is invisible -- observed 2026-09-26: a live
   wedge at ~19:51:54, the sentinel's restart at 19:54:37, and the monitor reporting only a bare
   `health 200 -> 000` with no cause. **`WEDGE` is therefore a live token**, and the note below that it
   "matches nothing in `src/`" is true and beside the point: it is a sentinel output, not an engine string,
@@ -76,12 +76,12 @@ a superseded duplicate kept only for the session that produced it.
   The backtrace resolves only the innermost frame on a release build; the wait distribution is what
   characterised the 2026-09-26 wedge (21 of 25 threads on `futex_do_wait`, five on one condvar, with ONE
   thread spinning in `sched_yield`).
-  **For a resolvable backtrace, run prod from the diagnostic build:** `build-diag` is configured
+  **For a resolvable backtrace, run QA from the diagnostic build:** `build-diag` is configured
   `RelWithDebInfo` and already contains `build-diag/apps/ninfer-serve`, so the next wedge captured while that
   binary is running will name the caller of the spin -- which the release build cannot (its frames below the
   innermost were `??`, and that caller is the frame that identifies the lock).
 - **A `health 200 -> 000` transition under heavy load is NOT an outage until you check two things.** Observed
-  2026-09-27 with prod serving an agentic workload: the watcher reported `200 -> 000` while the unit was
+  2026-09-27 with QA serving an agentic workload: the watcher reported `200 -> 000` while the unit was
   ACTIVE on the SAME pid and start time, and the journal showed it working throughout (throughput lines,
   checkpoint pricing, evictions). Under that load `/stats` took 60+ s -- the handler takes the engine's
   execution mutex -- and `/health` itself can miss a probe's timeout behind a prefill, though it answers in
@@ -102,10 +102,10 @@ a superseded duplicate kept only for the session that produced it.
   requests. Never offer "wait / let it accumulate" as an option — proceed, and
   keep working.
 
-### Dev time vs prod time — `NINFERDEV`
+### Dev time vs QA time — `NINFERDEV`
 
 **The operator declares which mode the host is in by creating the file `/tmp/NINFERDEV`.** Check it with
-`test -e /tmp/NINFERDEV` — present means dev time, absent means prod time. Do not infer the mode from the
+`test -e /tmp/NINFERDEV` — present means dev time, absent means QA time. Do not infer the mode from the
 hour, from `ANTHROPIC_BASE_URL`, or from how busy the journal looks.
 
 **Why a file and not an environment variable:** an `export` typed into the operator's session shell does
@@ -113,16 +113,16 @@ not reach the agent's tool calls — each Bash invocation gets a fresh shell ini
 `env NINFERDEV` comes back empty while the operator's own shell has it set. A file is visible to every
 invocation. (`~/.claude/settings.json`'s `env` block *does* propagate — that is where `ANTHROPIC_BASE_URL`
 comes from — so an env var set there would also work; the file is the lighter switch.) The two modes differ
-in what stopping prod *costs* and in what the session should do with its time — they do NOT differ in the
+in what stopping QA *costs* and in what the session should do with its time — they do NOT differ in the
 safety rules, which hold always (see below).
 
-- **`/tmp/NINFERDEV` exists — dev time.** Prod is not serving the operator: nothing local depends on it, so a GPU
+- **`/tmp/NINFERDEV` exists — dev time.** QA is not serving the operator: nothing local depends on it, so a GPU
   window or an e2e swap costs essentially nothing beyond the Bash classifier's round-trip for the
-  duration of the stop. **Run the experiment. Do not defer a run to "save prod time", and never offer
+  duration of the stop. **Run the experiment. Do not defer a run to "save QA time", and never offer
   batching as a reason to postpone one** — batch only when a run's own validity requires it (a shared
   build tree, a single freeze covering several suites). This is the mode where the open experiments are
   the work; a session here that only reads and edits is wasting the cheapest resource it has.
-- **`/tmp/NINFERDEV` absent — prod time.** Prod is serving the operator's sessions. Stopping it interrupts them
+- **`/tmp/NINFERDEV` absent — QA time.** QA is serving the operator's sessions. Stopping it interrupts them
   and breaks soak continuity, so the default action is **read, don't stop**: journal, `/stats`, the
   request log, the monitor. Collect insights — and note that soak data (net/census/evictions) accrues
   only while the server is driven with requests, so drive it rather than idling. If a stop is genuinely
@@ -139,12 +139,12 @@ cost an outage:
   pattern in a script — **and note that bracketing only helps if the unbracketed text appears nowhere else
   on that command line**: a call that both ran `journalctl -u ninfer` and bracketed-pgrep'd for it still
   matched its own shell;
-- after any window or swap, prod is restored and *verified* — `/health` 200, wedge sentinel active;
+- after any window or swap, QA is restored and *verified* — `/health` 200, wedge sentinel active;
 - the sentinel is stopped FIRST and re-armed LAST around a window;
 - one journal monitor at a time.
 
 The Bash classifier routes through NInfer in both modes, so a stop still blocks command classification
-while it lasts. In dev time that is the entire cost; in prod time it is the smallest part of it.
+while it lasts. In dev time that is the entire cost; in QA time it is the smallest part of it.
 
 ## Reviewing
 - **Reviews run in parallel with e2e, one pass per milestone — never a chain of
@@ -201,19 +201,19 @@ while it lasts. In dev time that is the entire cost; in prod time it is the smal
   `env ANTHROPIC_BASE_URL`. It is OpenRouter at the time of writing, and the operator moves it back to
   local NInfer when they judge the server stable enough, so the tooling must be correct in
   both states rather than tuned to one.
-- **The e2e server must NOT bind :8080, in either state.** :8080 is prod, and prod serves
+- **The e2e server must NOT bind :8080, in either state.** :8080 is QA, and QA serves
   real traffic whatever this session is doing: the classifier, and any live local session
   (this one included whenever `ANTHROPIC_BASE_URL` points at 127.0.0.1:8080). A test
   server there answers requests the suite never issued — tainting every cache and timing
   number with an unknown workload, and 400ing them on the test profile's smaller context.
   If this session *is* local, a swap also takes the session down for its duration.
-  The swap defaults its test server to `E2E_PORT=8085` (`PROD_PORT=8080` stays prod's) and
-  forwards `--port` to the suite; `~/.config/ninfer.conf` pins prod to 8080, so anything on
+  The swap defaults its test server to `E2E_PORT=8085` (`PROD_PORT=8080` stays QA's) and
+  forwards `--port` to the suite; `~/.config/ninfer.conf` pins QA to 8080, so anything on
   8085 is the test server by construction. Two checks enforce it: nothing may listen on
   either port before the test server starts, and after it starts the listener's pid must
   equal the pid recorded by `ninfer-start-test.sh`. Never pass `--port 8080` to a suite by
-  hand — a run that talks to prod is not a run.
-- **The reverse mix-up costs the same.** Load driven at prod (:8080, e.g.
+  hand — a run that talks to QA is not a run.
+- **The reverse mix-up costs the same.** Load driven at QA (:8080, e.g.
   `tools/load/prod-load.py`, deliberately not in `tools/e2e/` and asserting nothing) shares
   the server with that real traffic, and the request log cannot separate the two — same
   protocol, same growing-context shape, no client id. Readings taken that way are valid for
@@ -221,20 +221,20 @@ while it lasts. In dev time that is the entire cost; in prod time it is the smal
   reuse, queue and counter numbers, which belong on the isolated port.
 - The Bash classifier routes through NInfer; it may block swap/restart during
   prefills or thrash. Don't hammer retries — the user runs it with `! <cmd>`.
-- Build: `cmake --build build -j --target ninfer-serve`. After restarting prod on a build, verify by the
+- Build: `cmake --build build -j --target ninfer-serve`. After restarting QA on a build, verify by the
   **running exe's hash**, not the build directory's: `sha256sum /proc/$(systemctl show -p MainPID --value
   ninfer.service)/exe` must equal `sha256sum build/apps/ninfer-serve`. A build-directory hash changes on
   every relink and proves nothing on its own.
   **That check proves "running == last link", never "last link == HEAD", and the difference has already cost
   a deploy:** while iterating on one target (`ninfer_qwen3_5_prefix_real_test`) and never rebuilding
-  `ninfer-serve`, the two hashes agreed because both were the OLD build, and prod served a version of the
+  `ninfer-serve`, the two hashes agreed because both were the OLD build, and QA served a version of the
   change that lacked its guard and its instrument for ~10 minutes. **So pair it with a build-freshness
   check:** `cmake --build build -j --target ninfer-serve` first, then either
   `find src include apps -newer build/apps/ninfer-serve` (must print nothing) or grep the RUNNING exe for a
   string the change introduces — `grep -ac '<new log line>' /proc/$(systemctl show -p MainPID --value
   ninfer.service)/exe` must be ≥ 1, with an old string absent as the control. Without one of those, a change
-  that prints nothing cannot be observed on prod no matter how long you watch.
-- **Stopping prod is not a "kill it if busy" operation.** The unit runs with `TimeoutStopSec=300` (raised
+  that prints nothing cannot be observed on QA no matter how long you watch.
+- **Stopping QA is not a "kill it if busy" operation.** The unit runs with `TimeoutStopSec=300` (raised
   from 30 on 2026-09-26, `/etc/systemd/system/ninfer.service`; nothing else writes it, and
   `~/ninfer-ensure.sh` does not, so an edit there is authoritative). A stop-timeout SIGKILL destroys the
   engine's OWN shutdown path — `fail-all cleanup` and `post-recovery residual`, the only lines that report

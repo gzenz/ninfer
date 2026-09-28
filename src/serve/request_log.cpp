@@ -352,33 +352,12 @@ Json materialization_json(const ninfer::MaterializationDiagnostics& diagnostics)
         {"split_identity_ok", diagnostics.split_identity_ok},
         {"split_ended_by", diagnostics.split_ended_by},
         {"split_best_stored", diagnostics.split_best_stored},
-        // THE EXACT DIVERGENCE. `split_probe_index` is the first token index where the deepest entry's ledger
-        // and this prompt differ; the windows are the ids either side of it, present only when the probe is
-        // enabled. These are arrays, deliberately: a comma-joined string would need a parser at exactly the
-        // moment someone is trying to read a raw log.
+        // WHICH LEDGER the deepest match came from, and its resume point -- see the diagnostics.
+        {"split_best_source", diagnostics.split_best_source},
+        {"split_best_frontier", diagnostics.split_best_frontier},
+        // WHERE THE DEEPEST MATCH STOPPED, as an index. The 12-id windows that used to be emitted beside it
+        // were removed 2026-09-28: they had answered their question and they carried user content.
         {"split_probe_index", diagnostics.split_probe_index},
-        // Did the windows get captured at all? An empty array otherwise reads the same whether the probe is off
-        // or the wiring is broken, and a reader of a raw log has no way to tell.
-        {"split_probe_enabled", diagnostics.split_probe_enabled},
-        // WHERE THE WINDOWS START. Without it a reader has to know `kTokenProbeLead` and the clamp at the
-        // start of the prompt to line the two arrays up against `split_probe_index`.
-        {"split_probe_begin", diagnostics.split_probe_index >= ninfer::kTokenProbeLead
-                                  ? diagnostics.split_probe_index - ninfer::kTokenProbeLead
-                                  : 0u},
-        {"split_probe_stored", [&] {
-             Json array = Json::array();
-             for (std::size_t i = 0; i < diagnostics.split_probe_count; ++i) {
-                 array.push_back(diagnostics.split_probe_stored[i]);
-             }
-             return array;
-         }()},
-        {"split_probe_prompt", [&] {
-             Json array = Json::array();
-             for (std::size_t i = 0; i < diagnostics.split_probe_count; ++i) {
-                 array.push_back(diagnostics.split_probe_prompt[i]);
-             }
-             return array;
-         }()},
         {"session_cell_frontier", diagnostics.session_cell_frontier},
         {"session_cell_offered", diagnostics.session_cell_offered},
         {"session_cell_skip", diagnostics.session_cell_skip},

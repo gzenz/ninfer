@@ -1,20 +1,9 @@
-Note (corrected 2026-09-26): this tree **does** support concurrent sessions. The warning that stood here
-("does NOT work with concurrent sessions, it'll mix up the caches") described a real defect — a lane's
-prefill wrote and attended through the newly admitted lane's KV row — and it was fixed in `479c92c4`,
-then re-verified with two canary runs (`rc=0`, `bleed=0 partial_foreign=0`, agreeing exactly). The honest
-limit of that verification: the canary's own-prefix coverage is short (`missed_own=8/8`), so "no bleed"
-rests on a short prefix rather than on an exhaustive sweep. The V2 branch this note used to point at is
-retired; it is not a fallback.
+# NInfer
 
-# NInfer (YaRN)
+An inference engine for Qwen3.x on an RTX 5090 — device- and host-tiered KV caching, a pressure planner
+that demotes before it evicts, and YaRN context extension.
 
-This is a fork of [Ninfer](https://github.com/gzenz/ninfer), an inference engine designed to be optimized for Qwen3.x models and an RTX 5090. This project adds YaRN context extension and other enhancements:
-
-## Gzenz's fork of Doelfke's YaRN fork
-
-Thanks to [Doelfke](https://github.com/Doelfke/ninfer-yarn) for the YaRN work — this tree
-is our fork of his fork of [our fork](https://github.com/gzenz/ninfer). On top of
-Doelfke's tree we have added:
+## What this line adds
 
 - **KV / materialization correctness** — an atomic "seal-window claim" in the
   materialization planner that closes a TOCTOU race: a concurrent demote could bump a

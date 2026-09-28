@@ -37,9 +37,12 @@ void mtp_bridge_and_propose(PrefillContext& state, const Tensor& next_token,
     Tensor logits             = state.execution.io.logits.slice(1, 0, 1);
     Tensor draft0             = state.execution.io.mtp->draft_tokens.slice(0, 0, 1);
     Tensor rope_position_view = state.execution.work.alloc(DType::I32, {1, 3});
+    // Async + settle: the span's callers pass a block-local std::array, and the copy must stay
+    // ordered on the non-blocking compute stream.
     CUDA_CHECK(cudaMemcpyAsync(rope_position_view.data, rope_position.data(),
                                rope_position.size_bytes(), cudaMemcpyHostToDevice,
                                state.execution.device.stream));
+    CUDA_CHECK(cudaStreamSynchronize(state.execution.device.stream));
     const auto bridge_visible = static_cast<std::uint32_t>(position + 1);
     const ops::CausalAttentionExecutionEnvelope bridge_envelope{bridge_visible, bridge_visible};
     card.mtp_forward_batch(next_token, previous_hidden, position_view, bridge_envelope, mtp_hidden,

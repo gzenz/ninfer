@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/arena.h"
+#include "core/pinned_host_pool.h"
 #include "core/paged_kv_cache.h"
 #include "core/transfer_work.h"
 
@@ -180,7 +181,8 @@ private:
     struct Target {
         std::uint32_t layout = 0;
         std::uint32_t pages  = 0;
-        std::size_t offset   = 0;
+        std::uint32_t span   = 0;   // which pool extent the plan placed this run in
+        std::size_t offset   = 0;   // span-relative
         std::size_t bytes    = 0;
     };
 
@@ -194,7 +196,11 @@ private:
 
 class HostKVArena {
 public:
-    HostKVArena(std::size_t capacity_bytes, std::span<const HostKVPageLayout> supported_layouts);
+    // The arena now draws its memory from the SHARED pinned pool instead of owning one buffer, so it can
+    // take room the state pool is not using and give it back. `initial_bytes` is a reservation, not a
+    // ceiling; `span_bytes` is the size of one growth step.
+    HostKVArena(PinnedHostPool& pool, std::size_t initial_bytes, std::size_t span_bytes,
+                std::span<const HostKVPageLayout> supported_layouts);
 
     HostKVArena(const HostKVArena&)            = delete;
     HostKVArena& operator=(const HostKVArena&) = delete;
@@ -215,6 +221,31 @@ public:
                                     std::uint32_t pages) const noexcept;
     [[nodiscard]] std::optional<HostKVAllocation> allocate(const HostKVPageLayout& layout,
                                                            std::uint32_t pages) noexcept;
+
+    // THE SAME ALLOCATION, ALLOWED TO GROW A SPAN. `allocate` stays pure so a caller applying an
+    // already-planned recipe never changes the arena underneath itself.
+    [[nodiscard]] std::optional<HostKVAllocation> allocate_growing(const HostKVPageLayout& layout,
+                                                                   std::uint32_t pages) noexcept;
+
+    // How many more bytes would have to be pinned for this request to fit, 0 when it already does.
+    // NO PRODUCTION CALLER TODAY: a planner pre-grow is exactly what this change tried and removed, so the
+    // only callers are tests. Kept because it is the measurement a future pre-grow would need -- and named
+    // here as unused rather than described as though a planner were consulting it.
+    [[nodiscard]] std::size_t shortfall_for(std::uint32_t pages, std::size_t page_stride) const noexcept;
+
+    // Descriptors needed to describe `bytes` of host KV, using the SMALLEST supported page stride -- the
+    // most descriptors that region could ever require. Used by `grow_span`, so a span can never arrive
+    // unable to be described.
+    [[nodiscard]] std::size_t descriptor_hint_for(std::size_t bytes) const noexcept;
+
+    // Pin enough for `pages` of this layout, as one span. Page-shaped rather than byte-shaped to match the
+    // rest of this interface, and public because a caller that must not silently fail (the extent store's
+    // demote path, `host_kv_store.h`) needs to ask for the room explicitly.
+    [[nodiscard]] bool grow_for(std::uint32_t pages, std::size_t page_stride) noexcept;
+    [[nodiscard]] bool grow_bytes(std::size_t bytes) noexcept;
+
+    [[nodiscard]] std::uint64_t growth_count() const noexcept { return growth_count_; }
+    [[nodiscard]] std::uint64_t growth_refusals() const noexcept { return growth_refusals_; }
 
     [[nodiscard]] std::optional<HostKVAllocationRecipe>
     plan_after_releases(std::span<const HostKVAllocationHandle> proposed_releases,
@@ -241,8 +272,16 @@ private:
     friend class HostKVAllocationView;
     friend class HostKVAllocationConstView;
 
+    // ONE POOL EXTENT PER SPAN. A page run must be physically contiguous, so it lives inside a single span
+    // and never straddles two -- which is why growth adds spans rather than extending one address space.
+    struct Span {
+        PinnedHostPool::Handle allocation{};
+        std::size_t            bytes = 0;
+    };
+
     struct Descriptor {
-        std::size_t offset       = 0;
+        std::uint32_t span       = 0;
+        std::size_t offset       = 0;   // span-relative
         std::size_t bytes        = 0;
         std::uint32_t layout     = 0;
         std::uint32_t pages      = 0;
@@ -251,28 +290,42 @@ private:
     };
 
     struct FreeExtent {
-        std::size_t offset = 0;
+        std::uint32_t span  = 0;
+        std::size_t offset = 0;   // span-relative
         std::size_t bytes  = 0;
     };
 
     [[nodiscard]] std::optional<std::uint32_t>
     find_layout(const HostKVPageLayout& layout) const noexcept;
     [[nodiscard]] std::optional<std::size_t> find_free_extent(std::size_t bytes) const noexcept;
+    // Pin one more span of at least `bytes` from the shared pool. A failed attempt leaves the arena as it was.
+    [[nodiscard]] bool grow_span(std::size_t bytes) noexcept;
+    [[nodiscard]] std::size_t span_bytes(std::uint32_t span) const noexcept;
+    [[nodiscard]] std::size_t smallest_stride() const noexcept;
     [[nodiscard]] bool valid_handle(HostKVAllocationHandle handle) const noexcept;
     [[nodiscard]] std::uint32_t take_descriptor() noexcept;
     bool release_descriptor(std::uint32_t descriptor, std::uint32_t generation) noexcept;
     void insert_free_extent(FreeExtent extent) noexcept;
+    // ONE definition of "insert an extent into a (span, offset)-ordered list and coalesce, but only within
+    // the same span". THREE sites need it -- the real free list, the recipe simulation and the suballocation
+    // simulation -- and keeping three copies is exactly how two of them ended up span-blind, which the
+    // 2026-09-26 review reproduced as a false "8 contiguous pages fit" across two spans.
+    static void insert_extent_ordered(std::vector<FreeExtent>& extents, FreeExtent extent) noexcept;
     [[nodiscard]] std::byte* allocation_data(const Descriptor& descriptor) const noexcept;
     void bump_revision() noexcept;
 
-    std::optional<PinnedHostBuffer> backing_;
+    PinnedHostPool* pool_ = nullptr;  // non-owning: the program owns the shared budget
+    std::vector<Span> spans_;
+    std::size_t span_growth_bytes_ = 0;
     std::size_t capacity_bytes_ = 0;
     std::size_t occupied_bytes_ = 0;
     std::vector<HostKVPageLayout> layouts_;
     std::vector<Descriptor> descriptors_;
     std::vector<std::uint32_t> free_descriptors_;
     std::vector<FreeExtent> free_extents_;
-    std::uint64_t revision_ = 1;
+    std::uint64_t revision_    = 1;
+    std::uint64_t growth_count_    = 0;
+    std::uint64_t growth_refusals_ = 0;
 };
 
 } // namespace ninfer

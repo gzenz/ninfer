@@ -53,6 +53,24 @@ void free_pinned(void*& ptr) noexcept {
 
 } // namespace
 
+void* pin_host_memory(std::size_t bytes) noexcept {
+    if (bytes == 0U) { return nullptr; }
+    void* ptr = nullptr;
+    if (cudaMallocHost(&ptr, bytes) != cudaSuccess) {
+        // Clear the error: a failed pin must not leave the driver in an error state that the NEXT CUDA call
+        // reports as its own failure. The pool treats this as a refusal and continues.
+        (void)cudaGetLastError();
+        return nullptr;
+    }
+    return ptr;
+}
+
+void free_host_memory(void* base) noexcept {
+    if (base == nullptr) { return; }
+    void* ptr = base;
+    free_pinned(ptr);  // the existing helper, which logs the CUDA error from cudaFreeHost
+}
+
 DeviceBuffer::DeviceBuffer(std::size_t size_bytes) : bytes(size_bytes) {
     if (bytes == 0) { return; }
 

@@ -234,6 +234,28 @@ runtime::ExecutionTiming ProgramImpl::append_forced_tokens(
         throw std::invalid_argument("forced-token membership is invalid");
     }
 
+    // Forced-token path probe (NINFER_FORCED_PROBE=1). Read-only, and it prints the denominator that
+    // matters: how many rows this call was given, and which lanes they are.
+    //
+    // The path had never been observable at all. A comment in this file even claimed the request log's
+    // `units.control` showed it had never run -- false, that field is a control-plane work counter that
+    // is non-zero in most records (see the correction beside `bind_sequence_kv`). The condition that
+    // reaches here IS reproducible (`thinking.budget_tokens` with a prompt that exceeds it gives
+    // `stop_reason: max_tokens` with thinking past the budget), but whether this function then runs --
+    // and, above all, whether it ever sees *more than one row*, which is the case the per-row bind
+    // exists for -- needs an observation from inside the function. This is that observation.
+    if (std::getenv("NINFER_FORCED_PROBE") != nullptr) {
+        // `multi_row` is what matters: 1 means this call carried more than one row, i.e. the case the
+        // per-row KV bind exists for. (The first version printed this same boolean under the name
+        // `distinct_lanes`, which reads as a count of lanes and reported 0 for a single-row call --
+        // a label that said something other than what it measured.)
+        std::fprintf(stderr,
+                     "[forced] append_forced_tokens rows=%zu stride=%u tokens=%zu multi_row=%d\n",
+                     members.size(), row_stride, row_major_tokens.size(),
+                     static_cast<int>(members.size() > 1));
+        std::fflush(stderr);
+    }
+
     std::array<std::uint32_t, kMaximumConcurrency> lanes{};
     for (std::size_t row = 0; row < members.size(); ++row) {
         if (!valid_sequence(members[row])) {
@@ -275,8 +297,10 @@ runtime::ExecutionTiming ProgramImpl::append_forced_tokens(
         Tensor forced_ids =
             work.alloc(DType::I32, {checked_i32(static_cast<std::uint32_t>(row_major_tokens.size()),
                                                 "forced-token batch exceeds int32")});
+        // Async + settle: `row_major_tokens` is function-local and the copy must stay ordered.
         CUDA_CHECK(cudaMemcpyAsync(forced_ids.data, row_major_tokens.data(), forced_ids.bytes(),
                                    cudaMemcpyHostToDevice, device.stream));
+        CUDA_CHECK(cudaStreamSynchronize(device.stream));
         for (std::size_t row = 0; row < members.size(); ++row) {
             const std::uint32_t lane = lanes[row];
             if (requests[lane].sampling_host.token_counts == nullptr) { continue; }
@@ -330,19 +354,30 @@ runtime::ExecutionTiming ProgramImpl::append_forced_tokens(
                     (backend_kv_cache() && !sequence.kv->backend)) {
                     throw std::logic_error("DFlash forced continuation state is incomplete");
                 }
-                *dflash_host_ingress                            = {};
-                dflash_host_ingress->active_lanes[0]            = static_cast<std::int32_t>(lane);
-                const StateImageSelectors selectors             = state_selectors(sequence);
-                dflash_host_ingress->state_source_slots[0]      = selectors.source;
-                dflash_host_ingress->state_destination_slots[0] = selectors.destination;
-                dflash_host_ingress->dflash_kv_table_rows[0] =
-                    sequence.kv->backend ? backend_kv_addresses->bound_row(*sequence.kv->backend)
-                                         : 0;
-                CUDA_CHECK(cudaMemcpyAsync(io.dflash_decode->ingress.data, dflash_host_ingress,
-                                           sizeof(qwen3_5::DFlashDecodeIngress),
-                                           cudaMemcpyHostToDevice, device.stream));
+                // Same one-derivation rule as the prefill paths: this was a third copy.
+                bind_dflash_prefill_sink(sequence);
             }
 
+            // Re-bind THIS row's KV row before the chunk loop, for the same reason `advance_prefill`
+            // does at every step: the prefill kernels read the shared scalar `io.text_kv_table_row`
+            // (the lane-specific KV view handed to them is stored and never read -- the D2 carrier,
+            // 479c92c4), so with several rows in one batch every row would otherwise write and attend
+            // through whichever lane bound last. `commit_sequence_kv` below does not bind it: that only
+            // commits frontiers. Latent so far: this path needs thinking-control forced tokens.
+            //
+            // CORRECTED 2026-09-25. This comment used to say "the request log shows `units.control == 0`
+            // in every entry logged", offered as evidence the path had never run. That is false: the
+            // log's `units.control` is `timing.control_units` (request_log.cpp:354), a control-plane
+            // work counter that is non-zero in 3842 of 19163 records -- it has nothing to do with forced
+            // tokens and never was an indicator for this path. What is true is that the *condition* is
+            // reproducible: `thinking.budget_tokens` with a prompt that exceeds it gives
+            // `stop_reason: max_tokens` and thinking beyond the budget, which is when the engine forces
+            // the close. Whether `append_forced_tokens` then runs is not yet observed -- it needs a
+            // probe in that function, not a counter borrowed from an unrelated axis.
+            //
+            // The defect itself stands, and it is the same mechanism that produced measurable
+            // contamination under concurrency (8 foreign rebinds in 272 observed steps, 2026-09-25).
+            bind_sequence_kv(sequence);
             std::uint32_t cursor = base;
             while (cursor < end) {
                 const std::uint32_t count           = std::min(prefill_chunk, end - cursor);
@@ -625,6 +660,18 @@ FinishResult ProgramImpl::finish(SequenceHandle sequence) noexcept {
             state.reserved_state.reset();
         }
         if (state.rewrite_state && *state.rewrite_state == state.state.read) {
+            // NINFER_CAPTURE_PROBE: name the site that clears a live rewrite checkpoint during commit.
+            // This branch only runs when the checkpoint ALIASES the active state (so the refusal to
+            // clear is `checkpoint_references == 0`), and a sequence can lose the checkpoint that
+            // #11(a)'s recycling branch needs here -- one turn before the capture that would use it.
+            if (std::getenv("NINFER_CAPTURE_PROBE") != nullptr) {
+                const std::uint32_t refs = state_store->checkpoint_references(*state.rewrite_state);
+                if (refs != 0) {
+                    std::fprintf(stderr, "[commit] clears rewrite_state refs=%u frontier=%u lane=%u\n",
+                                 refs, state.rewrite_checkpoint.frontier, state.lane);
+                    std::fflush(stderr);
+                }
+            }
             if (state_store->checkpoint_references(*state.rewrite_state) == 0) { return out; }
             state_store->release_checkpoint_reference(*state.rewrite_state);
             state.rewrite_state.reset();
@@ -741,11 +788,24 @@ ProgramImpl::release_shared_prefix_state_strict(std::uint32_t index,
         slot.role = SharedPrefixSlotRole::Free;
         if (++slot.generation == 0) { ++slot.generation; }
         if (host_kv_extents) { (void)host_kv_extents->release_unreferenced(); }
+        // NOW is the natural moment to give idle pinned memory back: a release just finished, so something
+        // may have gone idle, and `maintain_host_memory` refuses to act while transfers are in flight.
+        maintain_host_memory(context_cache.host_pinned_chunk_bytes);
         return removed;
     } catch (...) { std::terminate(); }
 }
 
 ReleaseResult ProgramImpl::release_shared_prefix(SharedPrefixHandle&& handle) noexcept {
+    // I3(a): every refusal here is silent by design (this is a noexcept release path), which is how a
+    // slot whose role is wrong, or whose KV address cannot be released, keeps its occupancy without
+    // anyone learning why. `NINFER_RELEASE_PROBE=1` names the reason instead. Read-only.
+    const auto refusal = [](const char* reason, std::uint32_t index) noexcept {
+        if (std::getenv("NINFER_RELEASE_PROBE") != nullptr) {
+            std::fprintf(stderr, "[release-probe] shared-prefix release refused: %s index=%u\n",
+                         reason, index);
+            std::fflush(stderr);
+        }
+    };
     ReleaseResult out;
     const std::uint32_t index      = ContractAccess::index(handle);
     const std::uint64_t generation = ContractAccess::epoch(handle);
@@ -753,18 +813,42 @@ ReleaseResult ProgramImpl::release_shared_prefix(SharedPrefixHandle&& handle) no
         !has_context_transaction() && !pending_transaction_ && valid_shared_prefix(handle);
     if (!valid || index >= shared_prefix_capacity ||
         shared_prefix_slots[index].generation != generation) {
+        refusal(valid ? "stale-generation-or-index" : "transaction-in-flight-or-invalid-handle",
+                index);
         return out;
     }
     try {
         if (!can_release_shared_prefix_state(index, SharedPrefixSlotRole::Catalogued)) {
+            refusal("state-not-releasable", index);
             return out;
         }
-    } catch (...) { return out; }
+    } catch (...) {
+        refusal("state-releasable-check-threw", index);
+        return out;
+    }
     (void)release_shared_prefix_state_strict(index, SharedPrefixSlotRole::Catalogued);
     ContractAccess::consume(handle);
     advance_resource_revision();
     out.status = runtime::ConsumeStatus::Consumed;
     return out;
+}
+
+void ProgramImpl::resource_census() const noexcept {
+    // NULL-CHECKED, and that is a fix to a crash this census caused in the code it was written to serve.
+    // `backend_kv_addresses` is null in any configuration without a backend KV (MTP-less or DFlash-less
+    // engines, e.g. `pressure_resume_engine_options`), and calling a non-virtual member through a null
+    // pointer does not throw -- it segfaults. The `try` above cannot catch that.
+    //
+    // Reproduced 2026-09-26 in `feasibility-orphan` under gdb: `KVAddressSpaceStore::census
+    // (this=0x0, label="backend")` reached from `report_recovery_residual` -> `recover_from_oom_locked`.
+    // **The census runs whenever the residual is non-zero -- i.e. exactly when the engine is in #9's
+    // incident state, which is the state the census exists to report.** So this bug did not merely risk a
+    // crash: it would have taken the process down at the moment of the observation, converting the one
+    // event this whole investigation is waiting for into a crash with no diagnosis.
+    try {
+        if (text_kv_addresses) { text_kv_addresses->census("text"); }
+        if (backend_kv_addresses) { backend_kv_addresses->census("backend"); }
+    } catch (...) {}
 }
 
 void ProgramImpl::fail_all_cleanup() noexcept {
@@ -788,18 +872,54 @@ void ProgramImpl::fail_all_cleanup() noexcept {
         }
         invalidate_lane(lane);
     }
+    std::uint32_t continuations_live = 0;
     for (std::uint32_t index = 0; index < continuation_capacity; ++index) {
         if (continuation_slots[index].role != ContinuationSlotRole::Free) {
+            ++continuations_live;
             release_continuation_slot_best_effort(index);
         }
     }
+    // I3(b): what this cleanup actually released. The shared loop below skips any slot whose role is
+    // not `Catalogued`, so a slot parked in `ReservedCapture` -- which `abort_active_capture` does not
+    // reach when the transaction no longer holds that capture -- keeps its KV and state occupancy with
+    // no owner, and nothing reports it. That is the shape of the 2026-09-25 leak: ~958 device pages
+    // and one host state slot survived a recovery and no path could free them.
+    //
+    // One line, on an exceptional path only, so it needs no gate: the expected counts are one release
+    // per Catalogued slot and zero of everything else, and any other number here is the leak named.
+    std::uint32_t shared_catalogued    = 0;
+    std::uint32_t shared_skipped       = 0;
+    std::uint32_t shared_reserved_cap  = 0;
+    std::uint32_t shared_reserved_rep  = 0;
+    std::uint32_t shared_release_refus = 0;
     for (std::uint32_t index = 0; index < shared_prefix_capacity; ++index) {
-        if (shared_prefix_slots[index].role != SharedPrefixSlotRole::Catalogued) { continue; }
+        const SharedPrefixSlotRole role = shared_prefix_slots[index].role;
+        if (role != SharedPrefixSlotRole::Catalogued) {
+            if (role != SharedPrefixSlotRole::Free) {
+                ++shared_skipped;
+                if (role == SharedPrefixSlotRole::ReservedCapture) { ++shared_reserved_cap; }
+                if (role == SharedPrefixSlotRole::ReservedReplacement) { ++shared_reserved_rep; }
+            }
+            continue;
+        }
+        ++shared_catalogued;
         shared_prefix_states[index].active_references = 0;
         auto handle =
             ContractAccess::make_shared_prefix(this, index, shared_prefix_slots[index].generation);
-        (void)release_shared_prefix(std::move(handle));
+        const ReleaseResult released = release_shared_prefix(std::move(handle));
+        if (released.status != runtime::ConsumeStatus::Consumed) { ++shared_release_refus; }
     }
+    // The continuation count is a denominator, not an outcome: those releases are the non-strict
+    // variants (`release_sequence_kv`/`release_sequence_state` are void and noexcept), so a refusal
+    // cannot be counted from here. What it buys is attribution by elimination -- if the residual line
+    // is non-zero while every live continuation was released and the shared counts are clean, the leak
+    // is inside the non-strict release path or below it, not in a skipped slot.
+    std::fprintf(stderr,
+                 "[engine] fail-all cleanup: shared catalogued=%u released-refused=%u skipped=%u "
+                 "(reserved-capture=%u reserved-replacement=%u) continuations-live=%u\n",
+                 shared_catalogued, shared_release_refus, shared_skipped, shared_reserved_cap,
+                 shared_reserved_rep, continuations_live);
+    std::fflush(stderr);
 }
 
 

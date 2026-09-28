@@ -30,6 +30,9 @@ struct RequestLogContext {
     ninfer::ResolvedSamplingParameters sampling;
     double acquisition_seconds = 0.0;
     ninfer::PromptPreparationStats preparation;
+    std::optional<std::string> session_key;
+    std::optional<std::string> client_session_id;
+    std::optional<std::string> session_key_hash;
 };
 
 struct RequestLogMetadata {
@@ -37,6 +40,19 @@ struct RequestLogMetadata {
     bool stream                            = false;
     bool output_tokens_explicit            = false;
     bool preserve_thinking_semantic_change = false;
+    // THE DERIVED SESSION KEY, so key stability is checkable from traffic instead of inferred. Without it in
+    // the record, "does one conversation keep one key" and "do two concurrent streams share one key" are
+    // questions no log can answer -- and both are live: the port derives the key from system text plus the
+    // FIRST user turn, which an agentic client's sibling requests share. The value is an FNV-1a digest of that
+    // text, not the text.
+    std::optional<std::string> session_key;
+    // The client's own session id, hashed, when the body carries `metadata.user_id`. Logged beside the
+    // derived key so the two are comparable per request: if the client sends a stable id, the derived FNV
+    // preimage -- which a client's concurrent siblings SHARE -- can be replaced by it at the root.
+    std::optional<std::string> client_session_id;
+    // THE SAME HASH `prefill.cpp` puts on the sequence and the eviction line prints as `session=%016llx`, so an
+    // eviction can be tied to the request whose state it destroyed. Rendered as 16 hex digits for that match.
+    std::optional<std::string> session_key_hash;
 };
 
 // A parsed generation request that failed during synchronous preparation. It intentionally has a

@@ -206,7 +206,11 @@ int main() {
     failures += check(context_cache.context_cache.enabled &&
                           context_cache.context_cache.device_state_slots == 3 &&
                           context_cache.context_cache.host_state_slots == 5 &&
-                          context_cache.context_cache.host_kv_capacity_bytes == (64ULL << 20) &&
+                          // `--host-kv-mib` IS THE SHARED CACHE CEILING, and the KV arena starts at a quarter
+                          // of it (2026-09-28). Before that it sized the arena alone, and this assertion
+                          // encoded the old meaning -- which is how the semantics change broke this test.
+                          context_cache.context_cache.host_pinned_max_bytes == (64ULL << 20) &&
+                          context_cache.context_cache.host_kv_capacity_bytes == (16ULL << 20) &&
                           context_cache.context_cache.max_private_continuations == 9 &&
                           context_cache.context_cache.max_shared_prefixes == 4 &&
                           context_cache.context_cache.max_long_anchors_per_continuation == 2,

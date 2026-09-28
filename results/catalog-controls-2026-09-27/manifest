@@ -1,0 +1,29 @@
+# Evidence for the private-catalog observability work, 2026-09-27. Logs are gitignored by policy; THIS
+# manifest is the committed artifact.
+#
+# PROVENANCE, and why there is no commit id here: an earlier version recorded one, and the commit was
+# then amended twice, so the recorded id no longer exists on any remote and resolved for nobody. A
+# manifest inside a commit cannot cite that commit's own id, so identity is pinned by CONTENT instead:
+# the binary that produced these logs, and the two source files that define the behaviour.
+# commit id: recorded in plan.md section 1d at push time.
+binary-sha256: d5782d843bdf2266062897986c9433a0b65ad531ad7da16c0310d1e5708850dd   # rebuilt after the logs below; behaviourally identical for the LOGGED lines except the L1 fix, see note
+source-sha256 materialization_budget.h: 8299f3b86f24cd0149e00ffb6d8f4b09ef30790f75cd5ba376e6006b84a270b1
+source-sha256 resource_manager.h:      d4ef0973c789e17199782e7679b1e2749a797fd82988477a69aae70820cb0e36
+#
+# THE LOGS THAT PRODUCED THE TWO NUMBERS THE COMMIT QUOTES:
+log: atrisk-b.log sha256=513a228c9aa258d8471639abcc4a80fd3513cc6230b04e383e36b40eb15b9efd lines=112
+log: atrisk-c.log sha256=9bff3fd44b418a23ad8474d71c5ff034b7d6be17da65912d2c03bbf9955529ea lines=306
+# atrisk-b.log: 4 printed at-risk lines, evictable_owners 1..2, veto_goals=1, veto_other=0, veto_reuse=0
+# atrisk-c.log: 8 printed at-risk lines, evictable_owners 3..4, veto_goals=1..2, veto_other=0, veto_reuse=0
+# Both with 0 losses. NOTE the printed count is a SAMPLE (print capped at 8 then every 512th); the
+# uncapped totals are /stats pressure.publication_cell_at_risk_runs, added for that reason.
+#
+# Warning about the L1 fix: the at-risk logs predate it, so their evictable_owners came from the
+# planner's enumerated owner list (confounded). All 12 readings were 1..4, i.e. non-zero, which is the
+# value the confound does NOT manufacture -- a false zero is what it would produce.
+#
+log: window.log sha256=12c1dce7f7a80664ccfab9f5d9ebe40ee7474fd326929eed5ad3d8379b000dfd lines=95  # the three-case control window (loss binary)
+log: case-b-lanes2-cells2.log sha256=21e34c31d159883b605ae29a2c3f2cb5469ea127a589b4a42f2a5bd60566d414 lines=114
+log: case-c-lanes4-cells4.log sha256=c0ed3d1c19e30840a6658c259bef1ab2ce996d6202b48704deb9179b601fde4f lines=286
+# case-b: 24.9-25.1% shared-prefix reuse present, 6 evictions, 0 losses -- NOT "no reuse", which an
+# earlier version of the commit body said. It also carries the 99.9% turn-closure lines.

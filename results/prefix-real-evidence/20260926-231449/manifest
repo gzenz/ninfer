@@ -1,0 +1,13 @@
+binary=./build/tests/ninfer_qwen3_5_prefix_real_test
+binary_sha256=2ec23c8ece547fffe005f0af9ec0994c281feec91ba82e5656edb4c6c53cc74a
+binary_mtime=2026-09-26T23:14:29+02:00
+artifact=/home/zenz/ninfer-models/swift15/qwen3_8_27b_nvfp4swift15.ninfer
+artifact_sha256=683f5086a0e24e9b7c5caad256d373e13eff4e0491564f5b8c2acde33e52a11e
+git_head=bf0221a5b9b27ecb7abdab8ad658be9722a17f06
+git_dirty_paths=2
+scenario=state-image-restore (NINFER_PREFIX_REAL_SCENARIO)
+started=2026-09-26T23:14:49+02:00   # hand-written: the FIRST window of the pair (the journal has the stop/start cycles); the value here used to record the second
+state-image-restore-1 rc=0 log_sha256=b050da91ecd7dc99277512f494b7655bc6b3a78e3c4c633dfd2fd843ae6e6ef8
+state-image-restore-2 rc=0 log_sha256=b050da91ecd7dc99277512f494b7655bc6b3a78e3c4c633dfd2fd843ae6e6ef8
+finished=2026-09-26T23:16:59+02:00
+# Both runs agree exactly: state_h2d_delta=1 main_h2d_delta=3 backend_h2d_delta=2, path=2 reused=305 outputs=5.

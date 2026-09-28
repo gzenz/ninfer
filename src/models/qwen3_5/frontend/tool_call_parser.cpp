@@ -424,6 +424,16 @@ public:
                 // In tolerant mode a trailing suffix after one or more complete calls is
                 // discarded rather than failing the whole output.
                 if (tolerant_ && !calls.empty()) { return FallbackReason::TruncatedTail; }
+                if (tolerant_ && calls.empty()) {
+                    // Tolerant mode only: the model sometimes emits a literal <tool_call> in
+                    // leading prose (e.g. mentioning the tag) before the real call, which
+                    // anchors the region on the spurious marker. Scan for the next marker
+                    // instead of failing the whole output.
+                    const std::size_t next = text_.find(kToolOpen, pos);
+                    if (next == std::string_view::npos) { return FallbackReason::MalformedStructure; }
+                    pos = next;
+                    continue;
+                }
                 return calls.empty() ? FallbackReason::MalformedStructure
                                      : FallbackReason::TrailingContent;
             }
@@ -447,6 +457,12 @@ public:
             if (failure == FallbackReason::TruncatedTail && calls.empty() && !call.parameters.empty()) {
                 calls.push_back(std::move(call));
                 return FallbackReason::TruncatedTail;
+            }
+            if (tolerant_ && calls.empty()) {
+                // Tolerant mode only: the marker was spurious (a literal <tool_call> in
+                // prose) — skip past it and keep scanning for a real call region.
+                pos += kToolOpen.size();
+                continue;
             }
             return failure;
         }
@@ -618,11 +634,53 @@ private:
 
             --depth;
             if (depth == 0) {
+                // Tolerant mode only: a close tag closes the value only if the call can
+                // go on after it (another parameter, the function end, or the tool end).
+                // Tool payloads legitimately contain this markup as literal text -- a
+                // Write/Edit body, a chat template, or source that mentions the markers.
+                // Closing on a literal truncates the value, leaves the parse loop in the
+                // middle of the value, and fails the call, so the whole response falls
+                // back to plain text: the observed "tool markup returned as text" leak.
+                if (tolerant_ && !continues_call_at(close)) {
+                    ++depth;  // the tag was content, not structure
+                    scan = close + kParamClose.size();
+                    continue;
+                }
                 value_end = close;
                 return true;
             }
             scan = close + kParamClose.size();
         }
+    }
+
+    // True when the text following a candidate parameter close continues the call:
+    // another parameter open, the function close followed by the tool end, or the
+    // tool end itself. Anything else means the tag was payload content.
+    bool continues_call_at(std::size_t close) const {
+        const std::size_t after = skip_space(close + kParamClose.size());
+        // The region ending right after the close is the truncated-tail case (the call
+        // completed, the closing tags were cut by the output budget): accept it, or a
+        // truncated call would swallow the value and lose every argument.
+        if (after >= text_.size()) { return true; }
+        if (matches_at(after, kParamOpen) || matches_at(after, kToolClose)) { return true; }
+        if (matches_at(after, kFunctionClose)) {
+            const std::size_t after_function = skip_space(after + kFunctionClose.size());
+            return after_function >= text_.size() || matches_at(after_function, kToolClose) ||
+                   matches_at(after_function, kToolOpen);
+        }
+        return false;
+    }
+
+    std::size_t skip_space(std::size_t pos) const {
+        while (pos < text_.size() && (text_[pos] == ' ' || text_[pos] == '\t' ||
+                                      text_[pos] == '\n' || text_[pos] == '\r')) {
+            ++pos;
+        }
+        return pos;
+    }
+
+    bool matches_at(std::size_t pos, std::string_view token) const {
+        return pos + token.size() <= text_.size() && text_.compare(pos, token.size(), token) == 0;
     }
 
     std::string_view text_;

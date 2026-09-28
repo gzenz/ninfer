@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstdint>
 #include <iostream>
+#include <map>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -47,6 +48,10 @@ using ninfer::runtime::RetentionClass;
 using ninfer::runtime::VictimDisposition;
 
 int failures = 0;
+// A DENOMINATOR. "Exactly one failure, the recorded baseline" is not a checkable statement when the suite
+// reports only failures -- a run that stopped early, or that never reached a case, reads the same. The count
+// is printed at the end for the same reason every instrument in this repo prints its denominator.
+int tests_run = 0;
 
 void require(bool condition, const char* message) {
     if (!condition) { throw std::runtime_error(message); }
@@ -54,6 +59,7 @@ void require(bool condition, const char* message) {
 
 template <class Test>
 void run_test(const char* name, Test&& test) {
+    ++tests_run;
     try {
         test();
     } catch (const std::exception& error) {
@@ -94,6 +100,10 @@ CheckpointRecoveryAlternativeWork fake_recovery_work(std::uint64_t ns) {
 
 struct FakePreparedPrompt {
     std::uint32_t content_key = 0;
+    // Caps the token match BELOW the entry's ledger length, which is the only way the fake can produce a
+    // Diverged match. Without it `split.tokens` was always either 0 or the full ledger, so the Diverged branch
+    // below was dead code and the probe fields could never be set -- the second review pass found exactly that.
+    std::uint32_t match_limit = 0;
 };
 
 struct FakeCacheSessionKey {
@@ -216,6 +226,15 @@ struct FakeRequestBasePlan {
     RequestPlanSummary value;
     FakeContextCache cache;
     std::uint32_t shortlist_digest = 0;
+    // Refuses the shortlist key AT ONE FRONTIER, so a slot's entries can differ in outcome. Without it the
+    // fake's key is refusal-free or refused-everywhere, every entry of a slot takes the same outcome, and the
+    // endpoint-vs-anchor discriminator is never exercised -- the fourth review pass built a mutant replacing
+    // that comparison with `true` and it survived.
+    std::uint32_t refuse_frontier = 0;
+    // The identity-tag half of the key. The stored entries carry tag 0, so a non-zero value here is a genuine
+    // mismatch -- and because the tag check runs BEFORE the digest comparison, it is the only way to reach
+    // reason 4. Without it that site had no test and deleting it survived.
+    std::uint32_t identity_tag = 0;
     bool allow_shortlist           = true;
     bool isolated_feasible         = true;
 
@@ -226,7 +245,9 @@ struct FakeRequestBasePlan {
     [[nodiscard]] std::optional<FakeShortlistKey>
     prefix_shortlist_key(std::uint32_t frontier) const noexcept {
         if (!allow_shortlist || frontier == 0) { return std::nullopt; }
-        return FakeShortlistKey{.digest = shortlist_digest, .frontier = frontier};
+        return FakeShortlistKey{.digest       = frontier == refuse_frontier ? 99U : shortlist_digest,
+                                .frontier     = frontier,
+                                .identity_tag = identity_tag};
     }
 
     [[nodiscard]] std::size_t prefix_shortlist_size() const noexcept {
@@ -660,6 +681,132 @@ public:
         return base.isolated_feasible;
     }
 
+    // #6's counters, read by the stats assembly (`resource_manager.h`). The fake returns zeroes: this suite
+    // is host-only and asserts the plumbing, not the eviction policy -- but it must COMPILE, and it did not
+    // from the moment those two lines were added, because only the serve binary was built at the time.
+    [[nodiscard]] std::uint64_t demotable_evictions() const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t demotable_eviction_checks() const noexcept { return 0U; }
+    // Same class as the two above: in the real Program these are incremented inside ProgramImpl's own
+    // eviction/pressure TUs, which the fake does not model -- the fake never evaluates a victim's room or
+    // enumerates demote options, so zero is its truthful count, not a placeholder for one.
+    [[nodiscard]] std::uint64_t evictions_with_victim_room() const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t pressure_options() const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t demote_options() const noexcept { return 0U; }
+
+    // The private-catalog counters. Unlike the block above, these are MUTATED BY `ResourceManager` itself
+    // (planning decides them and holds only the Program façade), so the fake implements the real contract
+    // (`program_impl.h`): `note_*` pre-increments and returns the new total, `add_*` accumulates. Tests can
+    // therefore read what the manager recorded.
+    [[nodiscard]] std::uint64_t note_publication_cell_loss() noexcept {
+        return ++publication_cell_losses_;
+    }
+    [[nodiscard]] std::uint64_t note_publication_cell_at_risk() noexcept {
+        return ++publication_cell_at_risk_;
+    }
+    void add_publication_cell_at_risk(std::uint32_t at_risk, std::uint32_t goals, std::uint32_t other,
+                                      std::uint32_t reuse) noexcept {
+        publication_cell_at_risk_runs_ += at_risk;
+        publication_cell_veto_goals_ += goals;
+        publication_cell_veto_other_ += other;
+        publication_cell_veto_reuse_ += reuse;
+    }
+    void add_publication_cell_probes(std::uint64_t count) noexcept {
+        publication_cell_probes_ += count;
+    }
+    [[nodiscard]] std::uint64_t publication_cell_losses() const noexcept {
+        return publication_cell_losses_;
+    }
+    [[nodiscard]] std::uint64_t publication_cell_probes() const noexcept {
+        return publication_cell_probes_;
+    }
+    [[nodiscard]] std::uint64_t publication_cell_at_risk_runs() const noexcept {
+        return publication_cell_at_risk_runs_;
+    }
+    [[nodiscard]] std::uint64_t publication_cell_veto_goals() const noexcept {
+        return publication_cell_veto_goals_;
+    }
+    [[nodiscard]] std::uint64_t publication_cell_veto_other() const noexcept {
+        return publication_cell_veto_other_;
+    }
+    [[nodiscard]] std::uint64_t publication_cell_veto_reuse() const noexcept {
+        return publication_cell_veto_reuse_;
+    }
+
+    // THE SPLIT (`Program::prefix_split`). Contract: `tokens` = longest token-exact common prefix of the
+    // prompt with the owner's stored ledger; `restorable` = deepest restorable checkpoint frontier <= tokens;
+    // `identity_ok` = the identity chain also agrees at that match (only evaluated when tokens != 0); a stale
+    // or unknown owner yields the empty split.
+    //
+    // The fake's model of a ledger, which is INVENTED and must be read as such: the fake prompt carries only
+    // a `content_key`, and the fake's own reuse rule (`inspect_admission`) is "same content_key = the prompt
+    // extends that owner's history". So an owner the fake itself PUBLISHED (a finished continuation, or a
+    // shared prefix it published at capture) has a ledger of its published frontier and content key; a
+    // prompt with the same key matches the whole ledger, any other key matches nothing. The restorable set
+    // is the owner's CURRENT checkpoint summary as the fake last reported it (finish, or a retained victim's
+    // final summary after checkpoint drops). identity_ok = (tokens != 0): the fake has no render, so it
+    // cannot model a same-tokens/different-render divergence. Owners the fake never published (handles a
+    // test constructs by hand) are unknown to it and give the empty split, like a stale handle does.
+    // The fake mirrors `Program::PrefixSplit`'s surface AND, since the second review pass, the values the
+    // manager consumes (`match_end`, `stored`, `probe_index`). It fell behind the real one twice (the split's
+    // `match_end`/`stored` and the divergence probe), and each time this test stopped COMPILING -- so it ran
+    // nothing at all while looking like a suite that simply had no new failures. A host test that cannot
+    // build is the same failure mode as an instrument that cannot fire.
+    struct PrefixSplit {
+        std::uint32_t tokens      = 0;
+        std::uint32_t restorable  = 0;
+        bool          identity_ok = false;
+        std::uint8_t  match_end   = 0;
+        std::uint32_t stored      = 0;
+        std::uint32_t probe_index = 0;
+    };
+    [[nodiscard]] PrefixSplit prefix_split(const FakeContinuationHandle& owner,
+                                           const FakePreparedPrompt& prompt) const {
+        ++prefix_split_calls;
+        const auto found = private_ledgers_.find(owner.id);
+        if (owner.id == 0 || found == private_ledgers_.end()) { return {}; }
+        const PrivateLedger& ledger = found->second;
+        PrefixSplit split;
+        split.tokens = ledger.content_key == prompt.content_key ? ledger.length : 0U;
+        if (prompt.match_limit != 0U && split.tokens > prompt.match_limit) { split.tokens = prompt.match_limit; }
+        if (split.tokens == 0U) { return split; }
+        // THE VALUES, not just the shape. Adding the fields so the suite COMPILES left every manager-level
+        // assertion about them vacuous: the fake returned defaults, so a mutant dropping `.stored = split.stored`
+        // or `.match_end = split.match_end` in the manager survived. The fake has no prompt length, so it
+        // models StoredEnded (the match consumed the entry's whole ledger) and Diverged, and does NOT model
+        // PromptEnded; `probe_index` follows the real rule (set whenever diverged, gate or no gate).
+        split.stored     = ledger.length;
+        split.match_end  = split.tokens >= ledger.length ? 1U /*StoredEnded*/ : 0U /*Diverged*/;
+        if (split.match_end == 0U) { split.probe_index = split.tokens; }
+        split.identity_ok = true;
+        const auto consider = [&](const std::optional<FakeCheckpointSummary>& checkpoint) {
+            if (checkpoint && checkpoint->ref.frontier <= split.tokens) {
+                split.restorable = std::max(split.restorable, checkpoint->ref.frontier);
+            }
+        };
+        consider(ledger.summary.endpoint);
+        consider(ledger.summary.rewrite);
+        for (const FakeCheckpointSummary& anchor : ledger.summary.long_anchors) { consider(anchor); }
+        return split;
+    }
+    [[nodiscard]] PrefixSplit prefix_split(const FakeSharedPrefixHandle& owner,
+                                           const FakePreparedPrompt& prompt) const {
+        ++prefix_split_calls;
+        const auto found = shared_ledgers_.find(owner.id);
+        if (owner.id == 0 || found == shared_ledgers_.end()) { return {}; }
+        const SharedLedger& ledger = found->second;
+        PrefixSplit split;
+        split.tokens = ledger.content_key == prompt.content_key ? ledger.length : 0U;
+        if (prompt.match_limit != 0U && split.tokens > prompt.match_limit) { split.tokens = prompt.match_limit; }
+        if (split.tokens == 0U) { return split; }
+        // Modelled the same way as the private overload; it returned defaults for these fields before.
+        split.stored    = ledger.length;
+        split.match_end = split.tokens >= ledger.length ? 1U /*StoredEnded*/ : 0U /*Diverged*/;
+        if (split.match_end == 0U) { split.probe_index = split.tokens; }
+        split.identity_ok = true;
+        if (ledger.checkpoint_frontier <= split.tokens) { split.restorable = ledger.checkpoint_frontier; }
+        return split;
+    }
+
     [[nodiscard]] std::optional<FakeAdmissionCandidate>
     inspect_admission(const FakePreparedPrompt& prompt, const FakeRequestBasePlan& base, LaneId,
                       const FakeContinuationHandle* source,
@@ -852,6 +999,9 @@ public:
                             victim.final_summary->rewrite =
                                 rewrite_checkpoint(content, finish_frontier - 1U);
                         }
+                        note_private_summary(owner, *victim.final_summary);
+                    } else {
+                        private_ledgers_.erase(pending_plan_->private_owner_ids[index]);
                     }
                     result.victims.push_back(std::move(victim));
                 }
@@ -869,6 +1019,12 @@ public:
                         victim.final_summary      = FakeSharedPrefixSummary{
                                  .checkpoint = shared_checkpoint(owner, finish_frontier),
                         };
+                        const auto ledger = shared_ledgers_.find(owner);
+                        if (ledger != shared_ledgers_.end()) {
+                            ledger->second.checkpoint_frontier = finish_frontier;
+                        }
+                    } else {
+                        shared_ledgers_.erase(pending_plan_->shared_owner_ids[index]);
                     }
                     result.shared_victims.push_back(std::move(victim));
                 }
@@ -889,6 +1045,10 @@ public:
                     FakeSharedPrefixHandle handle;
                     handle.id          = next_shared_id_++;
                     handle.content_key = capture_assessment.shortlist_key.digest;
+                    shared_ledgers_[handle.id] = SharedLedger{
+                        .content_key         = capture_assessment.shortlist_key.digest,
+                        .length              = capture_assessment.shortlist_key.frontier,
+                        .checkpoint_frontier = capture_assessment.shortlist_key.frontier};
                     result.shared      = FakeSharedPrefixPublication{
                              .handle = std::move(handle),
                              .summary =
@@ -931,11 +1091,15 @@ public:
                     victim.final_summary->rewrite =
                         rewrite_checkpoint(content, finish_frontier - 1U);
                 }
+                note_private_summary(owner_id, *victim.final_summary);
+            } else {
+                private_ledgers_.erase(plan.private_owner_ids.at(index));
             }
             result.victims.push_back(std::move(victim));
         }
         for (std::size_t index = 0; index < plan.shared_actions.size(); ++index) {
             const FakeTargetDecision& action = plan.shared_actions[index];
+            if (action.evicts_continuation) { shared_ledgers_.erase(plan.shared_owner_ids.at(index)); }
             result.shared_victims.push_back(FakeMaterializationSharedVictimResult{
                 .owner              = plan.shared_planning_ids[index],
                 .disposition        = action.evicts_continuation ? VictimDisposition::Evicted
@@ -997,11 +1161,15 @@ public:
         return transaction_kind_ != TransactionKind::None;
     }
 
+    // The `site` parameter mirrors the real contract (`inspect_capture`'s call-site tag, which exists for
+    // the diagnostic line only): the mock must match the signature or the whole suite stops compiling,
+    // which is how this was found.
     [[nodiscard]] FakeCaptureAssessment inspect_capture(const FakeCaptureOffer&,
                                                         const FakeSharedPrefixHandle*,
                                                         const FakeSharedPrefixHandle*,
                                                         std::optional<CheckpointRef>,
-                                                        bool permit_shared_publication) const {
+                                                        bool permit_shared_publication,
+                                                        const char* /*site*/) const {
         FakeCaptureAssessment assessment = capture_assessment;
         if (!permit_shared_publication) { assessment.publishes_shared = false; }
         return assessment;
@@ -1110,10 +1278,16 @@ public:
         result.disposition      = FinishDisposition::Catalogued;
         const std::uint32_t key = sequence_content_keys_[sequence.id];
         result.summary.endpoint = endpoint(key, finish_frontier);
+        // THE CENSUS READS `state_residency`, and `endpoint()` builds every checkpoint DeviceOnly -- so without
+        // this knob no fixture could produce a host-resident checkpoint and `host_state_checkpoints_*` had
+        // nothing to count (two of its mutants survived on that).
+        if (host_residency != std::nullopt) { result.summary.endpoint->state_residency = *host_residency; }
         if (finish_with_rewrite) {
             result.summary.rewrite = rewrite_checkpoint(key, finish_frontier - 1U);
         }
         result.continuation.emplace(sequence.id, key);
+        private_ledgers_[sequence.id] =
+            PrivateLedger{.content_key = key, .length = finish_frontier, .summary = result.summary};
         return result;
     }
 
@@ -1128,6 +1302,7 @@ public:
     [[nodiscard]] FakeReleaseResult
     release_continuation(FakeContinuationHandle&& continuation) noexcept {
         released_continuations.push_back(continuation.id);
+        private_ledgers_.erase(continuation.id);
         advance_revision();
         return FakeReleaseResult{.status = ConsumeStatus::Consumed};
     }
@@ -1135,6 +1310,8 @@ public:
     [[nodiscard]] ProgramResourceRevision resource_revision() const noexcept { return revision_; }
 
     [[nodiscard]] FakePhysicalUsage physical_usage() const noexcept { return usage; }
+    // Added with the shared-replacement counter: `populate_runtime_stats` reads it, so the mock needs it.
+    [[nodiscard]] std::uint64_t shared_replacements() const noexcept { return 0; }
 
     void invalidate_resources() noexcept { advance_revision(); }
 
@@ -1162,6 +1339,8 @@ public:
     bool finish_fail_next                                = false;
     bool finish_release                                  = false;
     bool finish_with_rewrite                             = false;
+    // When set, published endpoints report this residency. Only the census consumes it.
+    std::optional<ninfer::runtime::ReplicaResidency> host_residency;
     bool abort_capture_start                             = false;
     bool report_shared_source_summary                    = false;
     bool change_shared_source_residency_on_second_report = false;
@@ -1183,16 +1362,51 @@ public:
     std::uint32_t started_source_id           = 0;
     PrivateSourceMode started_source_mode     = PrivateSourceMode::ConsumeToActive;
     std::vector<std::uint32_t> inspected_private_sources;
+    // The capture-skip counters the real `populate_runtime_stats` copies out. The fake skipped nothing, so
+    // all five are zero -- but they have to EXIST, or the suite does not compile. NO ASSERTION READS THEM, so
+    // the reason-to-field mapping in `populate_runtime_stats` (swapping two indices would survive) is
+    // untested; recorded rather than implied.
+    [[nodiscard]] std::uint64_t capture_skips(std::size_t) const noexcept { return 0; }
     std::vector<std::uint32_t> inspected_shared_sources;
     std::vector<std::vector<std::uint64_t>> seal_attempts;
     std::vector<std::uint64_t> started_action_ids;
     std::vector<std::uint32_t> selected_shared_capture_frontiers;
     std::vector<std::uint32_t> released_continuations;
 
+    mutable std::uint64_t prefix_split_calls = 0;
+
 private:
+    struct PrivateLedger {
+        std::uint32_t content_key = 0;
+        std::uint32_t length      = 0;
+        FakeContinuationSummary summary;
+    };
+    struct SharedLedger {
+        std::uint32_t content_key         = 0;
+        std::uint32_t length              = 0;
+        std::uint32_t checkpoint_frontier = 0;
+    };
+
     void advance_revision() noexcept {
         if (++revision_.value == 0) { ++revision_.value; }
     }
+
+    // A retained private victim's checkpoint set changed (drops): the ledger is unchanged, the restorable
+    // set follows the final summary the fake reported. Unknown owners stay unknown.
+    void note_private_summary(std::uint32_t id, const FakeContinuationSummary& summary) {
+        const auto found = private_ledgers_.find(id);
+        if (found != private_ledgers_.end()) { found->second.summary = summary; }
+    }
+
+    std::uint64_t publication_cell_losses_       = 0;
+    std::uint64_t publication_cell_probes_       = 0;
+    std::uint64_t publication_cell_at_risk_      = 0;
+    std::uint64_t publication_cell_at_risk_runs_ = 0;
+    std::uint64_t publication_cell_veto_goals_   = 0;
+    std::uint64_t publication_cell_veto_other_   = 0;
+    std::uint64_t publication_cell_veto_reuse_   = 0;
+    std::map<std::uint32_t, PrivateLedger> private_ledgers_;
+    std::map<std::uint32_t, SharedLedger> shared_ledgers_;
 
     ProgramResourceRevision revision_{.value = 1};
     std::uint32_t planning_generation_ = 0;
@@ -2423,6 +2637,369 @@ void test_root_lifecycle_and_prefix_reuse() {
             "failed start did not roll back its logical source claim");
 }
 
+// THE SPLIT, end to end through `ResourceManager`: every Catalogued entry is scanned with
+// `Program::prefix_split`, and `best_prefix_split` folds them into the request's diagnostics. Asserts values
+// that DIFFER by prompt, so a fake (or a manager) that returns constants cannot pass both halves: the
+// unrelated prompt must read 0 tokens over the same entries the related prompt reads 16 over.
+// THE SESSION FIELDS' OWN SEMANTICS, on a fresh manager so the catalog holds exactly one session slot with
+// two entries (endpoint 16, rewrite 15) and the per-frontier refusal can make them disagree.
+//
+// Two things this pins that the pass-3 assertions could not:
+//   * `session_endpoint_skip` answers for the ENDPOINT, not for whichever entry of the slot was visited last.
+//     Replacing its `index.checkpoint == own.summary.endpoint->ref` test with `true` survives the older cases,
+//     because there every entry of the slot agreed.
+//   * `session_cell_skip`'s offered-is-sticky rule. An endpoint that was offered followed by a refused
+//     rewrite must still read 1: the cell DID produce a candidate. Without the rule it reports the rewrite's
+//     refusal instead, which is the confusion the field exists to remove.
+// THE ERASURE COUNTERS MUST BE WIRED, not merely present -- the cell-clear counters once shipped incrementing
+// at nine sites and never copying out, so `/stats` served a hardcoded zero that read like a clean finding. This
+// drives the ordinary consume path and requires the counter to move, and pins the occupancy/capacity pair.
+void test_session_erase_counters_are_wired() {
+    FakeManager manager = make_manager(1, 4);
+    FakeProgram program;
+    const FakeCacheSessionKey session{21};
+    const auto materialize = [&](std::uint64_t order) {
+        FakeRequestBasePlan base = make_base(21, session, RetentionClass::LiveSession);
+        auto inspection = manager.inspect(program, FakePreparedPrompt{21}, base, order);
+        require(inspection.choice.has_value(), "erase fixture produced no choice");
+        const LaneId lane = inspection.choice->destination();
+        require(manager.reserve_materialization(program, std::move(*inspection.choice),
+                                                FakePreparedPrompt{21}, {}) ==
+                    FakeManager::MaterializationReserveResult::Reserved,
+                "erase fixture was not reserved");
+        auto outcome = [&]() -> FakeManager::MaterializationOutcome {
+            auto progress = manager.progress_context_transaction(program, {});
+            if (!std::holds_alternative<ContextTransactionInProgress>(progress)) {
+                return std::get<FakeManager::MaterializationOutcome>(std::move(progress));
+            }
+            auto completed = manager.progress_context_transaction(program, {});
+            return std::get<FakeManager::MaterializationOutcome>(std::move(completed));
+        }();
+        require(outcome.status == ContextTransactionStatus::Published && outcome.activation,
+                "erase fixture did not publish");
+        auto activation                   = std::move(*outcome.activation);
+        const FakeSequenceHandle sequence = activation.sequence();
+        manager.adopt(program, std::move(activation));
+        return ActiveRequest{.lane = lane, .sequence = sequence};
+    };
+
+    const ActiveRequest seed = materialize(1);
+    (void)finish_active(manager, program, seed, 16);
+    RuntimeStats before;
+    manager.populate_runtime_stats(program, before);
+    require(before.session_index_capacity_cells == 4,
+            "the session index must report its capacity, or a full index is indistinguishable from an empty one");
+    // EXACTLY ONE, not "at least one": `occupied := capacity` was a surviving mutant, and a >= test cannot
+    // see it. The conversation has published one continuation into an index of four.
+    require(before.session_index_occupied_cells == 1,
+            "one published continuation must occupy exactly one session index entry of the four");
+
+    // The conversation's next turn: same key, matching digest, so the source is CONSUMED as the active source.
+    const ActiveRequest next = materialize(2);
+    (void)next;
+    RuntimeStats after;
+    manager.populate_runtime_stats(program, after);
+    require(after.session_erasures_consume > before.session_erasures_consume,
+            "consuming a session's own continuation must count as a session-index erasure: this is the path "
+            "that leaves the next turn with no cell and a 23k-token re-prefill");
+    require(after.session_erasures_eviction == before.session_erasures_eviction,
+            "a consume must not be counted as an eviction -- the two have different fixes");
+}
+
+// M2: THE EVICTION PATH MUST COUNT AS AN EVICTION, not as a consume. The split between the two erasure
+// reasons is the whole point of the pair (an eviction is the route that leaves a conversation with no cell;
+// a consume is the ordinary path that then republishes), and until this test the Eviction site had NO
+// coverage at all -- swapping it to Consume survived every other case, because nothing drove an eviction
+// through the manager. `require_evictions` forces a plan whose every alternative evicts.
+void test_session_erase_counts_an_eviction_as_eviction() {
+    FakeManager manager = make_manager(1, 3);
+    FakeProgram program;
+    const FakeCacheSessionKey victim_session{31};
+    const FakeCacheSessionKey keeper_session{32};
+    const ActiveRequest victim = start_active(
+        manager, program, 31, make_base(31, victim_session, RetentionClass::LiveSession), 1);
+    (void)finish_active(manager, program, victim, 16);
+    const ActiveRequest keeper = start_active(
+        manager, program, 32, make_base(32, keeper_session, RetentionClass::LiveSession), 2);
+    (void)finish_active(manager, program, keeper, 16);
+
+    RuntimeStats before;
+    manager.populate_runtime_stats(program, before);
+    require(before.session_erasures_eviction == 0 && before.session_erasures_consume == 0,
+            "the fixture erased a session entry before any pressure was applied");
+
+    program.required_pressure_actions = 1;
+    program.require_evictions         = true;
+    auto inspection = manager.inspect(
+        program, FakePreparedPrompt{33},
+        make_base(33, FakeCacheSessionKey{33}, RetentionClass::LiveSession), 3);
+    require(inspection.choice.has_value(), "the eviction fixture produced no choice");
+    require(manager.reserve_materialization(program, std::move(*inspection.choice),
+                                            FakePreparedPrompt{33}, {}) ==
+                FakeManager::MaterializationReserveResult::Reserved,
+            "the eviction fixture was not reserved");
+    auto outcome = [&]() -> FakeManager::MaterializationOutcome {
+        auto progress = manager.progress_context_transaction(program, {});
+        if (!std::holds_alternative<ContextTransactionInProgress>(progress)) {
+            return std::get<FakeManager::MaterializationOutcome>(std::move(progress));
+        }
+        auto completed = manager.progress_context_transaction(program, {});
+        return std::get<FakeManager::MaterializationOutcome>(std::move(completed));
+    }();
+    require(outcome.status == ContextTransactionStatus::Published && outcome.activation,
+            "the eviction fixture did not publish");
+    auto activation                   = std::move(*outcome.activation);
+    const FakeSequenceHandle sequence = activation.sequence();
+    manager.adopt(program, std::move(activation));
+
+    RuntimeStats after;
+    manager.populate_runtime_stats(program, after);
+    require(after.session_erasures_eviction > before.session_erasures_eviction,
+            "an eviction erased a session entry and was not counted as an Eviction: swapping the two reasons "
+            "at the Evicted call site must fail here");
+    require(after.session_erasures_consume == before.session_erasures_consume,
+            "an eviction was counted as a Consume -- the two reasons have different fixes and must not mix");
+    require(manager.catalog_state(0) == FakeManager::CatalogState::Vacant,
+            "the eviction fixture did not evict the victim, so it proves nothing about that path");
+    (void)keeper;
+    (void)sequence;
+}
+
+// M4/M5: THE CENSUS MUST COUNT WHAT IT CLAIMS. `host_state_checkpoints_*` splits host-resident checkpoints
+// by whether a session cell or an active lane edge can still reach them, and it is the measurement that
+// decides whether a reclaim policy has a population at all. It had NO test: swapping the two counts, or
+// hard-coding `orphaned` to 0, both survived.
+//
+// The shape is deliberately ASYMMETRIC -- one anchored against two unanchored -- because a 1/1 fixture would
+// pass under the swap as well. Three continuations for ONE conversation, published in order: its cell holds
+// the newest, and the two it superseded stay Catalogued as anonymous cache.
+void test_host_state_census_counts_unanchored_checkpoints() {
+    FakeManager manager = make_manager(1, 4);
+    FakeProgram program;
+    program.host_residency = ninfer::runtime::ReplicaResidency::HostOnly;
+    const FakeCacheSessionKey session{41};
+    for (std::uint32_t i = 0; i < 3; ++i) {
+        const ActiveRequest turn = start_active(
+            manager, program, 41 + i, make_base(41 + i, session, RetentionClass::LiveSession), 1 + i);
+        (void)finish_active(manager, program, turn, 16 + i);
+    }
+    RuntimeStats stats;
+    manager.populate_runtime_stats(program, stats);
+    require(stats.host_state_checkpoints_reachable == 1,
+            "exactly one host-resident checkpoint is the conversation's cell; the census must count it once");
+    require(stats.host_state_checkpoints_unanchored == 2,
+            "the two superseded continuations are host-resident and unanchored; counting them as 0 (or as "
+            "reachable) is the mutant this catches");
+    // CONTROL: with residency DeviceOnly the same three continuations hold nothing on host, so both counts
+    // must be zero -- otherwise the numbers above could come from the catalog rather than from residency.
+    FakeProgram cold;
+    cold.host_residency = ninfer::runtime::ReplicaResidency::DeviceOnly;
+    FakeManager cold_manager = make_manager(1, 4);
+    for (std::uint32_t i = 0; i < 3; ++i) {
+        const ActiveRequest turn = start_active(
+            cold_manager, cold, 41 + i, make_base(41 + i, session, RetentionClass::LiveSession), 1 + i);
+        (void)finish_active(cold_manager, cold, turn, 16 + i);
+    }
+    RuntimeStats cold_stats;
+    cold_manager.populate_runtime_stats(cold, cold_stats);
+    require(cold_stats.host_state_checkpoints_reachable == 0 &&
+                cold_stats.host_state_checkpoints_unanchored == 0,
+            "device-only checkpoints must count zero: the census measures residency, not catalog size");
+}
+
+void test_session_endpoint_reason_is_per_frontier() {
+    const auto refusal_diagnostics = [](std::uint32_t refuse_frontier, bool allow_shortlist,
+                                        std::uint32_t prompt_key, std::uint32_t identity_tag = 0) {
+        FakeManager manager = make_manager(1, 4);
+        FakeProgram program;
+        const FakeCacheSessionKey session{13};
+        const auto materialize = [&](std::uint64_t order, std::uint32_t key, bool shortlist) {
+            FakeRequestBasePlan base = make_base(13, session, RetentionClass::LiveSession);
+            base.refuse_frontier     = refuse_frontier;
+            base.allow_shortlist     = shortlist;
+            base.identity_tag        = identity_tag;
+            auto inspection = manager.inspect(program, FakePreparedPrompt{key}, base, order);
+            require(inspection.choice.has_value(), "per-frontier fixture produced no choice");
+            const LaneId lane = inspection.choice->destination();
+            require(manager.reserve_materialization(program, std::move(*inspection.choice),
+                                                    FakePreparedPrompt{key}, {}) ==
+                        FakeManager::MaterializationReserveResult::Reserved,
+                    "per-frontier fixture was not reserved");
+            auto outcome = [&]() -> FakeManager::MaterializationOutcome {
+                auto progress = manager.progress_context_transaction(program, {});
+                if (!std::holds_alternative<ContextTransactionInProgress>(progress)) {
+                    return std::get<FakeManager::MaterializationOutcome>(std::move(progress));
+                }
+                auto completed = manager.progress_context_transaction(program, {});
+                return std::get<FakeManager::MaterializationOutcome>(std::move(completed));
+            }();
+            require(outcome.status == ContextTransactionStatus::Published && outcome.activation,
+                    "per-frontier fixture did not publish");
+            auto activation                   = std::move(*outcome.activation);
+            const FakeSequenceHandle sequence = activation.sequence();
+            manager.adopt(program, std::move(activation));
+            return std::pair{ActiveRequest{.lane = lane, .sequence = sequence}, outcome.diagnostics};
+        };
+
+        auto [seed, seed_diagnostics] = materialize(1, 13, true);
+        (void)seed_diagnostics;
+        // The rewrite is requested only AFTER materializing: setting it before makes the seal throw
+        // `selected checkpoint outcome is unknown or duplicated`.
+        program.finish_with_rewrite = true;
+        (void)finish_active(manager, program, seed, 16);
+        program.finish_with_rewrite = false;
+
+        auto [reuse, diagnostics] = materialize(2, prompt_key, allow_shortlist);
+        (void)reuse;
+        return diagnostics;
+    };
+
+    // ORDER DEPENDENCY, stated rather than left to be discovered: `endpoint_any` (a mutant making the
+    // endpoint test always true) dies here only because `rebuild_prefix_index` appends the endpoint BEFORE the
+    // rewrite, so "last writer wins" and "the endpoint wins" differ. Reversing those two appends would disarm
+    // this assertion silently. Anchors are appended later still, which is why adding one would make it
+    // order-proof -- not done, because the order is what the code guarantees today.
+    //
+    // The endpoint's own key is refused; the shallower rewrite is offered. The cell WAS offered, so
+    // `session_cell_skip` must stay 1, and the endpoint's refusal must show in `session_endpoint_skip`.
+    const auto endpoint_refused = refusal_diagnostics(16, true, 13);
+    require(endpoint_refused.session_cell_skip == 1 && endpoint_refused.session_endpoint_skip == 5,
+            "an offered cell with a refused endpoint must read cell=1 (offered is sticky) and endpoint=5");
+    // The rewrite's key is refused; the endpoint is offered. Both fields read 1.
+    const auto rewrite_refused = refusal_diagnostics(15, true, 13);
+    require(rewrite_refused.session_cell_skip == 1 && rewrite_refused.session_endpoint_skip == 1,
+            "a refused shallower entry must not overwrite the endpoint's own reason");
+
+    // The two remaining reachable codes. Without these the field reads the provisional 2 ("no index entry at
+    // all") when either site is dropped, which is a wrong diagnosis no assertion could catch -- the fifth
+    // review pass deleted each note site and the suite stayed green.
+    const auto no_shortlist = refusal_diagnostics(0, /*allow_shortlist=*/false, 13);
+    require(no_shortlist.session_cell_skip == 3 && no_shortlist.session_endpoint_skip == 3,
+            "a request offering no shortlist key must report code 3 in both fields");
+    const auto admission_refused = refusal_diagnostics(0, true, /*prompt_key=*/12);
+    require(admission_refused.session_cell_skip == 8 && admission_refused.session_endpoint_skip == 8,
+            "an entry whose key matches but whose source admission refuses it must report code 8");
+
+    // Code 4 is the LAST site cheaply reachable: the identity tag is compared before the digests, so a
+    // non-zero tag on the request side is a mismatch the fixture can produce without new lanes or knobs.
+    const auto tag_mismatch = refusal_diagnostics(0, true, 13, /*identity_tag=*/7);
+    require(tag_mismatch.session_cell_skip == 4 && tag_mismatch.session_endpoint_skip == 4,
+            "a request whose identity tag differs from the stored entry's must report code 4");
+}
+
+void test_prefix_split_diagnostics_follow_catalog() {
+    FakeManager manager = make_manager(1, 4);
+    FakeProgram program;
+    const auto materialize_with = [&](FakePreparedPrompt prompt, const FakeRequestBasePlan& base,
+                                      std::uint64_t order) {
+        auto inspection = manager.inspect(program, prompt, base, order);
+        require(inspection.choice.has_value(), "split fixture produced no choice");
+        const LaneId lane   = inspection.choice->destination();
+        const auto reserved = manager.reserve_materialization(program, std::move(*inspection.choice),
+                                                              std::move(prompt), {});
+        require(reserved == FakeManager::MaterializationReserveResult::Reserved,
+                "split fixture was not reserved");
+        auto outcome = [&]() -> FakeManager::MaterializationOutcome {
+            auto progress = manager.progress_context_transaction(program, {});
+            if (!std::holds_alternative<ContextTransactionInProgress>(progress)) {
+                return std::get<FakeManager::MaterializationOutcome>(std::move(progress));
+            }
+            auto completed = manager.progress_context_transaction(program, {});
+            return std::get<FakeManager::MaterializationOutcome>(std::move(completed));
+        }();
+        require(outcome.status == ContextTransactionStatus::Published && outcome.activation,
+                "split fixture did not publish");
+        auto activation                   = std::move(*outcome.activation);
+        const FakeSequenceHandle sequence = activation.sequence();
+        manager.adopt(program, std::move(activation));
+        return std::pair{ActiveRequest{.lane = lane, .sequence = sequence}, outcome.diagnostics};
+    };
+    const auto materialize = [&](std::uint32_t key, std::uint64_t order) {
+        return materialize_with(FakePreparedPrompt{key}, make_base(key), order);
+    };
+
+    // Empty catalog: nothing scanned, nothing matched -- the denominator is what tells this from a miss.
+    auto [first, empty] = materialize(7, 1);
+    require(empty.split_entries == 0 && empty.split_best_tokens == 0,
+            "empty catalog reported split entries");
+    // THE RED CONTROL FOR THE SENTINEL COLLISION (review, 2026-09-28). With no session cell, `session_slot` is
+    // the no-cell sentinel -- and that value was ALSO `kInvalidCatalogSlot`, which is what every unoccupied
+    // `prefix_index_` tail entry defaults to. So `index.slot != session_slot` was false for each of them and
+    // this field read 9, "failed validation", on every request without a session key (the Bash classifier's
+    // traffic included) while the documented 0 was unreachable. This assertion FAILS on that code -- with the
+    // caveat that the two guards it rests on are redundant (`!index.occupied` alone would close the collision),
+    // so it pins their union, not each of them separately.
+    require(empty.session_cell_skip == 0,
+            "a request with no session cell must report no-cell (0), not a skip reason: the no-cell sentinel "
+            "collided with the invalid-catalog-slot sentinel that unoccupied index entries carry");
+    program.finish_with_rewrite = true;
+    (void)finish_active(manager, program, first, 16);  // key 7: ledger 16, endpoint 16, rewrite 15
+    program.finish_with_rewrite = false;
+    auto [second, one] = materialize(9, 2);
+    require(one.split_entries == 1 && one.split_best_tokens == 0 && one.split_best_restorable == 0 &&
+                !one.split_identity_ok,
+            "unrelated prompt matched a foreign catalog entry");
+    (void)finish_active(manager, program, second, 24);  // key 9: ledger 24, endpoint 24
+
+    const std::uint64_t calls_before = program.prefix_split_calls;
+    auto [third, related]            = materialize(7, 3);
+    require(program.prefix_split_calls - calls_before == 2,
+            "split did not scan every Catalogued entry exactly once");
+    require(related.split_entries == 2, "split denominator does not count both entries");
+    require(related.split_best_tokens == 16 && related.split_best_restorable == 16 &&
+                related.split_identity_ok,
+            "related prompt did not read its own entry's match and restorable frontier");
+    // THE MANAGER'S WIRING of the two fields added with the split's localisation. They are computed by
+    // `best_prefix_split` (covered in test_materialization_budget) and copied here; without this the copy could
+    // be dropped and nothing would fail.
+    require(related.split_best_stored == 16 && related.split_ended_by == 1,
+            "the manager did not carry the deepest entry's ledger length and match-end discriminator");
+    // WHICH LEDGER. This request carries no session key, so a private entry is ANOTHER session's (2) -- and
+    // without the tag a divergence window cannot be attributed to the entry whose refusal is the question.
+    require(related.split_best_source == 2 && related.split_best_frontier == 16,
+            "the deepest match must name its ledger (2 = another session's here) and that entry's resume point");
+    // `third` is left unfinished by the block above; the lane has to come back before anything else can be
+    // admitted, since this fixture has exactly one.
+    (void)finish_active(manager, program, third, 32);
+
+    // THE INSTRUMENT'S OWN FIELDS, MADE ABLE TO FAIL. `0` is the default, so asserting 0 proves nothing about
+    // the wiring -- with only that assertion, deleting the offered-note or either diagnostics copy left the
+    // suite green, and the third review pass built those three mutants and all survived. Each case below takes
+    // a value a dropped line would change.
+    const FakeCacheSessionKey session{7};
+    auto [seed, seed_diagnostics] = materialize_with(
+        FakePreparedPrompt{11}, make_base(11, session, RetentionClass::LiveSession), 4);
+    (void)seed_diagnostics;
+    (void)finish_active(manager, program, seed, 16);
+
+    auto [reuse, reuse_diagnostics] = materialize_with(
+        FakePreparedPrompt{11}, make_base(11, session, RetentionClass::LiveSession), 5);
+    require(reuse_diagnostics.split_best_source == 1,
+            "a session-keyed request's own continuation must be tagged as its own ledger (1)");
+    require(reuse_diagnostics.session_cell_offered && reuse_diagnostics.session_cell_skip == 1 &&
+                reuse_diagnostics.session_endpoint_skip == 1 && reuse_diagnostics.session_cell_frontier == 16,
+            "a same-session reuse must read offered=1 in BOTH session fields, with the cell's frontier -- "
+            "0 here means the note or the copy is missing");
+    (void)finish_active(manager, program, reuse, 16);
+
+    FakeRequestBasePlan key_mismatch = make_base(11, session, RetentionClass::LiveSession);
+    key_mismatch.shortlist_digest    = 99;
+    auto [refused, refused_diagnostics] = materialize_with(FakePreparedPrompt{11}, key_mismatch, 6);
+    require(refused_diagnostics.session_cell_skip == 5 && refused_diagnostics.session_endpoint_skip == 5,
+            "a same-session key mismatch must report digest-mismatch (5) in both fields, not a default");
+    (void)finish_active(manager, program, refused, 16);
+
+    // A DIVERGENT match: the fake caps the match below the entry's ledger, which is the only way it can
+    // produce one -- and the probe fields are why the cap exists.
+    auto [diverged, diverged_diagnostics] =
+        materialize_with(FakePreparedPrompt{11, /*match_limit=*/8}, make_base(11), 7);
+    require(diverged_diagnostics.split_ended_by == 0 && diverged_diagnostics.split_probe_index == 8 &&
+                diverged_diagnostics.split_best_stored == 16,
+            "a capped match must report Diverged, the probe index at the stop, and the entry's own ledger");
+
+    (void)diverged;
+}
+
 void test_stale_revision_is_retryable() {
     FakeManager manager = make_manager();
     FakeProgram program;
@@ -2564,6 +3141,45 @@ void test_aborted_source_selection_does_not_create_hit_history() {
     require(program.started_action_ids.size() == 1 &&
                 program.started_action_ids.front() == 2000U + first.sequence.id,
             "aborted source selection incorrectly biased later retention policy");
+}
+
+// #10 / #14 stage two. An unplannable request used to be reported as `TemporarilyBlocked` whatever
+// the engine's state, so when the capacity it needed was occupied by something no owner could free, the
+// request waited out its deadline for ever and blocked every request behind it (the 2026-09-25 wedge).
+// A block is only temporary when something can end it -- an occupied lane can finish -- so with every
+// lane Free and the plan finding nothing, the verdict is final.
+//
+// The control matters as much as the assertion: this must NOT pass against a manager that simply never
+// blocks anything, so the same request is re-inspected while a lane is occupied and must then be
+// *temporary*.
+void test_unplannable_request_with_no_active_lane_is_permanently_infeasible() {
+    FakeManager manager = make_manager(2, 3);
+    FakeProgram program;
+    program.required_pressure_actions = 1;  // the plan must reclaim something; nothing exists to reclaim
+
+    // No lane has been started, so every lane is Free: the request is classed feasible against total
+    // capacity (isolated_feasible) yet the plan can place it nowhere, and nothing is occupied that
+    // could finish and change that. This is #10's condition, and it must be final rather than a wait.
+    FakeRequestBasePlan idle_base = make_base(77);
+    idle_base.isolated_feasible   = true;
+    auto idle = manager.inspect(program, FakePreparedPrompt{77}, idle_base, 1);
+    require(idle.readiness == Readiness::PermanentlyInfeasible && !idle.choice,
+            "an unplannable request with every lane free was reported as merely blocked");
+
+    // Control, taken afterwards because establishing a lane requires an admittable request: with a lane
+    // occupied the same shape must remain a *temporary* block, or the assertion above would pass
+    // against a manager that never blocks anything.
+    program.required_pressure_actions = 0;
+    const FakeCacheSessionKey session{1};
+    const ActiveRequest active = start_active(
+        manager, program, 9, make_base(9, session, RetentionClass::LiveSession), 2);
+    program.required_pressure_actions = 1;
+    FakeRequestBasePlan busy_base = make_base(78);
+    busy_base.isolated_feasible   = true;
+    auto blocked = manager.inspect(program, FakePreparedPrompt{78}, busy_base, 3);
+    require(blocked.readiness == Readiness::TemporarilyBlocked && !blocked.choice,
+            "the same request with a lane occupied must remain a temporary block");
+    (void)finish_active(manager, program, active);
 }
 
 void test_retained_source_is_protected_until_terminal() {
@@ -3387,9 +4003,13 @@ void test_complete_search_against_small_exhaustive_oracle() {
                     }
                     return std::nullopt;
                 };
-                std::uint64_t oracle = UINT64_MAX;
+                std::uint64_t oracle           = UINT64_MAX;
+                // The other half of the ranking: the oracle now minimises (restorable evictions, cost), the
+                // order `FoldedCost::key()` uses, so the pair needs a second accumulator.
+                std::uint32_t oracle_evictions = UINT32_MAX;
                 for (unsigned source = 0; source < 2; ++source) {
                     for (unsigned raw = 0; raw < 27; ++raw) {
+                        std::uint32_t evictions = 0;
                         unsigned digits = raw, relief = 0;
                         bool frees_slot = false, protects_source = true;
                         std::uint64_t cost                    = (source ? 100 : 800) * ms;
@@ -3403,6 +4023,18 @@ void test_complete_search_against_small_exhaustive_oracle() {
                             relief += choice;
                             if (choice == 2) {
                                 frees_slot = true;
+                                // THE POLICY THIS ORACLE ENCODES, and it changed under it (2026-09-27). The
+                                // operator's ruling is "evicting a victim that holds a restorable checkpoint
+                                // while the host has room is a defect", and `7746a98b` made the planner rank
+                                // RESTORABLE EVICTIONS ahead of cost. This oracle still chose the cheapest
+                                // plan, so it began failing on a configuration where the cheapest plan
+                                // evicts (912 ms, 1 eviction) while the best plan under the ruling does not
+                                // (1050 ms, 0). The planner picked 1050 -- the ruling, applied.
+                                //
+                                // So the oracle is updated to the policy rather than the case bent to go
+                                // green: in THIS test every chosen owner reports a restorable checkpoint, so
+                                // the count is simply the number of evicted owners.
+                                ++evictions;
                                 cost += drop[owner] +
                                         rebuild[owner] * weights[(owner + weight_rotation) % 3];
                             } else {
@@ -3416,7 +4048,13 @@ void test_complete_search_against_small_exhaustive_oracle() {
                             continue;
                         }
                         cost += rebuild[0] - remaining_public_saving;
-                        oracle = std::min(oracle, cost);
+                        // LEXICOGRAPHIC, the way `FoldedCost::key()` now is: fewer restorable evictions wins
+                        // outright, and cost decides among equals.
+                        if (evictions < oracle_evictions ||
+                            (evictions == oracle_evictions && cost < oracle)) {
+                            oracle_evictions = evictions;
+                            oracle           = cost;
+                        }
                     }
                 }
                 Planner planner;
@@ -3710,6 +4348,8 @@ void test_value_weights_rank_private_victims_by_rebuild_cost() {
 int main() {
     run_test("independent complete-target oracle",
              test_complete_search_against_small_exhaustive_oracle);
+    run_test("unplannable request with no active lane is permanently infeasible",
+             test_unplannable_request_with_no_active_lane_is_permanently_infeasible);
     run_test("publication-only construction",
              test_publication_only_pressure_constructs_adoptable_target);
     run_test("value-aware demotes high-value victim over eviction",
@@ -3734,6 +4374,14 @@ int main() {
     run_test("dominating identity fast path",
              test_dominating_identity_does_not_build_pressure_graph);
     run_test("root lifecycle and prefix reuse", test_root_lifecycle_and_prefix_reuse);
+    run_test("session erase counters are wired", test_session_erase_counters_are_wired);
+    run_test("session erase counts an eviction as eviction",
+             test_session_erase_counts_an_eviction_as_eviction);
+    run_test("host state census counts unanchored checkpoints",
+             test_host_state_census_counts_unanchored_checkpoints);
+    run_test("session endpoint reason is per frontier", test_session_endpoint_reason_is_per_frontier);
+    run_test("prefix split diagnostics follow the catalog",
+             test_prefix_split_diagnostics_follow_catalog);
     run_test("stale revision is retryable", test_stale_revision_is_retryable);
     run_test("materialization abort preserves source", test_materialization_abort_preserves_source);
     run_test("committed victim survives abort", test_committed_victim_survives_transaction_abort);
@@ -3782,7 +4430,10 @@ int main() {
     run_test("backfill proof and stats", test_backfill_proof_and_stats_follow_program_revision);
     run_test("shortlist exact verification",
              test_shortlist_collision_requires_program_exact_verification);
-    if (failures != 0) { return 1; }
-    std::cout << "ok\n";
+    if (failures != 0) {
+        std::cout << tests_run << " run, " << failures << " failed\n";
+        return 1;
+    }
+    std::cout << "ok (" << tests_run << " cases)\n";
     return 0;
 }

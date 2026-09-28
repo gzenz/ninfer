@@ -112,6 +112,50 @@ ProgramImpl::checkpoint_restore_requirements(const SequenceKVBundle& kv,
     }
     std::vector<runtime::ContextTransferRequirement> requirements;
     requirements.reserve(3);
+    // #11(b): the KV half of this checkpoint is walked below, page by page. The state half had no
+    // equivalent check. It gets a COUNTER and not a throw, because this file's neighbours are explicit
+    // that a throw on this path kills the worker and that such conditions are "deliberately not enforced
+    // until a mismatch has actually been observed" (`program_impl.h:923-926`) -- and this one has never
+    // been observed. The promotion criterion is the opposite of the obvious one: a non-zero numerator
+    // means the condition DOES occur on real traffic, and a throw there would kill the worker -- so it
+    // argues for keeping the counter. What would justify promoting it is a large denominator with the
+    // numerator still at zero, i.e. the invariant holding across everything real traffic does.
+    // The denominator prints whether or not the numerator fires. Printing only on the numerator -- which
+    // the first version did -- makes a run where pricing happened with no incomplete state look identical
+    // to a run where pricing never happened, and that is the shape this repo has been burned by before
+    // (`materialization.cpp`'s demotable counter carries the same note: "a counter that never fires is
+    // indistinguishable from a gate that can never be true").
+    ++checkpoint_state_checks_;
+    // TWO prints, rate-limited on their OWN counter, because each answers a different question and one
+    // gate cannot serve both. The denominator line says "pricing happened, and here is how often" -- the
+    // property without which a zero numerator is indistinguishable from never having run. The numerator
+    // line says "the condition occurred", and it prints the moment it does: gating the numerator on the
+    // DENOMINATOR's counter (the first version) meant an incomplete state found on checks 9..511 printed
+    // nothing until the next multiple of 512, which on light traffic is hours away or never. The repo has
+    // been burned by an instrument that cannot fire, so the alerting line must not depend on traffic
+    // volume.
+    const bool incomplete = !state_store->complete(state);
+    if (incomplete) {
+        ++incomplete_checkpoint_states_;
+        if (incomplete_checkpoint_states_ <= 8ULL || incomplete_checkpoint_states_ % 512ULL == 0ULL) {
+            std::fprintf(stderr,
+                         "[engine] checkpoint StateImage INCOMPLETE at pricing: not a restorable "
+                         "checkpoint (invalid, not immutable, no settled replica, or zero epoch) "
+                         "(numerator=%llu, denominator=%llu)\n",
+                         static_cast<unsigned long long>(incomplete_checkpoint_states_),
+                         static_cast<unsigned long long>(checkpoint_state_checks_));
+            std::fflush(stderr);
+        }
+    }
+    if (checkpoint_state_checks_ <= 8ULL || checkpoint_state_checks_ % 512ULL == 0ULL) {
+        std::fprintf(stderr,
+                     "[engine] checkpoint StateImage priced: incomplete=%d (numerator=%llu, "
+                     "denominator=%llu)\n",
+                     static_cast<int>(incomplete),
+                     static_cast<unsigned long long>(incomplete_checkpoint_states_),
+                     static_cast<unsigned long long>(checkpoint_state_checks_));
+        std::fflush(stderr);
+    }
     if (state_store->residency(state) == StateReplicaResidency::HostOnly) {
         if (host_state_images == nullptr) {
             throw std::logic_error("Host-only checkpoint has no Host StateImage pool");
@@ -828,6 +872,154 @@ ProgramImpl::checkpoint_recovery_work(const ContinuationHandle& owner,
             interval));
     }
     return alternatives;
+}
+
+// The deepest token-exact common prefix between an incoming prompt and a stored ledger, AND WHY IT STOPPED.
+//
+// WHY IT MUST SAY THAT, and the false reading it corrects: the loop stops at `min(prompt.size(), stored.size())`,
+// so "the stored ledger ENDED" and "the prompt DIVERGED here" produced the SAME NUMBER -- and the comment that
+// stood here asserted the wrong one as fact ("a shallow match is the PROMPT diverging"). A reviewer reading
+// 480 strict next-turn pairs against this field found the divergence-inside-the-prompt population to be ~0,
+// because nearly every apparent divergence was a ledger ending, a sibling's ledger, an entry missing from the
+// catalogue (this function only ever sees `Catalogued` entries, so a parent still running or already consumed is
+// invisible and the match falls back to some other ledger), or a pair split by a server restart. A field whose
+// zero and whose finding look identical has to carry its own discriminator.
+enum class MatchEnd : std::uint8_t {
+    Diverged,    // the tokens differ here: the two really do differ from this index
+    StoredEnded, // the stored ledger ran out first -- divergence may be beyond it, or nowhere
+    PromptEnded, // the prompt ran out first -- the stored ledger is a PREFIX of the prompt
+};
+
+struct TokenMatch {
+    std::uint32_t length = 0;
+    MatchEnd      end    = MatchEnd::Diverged;
+};
+
+// WHERE THE DEEPEST MATCH STOPPED, as an index only. The 12-id WINDOWS that used to live here were the
+// instrument that decoded the divergence (stored `assistant\n thinking\n<reasoning>` against prompt
+// `assistant\n thinking\n\n</think>\n\n`, i.e. the replayed turn's structure differing from the stored
+// ledger ~200 tokens before its end). They were opt-in because ids are content, and they were removed on
+// 2026-09-28 once they had answered: an instrument that logs user content should not outlive the question it
+// was gated for. The INDEX stays and is unconditional -- it is a number, and gating it once made it read a
+// constant 0 on the path production runs while four comments called it unconditional.
+// THE BOUNDED DIVERGENCE PROBE (2026-09-28). One question, one window, a handful of samples: after the
+// content-logging windows were removed, the surviving `split_probe_index` could say the digest matches stop
+// ~190 tokens before the ledger's end (tight, p25-p75 of 178-215, across ledgers of 32k-78k) but not WHAT is
+// in that band. This prints the ids either side of ONE divergence, to stderr, at most `kSampleCap` times per
+// process, only when `NINFER_DIVERGENCE_PROBE` is set.
+//
+// It deliberately does NOT touch the request log or the diagnostics: the ids are content, and the record is
+// the one place they must never land. Decoding happens OFFLINE with the model's own tokenizer -- that is how
+// the earlier windows were read (`assistant\n thinking\n<reasoning>` against `assistant\n thinking\n\n</think>\n\n`),
+// and it keeps the detokenizer, which lives in the frontend layer, out of this one.
+inline constexpr std::size_t kProbeWindow  = 40;
+inline constexpr std::size_t kProbeSamples = 8;
+
+inline void probe_divergence(std::span<const TokenId> prompt, std::span<const TokenId> stored,
+                             std::size_t index) {
+    static const bool enabled = std::getenv("NINFER_DIVERGENCE_PROBE") != nullptr;
+    if (!enabled) { return; }
+    static std::size_t emitted = 0;
+    if (emitted >= kProbeSamples) { return; }
+    const std::size_t limit = std::min(prompt.size(), stored.size());
+    if (index >= limit) { return; }
+    const std::size_t begin = index >= kProbeWindow / 2 ? index - kProbeWindow / 2 : 0;
+    const std::size_t count = std::min(kProbeWindow, limit - begin);
+    ++emitted;
+    std::fprintf(stderr, "[divergence] sample=%zu index=%zu ledger=%zu prompt=%zu begin=%zu n=%zu\n",
+                 emitted, index, stored.size(), prompt.size(), begin, count);
+    std::fprintf(stderr, "[divergence] stored=");
+    for (std::size_t i = 0; i < count; ++i) { std::fprintf(stderr, "%u,", stored[begin + i]); }
+    std::fprintf(stderr, "\n[divergence] prompt=");
+    for (std::size_t i = 0; i < count; ++i) { std::fprintf(stderr, "%u,", prompt[begin + i]); }
+    std::fprintf(stderr, "\n");
+    std::fflush(stderr);
+}
+
+template <typename Split>
+void note_probe_index(Split& split) {
+    if (split.match_end != static_cast<std::uint8_t>(MatchEnd::Diverged)) { return; }
+    split.probe_index = static_cast<std::uint32_t>(split.tokens);
+}
+
+[[nodiscard]] inline TokenMatch deepest_token_match(std::span<const TokenId> prompt,
+                                                    std::span<const TokenId> stored) {
+    const std::size_t limit = std::min(prompt.size(), stored.size());
+    std::size_t shared      = 0;
+    while (shared < limit && prompt[shared] == stored[shared]) { ++shared; }
+    MatchEnd end = MatchEnd::Diverged;
+    if (shared == limit) { end = prompt.size() <= stored.size() ? MatchEnd::PromptEnded : MatchEnd::StoredEnded; }
+    return TokenMatch{.length = static_cast<std::uint32_t>(shared), .end = end};
+}
+
+ProgramImpl::PrefixSplit ProgramImpl::prefix_split(const ContinuationHandle& owner,
+                                                   const PreparedPromptData& prompt) const {
+    PrefixSplit split;
+    if (!valid_continuation(owner)) { return split; }
+    const SequenceState& sequence = continuation_states[ContractAccess::index(owner)];
+    const TokenMatch continuation_match = deepest_token_match(prompt.token_ids, sequence.ledger);
+    split.tokens                        = continuation_match.length;
+    split.match_end                     = static_cast<std::uint8_t>(continuation_match.end);
+    split.stored                        = static_cast<std::uint32_t>(sequence.ledger.size());
+    note_probe_index(split);
+    if (split.match_end == static_cast<std::uint8_t>(MatchEnd::Diverged)) {
+        probe_divergence(prompt.token_ids, sequence.ledger, split.tokens);
+    }
+    // THE STRICTER TEST. Same tokens is not the same history: `prefix_matches` also requires the identity
+    // chain to agree, which is what a re-rendered (or thinking-stripped) earlier turn breaks. Only evaluated
+    // when there IS a match -- a zero-token match has nothing to verify.
+    if (split.tokens != 0U) {
+        split.identity_ok = qwen3_5::detail::prefix_matches(prompt, sequence.ledger,
+                                                            sequence.prefix_identity, split.tokens);
+    }
+    // NO IDENTITY CHECK HERE, deliberately: `prefix_matches` needs the full PreparedPromptData (token types
+    // and rope state), which this layer does not hold -- and the two numbers below are what §2f's verdict
+    // turns on. `identity_ok` stays false and is documented as NOT MEASURED rather than as "not matching",
+    // because a false there would be read as "the render differs" and that would be an invented finding.
+    // The deepest RESTORABLE checkpoint at or below the match: an endpoint or rewrite frontier the sequence
+    // can actually be restored from. This is half (b) of the split -- a deep match with a shallow
+    // restorable frontier is placement or retention, and it is ours.
+    const qwen3_5::ContinuationSummary summary = continuation_summary(sequence);
+    const auto consider = [&](const std::optional<qwen3_5::CheckpointSummary>& checkpoint) {
+        if (!checkpoint || checkpoint->ref.frontier > split.tokens) { return; }
+        split.restorable = std::max(split.restorable, checkpoint->ref.frontier);
+    };
+    consider(summary.endpoint);
+    consider(summary.rewrite);
+    for (const auto& anchor : summary.long_anchors) {
+        if (anchor.ref.frontier <= split.tokens) {
+            split.restorable = std::max(split.restorable, anchor.ref.frontier);
+        }
+    }
+    return split;
+}
+
+ProgramImpl::PrefixSplit ProgramImpl::prefix_split(const SharedPrefixHandle& owner,
+                                                   const PreparedPromptData& prompt) const {
+    PrefixSplit split;
+    if (!valid_shared_prefix(owner)) { return split; }
+    const SharedPrefixState& shared = shared_prefix_states[ContractAccess::index(owner)];
+    // The shared prefix's tokens live on its identity, not on the state -- the same reach the materialization
+    // path uses (`shared_state->identity->ledger()`), and there is no ledger without an identity.
+    if (!shared.identity) { return split; }
+    const TokenMatch shared_match = deepest_token_match(prompt.token_ids, shared.identity->ledger());
+    split.tokens                  = shared_match.length;
+    split.match_end               = static_cast<std::uint8_t>(shared_match.end);
+    split.stored                  = static_cast<std::uint32_t>(shared.identity->ledger().size());
+    note_probe_index(split);
+    if (split.match_end == static_cast<std::uint8_t>(MatchEnd::Diverged)) {
+        probe_divergence(prompt.token_ids, shared.identity->ledger(), split.tokens);
+    }
+    if (split.tokens != 0U && shared.identity->prefix_identity() != nullptr) {
+        split.identity_ok = qwen3_5::detail::prefix_matches(prompt, shared.identity->ledger(),
+                                                            *shared.identity->prefix_identity(),
+                                                            split.tokens);
+    }
+    const qwen3_5::SharedPrefixSummary summary = shared_prefix_summary(shared);
+    if (summary.checkpoint.ref.frontier <= split.tokens) {
+        split.restorable = summary.checkpoint.ref.frontier;
+    }
+    return split;
 }
 
 std::vector<runtime::CheckpointRecoveryAlternativeWork>

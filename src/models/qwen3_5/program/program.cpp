@@ -259,8 +259,9 @@ Program::Program(std::unique_ptr<detail::ProgramImpl> impl) noexcept : impl_(std
 Program::~Program() noexcept = default;
 
 RequestBasePlan Program::plan_request(const PreparedPrompt& prompt,
-                                      const runtime::ResolvedExecutionOptions& options) {
-    return impl_->plan_request(PreparedPromptAccess::view(prompt), options);
+                                      const runtime::ResolvedExecutionOptions& options,
+                                      std::optional<std::uint32_t> branch_anchor_frontier) {
+    return impl_->plan_request(PreparedPromptAccess::view(prompt), options, branch_anchor_frontier);
 }
 
 std::vector<float> Program::causal_score(PreparedPrompt&& prompt, std::uint32_t first_target) {
@@ -364,9 +365,9 @@ CaptureAssessment
 Program::inspect_capture(const CaptureOffer& offer, const SharedPrefixHandle* exact_shared,
                          const SharedPrefixHandle* replacement,
                          std::optional<runtime::CheckpointRef> private_replacement,
-                         bool permit_shared_publication) const {
+                         bool permit_shared_publication, const char* site) const {
     return impl_->inspect_capture(offer, exact_shared, replacement, private_replacement,
-                                  permit_shared_publication);
+                                  permit_shared_publication, site);
 }
 
 std::vector<runtime::CheckpointRecoveryAlternativeWork>
@@ -469,6 +470,68 @@ ReleaseResult Program::release_shared_prefix(SharedPrefixHandle&& shared) noexce
 }
 
 void Program::fail_all_cleanup() noexcept { impl_->fail_all_cleanup(); }
+void Program::resource_census() const noexcept { impl_->resource_census(); }
+std::uint64_t Program::shared_replacements() const noexcept { return impl_->shared_replacements(); }
+std::uint64_t Program::demotable_evictions() const noexcept { return impl_->demotable_evictions(); }
+
+std::uint64_t Program::evictions_with_victim_room() const noexcept {
+    return impl_->evictions_with_victim_room();
+}
+std::uint64_t Program::demotable_eviction_checks() const noexcept {
+    return impl_->demotable_eviction_checks();
+}
+std::uint64_t Program::pressure_options() const noexcept { return impl_->pressure_options(); }
+std::uint64_t Program::demote_options() const noexcept { return impl_->demote_options(); }
+std::uint64_t Program::capture_skips(std::uint32_t reason) const noexcept {
+    return impl_->capture_skips(static_cast<detail::ProgramImpl::CaptureSkipReason>(reason));
+}
+std::uint64_t Program::note_publication_cell_loss() noexcept { return impl_->note_publication_cell_loss(); }
+std::uint64_t Program::note_publication_cell_at_risk() noexcept {
+    return impl_->note_publication_cell_at_risk();
+}
+void Program::add_publication_cell_at_risk(std::uint32_t at_risk, std::uint32_t goals, std::uint32_t other,
+                                           std::uint32_t reuse) noexcept {
+    impl_->add_publication_cell_at_risk(at_risk, goals, other, reuse);
+}
+std::uint64_t Program::publication_cell_at_risk_runs() const noexcept {
+    return impl_->publication_cell_at_risk_runs();
+}
+std::uint64_t Program::publication_cell_veto_goals() const noexcept {
+    return impl_->publication_cell_veto_goals();
+}
+std::uint64_t Program::publication_cell_veto_other() const noexcept {
+    return impl_->publication_cell_veto_other();
+}
+std::uint64_t Program::publication_cell_veto_reuse() const noexcept {
+    return impl_->publication_cell_veto_reuse();
+}
+void Program::add_publication_cell_probes(std::uint64_t count) noexcept {
+    impl_->add_publication_cell_probes(count);
+}
+Program::PrefixSplit Program::prefix_split(const ContinuationHandle& owner,
+                                          const PreparedPrompt& prompt) const {
+    const detail::ProgramImpl::PrefixSplit split =
+        impl_->prefix_split(owner, PreparedPromptAccess::view(prompt));
+    return PrefixSplit{.tokens = split.tokens, .restorable = split.restorable,
+                       .identity_ok = split.identity_ok, .match_end = split.match_end,
+                       .stored = split.stored,
+                       .probe_index = split.probe_index};
+}
+Program::PrefixSplit Program::prefix_split(const SharedPrefixHandle& owner,
+                                          const PreparedPrompt& prompt) const {
+    const detail::ProgramImpl::PrefixSplit split =
+        impl_->prefix_split(owner, PreparedPromptAccess::view(prompt));
+    return PrefixSplit{.tokens = split.tokens, .restorable = split.restorable,
+                       .identity_ok = split.identity_ok, .match_end = split.match_end,
+                       .stored = split.stored,
+                       .probe_index = split.probe_index};
+}
+std::uint64_t Program::publication_cell_losses() const noexcept {
+    return impl_->publication_cell_losses();
+}
+std::uint64_t Program::publication_cell_probes() const noexcept {
+    return impl_->publication_cell_probes();
+}
 
 bool Program::isolated_request_feasible(const RequestBasePlan& base) const noexcept {
     return impl_->isolated_request_feasible(base);

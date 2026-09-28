@@ -1,6 +1,10 @@
-Note: The current version does NOT work with concurrent sessions, it'll mix up the caches.
-
-If you want to use this with concurrent version I suggest using the old V2 version: https://github.com/gzenz/ninfer/tree/docs/prune-plan
+Note (corrected 2026-09-26): this tree **does** support concurrent sessions. The warning that stood here
+("does NOT work with concurrent sessions, it'll mix up the caches") described a real defect — a lane's
+prefill wrote and attended through the newly admitted lane's KV row — and it was fixed in `479c92c4`,
+then re-verified with two canary runs (`rc=0`, `bleed=0 partial_foreign=0`, agreeing exactly). The honest
+limit of that verification: the canary's own-prefix coverage is short (`missed_own=8/8`), so "no bleed"
+rests on a short prefix rather than on an exhaustive sweep. The V2 branch this note used to point at is
+retired; it is not a fallback.
 
 # NInfer (YaRN)
 
@@ -46,16 +50,18 @@ Our forensics rule out an engine cause:
 
 The symptom is task-state tracking over an extremely long agentic history — a model
 behavior, not an attention/cache/YaRN defect. We therefore currently recommend running the
-**Swift model at a 262k context** (see the deploy config below) rather than a
-YaRN-extended NVFP4 context.
+**Swift model at a 262k context** rather than a YaRN-extended NVFP4 context at 350k+: the
+`dflash2` block at the end of this file is our production configuration, and the
+docker-compose example in the middle is the older YaRN/NVFP4 setup at 420k, which is not
+what we deploy.
 
 **Swift model artifact.** We run the single-file v3 NInfer artifact
-[`CaptainArni/Swift-Qwen3.8-27B-NInfer`](https://huggingface.co/CaptainArni/Swift-Qwen3.8-27B-NInfer)
+[`CaptainArni/Swift-1.5-Qwen3.8-27B-NInfer`](https://huggingface.co/CaptainArni/Swift-1.5-Qwen3.8-27B-NInfer)
 (21.2 GiB, DFlash2 draft included, sha256 `5412a0e7…`):
 
 ```bash
-hf download CaptainArni/Swift-Qwen3.8-27B-NInfer \
-  qwen3_8_27b_nvfp4swift.ninfer --local-dir ~/ninfer-models
+hf download CaptainArni/Swift-1.5-Qwen3.8-27B-NInfer \
+  qwen3_8_27b_nvfp4swift15.ninfer --local-dir ~/ninfer-models/swift15
 ```
 
 Provenance: built from
@@ -122,10 +128,11 @@ services:
 
 ```
 
-With dflash2:
+With dflash2 (this is what we actually run in production, at the 262k context recommended above — the
+larger number in the older block was never the deployed setting):
 ```
-  "--max-context", "400000",
-  "--kv-capacity", "400000",
+  "--max-context", "262144",
+  "--kv-capacity", "262144",
   "--spec", "dflash2",
   "--draft-tokens", "7",
 ```

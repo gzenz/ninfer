@@ -3,6 +3,7 @@
 // Small fixed-capacity request execution for every backend.
 
 #include "core/device.h"
+#include "core/diagnostics.h"
 #include "core/nvtx.h"
 #include "ninfer/types.h"
 #include "runtime/contract/execution.h"
@@ -11,6 +12,7 @@
 #include "runtime/engine/context_cache/resource_manager.h"
 #include "runtime/engine/scheduler.h"
 #include "runtime/engine/generation_budget.h"
+#include "runtime/engine/idle_block_grace.h"
 
 #include <algorithm>
 #include <array>
@@ -1113,6 +1115,24 @@ private:
             generated_staged = false;
         };
         try {
+            // Batch-composition audit (NINFER_MAT_DEBUG=1): cross-session bleed needs >=3
+            // lanes and only occurs when lanes reuse prefixes (i.e. when a batch mixes
+            // prefilling and decoding lanes). Print the composition so a bleeding turn can be
+            // matched to the batch shape that produced it.
+            if (std::getenv("NINFER_MAT_DEBUG") != nullptr) {
+                std::string shape;
+                std::uint32_t prefilling = 0;
+                for (std::size_t row = 0; row < row_count; ++row) {
+                    const std::uint32_t lane = lane_indices[row];
+                    const auto& probe        = slots_[lane];
+                    const bool pref          = probe != nullptr && probe->is_prefilling();
+                    if (pref) { ++prefilling; }
+                    shape += pref ? "P" : "d";
+                }
+                std::fprintf(stderr, "[mat-debug] BATCH rows=%zu shape=%s prefilling=%u decode_round=%d\n",
+                             row_count, shape.c_str(), prefilling, decode_round ? 1 : 0);
+                std::fflush(stderr);
+            }
             for (std::size_t row = 0; row < row_count; ++row) {
                 const std::uint32_t lane = lane_indices[row];
                 const auto& request      = slots_[lane];
@@ -1460,8 +1480,17 @@ private:
 
     void ensure_base_plan(const std::shared_ptr<Request>& request) {
         if (!request->base_plan) {
-            request->base_plan.emplace(
-                instance_.program->plan_request(request->prompt, request->options.execution));
+            // THE BRANCH ANCHOR'S FRONTIER, computed BEFORE the plan is built so the capture group can be part
+            // of it from the start (identity and pricing included). GATED, because the search scans the
+            // catalog's ledgers and that cost has never been measured at 64 cells -- the default path must not
+            // pay it.
+            static const bool branch_anchor_enabled = std::getenv("NINFER_BRANCH_ANCHOR") != nullptr;
+            std::optional<std::uint32_t> branch_anchor;
+            if (branch_anchor_enabled) {
+                branch_anchor = resources_.branch_anchor_frontier(*instance_.program, request->prompt);
+            }
+            request->base_plan.emplace(instance_.program->plan_request(
+                request->prompt, request->options.execution, branch_anchor));
         }
         const RequestPlanSummary& summary = request->base_plan->summary();
         if (summary.service_work_quanta == 0) {
@@ -1775,7 +1804,68 @@ private:
             const ActiveAdmissionSet active =
                 scheduler_.active_admission_set(slots_, max_concurrency_);
             if (active.size == 0) {
-                throw std::logic_error("isolated-feasible request is blocked in an idle Engine");
+                // A stall, not a corruption. What this throw actually did, corrected 2026-09-25
+                // after a review checked it: the logic_error goes through WORKER RECOVER (it does not
+                // kill the worker directly). The journal shows nine RECOVER lines over about 35 ms,
+                // then "8 consecutive recoveries -- failing all", and only then the worker exits --
+                // which left prod answering 503 to everything with a completely EMPTY scheduler
+                // while /stats still responded, a wedge only a restart cleared
+                // (tasks #14). Reporting no progress keeps the engine able to move and turns the
+                // condition into a client-visible outcome rather than a dead worker.
+                //
+                // What resolves it, stated accurately: the request's own deadline is 900 s
+                // (--pending-timeout-ms in prod), and the wedge sentinel's Class A fires far
+                // earlier at ~150 s. Its cap is two restarts per 30 min -- the third trigger sets
+                // its stopped flag instead of restarting -- so the sentinel is the resolver. Better
+                // than before, when the empty scheduler armed none of the sentinel's classes.
+                //
+                // NOTE: this line prints "[engine] admission stalled", which does NOT match the
+                // token list in CLAUDE.md's journal-monitor pattern -- add it there or the condition
+                // is invisible to the documented monitor. Rate-limited, because it can persist for
+                // the whole deadline.
+                // Fail-fast, rather than waiting for the head's deadline. With an empty active set
+                // there is nothing that can free what the head waits for, so the block cannot be
+                // satisfied by waiting -- and a stalled FIFO head blocks *every* request behind it,
+                // so the cost of waiting is not one request but the queue. The 2026-09-25 wedge was
+                // exactly this: a recovery left occupancy owned by nothing, so a request above the
+                // remaining capacity was classed feasible and then blocked forever, and the only
+                // resolver was a restart (the sentinel's Class A, twice, then it stops).
+                //
+                // Bounded by a persistence window so a transient race does not fail a request the next
+                // boundary would admit: the condition must hold continuously for the grace period
+                // before the head is rejected. `Overloaded` is the honest kind -- the engine is up and
+                // answering, it simply cannot serve this request.
+                // The window is monotone per head, in `IdleBlockGrace`, which has a unit test: the
+                // inline version this replaces reset its own start with the same condition it tested,
+                // so it could only fire if a poll landed exactly on the boundary -- and its "0
+                // rejections on healthy traffic" evidence was a negative that could not have failed.
+                static IdleBlockGrace idle_block_grace;
+                const auto now = Clock::now();
+                if (idle_block_grace.observe(head->id, now, kIdleBlockGracePeriod)) {
+                    std::fprintf(stderr,
+                                 "[engine] admission rejected: request %llu stayed blocked for %lld s "
+                                 "with an empty active set; nothing can free what it waits for\n",
+                                 static_cast<unsigned long long>(head->id),
+                                 static_cast<long long>(kIdleBlockGracePeriod.count()));
+                    std::fflush(stderr);
+                    (void)remove_pending_error(
+                        head, std::make_exception_ptr(RequestError(
+                                  RequestErrorKind::Overloaded,
+                                  "the engine is idle and cannot admit this request within its "
+                                  "remaining capacity")));
+                    return AdmissionProgress::ControlProgress;
+                }
+                static auto last_report = Clock::time_point{};
+                if (now - last_report > std::chrono::seconds(5)) {
+                    last_report = now;
+                    std::fprintf(stderr,
+                                 "[engine] admission stalled: request %llu is feasible but the active "
+                                 "set is empty (engine idle); grace %lld s before it is rejected\n",
+                                 static_cast<unsigned long long>(head->id),
+                                 static_cast<long long>(kIdleBlockGracePeriod.count()));
+                    std::fflush(stderr);
+                }
+                return control_progress ? AdmissionProgress::ControlProgress : AdmissionProgress::None;
             }
             if (!scheduler_.protect_blocked_head(head->id, active.span(),
                                                  instance_.program->resource_revision())) {
@@ -1860,6 +1950,29 @@ private:
 
     void run_decode_round(const RoundMembership& membership,
                           const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start) {
+        // WITHDRAWN CONTROL -- kept only for reference, do not use for measurements: it slices the
+        // decode membership to one row while the scheduler still believes the whole membership
+        // decoded, so it perturbs the bookkeeping it was meant to hold fixed (a queued run with it
+        // armed bled where the queued run without it was clean).
+        //
+        // It is also compiled out by default. The rule for anything left in the tree is that a
+        // probe must not be *able* to harm; this one substitutes a different decode membership in
+        // the live scheduler, so an operator who exported the variable from an old shell would run
+        // a perturbed engine believing it was the shipped one. Rebuild with
+        // -DNINFER_ENABLE_HARMFUL_CONTROLS to get it back -- a deliberate act, which is the point.
+        const bool decode_batch_one = diagnostic_control_enabled("NINFER_DECODE_BATCH");
+        if (decode_batch_one && membership.size > 1) {
+            const auto sequences = membership.sequence_span().first(1);
+            const auto budgets   = membership.budget_span().first(1);
+            const auto lanes     = membership.lane_span().first(1);
+            nvtx::ScopedRange decode_range(nvtx::Name::Decode, nvtx::Category::Decode, 1);
+            ProgramCallScope program_call(*this);
+            auto pending = instance_.program->decode(sequences, budgets, &program_call.failed_timing());
+            program_call.finish(pending.execution_timing());
+            commit_pending(std::move(pending), lanes, true, cancelled_at_unit_start);
+            publish_runtime_stats();
+            return;
+        }
         nvtx::ScopedRange decode_range(nvtx::Name::Decode, nvtx::Category::Decode,
                                        static_cast<std::uint64_t>(membership.size));
         ProgramCallScope program_call(*this);
@@ -1871,6 +1984,23 @@ private:
     }
 
     void run_control_batch(const ControlMembership& membership) {
+        // Membership probe (NINFER_FORCED_PROBE=1), read-only. It answers the question three load shapes
+        // could not: whether a one-row membership is the *scheduler's choice* or simply all there was.
+        // The membership is built by `build_control_membership(slots_, max_concurrency_)`, so if several
+        // lanes are control-ready here and the membership still holds one row, the multi-row case
+        // `append_forced_tokens` guards cannot be produced by concurrency at all in this configuration --
+        // which is an answer about the fix's reach, not a defect in it. If only one lane is ready, the
+        // separation is timing, and the answer is scheduling.
+        if (std::getenv("NINFER_FORCED_PROBE") != nullptr) {
+            std::uint32_t control_ready = 0;
+            for (const auto& request : slots_) {
+                if (request != nullptr && request->is_control_ready()) { ++control_ready; }
+            }
+            std::fprintf(stderr,
+                         "[forced] run_control_batch membership=%zu control_ready_lanes=%u\n",
+                         membership.size, control_ready);
+            std::fflush(stderr);
+        }
         nvtx::ScopedRange control_range(nvtx::Name::ControlBatch, nvtx::Category::Control,
                                         static_cast<std::uint64_t>(membership.size));
         EnginePhaseScope phase(*this, EngineHostPhase::CommitOutput);
@@ -1970,6 +2100,55 @@ private:
     // the scheduler and program state, but leaves pending requests in the FIFO so they
     // can retry once memory is freed.  The worker loop continues after this.
     // The worker holds execution_mutex_ across the failing operation and this cleanup.
+    // Post-recovery residual (I1). A recovery clears the scheduler and the program's catalogs, and is
+    // *expected* to release every page and slot those were holding -- so the occupancy measured
+    // immediately afterwards should be zero, and a non-zero line here is the leak, named.
+    //
+    // This exists because of the 2026-09-25 wedge, whose first stage was a recovery that left about
+    // 958 device pages and one host state slot owned by nothing. Nothing reported it: the residual was
+    // visible only to someone who later correlated `/stats` by hand, and the block it left could not
+    // be freed by any path, so a request above the remaining capacity was classed feasible and then
+    // blocked forever. The point of printing at the moment of recovery is that the journal -- which is
+    // what the monitor watches -- then carries the residual next to the recovery line.
+    //
+    // Runs only on an exceptional path, so it is not gated and costs nothing in normal operation.
+    // Reports the same quantities the request log's throughput records carry (`program.physical_usage`
+    // is the accessor behind both), so a residual here can be compared with them directly.
+    void report_recovery_residual(const char* what) noexcept {
+        try {
+            const auto usage = instance_.program->physical_usage();
+            std::fprintf(stderr,
+                         "[engine] post-recovery residual (%s): main_kv_pages=%u backend_kv_pages=%u "
+                         "device_state_slots=%u host_state_slots=%u host_kv_bytes=%zu\n",
+                         what, usage.device_main_kv_pages, usage.device_backend_kv_pages,
+                         usage.device_state_slots, usage.host_state_slots, usage.host_kv_bytes);
+            std::fflush(stderr);
+            // #9: the amount is printed above; this names the owner -- but ONLY when there is something
+            // to name. A zero residual needs no owner, and the census itself is the expensive part.
+            //
+            // CORRECTED 2026-09-26 (this comment used to blame teardown -- "also runs on the shutdown
+            // path (`fail-all`), where the stores may already be torn down" -- and that attribution was
+            // wrong): the guard is here for the residual check, and the crash that taught it was a NULL
+            // STORE, not a torn-down one. Under gdb the fault was `census(this=0x0, label="backend")`:
+            // `backend_kv_addresses` is only constructed when `backend_kv_cache()` is non-null
+            // (`program_impl.cpp:174-181`), so in every scenario without a backend KV cache the pointer
+            // is null for the whole life of the engine, not merely at the end of it. The lesson that
+            // holds is narrower than the old sentence: a `try` cannot catch a segfault, and a fault here
+            // is worth the null-check in `resource_census` rather than a call-site condition.
+            if (usage.device_main_kv_pages != 0 || usage.device_backend_kv_pages != 0 ||
+                usage.device_state_slots != 0 || usage.host_state_slots != 0 ||
+                usage.host_kv_bytes != 0) {
+                instance_.program->resource_census();
+            }
+        } catch (...) {}
+    }
+
+    // How long a head may remain blocked with an *empty* active set before it is rejected outright.
+    // Nothing can free resources while no lane is active, so this is a persistence window that
+    // separates a transient race from the unsatisfiable block the 2026-09-25 wedge was; 5 s is far
+    // below the 900 s request deadline and far below the sentinel's ~150 s Class A restart.
+    static constexpr std::chrono::seconds kIdleBlockGracePeriod{5};
+
     void recover_from_oom_locked(std::exception_ptr error) noexcept {
         if (!error) { error = oom_fallback_error_; }
         try { scheduler_.reset(); } catch (...) {}
@@ -1992,6 +2171,7 @@ private:
         // FIFO requests are re-inspected on the next boundary without waiting for a new submission.
         request_admission_check();
         try { publish_runtime_stats(); } catch (...) {}
+        report_recovery_residual("recover");
     }
 
     // The worker holds execution_mutex_ across the failing operation and this cleanup, so no
@@ -2021,6 +2201,7 @@ private:
         }
         for (const auto& request : pending) { force_complete_error(request, error); }
         try { publish_runtime_stats(); } catch (...) {}
+        report_recovery_residual("fail-all");
     }
 
     void worker_loop() noexcept {

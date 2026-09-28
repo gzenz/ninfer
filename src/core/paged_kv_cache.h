@@ -114,6 +114,10 @@ public:
 
     [[nodiscard]] bool valid() const noexcept { return owner_ != nullptr; }
 
+    // Physical page ordinal within its pool. Read-only and stable for the handle's lifetime;
+    // used by callers that must prove two address spaces do not share a physical page.
+    [[nodiscard]] std::int32_t index() const noexcept { return index_; }
+
 private:
     friend class DeviceKVPagePool;
     friend class DeviceKVPageLease;

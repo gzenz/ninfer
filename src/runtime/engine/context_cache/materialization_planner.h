@@ -103,6 +103,11 @@ public:
         if (candidates.empty() || root_candidate_index >= candidates.size()) {
             throw std::invalid_argument("materialization planning problem has no root candidate");
         }
+        // #6's counter is PER RUN, and the first version of it was not: it is a member of a planner that
+        // outlives a request, so it accumulated -- which is how two different requests reported the same
+        // 607. Reset here, at the only point a planning run begins, so the number means "in THIS run".
+        feasible_preserving_alternatives_ = 0;
+        assessed_targets_without_goal_    = 0;
         for (std::size_t index = 0; index < candidates.size(); ++index) {
             if (candidates[index].candidate == nullptr ||
                 std::find_if(candidates.begin(), candidates.begin() + index,
@@ -312,11 +317,43 @@ public:
         // `allowance` used elsewhere; only the search's internal budget is restarted.
         PlanningAllowance search_allowance = allowance;
         search_allowance.started_ns = search_origin_ns;
-        // The search must explore several construction steps (one per pressure owner, each a few
-        // ms) before reaching the preserving alternative for the re-touch's own checkpoint, so it
-        // needs the full single-request allowance, not the reduced concurrency window. The cost it
-        // avoids (a multi-hundred-ms re-prefill) dwarfs the extra planning time.
-        search_allowance.limit_ns = 100'000'000;
+        // This is a CUT-OFF, not a completeness bound. What the artifacts contain, with inference
+        // labelled and denominators stated:
+        //   - the gate's own FORECAST for a construction step (`GATE DENY phase=construction
+        //     completion=…`, the `completion` argument passed to `allow_work` -- an estimate, not a
+        //     measured duration). From ONE log (`/tmp/why.log`, n=8, all `complete=0`): 7.4-30.8 ms.
+        //     Across every surviving log the same line reads 0.024-30.8 ms (n=92, p50 4.7 ms), so
+        //     "several times the flat 5 ms window" holds for that log, not for the population;
+        //   - the collapse artifacts' stop reasons read `{'no_pressure': 1, 'time_budget': 15}` with
+        //     0% prefix reuse;
+        //   - in the 400 ms arm 14 of its 16 records report `search_elapsed` ~395 ms with
+        //     `budget_exhausted: true` (req 1 made no search; req 2 stopped `queue_exhausted` at
+        //     ~150 ms), i.e. the search is stopped by this bound, not finished;
+        //   - `first_improvement_ns` is carried by 15 of serve-292073's 16 records, spanning
+        //     8.534-163.925 ms; req 16's is 95.541 ms (an earlier version said "the record that
+        //     carries it", singular -- wrong by 14 records). The later acceptance arm spans
+        //     8.227-166.211 ms, and earlier runs 18.7-23.4 ms (serve-277147, serve-277417,
+        //     serve-278329 -- the range was written as "19-23 ms", which excludes 18.740).
+        // THE MEASURED A/B (2026-09-24, prod4 4x150k; arms by instance id -- neither recorded a binary). Counts per COMPLETED turn: records the 420 s cap cancelled in flight (`finish_reason=cancelled`, `prefill=0`) carry no reuse evidence and are excluded.
+        //   * 5 ms arm 1 (serve-293952): cut after 9 of 16 turns completed (rc=124), 3 cancelled in flight. Of the 9: 9/9 root with 0 hits, 8 with search_work>0 (granted 5e6, time_budget), 1 no_pressure (granted 0).
+        //   * 5 ms arm 2 (serve-307902, 3 rounds): cut after 9 of 12 completed, 3 cancelled. Of the 9: 8/9 root with 0 hits, 1 private_endpoint (152,227 hits), 7 with search_work>0.
+        //   * combined: 17 of 18 completed turns re-prefilled from root.
+        //   * 400 ms arm (serve-292073): completed 16/16; rounds 2-3 (records 5-12) 8/8 private_endpoint with hits 152,333-154,799; overall 12 of 16 private_endpoint (152,333-157,004), 4 root (round 1), 15 of 16 with search_work>0 (exception: record 1, no_pressure, granted 0).
+        // SCOPE: at 5 ms the old capped expression and the new one are numerically identical (both 5 ms) with `allow()` byte-identical, so this pair measures THE WINDOW'S VALUE; the cap's removal is what makes 400 ms reachable (arithmetic), not separately measured.
+        // STILL TUNED: 400 ms is the only value measured PASSING. 100 ms fails the gate (`/tmp/cmp-ms100.json`: root 12/16, 614,577 hits, queue_wait_s.max 153.03 s); a 32 ms arm failed too but its artifact is byte-identical to an 800 ms arm's and tagged only `build`, so it establishes nothing.
+        // NINFER_SEARCH_MS is an operator override, not a diagnostic: it sets this bound, is the
+        // supported way to A/B it, and is deliberately not behind the harmful-control guard (see
+        // src/core/diagnostics.h, which names this and the ingress probe as its two documented
+        // exceptions). A negative value is clamped rather than rejected (`strtoull` negation lands
+        // above the clamp, so it becomes the 2000 ms ceiling) -- read it as "no limit".
+        search_allowance.limit_ns = 400'000'000;
+        if (const char* override_ms = std::getenv("NINFER_SEARCH_MS")) {
+            const auto parsed = std::strtoull(override_ms, nullptr, 10);
+            // Clamped: an unbounded planning window would spend a request's whole deadline here.
+            if (parsed > 0) {
+                search_allowance.limit_ns = std::min<std::uint64_t>(parsed, 2'000ULL) * 1'000'000ULL;
+            }
+        }
         MaterializationSearchBudget search_budget(search_allowance, search_origin_ns,
                                                   incumbent.cost.total_ns);
         const auto initial_cost_ns = incumbent.cost.total_ns;
@@ -421,6 +458,10 @@ public:
             }
             mark_target(assessment.stable_target_ordinal, kTargetDiscovered | kTargetAssessed);
             ++targets_evaluated;
+            // Counted HERE, once, for both paths: an assessment that is physically feasible and whose cost
+            // destroys no restorable checkpoint is a plan that would have preserved one, whether or not the
+            // search adopts it. Paired with the chosen plan's own count in the diagnostics, this is what
+            // separates "the ordering let one through" from "nothing feasible preserved".
             planning_saturating_add(projection_work, assessment.projection_work);
             const FoldedCost cost =
                 fold_assessment(candidates[expected_candidate], assessment, pressure.owner_policy,
@@ -430,9 +471,21 @@ public:
                 goal = logical_goal(assessment.candidate, assessment.source_mode,
                                     assessment.owner_outcomes);
             }
+            // COUNTED HERE, beside the goal decision: a target with no goal is one that was ASSESSED and
+            // could not be adopted -- which is what separates "the relief step was generated and rejected"
+            // from "it was never reached in the arena".
+            if (!goal) { ++assessed_targets_without_goal_; }
             if (goal) {
                 mark_target(assessment.stable_target_ordinal, kTargetFeasible);
                 candidate_seeded[expected_candidate] = true;
+                // #6's "was a preserving plan ADOPTABLE" -- and the first version of this counter got it
+                // wrong in a way its own reading exposed: it incremented on physical feasibility alone, so
+                // it reported 607 available preserving alternatives against a chosen plan that evicted one
+                // (line=23809), a combination the key ordering makes impossible if those alternatives were
+                // real. They were not: a target with no `logical_goal` can never become an incumbent (the
+                // adoption below is `goal && cost.less(...)`), so counting it claims availability that the
+                // planner could not use. Gated on `goal` now, which is the same condition adoption uses.
+                if (cost.restorable_evictions == 0) { ++feasible_preserving_alternatives_; }
             }
             const bool becomes_incumbent = goal && cost.less(incumbent.cost);
             if (dbg) {
@@ -810,7 +863,17 @@ public:
             const PressureTargetAssessment& assessment = assessed.assessment();
             if (assessment.candidate != candidates[incumbent.candidate_index].id ||
                 assessment.physical_status != MaterializationPhysicalStatus::Feasible) {
-                throw std::logic_error("selected identity target lost exact feasibility");
+                // Stale before commit: a concurrent transition took the target's room. Reject
+                // without physical side effects (§12 invariant 10) and let the caller fall back
+                // to the root identity, so the request re-prefills instead of failing the batch
+                // with a 500.
+                if (dbg) {
+                    std::fprintf(stderr,
+                                 "[mat-debug] STALE identity target -> re-prefill cand=%lu\n",
+                                 static_cast<unsigned long>(incumbent.candidate_index));
+                    dbg_flush();
+                }
+                return std::nullopt;
             }
             incumbent.assessed.emplace(std::move(assessed));
         }
@@ -851,12 +914,26 @@ public:
             AssessedPressureTarget root_assessed = session.assess(root);
             if (root_assessed.assessment().physical_status !=
                 MaterializationPhysicalStatus::Feasible) {
-                throw std::logic_error("eviction fallback target lost feasibility");
+                // The fallback is not guaranteed feasible under concurrent transitions either.
+                // Re-prefill is the intended outcome (see the comment above): a retention loss
+                // must never become a request failure.
+                if (dbg) {
+                    std::fprintf(stderr, "[mat-debug] SEAL FALLBACK infeasible -> re-prefill\n");
+                    dbg_flush();
+                }
+                return std::nullopt;
             }
             sealed = session.seal(std::move(root_assessed), prompt,
                                   FinalScheduleIntent{.shared_capture_frontiers = shared_frontiers});
             if (!sealed) {
-                throw std::logic_error("eviction fallback target could not be sealed");
+                // Reproduced under 4 concurrent sessions sharing a large prefix: the losing lane
+                // cannot claim the seal window, so neither the preserving target nor the
+                // root-maximal fallback seals. Degrade to re-prefill instead of HTTP 500.
+                if (dbg) {
+                    std::fprintf(stderr, "[mat-debug] SEAL FALLBACK claims blocked -> re-prefill\n");
+                    dbg_flush();
+                }
+                return std::nullopt;
             }
             incumbent.root_maximal = true;
         }
@@ -881,7 +958,11 @@ public:
 
         MaterializationDiagnostics diagnostics = make_diagnostics(
             incumbent.cost, targets_evaluated, projection_work, planning_started, search_elapsed_ns,
-            stop_reason, budget_exhausted, incumbent.degradation_units, incumbent.root_maximal);
+            stop_reason, budget_exhausted, incumbent.degradation_units, incumbent.root_maximal,
+            feasible_preserving_alternatives_, assessed_targets_without_goal_);
+        // #6's decisive pair is `feasible_preserving_alternatives` (set above) against
+        // `chosen_restorable_evictions` (the incumbent's own count, filled by make_diagnostics). Both
+        // non-zero in one record means a preserving plan was available and a destroying one was taken.
 
         diagnostics.initial_predicted_total_ns = initial_cost_ns;
         diagnostics.first_improvement_ns       = first_improvement_ns;
@@ -895,6 +976,14 @@ public:
         diagnostics.search_overshoot_ns        = search_elapsed_ns > search_budget.granted_ns()
                                                      ? search_elapsed_ns - search_budget.granted_ns()
                                                      : 0;
+        if (!sealed) {
+            if (dbg) {
+                std::fprintf(stderr, "[mat-debug] NO SEAL -> re-prefill cand=%lu\n",
+                             static_cast<unsigned long>(incumbent.candidate_index));
+                dbg_flush();
+            }
+            return std::nullopt;
+        }
         Result result;
         result.plan                = std::move(*sealed);
         result.candidate           = candidates[incumbent.candidate_index].id;
@@ -924,46 +1013,6 @@ public:
 private:
     static constexpr std::uint32_t kTargetBudget = 4096;
 
-    struct FoldedCost {
-        std::uint64_t now_ns                    = 0;
-        std::uint64_t future_loss_ns            = 0;
-        std::uint64_t total_ns                  = 0;
-        std::uint64_t lower_bound_ns            = 0;
-        std::uint64_t affected_selected_hits    = 0;
-        std::uint64_t newest_affected_hit_epoch = 0;
-        std::uint32_t owner_evictions           = 0;
-        std::uint32_t checkpoint_drops          = 0;
-        std::uint32_t copy_operations           = 0;
-        std::uint64_t transferred_bytes         = 0;
-        std::uint64_t remaining_text_prefill    = 0;
-        std::uint64_t remaining_vision_prefill  = 0;
-        std::uint32_t reused_prompt_tokens      = 0;
-        bool current_session_binding            = false;
-        std::uint32_t candidate_ordinal         = 0;
-        std::uint32_t target_ordinal            = 0;
-
-        [[nodiscard]] auto key() const noexcept {
-            return std::tuple{
-                total_ns,
-                affected_selected_hits,
-                newest_affected_hit_epoch,
-                owner_evictions,
-                checkpoint_drops,
-                copy_operations,
-                transferred_bytes,
-                remaining_text_prefill,
-                remaining_vision_prefill,
-                std::numeric_limits<std::uint32_t>::max() - reused_prompt_tokens,
-                current_session_binding ? 0U : 1U,
-                candidate_ordinal,
-                target_ordinal,
-            };
-        }
-
-        [[nodiscard]] bool less(const FoldedCost& other) const noexcept {
-            return key() < other.key();
-        }
-    };
 
     struct Incumbent {
         PressureTargetHandle target{};
@@ -1271,6 +1320,21 @@ private:
         cost.target_ordinal          = assessment.stable_target_ordinal;
         cost.checkpoint_drops        = assessment.dropped_checkpoints;
 
+        // #6: count evictions of victims that HELD a recoverable checkpoint -- the quantity the ruling
+        // names. An owner appears in `checkpoint_impacts` only when it had a checkpoint whose recovery
+        // recipe is supported, so its presence is the "restorable" half; the eviction itself supplies the
+        // other half. Victims with nothing to lose are not counted, which is what keeps this from
+        // outranking cost for throwaway evictions.
+        for (const PressureOwnerOutcome& outcome : assessment.owner_outcomes) {
+            if (outcome.disposition != VictimDisposition::Evicted) { continue; }
+            const bool had_recoverable_checkpoint = std::any_of(
+                assessment.checkpoint_impacts.begin(), assessment.checkpoint_impacts.end(),
+                [&](const PressureCheckpointRecoveryImpact& impact) {
+                    return impact.owner == outcome.owner;
+                });
+            if (had_recoverable_checkpoint) { ++cost.restorable_evictions; }
+        }
+
         for (const PressureOwnerOutcome& outcome : assessment.owner_outcomes) {
             const MaterializationOwnerPolicy* policy =
                 owner_policy_for(owner_policies, outcome.owner);
@@ -1468,7 +1532,9 @@ private:
                      std::uint64_t projection_work, Clock::time_point planning_started,
                      std::uint64_t search_elapsed_ns, MaterializationStopReason reason,
                      bool budget_exhausted, std::uint32_t degradation_units,
-                     bool maximal_fallback) noexcept {
+                     bool maximal_fallback,
+                     std::uint64_t feasible_preserving_alternatives = 0,
+                     std::uint64_t assessed_targets_without_goal = 0) noexcept {
         return MaterializationDiagnostics{
             .predicted_now_ns           = cost.now_ns,
             .predicted_future_loss_ns   = cost.future_loss_ns,
@@ -1480,14 +1546,23 @@ private:
             .stop_reason                = reason,
             .budget_exhausted           = budget_exhausted,
             .selected_degradation_units = degradation_units,
-            .selected_maximal_fallback  = maximal_fallback,
-            .initial_predicted_total_ns = cost.total_ns,
+            .selected_maximal_fallback        = maximal_fallback,
+            .feasible_preserving_alternatives = feasible_preserving_alternatives,
+            .chosen_restorable_evictions      = cost.restorable_evictions,
+            .assessed_targets_without_goal    = assessed_targets_without_goal,
+            .initial_predicted_total_ns       = cost.total_ns,
         };
     }
 
     std::vector<QueueEntry> queue_;
     std::vector<PendingEntry> pending_;
     std::vector<FoldedCost> identity_costs_;
+    // #6 (2026-09-27): how many targets this planning run assessed FEASIBLE whose cost evicted no
+    // restorable victim -- i.e. how many plans existed that would have preserved one. Counted in
+    // `assess_target` because BOTH paths (the seeded candidate and the search) mark feasibility there, so
+    // one site covers both; see the diagnostics field of the same name.
+    std::uint64_t feasible_preserving_alternatives_ = 0;
+    std::uint64_t assessed_targets_without_goal_    = 0;
     BoundedTargetLedger target_ledger_;
     std::vector<CombinedImpact> impact_scratch_;
     ContextPortfolioValue portfolio_value_;

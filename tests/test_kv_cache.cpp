@@ -1,5 +1,6 @@
 #include "core/device.h"
 #include "core/host_kv_arena.h"
+#include "core/pinned_host_pool.h"
 #include "core/paged_kv_cache.h"
 
 #include <cuda_runtime.h>
@@ -7,6 +8,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <new>
@@ -278,7 +280,15 @@ int exercise_layout_and_transfer(ninfer::DeviceContext& context, ninfer::KVPageG
     const ninfer::HostKVPageLayout host_layout =
         ninfer::plan_host_kv_page_layout(source.geometry());
     const ninfer::HostKVPageLayout layouts[] = {host_layout};
-    ninfer::HostKVArena host_arena(host_layout.page_stride * 24,
+    // CPU-only chunk source: these tests check the ALLOCATOR, not that memory is pinned. `span_bytes` is set
+    // equal to the initial size so the arena starts as exactly the one span these assertions were written
+    // against -- the exhaustion cases below must keep their meaning now that it CAN grow.
+    ninfer::PinnedHostPool host_pool(
+        ninfer::PinnedHostPool::Config{host_layout.page_stride * 24U, 256U},
+        [](std::size_t bytes) { return std::malloc(bytes); },
+        [](void* base) { std::free(base); });
+    ninfer::HostKVArena host_arena(host_pool, host_layout.page_stride * 24,
+                                   host_layout.page_stride * 24,
                                    std::span<const ninfer::HostKVPageLayout>(layouts));
     failures += expect(!host_arena.can_allocate(host_layout, 25),
                        label + " oversized Host extent was reported allocatable");
@@ -362,7 +372,12 @@ int exercise_layout_and_transfer(ninfer::DeviceContext& context, ninfer::KVPageG
     std::optional<ninfer::HostKVAllocation> reused = host_arena.allocate(host_layout, 1);
     failures += expect(reused.has_value(), label + " released Host subextent was not reusable");
 
-    ninfer::HostKVArena recipe_arena(host_layout.page_stride * 8,
+    ninfer::PinnedHostPool recipe_pool(
+        ninfer::PinnedHostPool::Config{host_layout.page_stride * 8U, 256U},
+        [](std::size_t bytes) { return std::malloc(bytes); },
+        [](void* base) { std::free(base); });
+    ninfer::HostKVArena recipe_arena(recipe_pool, host_layout.page_stride * 8,
+                                     host_layout.page_stride * 8,
                                      std::span<const ninfer::HostKVPageLayout>(layouts));
     auto recipe_left   = recipe_arena.allocate(host_layout, 2);
     auto recipe_middle = recipe_arena.allocate(host_layout, 3);
@@ -392,7 +407,12 @@ int exercise_layout_and_transfer(ninfer::DeviceContext& context, ninfer::KVPageG
                            !recipe_right->valid(),
                        label + " release-aware Host recipe published an invalid result");
 
-    ninfer::HostKVArena subrelease_arena(host_layout.page_stride * 8,
+    ninfer::PinnedHostPool subrelease_pool(
+        ninfer::PinnedHostPool::Config{host_layout.page_stride * 8U, 256U},
+        [](std::size_t bytes) { return std::malloc(bytes); },
+        [](void* base) { std::free(base); });
+    ninfer::HostKVArena subrelease_arena(subrelease_pool, host_layout.page_stride * 8,
+                                         host_layout.page_stride * 8,
                                          std::span<const ninfer::HostKVPageLayout>(layouts));
     auto subrelease_left   = subrelease_arena.allocate(host_layout, 2);
     auto subrelease_middle = subrelease_arena.allocate(host_layout, 4);
@@ -414,6 +434,199 @@ int exercise_layout_and_transfer(ninfer::DeviceContext& context, ninfer::KVPageG
     (void)left;
     (void)tail;
     (void)blockers;
+    return failures;
+}
+
+
+// GROWTH: the arena takes more memory on demand from the shared pool. What this must prove is (a) a request
+// that cannot fit still succeeds by growing, and (b) -- the property the whole design rests on -- growing
+// does NOT move an allocation that already exists, because views into these bytes are held across in-flight
+// D2H/H2D copies.
+int exercise_host_arena_growth(ninfer::DeviceContext& device, ninfer::HostKVPageLayout host_layout,
+                               const std::string& label) {
+    (void)device;
+    int failures = 0;
+    const ninfer::HostKVPageLayout layouts[] = {host_layout};
+    ninfer::PinnedHostPool pool(  // CPU-only source: the allocator is what is under test, not the pinning
+        ninfer::PinnedHostPool::Config{host_layout.page_stride * 8U, 256U},
+        [](std::size_t bytes) { return std::malloc(bytes); },
+        [](void* base) { std::free(base); });
+    // One span of 8 pages to start with; growth adds more of the same size.
+    ninfer::HostKVArena arena(pool, host_layout.page_stride * 8, host_layout.page_stride * 8,
+                              std::span<const ninfer::HostKVPageLayout>(layouts));
+    failures += expect_size(arena.capacity_bytes(), host_layout.page_stride * 8,
+                            label + " initial capacity");
+
+    auto held = arena.allocate(host_layout, 2);
+    failures += expect(held.has_value(), label + " growth fixture allocation failed");
+    const std::byte* const address_before =
+        held.has_value() ? arena.writable_view(*held).data() : nullptr;
+
+    // With 2 of 8 pages taken there IS room, so the shortfall is zero -- asserted HERE rather than after the
+    // span is filled, which is where an earlier version of this test put it and then failed against correct
+    // code (2 + 6 fills the span exactly, so a one-page request genuinely does not fit).
+    failures += expect_size(arena.shortfall_for(1, host_layout.page_stride), 0,
+                            label + " shortfall reported for a request that fits");
+    auto filler = arena.allocate(host_layout, 6);
+    failures += expect(filler.has_value(), label + " growth filler allocation failed");
+    failures += expect(!arena.allocate(host_layout, 1).has_value(),
+                       label + " the PURE allocate did not report the span as full");
+    const std::size_t shortfall = arena.shortfall_for(1, host_layout.page_stride);
+    failures += expect(shortfall >= host_layout.page_stride,
+                       label + " shortfall did not name the missing bytes");
+
+    const std::uint64_t grows_before = arena.growth_count();
+    auto grown                       = arena.allocate_growing(host_layout, 1);
+    failures += expect(grown.has_value(), label + " allocate_growing did not add a span");
+    failures += expect(arena.growth_count() == grows_before + 1U, label + " the growth is counted");
+    failures += expect_size(arena.capacity_bytes(), host_layout.page_stride * 16,
+                            label + " capacity followed the growth");
+    failures += expect(arena.writable_view(*held).data() == address_before,
+                       label + " growth MOVED an existing allocation (it must only add spans)");
+    failures += expect(arena.writable_view(*grown).data() != address_before,
+                       label + " the new allocation shares the old address");
+    return failures;
+}
+
+
+// MULTI-SPAN, and this test exists because the rest of this file cannot see the class of bug it covers.
+// `exercise_host_arena_growth` is the only other test whose arena reaches a second span, and NOTHING else
+// splits, releases or simulates in a non-zero span -- so a dropped or defaulted span is correct by
+// coincidence everywhere else. That is exactly why the suite passed while `split` failed to carry the span
+// and the suballocation simulation coalesced across span boundaries -- two defects a review reproduced with
+// a standalone program on 2026-09-26. This test puts its fixtures in span 1 on purpose, and carries a case
+// for each defect: the split case, and the cross-span-merge case.
+int exercise_host_arena_multispan(ninfer::DeviceContext& device, ninfer::HostKVPageLayout host_layout,
+                                  const std::string& label) {
+    (void)device;
+    int failures = 0;
+    const ninfer::HostKVPageLayout layouts[] = {host_layout};
+    const std::size_t stride                 = host_layout.page_stride;
+    ninfer::PinnedHostPool pool(
+        ninfer::PinnedHostPool::Config{stride * 8U, 256U},
+        [](std::size_t bytes) { return std::malloc(bytes); },
+        [](void* base) { std::free(base); });
+    ninfer::HostKVArena arena(pool, stride * 8, stride * 8,
+                              std::span<const ninfer::HostKVPageLayout>(layouts));
+
+    auto filler = arena.allocate(host_layout, 8);  // fills span 0 exactly
+    failures += expect(filler.has_value(), label + " span-0 filler");
+    const std::byte* const span0_base = arena.writable_view(*filler).data();
+
+    // RELATIVE: the constructor pins the initial span through the same path, so the count is already 1 --
+    // an absolute expectation here encodes the fixture rather than what this line tests.
+    const std::uint64_t spans_before = arena.growth_count();
+    auto held = arena.allocate_growing(host_layout, 4);  // nothing fits -> pins the SECOND span
+    failures += expect(held.has_value(), label + " multi-span fixture allocation");
+    failures += expect(arena.growth_count() == spans_before + 1U, label + " second span pinned");
+    const std::byte* const held_base = arena.writable_view(*held).data();
+    failures += expect(held_base != span0_base, label + " the fixture is NOT in span 0");
+
+    // SPLIT must carry the span: the right half belongs to the SAME span, immediately after the left.
+    auto halves                       = arena.split(std::move(*held), 2);
+    const std::byte* const left_base  = arena.writable_view(halves.first).data();
+    const std::byte* const right_base = arena.writable_view(halves.second).data();
+    failures += expect(left_base == held_base, label + " split moved the left half");
+    failures += expect(right_base == held_base + 2 * stride,
+                       label + " split's right half is not 2 pages along the SAME span (span dropped)");
+
+    // Releasing the left half must free THAT memory, not another span's.
+    halves.first.release();
+    auto reused = arena.allocate(host_layout, 2);
+    failures += expect(reused.has_value(), label + " released subextent was not reusable");
+    failures += expect(arena.writable_view(*reused).data() == left_base,
+                       label + " the released subextent was reused elsewhere (span-blind release)");
+    failures += expect(arena.writable_view(halves.second).data() == right_base,
+                       label + " the right half's data moved");
+
+    // A run must never be assembled ACROSS two spans: span 0 is full and span 1 holds 2 free pages, so 8
+    // contiguous pages do not fit. NOTE this case CANNOT catch a span-blind predicate -- span 0 holds no
+    // free extent at all here, so there is nothing for an offset-only merge to join span 1's run to, and
+    // the correct and the offset-only simulation answer alike. Mutation-checked: reverting the helper to
+    // the offset-only lambda leaves this case green. The cross-span merge is what the NEXT case tests.
+    const std::array release_left{ninfer::HostKVSuballocationRelease{
+        .allocation = reused->handle(), .begin_page = 0, .page_count = 2}};
+    const std::array eight_pages{ninfer::HostKVAllocationRequest{.layout = &host_layout, .pages = 8}};
+    const std::array two_pages{ninfer::HostKVAllocationRequest{.layout = &host_layout, .pages = 2}};
+    failures += expect(!arena.can_allocate_after_suballocation_releases(release_left, eight_pages),
+                       label + " the suballocation predicate claimed 8 pages with only 2 free");
+    failures += expect(arena.can_allocate_after_suballocation_releases(release_left, two_pages),
+                       label + " the suballocation predicate lost a run inside one span");
+
+    // THE CASE THAT CATCHES A SPAN-BLIND SIMULATION, taken from the review's repro (fixture 2): free runs in
+    // BOTH spans, adjacent by offset. Span 0 = A(2) + B(6); span 1 = C(2) + D(2) + E(4). Releasing A and E
+    // and suballocation-releasing D leaves span 0 free at [0, 2p) and span 1 free at [2p, 8p) -- 6
+    // contiguous pages. By OFFSET those two runs look adjacent, so an offset-only coalesce declares 8 pages
+    // available across a span boundary, and a plan priced on it cannot be allocated. Verified by mutation
+    // (twice): the offset-only lambda makes this case FAIL, the span-keyed helper passes it.
+    {
+        ninfer::PinnedHostPool pool2(
+            ninfer::PinnedHostPool::Config{stride * 8U, 256U},
+            [](std::size_t bytes) { return std::malloc(bytes); },
+            [](void* base) { std::free(base); });
+        ninfer::HostKVArena arena2(pool2, stride * 8, stride * 8,
+                                   std::span<const ninfer::HostKVPageLayout>(layouts));
+        auto a = arena2.allocate(host_layout, 2);          // span 0 [0, 2p)
+        auto b = arena2.allocate(host_layout, 6);          // span 0 [2p, 8p) -- span 0 FULL
+        auto c = arena2.allocate_growing(host_layout, 2);  // span 1 [0, 2p)
+        auto d = arena2.allocate(host_layout, 2);          // span 1 [2p, 4p)
+        auto e = arena2.allocate(host_layout, 4);          // span 1 [4p, 8p) -- span 1 FULL
+        failures += expect(a.has_value() && b.has_value() && c.has_value() && d.has_value() &&
+                               e.has_value(),
+                           label + " suballoc fixture allocations");
+        if (a && b && c && d && e) {
+            // BOTH PREDICATES ARE PURE -- they simulate the releases rather than performing them, so the
+            // fixture stays live throughout and the two cases cannot interfere. (Releasing for real first
+            // makes the second call reject its now-invalid handles, which is how the first draft of this
+            // case failed its own CONTROL assertion on correct code.)
+            // Released: span 0 frees [0, 2p); span 1 frees [2p, 8p) from D(2) + E(4) -> ONE 6-page run.
+            // By OFFSET those two runs look adjacent ([0, 2p) then [2p, 8p)), so an offset-only coalesce
+            // sees ONE 8-page run at offset 0 ACROSS the span boundary. The largest REAL run is 6 pages.
+            const std::array release_all{
+                ninfer::HostKVSuballocationRelease{
+                    .allocation = a->handle(), .begin_page = 0, .page_count = 2},
+                ninfer::HostKVSuballocationRelease{
+                    .allocation = d->handle(), .begin_page = 0, .page_count = 2},
+                ninfer::HostKVSuballocationRelease{
+                    .allocation = e->handle(), .begin_page = 0, .page_count = 4}};
+            const std::array eight{ninfer::HostKVAllocationRequest{.layout = &host_layout, .pages = 8}};
+            const std::array six{ninfer::HostKVAllocationRequest{.layout = &host_layout, .pages = 6}};
+            failures += expect(!arena2.can_allocate_after_suballocation_releases(release_all, eight),
+                               label +
+                                   " the suballocation predicate merged two spans' runs into 8 pages");
+            failures += expect(arena2.can_allocate_after_suballocation_releases(release_all, six),
+                               label + " the suballocation predicate lost span 1's 6-page run");
+
+            // THE SAME FIXTURE AGAINST THE SECOND SIMULATION. `can_allocate_after_suballocation_releases`
+            // and `plan_after_releases` are the two users of the span-keyed helper, and covering only one of
+            // them was the gap a review found next: an offset-only lambda in `plan_after_releases` passed
+            // this whole test.
+            const std::array recipe_releases{a->handle(), d->handle(), e->handle()};
+            failures += expect(!arena2.plan_after_releases(recipe_releases, eight).has_value(),
+                               label + " plan_after_releases planned 8 pages ACROSS two spans");
+            failures += expect(arena2.plan_after_releases(recipe_releases, six).has_value(),
+                               label + " plan_after_releases lost span 1's 6-page run");
+
+            // AND THE THIRD USER, THE REAL FREE LIST -- the one that actually hands out memory. It was
+            // still uncovered after the two simulation cases landed: an `insert_free_extent` switched to an
+            // offset-only insert-and-coalesce passed this whole test, twice, which is the same
+            // double-allocation class as the `split` defect. These are REAL releases, unlike the simulated
+            // ones above, so this runs last and leaves the arena consumed at the end of the case.
+            a->release();
+            d->release();
+            e->release();
+            auto merged = arena2.allocate(host_layout, 8);  // must fail: the largest real run is 6 pages
+            failures += expect(!merged.has_value(),
+                               label + " the real free list merged two spans into one 8-page run");
+            if (merged) {
+                merged->release();  // without this, an offset-only free list fails the 6-page control as a
+                                    // knock-on and the two assertions stop being independent
+            }
+            auto legit = arena2.allocate(host_layout, 6);  // fits inside span 1 alone
+            failures += expect(legit.has_value(), label + " the real free list lost span 1's 6-page run");
+            if (legit) { legit->release(); }
+        }
+    }
     return failures;
 }
 
@@ -469,6 +682,27 @@ int main() {
                     },
             },
             "K8V4 asymmetric PageMajor");
+        failures += exercise_host_arena_multispan(
+            context,
+            ninfer::plan_host_kv_page_layout(ninfer::KVPageGeometry{
+                .device_plane_order = ninfer::PagedKVPlaneOrder::PageMajor,
+                .planes =
+                    {
+                        {ninfer::DType::I8, 8, 2, 256},
+                        {ninfer::DType::FP16, 1, 2, 256},
+                    },
+            }),
+            "multispan");
+        failures += exercise_host_arena_growth(
+            context, ninfer::plan_host_kv_page_layout(ninfer::KVPageGeometry{
+                         .device_plane_order = ninfer::PagedKVPlaneOrder::PageMajor,
+                         .planes =
+                             {
+                                 {ninfer::DType::I8, 8, 2, 256},
+                                 {ninfer::DType::FP16, 1, 2, 256},
+                             },
+                     }),
+            "growth");
         if (failures != 0) {
             std::cerr << failures << " Paged KV physical-container checks failed\n";
             return 1;

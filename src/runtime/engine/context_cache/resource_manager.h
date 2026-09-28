@@ -4,6 +4,7 @@
 #include "runtime/contract/execution.h"
 #include "runtime/contract/resources.h"
 #include "runtime/engine/context_cache/context_cost.h"
+#include "runtime/engine/context_cache/materialization_budget.h"
 #include "runtime/engine/context_cache/materialization_planner.h"
 #include "runtime/engine/context_cache/shared_capture_planner.h"
 
@@ -28,6 +29,9 @@
 namespace ninfer::runtime {
 
 inline constexpr std::uint32_t kInvalidCatalogSlot = std::numeric_limits<std::uint32_t>::max();
+// A goal probe that never resolved a candidate (the caller passed an id no candidate carries). Distinct from
+// a resolved candidate index of 0, which is why it is a sentinel and not a zero.
+inline constexpr std::size_t kNoCandidateIndex = std::numeric_limits<std::size_t>::max();
 
 enum class LogicalLaneState : std::uint8_t {
     Free,
@@ -272,6 +276,38 @@ public:
         }
     }
 
+    // THE DEPTH AT WHICH TO CAPTURE A CHECKPOINT, computed BEFORE the base plan is built -- which is the only
+    // point from which it can be made correct. Two earlier attempts failed for two different reasons, and the
+    // second is instructive: injecting the group into the CANDIDATE copy produced a group with NO identity and
+    // no pricing, and every capture group must carry a `PreparedCaptureIdentity` (`backing`, work at its
+    // frontier, per-frontier digests) or the engine throws `planned capture identity is invalid` and recovers
+    // (observed on prod 2026-09-27, followed by a cascade of `prepared prompt is empty`). Injecting here, via
+    // the base build's own `add_capture`, means the group passes through the identity AND pricing passes like
+    // every client marker.
+    //
+    // The condition is the measured one: this prompt matches stored content DEEPER than any checkpoint below it
+    // can resume from, so the matched tail is re-prefilled (28,564 against 23,353 on the shared class; 45,717
+    // against 31,229 on the private one, both with the identity chain agreeing).
+    [[nodiscard]] std::optional<std::uint32_t> branch_anchor_frontier(const Program& program,
+                                                                      const PreparedPrompt& prompt) const {
+        std::uint32_t best = 0;
+        const auto consider = [&](const Program::PrefixSplit& split) {
+            if (split.tokens > split.restorable && split.tokens > best) { best = split.tokens; }
+        };
+        for (std::uint32_t slot = 0; slot < catalog_count_; ++slot) {
+            const CatalogEntry& entry = catalog_[slot];
+            if (entry.state != CatalogState::Catalogued || !entry.handle) { continue; }
+            consider(program.prefix_split(*entry.handle, prompt));
+        }
+        for (std::uint32_t slot = 0; slot < shared_catalog_count_; ++slot) {
+            const SharedCatalogEntry& entry = shared_catalog_[slot];
+            if (entry.state != SharedCatalogState::Catalogued || !entry.handle) { continue; }
+            consider(program.prefix_split(*entry.handle, prompt));
+        }
+        if (best == 0) { return std::nullopt; }
+        return best;
+    }
+
     [[nodiscard]] Inspection inspect(Program& program, const PreparedPrompt& prompt,
                                      const RequestBasePlan& base, std::uint64_t publication_order,
                                      PlanningAllowance allowance = {}) {
@@ -295,9 +331,29 @@ public:
         if (!destination) { return {.readiness = Readiness::TemporarilyBlocked}; }
 
         const typename Planner::Clock::time_point planning_started = Planner::Clock::now();
-        const bool cdbg = std::getenv("NINFER_MAT_DEBUG") != nullptr;
+        // THE CANDGEN DIAGNOSTIC GETS ITS OWN GATE. Every `cdbg_log` site in this file (10 of them) is a
+        // `[candgen]` line, and it was reachable only through `NINFER_MAT_DEBUG` -- which also switches on the
+        // planner's `[mat-debug]` probes: 1.7 MB of output for one prod4 run, 678 MB of serve log, and all of
+        // it on the paths the suite TIMES. So the one diagnostic that answers "was the session's own cell even
+        // found" could not be enabled on a serving instance, which is exactly where the question was asked
+        // (2026-09-27: a third of requests after a restart reused a shared prefix for 23,353 tokens with NO
+        // private candidate, and three same-shaped requests took a root instead -- 0% -- and the difference is
+        // visible in these lines). `getenv` is non-NULL for an EMPTY string, so an exported empty name turns
+        // it ON; that is deliberate here and is why the test harness unsets rather than blanks MAT_*.
+        const bool cdbg = std::getenv("NINFER_MAT_DEBUG") != nullptr ||
+                          std::getenv("NINFER_CANDGEN_DEBUG") != nullptr;
+        // RATE-LIMITED, and that is the whole point of this change (2026-09-27). Turning the gate on used to
+        // emit EVERY line: one nine-minute prod window produced 468,786 `[candgen]` lines out of 470,661
+        // journal lines, and journald responded by suppressing 28,058 messages -- which can drop `WORKER OOM`
+        // and the eviction line, with the watcher blind to the loss (`grep -i suppress tools/ops/ninfer-watch.*`
+        // finds nothing). A diagnostic that hides alerts is worse than no diagnostic, so the first 8 and then
+        // every 512th is the policy here too -- the same split the eviction print uses. The un-muted readings
+        // live in `/stats` and in the request record, which is where a rate limit cannot reach.
+        static std::uint64_t cdbg_seen = 0;
         const auto cdbg_log = [cdbg](const char* fmt, ...) {
             if (!cdbg) { return; }
+            ++cdbg_seen;
+            if (cdbg_seen > 8U && cdbg_seen % 512U != 0U) { return; }
             std::va_list ap;
             va_start(ap, fmt);
             std::vfprintf(stderr, fmt, ap);
@@ -323,6 +379,7 @@ public:
             base.context_cache().update_session_index) {
             current_session_cell = find_session_cell(*base.context_cache().session_key);
         }
+        CandidateCounters candidate_counters;
         std::vector<Candidate> candidates;
         candidates.reserve(1U + prefix_index_.size());
         std::optional<AdmissionCandidate> root = program.inspect_admission(
@@ -363,8 +420,73 @@ public:
                              base.prefix_shortlist_size());
                 }
             }
+            // The session cell's slot, resolved BEFORE the loop so each skip site below can say whether the entry
+            // it just dropped was the conversation's OWN. Resolving it after the loop would report the outcome
+            // without the cause, which is the shape that has cost this work several cycles already.
+            static constexpr std::uint32_t kNoSessionSlot = 0xFFFFFFFFu;
+            const std::uint32_t session_slot =
+                (current_session_cell && session_index_[*current_session_cell].slot < catalog_count_)
+                    ? session_index_[*current_session_cell].slot
+                    : kNoSessionSlot;
+            if (session_slot != kNoSessionSlot) {
+                // Provisional: "the slot never appeared in the index". Every site below overwrites it, so a
+                // final reason of 2 means the loop genuinely never met this slot.
+                candidate_counters.session_cell_skip = 2;
+            }
+            // A PRIVATE SLOT NUMBER IS NOT A SHARED SLOT NUMBER, and the first version of this treated them as
+            // one. `rebuild_prefix_index` appends every shared entry AFTER every private one, so shared entries
+            // are visited last; both namespaces start at 0; and the three key sites below run before the
+            // `if (!index.shared)` branch. A shared entry whose key missed this prompt could therefore write
+            // its reason into the private session cell's field -- producing a plausible-looking 3/4/5 for a
+            // cell that was in fact offered. Every reason below is therefore taken ONLY from a private entry.
+            //
+            // TWO FIELDS, because one slot can hold several index entries (endpoint, rewrite, each long
+            // anchor) and they compete: an endpoint skipped for a reason and a shallower anchor offered
+            // afterwards would otherwise report a bare `1`, hiding exactly the question this instrument exists
+            // to answer. `session_cell_skip` answers "did the cell produce a candidate"; `session_endpoint_skip`
+            // answers what happened to the conversation's OWN endpoint.
+            //
+            // UNVERIFIED BY TEST, and that is recorded rather than implied: a red control for the shared-slot
+            // collision was attempted and WITHDRAWN, because it passed with the guard removed -- the fixture
+            // never produced the slot-number equality the bug needs, so it proved nothing. The fix rests on the
+            // code order above (shared appended after private, both numbering from 0, key sites before the
+            // `if (!index.shared)` branch) and on no run. A control that cannot fail is worse than none: it
+            // reads as verification.
+            // THE SENTINEL COLLISION, and it is the same value on both sides: `kNoSessionSlot` is 0xFFFFFFFF
+            // and `PrefixIndexEntry::slot` defaults to `kInvalidCatalogSlot`, which is
+            // `numeric_limits<uint32_t>::max()` -- the same number. `prefix_index_` is a FIXED array filled
+            // only at its head, so a request with no session cell used to match every UNOCCUPIED tail entry
+            // (`index.slot != session_slot` was 0xFFFFFFFF != 0xFFFFFFFF, i.e. false) and write reason 9 --
+            // making "failed validation" the reading on every request without a session key, the Bash
+            // classifier's traffic included, while the documented 0 was unreachable. The first version also
+            // indexed `catalog_[0xFFFFFFFF]` on that path and segfaulted the whole suite; the guard added for
+            // that stopped the crash and left the misreport, which is the wrong repair -- the sentinel is what
+            // made it misreport, not the slot's trustworthiness. NOTE the two guards below are REDUNDANT:
+            // `!index.occupied` alone closes the collision, because an unoccupied entry is exactly what carries
+            // the colliding slot default. Both are kept so the intent reads directly, but a control that removes
+            // only one of them will not fail, and the one in the suite pins only their union.
+            const auto note_session_slot = [&](const PrefixIndexEntry& index, std::uint8_t reason) {
+                if (session_slot == kNoSessionSlot || !index.occupied || index.shared ||
+                    index.slot != session_slot) {
+                    return;
+                }
+                const CatalogEntry& own = catalog_[index.slot];
+                if (own.summary.endpoint && index.checkpoint == own.summary.endpoint->ref) {
+                    candidate_counters.session_endpoint_skip = reason;
+                }
+                if (reason == 1) {
+                    candidate_counters.session_cell_skip = 1;  // offered is sticky: later entries cannot undo it
+                } else if (candidate_counters.session_cell_skip != 1) {
+                    candidate_counters.session_cell_skip = reason;
+                }
+            };
             for (const PrefixIndexEntry& index : prefix_index_) {
-                if (!valid_prefix_index_entry(index)) { continue; }
+                if (!valid_prefix_index_entry(index)) {
+                    // 9, not the provisional 2: the slot IS in the index but failed validation here, and a
+                    // reader must be able to tell that from "no index entry at all".
+                    note_session_slot(index, 9);
+                    continue;
+                }
                 const std::optional<PrefixShortlistKey> incoming =
                     base.prefix_shortlist_key(index.key.frontier);
                 if (!incoming) {
@@ -377,12 +499,14 @@ public:
                              "sl_size=%zu sess=%016lx %s\n",
                              index.slot, index.key.frontier, index.shared ? 1 : 0,
                              base.prefix_shortlist_size(), nh, nown ? "OWN" : "XSESSION");
+                    note_session_slot(index, 3);
                     continue;
                 }
                 if (incoming->identity_tag != index.key.identity_tag) {
                     cdbg_log("[candgen] priv SKIP slot=%u TAG-MISMATCH base=%u idx=%u f=%u\n",
                              index.slot, incoming->identity_tag, index.key.identity_tag,
                              index.key.frontier);
+                    note_session_slot(index, 4);
                     continue;
                 }
                 if (*incoming != index.key) {
@@ -402,6 +526,7 @@ public:
                              index.key.frontier,
                              incoming->digests[0], incoming->digests[1],
                              index.key.digests[0], index.key.digests[1]);
+                    note_session_slot(index, 5);
                     continue;
                 }
 
@@ -409,28 +534,69 @@ public:
                     const CatalogEntry& entry = catalog_[index.slot];
                     if (entry.state != CatalogState::Catalogued || !entry.handle ||
                         private_has_active_edge(index.slot)) {
+                        const bool held_by_active_edge = private_has_active_edge(index.slot);
                         cdbg_log("[candgen] priv SKIP slot=%u state=%d handle=%d active_edge=%d "
                                  "(key matched)\n",
                                  index.slot, static_cast<int>(entry.state),
                                  entry.handle ? 1 : 0,
-                                 private_has_active_edge(index.slot) ? 1 : 0);
+                                 held_by_active_edge ? 1 : 0);
+                        // 7 only. The validator above (`valid_prefix_index_entry`) already requires
+                        // `state == Catalogued && handle`, so the state/handle arm of this ternary was
+                        // unreachable and code 6 could never be emitted -- a reason in the table that no
+                        // input could produce.
+                        note_session_slot(index, 7);
                         continue;
                     }
+                    // THE SIBLING CASE (2026-09-27). `retain` above is false exactly when the entry IS this
+                    // request's own session's -- so the request CONSUMES it, and the plan is Replace, which
+                    // destroys the entry's endpoint (`request_plan.cpp` Replace; the consume at
+                    // `storage/context.cpp`). That is right for the conversation's next turn and WRONG for a
+                    // SIBLING: a concurrent request built from the same prompt plus a small delta resumes the
+                    // same checkpoint, leaves the endpoint ledger before the endpoint, and takes the endpoint
+                    // with it. The real next turn then finds nothing at its own depth and falls back to the
+                    // shared marker's 23,353.
+                    //
+                    // Demonstrated live from traffic, per key (2026-09-27, `request.session_key`):
+                    //   prompt 36225 -> private_endpoint reuse 31160
+                    //   prompt 36363 -> private_endpoint reuse 31160   (+138: the sibling, same checkpoint)
+                    //   prompt 38472 -> shared_stable_prefix 23355     (the next turn, endpoint gone)
+                    // and 15 of the 55 ceiling requests have `split_best_tokens - 1` equal to an earlier
+                    // request's reuse point, in 15/15 cases a `private_response_replay`; 196 of 218 such
+                    // requests arrived BEFORE the request they extend finished, so they cannot contain its
+                    // response -- they are siblings, not next turns.
+                    //
+                    // The condition is the one that was measured: the request's whole prompt is SHORTER than
+                    // the entry's endpoint frontier, so consuming the entry would discard an endpoint this
+                    // request can never reach. Retain instead, and the endpoint survives for the turn that
+                    // needs it. GATED, because it is unproven and its cost is real: Retain needs a publication
+                    // cell where Replace took the source's own, and cells are what prod is short of.
+                    const bool endpoint_beyond_prompt =
+                        entry.summary.endpoint &&
+                        base.summary().prompt_tokens < entry.summary.endpoint->ref.frontier;
+                    // COUNTED EVEN WHILE THE BEHAVIOUR IS OFF: this sizes the population the sibling fix would
+                    // touch, from traffic, before anything changes. The audit's chain says such a request takes
+                    // `Replace` and destroys the conversation's endpoint; `retained_sources`/`consumed_sources`
+                    // verify that from the decision rather than from the code.
+                    if (endpoint_beyond_prompt) { ++candidate_counters.sibling_candidates; }
+                    static const bool sibling_retain = std::getenv("NINFER_SIBLING_RETAIN") != nullptr;
                     const bool retain =
-                        entry.session && (!base.context_cache().session_key ||
-                                          *entry.session != *base.context_cache().session_key ||
-                                          !base.context_cache().update_session_index);
+                        (entry.session && (!base.context_cache().session_key ||
+                                           *entry.session != *base.context_cache().session_key ||
+                                           !base.context_cache().update_session_index)) ||
+                        (sibling_retain && endpoint_beyond_prompt);
                     std::optional<AdmissionCandidate> plan =
                         program.inspect_admission(prompt, base, *destination, &*entry.handle,
                                                   nullptr, index.checkpoint, retain);
                     if (!plan) {
                         cdbg_log("[candgen] priv SKIP slot=%u inspect_admission=nullopt\n",
                                  index.slot);
+                        note_session_slot(index, 8);
                         continue;
                     }
                     cdbg_log("[candgen] priv BUILD slot=%u reuse_tok=%u retain=%d\n", index.slot,
                              static_cast<unsigned>(plan->summary().reusable_prompt_tokens),
                              retain ? 1 : 0);
+                    if (retain) { ++candidate_counters.retained_sources; } else { ++candidate_counters.consumed_sources; }
                     if (plan->summary().reusable_prompt_tokens == 0 ||
                         (retain &&
                          plan->identity_assessment().source_mode != PrivateSourceMode::Retain)) {
@@ -442,6 +608,7 @@ public:
                         session_index_[*current_session_cell].owner_id == entry.id &&
                         session_index_[*current_session_cell].revision == entry.revision;
                     append_unique(provisional_demand.exact_resident_keys, index.key);
+                    note_session_slot(index, 1);
                     candidates.push_back(Candidate{
                         .plan                    = std::move(*plan),
                         .current_session_binding = current_session_binding,
@@ -486,9 +653,31 @@ public:
         }
 
         std::optional<Choice> selected =
-            plan_materialization(program, prompt, base, *destination, candidates, publication_order,
+            plan_materialization(program, prompt, base, *destination, candidates, candidate_counters,
+                                 publication_order,
                                  planning_started, provisional_demand, allowance);
-        if (!selected) { return {.readiness = Readiness::TemporarilyBlocked}; }
+        if (!selected) {
+            // "No plan" is only *temporary* when something can change the answer: an occupied lane
+            // finishing, or a reclaimable owner. With every lane Free and no context transaction in
+            // flight (checked on entry), nothing can, so the verdict is final.
+            //
+            // This is the wedge's stage two (#14/#9, 2026-09-25): a recovery left ~958 device pages and
+            // one host state slot owned by nothing, so a request above the remaining capacity planned to
+            // nothing -- and because feasibility is asked against full capacity, it was never called
+            // infeasible either. The head then waited out its 900 s deadline, blocking every request
+            // queued behind it, and the only resolver was a restart. Reporting the unsatisfiable block
+            // as PermanentlyInfeasible turns it into the capacity error the engine already raises for
+            // that enum, at the moment it is decided rather than after a grace period.
+            //
+            // Safe in the other direction: `Materializing` and `TerminalPending` are not Free, so any
+            // lane that could still free or take capacity keeps the request temporarily blocked.
+            const bool any_lane_occupied =
+                std::any_of(lanes_.begin(), lanes_.end(), [](LogicalLaneState state) {
+                    return state != LogicalLaneState::Free;
+                });
+            if (!any_lane_occupied) { return {.readiness = Readiness::PermanentlyInfeasible}; }
+            return {.readiness = Readiness::TemporarilyBlocked};
+        }
         return {
             .readiness = selected->needs_transfer() ? Readiness::NeedsTransfer : Readiness::Ready,
             .choice    = std::move(selected),
@@ -606,7 +795,7 @@ public:
         rebuild_prefix_index();
 
         CaptureAssessment private_baseline =
-            program.inspect_capture(offer, nullptr, nullptr, std::nullopt, false);
+            program.inspect_capture(offer, nullptr, nullptr, std::nullopt, false, "baseline");
         std::optional<CheckpointRef> private_replacement;
         if (!private_baseline.private_replacement_candidates.empty()) {
             private_replacement =
@@ -617,11 +806,11 @@ public:
                                              std::tuple{rhs.kind, rhs.frontier, rhs.ordinal};
                                   });
             private_baseline =
-                program.inspect_capture(offer, nullptr, nullptr, private_replacement, false);
+                program.inspect_capture(offer, nullptr, nullptr, private_replacement, false, "candidate");
         }
 
         CaptureAssessment candidate =
-            program.inspect_capture(offer, nullptr, nullptr, private_replacement, true);
+            program.inspect_capture(offer, nullptr, nullptr, private_replacement, true, "candidate-shared");
         const SharedPrefixHandle* exact_shared = nullptr;
         if (candidate.publishes_shared) {
             for (const PrefixIndexEntry& index : prefix_index_) {
@@ -697,7 +886,7 @@ public:
                         continue;
                     }
                     CaptureAssessment assessment = program.inspect_capture(
-                        offer, nullptr, &*entry.handle, private_replacement, true);
+                        offer, nullptr, &*entry.handle, private_replacement, true, "shared-replacement");
                     if (!assessment.publishes_shared) { continue; }
                     scenarios.push_back(CaptureScenario{
                         .assessment           = std::move(assessment),
@@ -1031,6 +1220,7 @@ public:
                     "Program could neither retain nor discard terminal sequence");
             }
             release_active_references(lane);
+            note_cell_clear(CellClearReason::Terminal);
             clear_catalog_entry(catalog_.at(active.publication_slot));
             reset_active_entry(active);
             lanes_[lane.value] = LogicalLaneState::Free;
@@ -1048,6 +1238,7 @@ public:
                 throw std::logic_error("released finish returned a continuation");
             }
             release_active_references(lane);
+            note_cell_clear(CellClearReason::Terminal);
             clear_catalog_entry(publication);
             reset_active_entry(active);
             lanes_[lane.value] = LogicalLaneState::Free;
@@ -1099,7 +1290,8 @@ public:
             throw std::logic_error("Program did not consume aborted sequence");
         }
         release_active_references(lane);
-        clear_catalog_entry(catalog_.at(active_[lane.value].publication_slot));
+        note_cell_clear(CellClearReason::Cancelled);
+    clear_catalog_entry(catalog_.at(active_[lane.value].publication_slot));
         reset_active_entry(active_[lane.value]);
         lanes_[lane.value] = LogicalLaneState::Free;
         return result;
@@ -1179,9 +1371,101 @@ public:
         out.partial_tail_cow_pages             = context_stats_.partial_tail_cow_pages;
         out.pressure_private_owners_degraded   = context_stats_.pressure_private_owners_degraded;
         out.pressure_private_owners_demoted    = context_stats_.pressure_private_owners_demoted;
+        out.pressure_private_owners_demoted_kv      = context_stats_.pressure_private_owners_demoted_kv;
+        out.pressure_private_owners_demoted_kv_only = context_stats_.pressure_private_owners_demoted_kv_only;
         out.pressure_private_owners_evicted    = context_stats_.pressure_private_owners_evicted;
         out.pressure_shared_owners_degraded    = context_stats_.pressure_shared_owners_degraded;
         out.pressure_shared_owners_evicted     = context_stats_.pressure_shared_owners_evicted;
+        out.pressure_shared_owners_replaced    = program.shared_replacements();
+        out.pressure_private_evictions_demotable = program.demotable_evictions();
+        out.pressure_evictions_with_victim_room  = program.evictions_with_victim_room();
+        out.pressure_private_eviction_checks    = program.demotable_eviction_checks();
+        out.pressure_demote_options             = program.demote_options();
+        out.pressure_options                    = program.pressure_options();
+        // WIRED WITH THE COUNTERS, not after them: the catalog-cell counters shipped incremented at nine sites
+        // and never copied, so /stats served a hardcoded zero that read like a clean finding.
+        out.capture_skips_transaction_or_fork      = program.capture_skips(0U);
+        out.capture_skips_cancelled                = program.capture_skips(1U);
+        out.capture_skips_nothing_to_publish       = program.capture_skips(2U);
+        out.capture_skips_stale_pressure_plan      = program.capture_skips(3U);
+        out.capture_skips_not_feasible_no_pressure = program.capture_skips(4U);
+        // The catalog's capacity/occupancy pair, as of this publication. It had neither half, which is why its exhaustion could
+        // only be noticed as a silent loss of reuse. (Not the only pool in that state: the shared-prefix pool
+        // has neither half either and device-state-slots has occupancy without a capacity -- `plan.md` §4.)
+        out.private_catalog_capacity_cells      = catalog_count_;
+        // THE COPY-OUT, and its absence is why the first reading of these five was all zeros: the counters
+        // were incremented at nine sites and never copied, so `/stats` served the struct's default 0 -- a dead
+        // instrument reading as a clean zero, which would have been read as "no cell is ever cleared" and that
+        // is a claim about the ENGINE drawn from a counter that was never wired. `terminal` alone must be at
+        // least one per completed request, so a zero here is an instrument failure, not a finding.
+        out.catalog_cell_clears_terminal  = cell_clears_[static_cast<std::size_t>(CellClearReason::Terminal)];
+        out.catalog_cell_clears_action    = cell_clears_[static_cast<std::size_t>(CellClearReason::Action)];
+        out.catalog_cell_clears_cancelled = cell_clears_[static_cast<std::size_t>(CellClearReason::Cancelled)];
+        out.catalog_cell_clears_cleanup   = cell_clears_[static_cast<std::size_t>(CellClearReason::Cleanup)];
+        out.catalog_cell_clears_rollback  = cell_clears_[static_cast<std::size_t>(CellClearReason::Rollback)];
+        out.session_erasures_eviction = session_erases_[static_cast<std::size_t>(SessionEraseReason::Eviction)];
+        out.session_erasures_consume  = session_erases_[static_cast<std::size_t>(SessionEraseReason::Consume)];
+        // The session index's own capacity/occupancy pair. It had NEITHER, which is the same blindness the
+        // private catalog had before it got one: `session_cell_frontier == 0` says "no cell" without saying
+        // whether the index is full, empty, or the entry was erased.
+        out.session_index_capacity_cells = static_cast<std::uint32_t>(session_index_.size());
+        out.session_index_occupied_cells = static_cast<std::uint32_t>(
+            std::count_if(session_index_.begin(), session_index_.end(),
+                          [](const SessionIndexEntry& e) { return e.state == SessionIndexState::Occupied; }));
+        out.private_catalog_occupied_cells      = catalog_occupied_cells();
+        // HOW MUCH OF THE SCARCE AXIS IS HELD BY CONTINUATIONS NOTHING IS ANCHORED TO. "Unanchored" is the
+        // whole of the claim and it is NOT "reclaimable": candidate scans run over the entire catalog, so an
+        // unanchored entry is still matchable -- measured, 76 request-log records reused a private entry that
+        // was not their own session cell. So this counts what is not pinned by a cell or an edge, which is the
+        // denominator a reclaim policy would have to reason about, not a population it could free.
+        //
+        // The forced evictions of
+        // 2026-09-28 were all `demote_refusal=already-on-host` with `victim_host_slots=2..3`: the plan was
+        // short on HOST STATE SLOTS and the only way to close a host-state deficit is to drop something that
+        // HOLDS host state -- a demote moves state onto the scarce axis, it cannot relieve it. So before any
+        // reclaim policy can be aimed, the population has to exist and be countable: per catalogued
+        // continuation, how many of its checkpoints sit on host (`CheckpointSummary.state_residency`, which
+        // the store maintains at publish), split by whether anything can still reach it -- the session cell
+        // this key resolves to, or an active lane edge. A checkpoint is a proxy for a slot, not a slot count:
+        // the per-victim tallies showed 2-3 per victim (endpoint + rewrite + anchors), which is this number.
+        {
+            std::uint32_t reachable = 0;
+            std::uint32_t orphaned  = 0;
+            // Generic, because the checkpoint type is a ModelContract alias and naming it here would couple
+            // this model-agnostic file to one model's names.
+            const auto hosts = [](const auto& summary) -> std::uint32_t {
+                const auto on_host = [](const auto& checkpoint) -> std::uint32_t {
+                    return checkpoint.state_residency != ReplicaResidency::DeviceOnly ? 1U : 0U;
+                };
+                std::uint32_t n = 0;
+                if (summary.endpoint) { n += on_host(*summary.endpoint); }
+                if (summary.rewrite) { n += on_host(*summary.rewrite); }
+                for (const auto& anchor : summary.long_anchors) { n += on_host(anchor); }
+                return n;
+            };
+            for (std::uint32_t slot = 0; slot < catalog_count_; ++slot) {
+                const CatalogEntry& entry = catalog_[slot];
+                if (entry.state != CatalogState::Catalogued || !entry.handle) { continue; }
+                const std::uint32_t n = hosts(entry.summary);
+                if (n == 0) { continue; }
+                bool held = private_has_active_edge(slot);
+                if (!held) {
+                    for (std::size_t cell = 0; cell < session_index_.size(); ++cell) {
+                        if (session_index_[cell].state == SessionIndexState::Occupied &&
+                            session_index_[cell].slot == slot) { held = true; break; }
+                    }
+                }
+                (held ? reachable : orphaned) += n;
+            }
+            out.host_state_checkpoints_reachable = reachable;
+            out.host_state_checkpoints_unanchored  = orphaned;
+        }
+        out.pressure_publication_cell_losses    = program.publication_cell_losses();
+        out.pressure_publication_cell_probes    = program.publication_cell_probes();
+        out.pressure_publication_cell_at_risk_runs = program.publication_cell_at_risk_runs();
+        out.pressure_publication_cell_veto_goals   = program.publication_cell_veto_goals();
+        out.pressure_publication_cell_veto_other   = program.publication_cell_veto_other();
+        out.pressure_publication_cell_veto_reuse   = program.publication_cell_veto_reuse();
         out.pressure_checkpoints_dropped       = context_stats_.pressure_checkpoints_dropped;
         out.pressure_searches                  = context_stats_.pressure_searches;
         out.pressure_search_budget_exhaustions = context_stats_.pressure_search_budget_exhaustions;
@@ -1218,7 +1502,15 @@ public:
     void clear_after_program_cleanup() noexcept {
         transaction_.template emplace<std::monostate>();
         for (CatalogEntry& entry : catalog_) {
+            // COUNTED ONLY WHEN THE SLOT HELD SOMETHING, and Action is NOT counted here at all.
+            // This loop walks the whole array, so incrementing per slot made `cleanup` a count of the catalog
+            // SIZE after any recovery rather than of cells that were cleared -- and it incremented `action`
+            // too, for vacant slots, on top of the Evicted branch's own count. So `action` jumped by 64 on the
+            // first recovery and `action == private_owners_evicted` (which held all day) would have broken
+            // there without anything recording it. `action` now means one thing: a private owner evicted.
+            const bool held = entry.state != CatalogState::Vacant || entry.handle.has_value();
             entry.handle.reset();
+            if (held) { note_cell_clear(CellClearReason::Cleanup); }
             clear_catalog_entry(entry);
         }
         for (SharedCatalogEntry& entry : shared_catalog_) {
@@ -1235,6 +1527,37 @@ public:
     }
 
 private:
+    // Counters the candidate loop produces and `plan_materialization` reports: they are known only where the
+    // source was offered (the retain decision and the endpoint-beyond-prompt test), and read only where the
+    // diagnostics are assembled, so they travel the same path as `candidates` rather than living as members.
+    struct CandidateCounters {
+        std::uint32_t sibling_candidates = 0;  // sources whose own endpoint lies beyond this prompt
+        std::uint32_t retained_sources   = 0;
+        std::uint32_t consumed_sources   = 0;
+        // WHY THE CONVERSATION'S OWN CELL ENTRY WAS NOT A CANDIDATE. `session_cell_offered` says whether it
+        // was; on the first real reading it was FALSE in 100% of shared-class requests -- including ones whose
+        // cell held a deep frontier -- and a bare false cannot tell "no cell exists" from "the entry is held by
+        // a running lane" from "identity refused it". The five sites below are where that is actually known.
+        // PRIVATE ENTRIES ONLY -- a shared entry's slot is a different namespace (see `note_session_slot`).
+        // COVERAGE: `test_resource_manager` pins codes 1, 3, 4, 5 and 8 by value -- each has a case whose
+        // asserted number changes if its site is deleted. 9 is pinned only as an ABSENCE: a no-cell request
+        // must NOT read it, and nothing asserts it is ever emitted (the table calls it unreachable).
+        // 7 (a lane's active edge) is UNTESTED: it needs a second lane, and a mutant deleting that site
+        // survives. Read 7 with that in mind.
+        // 0 = no cell / no session key / `update_session_index` false / cache disabled; 1 = offered (the cell's
+        // slot produced a candidate, and this is STICKY -- a later entry cannot undo it); 2 = the slot has no
+        // index entry at all; 3 = no shortlist key at its frontier; 4 = identity-tag mismatch; 5 = digest
+        // mismatch; 7 = the entry is held by an active lane's edge; 8 = `inspect_admission` refused it.
+        // (6 is retired: the validator already requires `Catalogued && handle`. 9 -- "failed validation" -- is
+        // emitted at that site but unreachable on the current path; kept rather than retired because a slot
+        // recycled after the rebuild would land there, and that case is not audited.)
+        std::uint8_t  session_cell_skip  = 0;
+        // ...and what happened to the conversation's OWN endpoint specifically, which `session_cell_skip` cannot
+        // report once a shallower anchor of the same slot has been offered. Same codes; 0 means the loop never
+        // met an index entry that is this slot's endpoint.
+        std::uint8_t  session_endpoint_skip = 0;
+    };
+
     struct Candidate {
         std::optional<AdmissionCandidate> plan;
         bool current_session_binding = false;
@@ -1642,6 +1965,41 @@ private:
         }
     }
 
+    // WHY A CATALOG CELL WAS EMPTIED -- five paths, counted separately, because inferring it from outside took
+    // two rounds and settled nothing: a join proved that of 231 forks that vanished between one request and the
+    // next of the same conversation, ZERO were named by an eviction line. So the removal is one of the paths
+    // below, and which one decides whether it is a defect (a policy destroying state) or ordinary spend (a turn
+    // consuming the fork it used and publishing a new one). `mark_terminal_pending` is expected and correct for
+    // a consumed source; `apply_private_action` is the pressure path; `release_cancelled_lane` is a
+    // cancellation; the other two are failure paths.
+    enum class CellClearReason : std::uint8_t {
+        Terminal,   // mark_terminal_pending -- a lane finished (the ordinary consume/replace)
+        Action,     // apply_private_action -- the pressure path (evict/discard)
+        Cancelled,  // release_cancelled_lane
+        Cleanup,    // clear_after_program_cleanup
+        Rollback,   // rollback_logical_materialization
+        Count,
+    };
+    std::array<std::uint64_t, static_cast<std::size_t>(CellClearReason::Count)> cell_clears_{};
+
+    void note_cell_clear(CellClearReason reason) noexcept {
+        ++cell_clears_[static_cast<std::size_t>(reason)];
+    }
+
+    // WHY A SESSION ENTRY WAS ERASED -- a separate axis from the cell clears above, and it had NO counter at
+    // all until 2026-09-28. `erase_session_if_owner` is what makes `session_cell_frontier` read 0, i.e. what
+    // turns a conversation's next turn into a 23k-token re-prefill, and it is called from two unrelated places:
+    // an EVICTION of the owner, and a request CONSUMING the endpoint as its active source. It is a SEPARATE
+    // axis because a consume erases the session entry WITHOUT clearing the cell at all -- not because an
+    // eviction's two clears take different routes, which is what this comment wrongly said first (they are
+    // adjacent lines; the cell clear there simply was not counted, see the Evicted branch).
+    enum class SessionEraseReason : std::uint8_t {
+        Eviction,  // apply_private_action, VictimDisposition::Evicted
+        Consume,   // the source was taken as an active source (ConsumeToActive)
+        Count,
+    };
+    std::array<std::uint64_t, static_cast<std::size_t>(SessionEraseReason::Count)> session_erases_{};
+
     void clear_catalog_entry(CatalogEntry& entry) noexcept {
         entry.state = CatalogState::Vacant;
         entry.id    = 0;
@@ -1654,6 +2012,39 @@ private:
         entry.observations.clear();
         entry.retention = RetentionClass::RecentPrivate;
         advance_revision(entry.revision);
+    }
+
+    // Cells not `Vacant` -- catalogued, claimed, or reserved for the in-flight capture. This is the
+    // occupancy half of the catalog's capacity pair, and the number the `/stats` read reports. COUNTED, not
+    // tracked: a separate counter would be one more thing that can drift from `catalog_`. Called only from
+    // `populate_runtime_stats`, i.e. on the engine worker under `execution_mutex_` -- the same lock planning
+    // runs under -- so this walk of `catalog_` is not a concurrent read of a mutating container.
+    // The owners a publication cell could be taken FROM, read from `catalog_` rather than from the planner's
+    // `private_owner_ids`. THAT DISTINCTION IS THE WHOLE POINT: `private_owner_ids` is filled inside
+    // `build_pressure_inputs`, which runs only if the planner reaches its pressure phase, so a run that
+    // returned early (the identity path) reports ZERO owners even when the catalog is full of them -- and
+    // zero owners is the reading that was designated as "the catalog really was empty". A confounded meter
+    // whose decisive value can be produced by lazy construction is worse than none. This mirrors the filter
+    // at `build_pressure_inputs` exactly: Catalogued, has a handle, no active edge.
+    [[nodiscard]] std::uint32_t evictable_private_owners() const noexcept {
+        std::uint32_t owners = 0;
+        for (std::uint32_t slot = 0; slot < catalog_count_; ++slot) {
+            const CatalogEntry& entry = catalog_[slot];
+            if (entry.state != CatalogState::Catalogued || !entry.handle ||
+                private_has_active_edge(slot)) {
+                continue;
+            }
+            ++owners;
+        }
+        return owners;
+    }
+
+    [[nodiscard]] std::uint32_t catalog_occupied_cells() const noexcept {
+        std::uint32_t occupied = 0;
+        for (const CatalogEntry& entry : catalog_) {
+            if (entry.state != CatalogState::Vacant) { ++occupied; }
+        }
+        return occupied;
     }
 
     void clear_shared_entry(SharedCatalogEntry& entry) noexcept {
@@ -1922,7 +2313,8 @@ private:
     [[nodiscard]] std::optional<Choice>
     plan_materialization(Program& program, const PreparedPrompt& prompt,
                          const RequestBasePlan& base, LaneId destination,
-                         std::vector<Candidate>& candidates, std::uint64_t publication_order,
+                         std::vector<Candidate>& candidates, const CandidateCounters& candidate_counters,
+                         std::uint64_t publication_order,
                          typename Planner::Clock::time_point planning_started,
                          PrefixDemandRecord& provisional_demand, PlanningAllowance allowance) {
         std::vector<typename Planner::CandidateInput> candidate_inputs;
@@ -2075,29 +2467,37 @@ private:
             };
         };
 
-        const auto logical_goal = [&](PlanningCandidateId candidate_id,
-                                      PrivateSourceMode source_mode,
-                                      std::span<const PressureOwnerOutcome> outcomes)
-            -> std::optional<typename Planner::LogicalGoal> {
+        // The probe, split from the goal so that a FAILURE'S REASON survives: the planner calls this from five
+        // sites and most calls are the search exercising an option, so what matters is not how often it
+        // fails but whether the cell was the ONLY thing that could have blocked a candidate. `cell_only`
+        // marks the one failure that is the catalog's doing; every other return is `false`.
+        struct GoalProbe {
+            std::optional<typename Planner::LogicalGoal> goal;
+            std::size_t candidate_index = kNoCandidateIndex;
+            bool cell_only              = false;
+        };
+        const auto logical_goal_probe = [&](PlanningCandidateId candidate_id,
+                                            PrivateSourceMode source_mode,
+                                            std::span<const PressureOwnerOutcome> outcomes) -> GoalProbe {
             const auto candidate_record =
                 std::find_if(candidate_inputs.begin(), candidate_inputs.end(),
                              [&](const typename Planner::CandidateInput& input) {
                                  return input.id == candidate_id;
                              });
-            if (candidate_record == candidate_inputs.end()) { return std::nullopt; }
+            if (candidate_record == candidate_inputs.end()) { return GoalProbe{}; }
             const std::size_t candidate_index =
                 static_cast<std::size_t>(candidate_record - candidate_inputs.begin());
             const Candidate& candidate = candidates[candidate_index];
             if (candidate.shared_source && source_mode != PrivateSourceMode::Retain) {
-                return std::nullopt;
+                return GoalProbe{.candidate_index = candidate_index};
             }
             if (!candidate.private_source && !candidate.shared_source &&
                 source_mode == PrivateSourceMode::Retain) {
-                return std::nullopt;
+                return GoalProbe{.candidate_index = candidate_index};
             }
             if (candidate.private_source && source_mode != PrivateSourceMode::Retain &&
                 source_mode != PrivateSourceMode::ConsumeToActive) {
-                return std::nullopt;
+                return GoalProbe{.candidate_index = candidate_index};
             }
 
             std::uint32_t publication_slot = kInvalidCatalogSlot;
@@ -2116,31 +2516,31 @@ private:
                 const PressureOwnerOutcome& outcome = outcomes[row];
                 if (outcome.disposition != VictimDisposition::Retained &&
                     outcome.disposition != VictimDisposition::Evicted) {
-                    return std::nullopt;
+                    return GoalProbe{.candidate_index = candidate_index};
                 }
                 if (std::find_if(outcomes.begin(), outcomes.begin() + row,
                                  [&](const PressureOwnerOutcome& prior) {
                                      return prior.owner == outcome.owner;
                                  }) != outcomes.begin() + row) {
-                    return std::nullopt;
+                    return GoalProbe{.candidate_index = candidate_index};
                 }
                 const auto record = std::find_if(
                     owner_records.begin(), owner_records.end(),
                     [&](const PlanningOwnerRecord& item) { return item.id == outcome.owner; });
-                if (record == owner_records.end()) { return std::nullopt; }
+                if (record == owner_records.end()) { return GoalProbe{.candidate_index = candidate_index}; }
                 const bool shared = record->capability.owner.kind == LogicalOwnerKind::SharedPrefix;
                 if (!shared) {
                     const std::uint32_t slot = record->capability.slot;
                     if (slot >= catalog_count_ ||
                         (candidate.private_source && slot == candidate.private_source->slot)) {
-                        return std::nullopt;
+                        return GoalProbe{.candidate_index = candidate_index};
                     }
                     const CatalogEntry& entry = catalog_[slot];
                     if (entry.state != CatalogState::Catalogued || !entry.handle ||
                         entry.id != record->capability.owner.id ||
                         entry.revision != record->capability.generation ||
                         private_has_active_edge(slot)) {
-                        return std::nullopt;
+                        return GoalProbe{.candidate_index = candidate_index};
                     }
                     if (publication_slot == kInvalidCatalogSlot &&
                         outcome.disposition == VictimDisposition::Evicted) {
@@ -2150,19 +2550,54 @@ private:
                     const std::uint32_t slot = record->capability.slot;
                     if (slot >= shared_catalog_count_ ||
                         (candidate.shared_source && slot == candidate.shared_source->slot)) {
-                        return std::nullopt;
+                        return GoalProbe{.candidate_index = candidate_index};
                     }
                     const SharedCatalogEntry& entry = shared_catalog_[slot];
                     if (entry.state != SharedCatalogState::Catalogued || !entry.handle ||
                         entry.id != record->capability.owner.id ||
                         entry.revision != record->capability.generation ||
                         entry.transaction_pins != 0 || shared_active_edge_count(slot) != 0) {
-                        return std::nullopt;
+                        return GoalProbe{.candidate_index = candidate_index};
                     }
                 }
             }
-            if (publication_slot == kInvalidCatalogSlot) { return std::nullopt; }
-            return typename Planner::LogicalGoal{.publication_slot = publication_slot};
+            if (publication_slot == kInvalidCatalogSlot) {
+                // THE ONE FAILURE THAT IS THE CATALOG'S DOING -- reported as a REASON, not counted here. This
+                // site is reached only after every other validation passed, so it is precisely "this
+                // candidate could have been adopted if a cell had been obtainable". Whether that COST
+                // anything is not decidable at this point and is not decided here: the planner is allowed to
+                // probe this option on the way to taking an eviction, and it does so thousands of times per
+                // request. The loss is decided once per planning run, in `publication_cell_loss` below. (The
+                // first version of this instrument counted THESE calls, reached 108,544 across 24 requests,
+                // and printed a "dropped" line for candidates that then won -- see the header.)
+                return GoalProbe{.candidate_index = candidate_index, .cell_only = true};
+            }
+            return GoalProbe{.goal = typename Planner::LogicalGoal{.publication_slot = publication_slot},
+                             .candidate_index = candidate_index};
+        };
+
+        // The tally the planner's calls accumulate into, and the wrapper that is what the planner sees. The
+        // wrapper's signature is the one the five call sites already use, so nothing in the planner changed.
+        std::vector<PublicationCellProbe> probe_tally;
+        const auto logical_goal = [&](PlanningCandidateId candidate_id, PrivateSourceMode source_mode,
+                                      std::span<const PressureOwnerOutcome> outcomes)
+            -> std::optional<typename Planner::LogicalGoal> {
+            const GoalProbe probe = logical_goal_probe(candidate_id, source_mode, outcomes);
+            if (probe.candidate_index != kNoCandidateIndex) {
+                if (probe.candidate_index >= probe_tally.size()) {
+                    probe_tally.resize(probe.candidate_index + 1U);
+                }
+                PublicationCellProbe& tally = probe_tally[probe.candidate_index];
+                ++tally.probes;
+                if (probe.goal) {
+                    ++tally.goals;
+                } else if (probe.cell_only) {
+                    ++tally.cell_only;
+                } else {
+                    ++tally.other;
+                }
+            }
+            return probe.goal;
         };
 
         const auto final_schedule = [&](PlanningCandidateId candidate_id,
@@ -2184,6 +2619,14 @@ private:
         std::optional<typename Planner::Result> planned =
             planner_.plan(program, prompt, cost_model_, candidate_inputs, 0, build_pressure_inputs,
                           logical_goal, final_schedule, planning_started, allowance);
+        // The probe denominator is added BEFORE the early return, so a planning run that produced no plan still
+        // contributes its probes. Conditioning it on success made "probed but never planned" look identical to
+        // "stopped probing" -- the one thing a denominator exists to distinguish.
+        {
+            std::uint64_t probes_total = 0;
+            for (const PublicationCellProbe& tally : probe_tally) { probes_total += tally.probes; }
+            program.add_publication_cell_probes(probes_total);
+        }
         const auto selected_candidate =
             planned ? std::find_if(candidate_inputs.begin(), candidate_inputs.end(),
                                    [&](const typename Planner::CandidateInput& input) {
@@ -2197,6 +2640,144 @@ private:
         Candidate& candidate =
             candidates[static_cast<std::size_t>(selected_candidate - candidate_inputs.begin())];
 
+        // DID THE CATALOG COST THIS REQUEST ANY REUSE? Decided ONCE, here, after the winner is known -- and
+        // the whole of the instrument is this one question, because the raw probe count answers a different
+        // one. `probe_tally` holds, per candidate, how many times the goal builder failed for it and WHY:
+        // a candidate whose every failure was `cell_only` could not be adopted at all, so if it would have
+        // reused more than the plan that won, the cell took that reuse away. The winner is excluded: its own
+        // probes failing on the cell is the ordinary eviction-to-publish path, which is expected.
+        //
+        // The comparison is on `reusable_prompt_tokens`, the same quantity the selection instrument uses.
+        {
+            const std::size_t winner_index = static_cast<std::size_t>(&candidate - candidates.data());
+            const std::uint32_t winner_reuse =
+                candidate.plan ? candidate.plan->summary().reusable_prompt_tokens : 0U;
+            const auto reuse_of = [&](std::size_t index) -> std::uint32_t {
+                return candidates[index].plan ? candidates[index].plan->summary().reusable_prompt_tokens
+                                              : 0U;
+            };
+            const PublicationCellLoss loss =
+                publication_cell_loss(probe_tally, candidates.size(), winner_index, winner_reuse, reuse_of);
+            std::uint64_t probes_total = 0;
+            for (const PublicationCellProbe& tally : probe_tally) { probes_total += tally.probes; }
+            // THE AT-RISK LINE IS LOG-ONLY AND DELIBERATELY NOT AN ALERT (see the awk). Its purpose is to
+            // settle whether a catalog-caused loss is REACHABLE at this configuration: `evictable_owners` is
+            // the count of private owner records the planner had -- i.e. owners it could have taken a cell
+            // from -- so `at_risk` positive WITH `evictable_owners=0` is the mechanism real, and `at_risk`
+            // positive only ever with owners available says a cell was obtainable and this predicate is
+            // measuring search truncation instead. Until that is measured, arming on it would put an
+            // uninterpreted number in the alert stream.
+            // TALLIED UNCONDITIONALLY, and this is not tidiness: the PRINT is capped at 8 then every 512th, so
+            // the printed line count is a SAMPLE and never the count. Reading "8 at-risk runs" off eight lines
+            // is the exact error CLAUDE.md records for the eviction print, and it was made here before this
+            // counter existed. `/stats` carries the totals; the journal carries an example.
+            if (loss.at_risk != 0U) {
+                program.add_publication_cell_at_risk(loss.at_risk, loss.blocked_by_goals, loss.blocked_by_other,
+                                                     loss.blocked_by_reuse);
+                const std::uint64_t at_risk_seen = program.note_publication_cell_at_risk();
+                if (at_risk_seen <= 8U || at_risk_seen % 512U == 0U) {
+                    std::fprintf(stderr,
+                                 "[engine] catalog cell at-risk: occupied=%u/%u at_risk=%u evictable_owners=%u "
+                                 "owners_enumerated=%zu veto_goals=%u veto_other=%u veto_reuse=%u counted=%u "
+                                 "probes=%llu seen=%llu\n",
+                                 catalog_occupied_cells(), catalog_count_, loss.at_risk,
+                                 evictable_private_owners(), private_owner_ids.size(),
+                                 loss.blocked_by_goals, loss.blocked_by_other, loss.blocked_by_reuse,
+                                 loss.candidates, static_cast<unsigned long long>(probes_total),
+                                 static_cast<unsigned long long>(at_risk_seen));
+                    std::fflush(stderr);
+                }
+            }
+            if (loss.candidates != 0U) {
+                const std::uint64_t losses = program.note_publication_cell_loss();
+                // Rate-limited to the first 8 then every 512th, like the eviction print; the `/stats` counter
+                // is the un-muted reading, so silence after the 8th means "not printed", never "not recurring".
+                if (losses <= 8U || losses % 512U == 0U) {
+                    std::fprintf(stderr,
+                                 "[engine] catalog cell blocked reuse: occupied=%u/%u candidates=%u "
+                                 "best_blocked_reuse=%u chosen_reuse=%u probes=%llu losses=%llu\n",
+                                 catalog_occupied_cells(), catalog_count_, loss.candidates,
+                                 loss.best_blocked_reuse, winner_reuse,
+                                 static_cast<unsigned long long>(probes_total),
+                                 static_cast<unsigned long long>(losses));
+                    std::fflush(stderr);
+                }
+            }
+        }
+
+        // THE DECIDING COMPARISON (2026-09-27). The reuse-choice instrument (`request_plan.cpp`) established
+        // that a LONGER private continuation is alive when the shared snapshot is taken, and that is all it
+        // could say -- which candidate won, and by what, was invisible. This reports the winner beside the
+        // best LOSING candidate, by the one quantity that says how much reuse each would have saved.
+        //
+        // It exists because a fix was attempted on a guess: `FoldedCost::key()` was reordered to promote
+        // `remaining_text_prefill` above the hit/credit terms, and after a rebuild the selections were
+        // BYTE-IDENTICAL -- so that key does not decide this comparison, or the term does not differ between
+        // these candidates. Reading the decision beats guessing at it, and this is the read.
+        //
+        // `longer_lost=1` is the defect: a candidate reusing strictly more tokens was available and lost.
+        // Populated for the REQUEST LOG, not just the rate-limited line below. See the field's comment in
+        // `types.h`: the journal line answers "was a longer candidate refused" only for the first 8
+        // selections per process, which is precisely when nobody is asking.
+        std::vector<MaterializationDiagnostics::MaterializationCandidate> candidate_rows;
+        std::uint32_t selection_chosen_reuse = 0;
+        std::uint32_t selection_best_loser   = 0;
+        bool          selection_longer_lost  = false;
+        {
+            static std::uint64_t selections = 0;
+            ++selections;
+            // COMPUTE FIRST, THEN DECIDE WHETHER TO SPEAK -- the first version tested the condition before the
+            // loop that produces it, so the interesting case could not have been selected for anyway.
+            const auto reuse_of = [](const Candidate& item) -> std::uint32_t {
+                return item.plan ? item.plan->summary().reusable_prompt_tokens : 0U;
+            };
+            const std::uint32_t winner_reuse       = reuse_of(candidate);
+            std::uint32_t       best_other_reuse   = 0U;
+            bool                best_other_is_shared = false;
+            for (const Candidate& other : candidates) {
+                if (&other == &candidate) { continue; }
+                const std::uint32_t other_reuse = reuse_of(other);
+                if (other_reuse > best_other_reuse) {
+                    best_other_reuse     = other_reuse;
+                    best_other_is_shared = other.shared_source.has_value();
+                }
+            }
+            const bool longer_lost = best_other_reuse > winner_reuse;
+            selection_chosen_reuse = winner_reuse;
+            selection_best_loser   = best_other_reuse;
+            selection_longer_lost  = longer_lost;
+            candidate_rows.reserve(candidates.size());
+            for (std::size_t index = 0; index < candidates.size(); ++index) {
+                const Candidate& item = candidates[index];
+                MaterializationDiagnostics::MaterializationCandidate row;
+                row.reuse          = item.plan ? item.plan->summary().reusable_prompt_tokens : 0U;
+                row.winner         = &item == &candidate;
+                row.private_source = item.private_source.has_value();
+                row.shared_source  = item.shared_source.has_value();
+                if (index < probe_tally.size()) {
+                    row.probes    = probe_tally[index].probes;
+                    row.goals     = probe_tally[index].goals;
+                    row.cell_only = probe_tally[index].cell_only;
+                    row.other     = probe_tally[index].other;
+                }
+                candidate_rows.push_back(row);
+            }
+            // `longer_lost` is the ONLY case worth acting on, so it is never rate-limited away. The 8-sample
+            // limit meant "the planner consistently picks the longer candidate" rested on the process's first
+            // eight admissions -- before any shared prefix was even captured -- while ~70 later selections
+            // went unprinted. A conclusion drawn from the unrepresentative 12% is how that claim got made.
+            if (selections <= 8U || selections % 512U == 0U || longer_lost) {
+                std::fprintf(stderr,
+                             "[engine] reuse-select: winner=%s reuse=%u | best_loser=%s reuse=%u "
+                             "longer_lost=%d candidates=%zu selects=%llu\n",
+                             candidate.shared_source.has_value() ? "shared" : "private", winner_reuse,
+                             best_other_is_shared ? "shared" : "private", best_other_reuse,
+                             static_cast<int>(longer_lost), candidates.size(),
+                             static_cast<unsigned long long>(selections));
+                std::fflush(stderr);
+            }
+        }
+
         Choice choice(destination, std::move(*planned->plan), catalog_count_,
                       base.context_cache().session_key, base.context_cache().retention,
                       base.context_cache().update_session_index, publication_order);
@@ -2206,6 +2787,104 @@ private:
         choice.publication_slot_               = planned->publication_slot;
         choice.selected_observation_           = candidate.selected_observation;
         choice.diagnostics_                    = planned->diagnostics;
+        // THE SPLIT, over the catalog itself. Reported per request because §2f's verdict is per request:
+        // whether the deepest match is shallow (the prompt diverged) or deep with a shallow restorable
+        // frontier (ours). Every stored entry is scanned, not only the ones the search happened to offer.
+        {
+            // THE SESSION CELL vs THE CANDIDATES, computed here where both are in scope: the cell holds the
+            // conversation's NEWEST published continuation, and this says what it holds and whether it was
+            // offered. `candidates` carries each one's slot through `private_source`.
+            std::uint32_t session_cell_frontier = 0;
+            bool          session_cell_offered  = false;
+            if (cache_enabled_ && base.context_cache().session_key &&
+                base.context_cache().update_session_index) {
+                const std::optional<std::size_t> cell = find_session_cell(*base.context_cache().session_key);
+                if (cell && session_index_[*cell].slot < catalog_count_) {
+                    const std::uint32_t slot  = session_index_[*cell].slot;
+                    const CatalogEntry& entry = catalog_[slot];
+                    if (entry.state == CatalogState::Catalogued && entry.summary.endpoint) {
+                        session_cell_frontier = entry.summary.endpoint->ref.frontier;
+                        for (const Candidate& offered : candidates) {
+                            if (offered.private_source && offered.private_source->slot == slot) {
+                                session_cell_offered = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            std::vector<PrefixSplitSample> samples;
+            samples.reserve(static_cast<std::size_t>(catalog_count_) + shared_catalog_count_);
+            // `source` says WHOSE ledger this sample is. It is taken from the SESSION INDEX -- the cell this
+            // request's key resolves to -- and NOT from `entry.session`, which is the wrong field and was the
+            // first version of this: `demote_replaced_session` does `prior.session.reset()` every time a newer
+            // continuation publishes, so this conversation's own SUPERSEDED ledgers carry no session marker and
+            // were being labelled "another session's". That inflates the very population this tag exists to
+            // measure. 1 = the cell this request's key resolves to, 2 = any other private entry (which
+            // includes this conversation's superseded ones -- they are no longer its cell), 3 = shared.
+            const std::uint32_t own_cell_slot = [&]() -> std::uint32_t {
+                if (!cache_enabled_ || !base.context_cache().session_key) {
+                    return kInvalidCatalogSlot;
+                }
+                const std::optional<std::size_t> cell =
+                    find_session_cell(*base.context_cache().session_key);
+                return cell && session_index_[*cell].slot < catalog_count_
+                           ? session_index_[*cell].slot
+                           : kInvalidCatalogSlot;
+            }();
+            const auto consider = [&](const Program::PrefixSplit& split, std::uint8_t source) {
+                samples.push_back(PrefixSplitSample{.tokens      = split.tokens,
+                                                    .restorable  = split.restorable,
+                                                    .identity_ok = split.identity_ok,
+                                                    .match_end   = split.match_end,
+                                                    .stored      = split.stored,
+                                                    .source      = source,
+                                                    // THIS entry's own restorable point at or below its match --
+                                                    // NOT the resume point and NOT comparable to
+                                                    // `session_cell_frontier`. `prefix_split` skips any
+                                                    // checkpoint whose frontier exceeds the match, so this is
+                                                    // <= match <= the prompt by construction: "a frontier beyond
+                                                    // the prompt" is impossible here, although the first
+                                                    // comment on this field claimed it could be read that way.
+                                                    .frontier    = split.restorable,
+                                                    .probe_index = split.probe_index,
+});
+            };
+            for (std::uint32_t slot = 0; slot < catalog_count_; ++slot) {
+                const CatalogEntry& entry = catalog_[slot];
+                if (entry.state != CatalogState::Catalogued || !entry.handle) { continue; }
+                consider(program.prefix_split(*entry.handle, prompt), slot == own_cell_slot ? 1U : 2U);
+            }
+            for (std::uint32_t slot = 0; slot < shared_catalog_count_; ++slot) {
+                const SharedCatalogEntry& entry = shared_catalog_[slot];
+                if (entry.state != SharedCatalogState::Catalogued || !entry.handle) { continue; }
+                consider(program.prefix_split(*entry.handle, prompt), 3U);
+            }
+            const PrefixSplitBest best = best_prefix_split(samples);
+            choice.diagnostics_.split_best_tokens     = best.tokens;
+            choice.diagnostics_.split_best_restorable = best.restorable;
+            choice.diagnostics_.split_entries         = best.entries;
+            choice.diagnostics_.split_identity_ok     = best.identity_ok;
+            // WHY the deepest match stopped: a field whose zero and whose finding look identical gets read as
+            // whichever the reader expects -- and it was, by me, as "61% of prompts diverge inside the region
+            // they should share", when nearly every case was a ledger ending or a missing entry.
+            choice.diagnostics_.split_ended_by         = best.match_end;
+            choice.diagnostics_.split_best_stored      = best.stored;
+            choice.diagnostics_.split_best_source      = best.source;
+            choice.diagnostics_.split_best_frontier    = best.frontier;
+            choice.diagnostics_.split_probe_index      = best.probe_index;
+            choice.diagnostics_.session_cell_frontier = session_cell_frontier;
+            choice.diagnostics_.session_cell_offered  = session_cell_offered;
+            choice.diagnostics_.session_cell_skip     = candidate_counters.session_cell_skip;
+            choice.diagnostics_.session_endpoint_skip = candidate_counters.session_endpoint_skip;
+            choice.diagnostics_.sibling_candidates    = candidate_counters.sibling_candidates;
+            choice.diagnostics_.retained_sources      = candidate_counters.retained_sources;
+            choice.diagnostics_.consumed_sources      = candidate_counters.consumed_sources;
+        }
+        choice.diagnostics_.candidates         = std::move(candidate_rows);
+        choice.diagnostics_.chosen_reuse       = selection_chosen_reuse;
+        choice.diagnostics_.best_loser_reuse   = selection_best_loser;
+        choice.diagnostics_.longer_lost        = selection_longer_lost;
         provisional_demand.selected_source_key = candidate.source_key;
         choice.demand_                         = std::move(provisional_demand);
         for (const PressureOwnerOutcome& outcome : planned->owner_outcomes) {
@@ -2384,6 +3063,8 @@ private:
         }
         CatalogEntry& publication = catalog_[record.publication_slot];
         if (publication.id == 0 && !publication.handle) {
+            // The restore path also clears the cell it had to abandon; counted here rather than left dead.
+            note_cell_clear(CellClearReason::Rollback);
             publication.state = CatalogState::Vacant;
         }
     }
@@ -2690,8 +3371,14 @@ private:
         const std::uint32_t dropped =
             dropped_checkpoint_count(entry.summary, result.final_summary, result.disposition);
         if (result.disposition == VictimDisposition::Evicted) {
-            erase_session_if_owner(claim.capability.owner.id);
+            erase_session_if_owner(claim.capability.owner.id, SessionEraseReason::Eviction);
             clear_catalog_entry(entry);
+            // THE CELL CLEAR ON THE PRESSURE PATH. This increment lived only in `clear_after_program_cleanup`,
+            // beside Cleanup, so `catalog_cell_clears_action` read 0 no matter how many owners were evicted --
+            // and a reader comparing it against `pressure_private_owners_evicted` (live: 65) read the
+            // miswiring as the finding "evictions do not clear cells". They do; it was not counted. The
+            // previous comment here explained the gap as "different routes", which was invented.
+            note_cell_clear(CellClearReason::Action);
             saturating_increment(context_stats_.pressure_private_owners_evicted);
             record_checkpoint_drops(context_stats_, dropped);
             return;
@@ -2709,11 +3396,19 @@ private:
         // Both) is a demote-to-host: the checkpoint stays Catalogued + session-cell (restorable)
         // rather than dropped. Track it separately from a plain in-device degrade.
         const auto& final_summary = *result.final_summary;
-        if (final_summary.endpoint &&
+        const bool state_hosted =
+            final_summary.endpoint &&
             (final_summary.endpoint->state_residency == runtime::ReplicaResidency::HostOnly ||
-             final_summary.endpoint->state_residency == runtime::ReplicaResidency::Both)) {
+             final_summary.endpoint->state_residency == runtime::ReplicaResidency::Both);
+        if (state_hosted) {
             saturating_increment(context_stats_.pressure_private_owners_demoted);
         }
+        // The KV axis of a demote is NOT countable here: `MaterializationVictimResult` carries no
+        // operation counts and `CheckpointSummary` carries no KV residency, so the only place the
+        // information exists is the pressure work that performs the spill
+        // (publish_pressure_work -> ContextOperationCounts, folded into context_stats_ by
+        // observe_operations). An attempt to count it here did not compile, which is the honest reason
+        // it lives there instead.
         record_checkpoint_drops(context_stats_, dropped);
         entry.state = CatalogState::Catalogued;
     }
@@ -2764,6 +3459,8 @@ private:
         CatalogEntry& publication = catalog_[record.publication_slot];
         if (publication.state == CatalogState::Claimed && publication.id == 0 &&
             !publication.handle) {
+            // The restore path also clears the cell it had to abandon; counted here rather than left dead.
+            note_cell_clear(CellClearReason::Rollback);
             publication.state = CatalogState::Vacant;
         }
     }
@@ -2958,7 +3655,7 @@ private:
                 source.state            = CatalogState::Catalogued;
                 retained_private_source = result.status == ContextTransactionStatus::Published;
             } else if (result.source->mode == PrivateSourceMode::ConsumeToActive) {
-                erase_session_if_owner(source.id);
+                erase_session_if_owner(source.id, SessionEraseReason::Consume);
                 source.handle.reset();
                 source.summary.endpoint.reset();
                 source.summary.rewrite.reset();
@@ -3258,7 +3955,8 @@ private:
             throw std::logic_error("cancelled lane has no logical active owner");
         }
         release_active_references(lane);
-        clear_catalog_entry(catalog_.at(active_[lane.value].publication_slot));
+        note_cell_clear(CellClearReason::Cancelled);
+    clear_catalog_entry(catalog_.at(active_[lane.value].publication_slot));
         reset_active_entry(active_[lane.value]);
         lanes_[lane.value] = LogicalLaneState::Free;
     }
@@ -3302,7 +4000,7 @@ private:
         throw std::logic_error("session index is full");
     }
 
-    void erase_session_if_owner(std::uint64_t owner_id) noexcept {
+    void erase_session_if_owner(std::uint64_t owner_id, SessionEraseReason reason) noexcept {
         if (owner_id == 0) { return; }
         for (SessionIndexEntry& entry : session_index_) {
             if (entry.state == SessionIndexState::Occupied && entry.owner_id == owner_id) {
@@ -3311,6 +4009,7 @@ private:
                 entry.owner_id          = 0;
                 entry.revision          = 0;
                 entry.publication_order = 0;
+                ++session_erases_[static_cast<std::size_t>(reason)];
             }
         }
     }
@@ -3458,6 +4157,10 @@ private:
         context_stats_.state_forks += result.operations.state_forks;
         context_stats_.state_restores += result.operations.state_restores;
         context_stats_.pressure_spill_pages += result.operations.pressure_spill_pages;
+        context_stats_.pressure_private_owners_demoted_kv +=
+            result.operations.pressure_private_owners_demoted_kv;
+        context_stats_.pressure_private_owners_demoted_kv_only +=
+            result.operations.pressure_private_owners_demoted_kv_only;
         context_stats_.partial_tail_cow_pages += result.operations.partial_tail_cow_pages;
         context_stats_.historical_fork_hits += result.operations.historical_fork_hits;
     }

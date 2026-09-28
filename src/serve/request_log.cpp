@@ -217,6 +217,15 @@ Json request_json(const RequestLogContext& context) {
                 {"preserve_thinking",
                  context.preserve_thinking ? Json(*context.preserve_thinking) : Json(nullptr)},
                 {"preserve_thinking_semantic_change", context.preserve_thinking_semantic_change},
+                // The key the engine actually scoped this request to (derived on the Messages path, explicit
+                // on the Responses path). Absent means the request ran with no key at all -- the condition
+                // that made everything session-scoped unreachable until 2026-09-27.
+                {"session_key", context.session_key ? Json(*context.session_key) : Json(nullptr)},
+                {"client_session_id",
+                 context.client_session_id ? Json(*context.client_session_id) : Json(nullptr)},
+                // Join key with the engine's eviction line (`session=%016llx`, `prefill.cpp`'s hash).
+                {"session_key_hash",
+                 context.session_key_hash ? Json(*context.session_key_hash) : Json(nullptr)},
                 {"sampling", sampler_json(context.sampling)}};
 }
 
@@ -307,6 +316,55 @@ Json materialization_json(const ninfer::MaterializationDiagnostics& diagnostics)
         {"budget_exhausted", diagnostics.budget_exhausted},
         {"selected_degradation_units", diagnostics.selected_degradation_units},
         {"selected_maximal_fallback", diagnostics.selected_maximal_fallback},
+        // #6 (2026-09-27): the decisive pair. Both non-zero in one request means a plan that preserved a
+        // restorable checkpoint was assessed FEASIBLE and a plan that destroyed one was taken anyway --
+        // the defect surviving. `chosen_restorable_evictions > 0` with the other at 0 is the honest other
+        // case: nothing feasible preserved, which is what the KV-saturated prod evictions looked like.
+        {"feasible_preserving_alternatives", diagnostics.feasible_preserving_alternatives},
+        {"chosen_restorable_evictions", diagnostics.chosen_restorable_evictions},
+        {"assessed_targets_without_goal", diagnostics.assessed_targets_without_goal},
+        // THE CANDIDATE SET, per request. `longer_lost` true beside a `best_loser_reuse` above
+        // `chosen_reuse` is the defect: a longer source was available and refused. Each row then says what
+        // happened to that candidate -- how many goal probes it got, how many produced an adoptable goal,
+        // and how many were blocked by the publication cell alone versus anything else.
+        {"candidates", [&] {
+             Json array = Json::array();
+             for (const auto& row : diagnostics.candidates) {
+                 array.push_back(Json{{"reuse", row.reuse},
+                                      {"probes", row.probes},
+                                      {"goals", row.goals},
+                                      {"cell_only", row.cell_only},
+                                      {"other", row.other},
+                                      {"winner", row.winner},
+                                      {"private_source", row.private_source},
+                                      {"shared_source", row.shared_source}});
+             }
+             return array;
+         }()},
+        {"chosen_reuse", diagnostics.chosen_reuse},
+        {"best_loser_reuse", diagnostics.best_loser_reuse},
+        {"longer_lost", diagnostics.longer_lost},
+        // THE SPLIT (§2f): the deepest token-exact match against ANY stored ledger, the deepest restorable
+        // checkpoint at or below it, and the entry count examined.
+        {"split_best_tokens", diagnostics.split_best_tokens},
+        {"split_best_restorable", diagnostics.split_best_restorable},
+        {"split_entries", diagnostics.split_entries},
+        {"split_identity_ok", diagnostics.split_identity_ok},
+        {"split_ended_by", diagnostics.split_ended_by},
+        {"split_best_stored", diagnostics.split_best_stored},
+        // WHICH LEDGER the deepest match came from, and its resume point -- see the diagnostics.
+        {"split_best_source", diagnostics.split_best_source},
+        {"split_best_frontier", diagnostics.split_best_frontier},
+        // WHERE THE DEEPEST MATCH STOPPED, as an index. The 12-id windows that used to be emitted beside it
+        // were removed 2026-09-28: they had answered their question and they carried user content.
+        {"split_probe_index", diagnostics.split_probe_index},
+        {"session_cell_frontier", diagnostics.session_cell_frontier},
+        {"session_cell_offered", diagnostics.session_cell_offered},
+        {"session_cell_skip", diagnostics.session_cell_skip},
+        {"session_endpoint_skip", diagnostics.session_endpoint_skip},
+        {"sibling_candidates", diagnostics.sibling_candidates},
+        {"retained_sources", diagnostics.retained_sources},
+        {"consumed_sources", diagnostics.consumed_sources},
         {"initial_predicted_total_ns", diagnostics.initial_predicted_total_ns},
         {"first_improvement_ns", diagnostics.first_improvement_ns
                                      ? Json(*diagnostics.first_improvement_ns)
@@ -755,6 +813,11 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
                                                          current.pressure_private_owners_degraded)},
              {"private_owners_demoted", monotonic_delta(previous.pressure_private_owners_demoted,
                                                         current.pressure_private_owners_demoted)},
+             {"private_owners_demoted_kv", monotonic_delta(previous.pressure_private_owners_demoted_kv,
+                                                           current.pressure_private_owners_demoted_kv)},
+             {"private_owners_demoted_kv_only",
+              monotonic_delta(previous.pressure_private_owners_demoted_kv_only,
+                              current.pressure_private_owners_demoted_kv_only)},
              {"private_owners_evicted", monotonic_delta(previous.pressure_private_owners_evicted,
                                                         current.pressure_private_owners_evicted)},
              {"shared_owners_degraded", monotonic_delta(previous.pressure_shared_owners_degraded,

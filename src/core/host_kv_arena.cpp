@@ -208,9 +208,10 @@ void HostKVAllocation::disarm() noexcept {
     generation_ = 0;
 }
 
-HostKVArena::HostKVArena(std::size_t capacity_bytes,
+HostKVArena::HostKVArena(PinnedHostPool& pool, std::size_t initial_bytes, std::size_t span_bytes,
                          std::span<const HostKVPageLayout> supported_layouts)
-    : capacity_bytes_(capacity_bytes),
+    : pool_(&pool),
+      span_growth_bytes_(span_bytes != 0U ? span_bytes : (initial_bytes != 0U ? initial_bytes : (1ULL << 20U))),
       layouts_(supported_layouts.begin(), supported_layouts.end()) {
     for (std::size_t index = 0; index < layouts_.size(); ++index) {
         const HostKVPageLayout planned = plan_host_kv_page_layout(layouts_[index].geometry);
@@ -223,27 +224,72 @@ HostKVArena::HostKVArena(std::size_t capacity_bytes,
             }
         }
     }
-    if (capacity_bytes_ == 0) { return; }
+    if (initial_bytes == 0) { return; }
     if (layouts_.empty()) {
         throw std::invalid_argument("Non-empty Host KV arena requires supported page layouts");
     }
+    // The FIRST span, pinned from the shared pool. Everything else arrives through `grow_span`, so the old
+    // "one buffer sized at startup" is now just "the first of however many the engine ends up needing".
+    if (!grow_span(initial_bytes)) {
+        throw std::runtime_error("Host KV arena could not pin its initial span");
+    }
+}
 
-    backing_.emplace(capacity_bytes_);
-    const auto smallest = std::min_element(
-        layouts_.begin(), layouts_.end(), [](const HostKVPageLayout& a, const HostKVPageLayout& b) {
-            return a.page_stride < b.page_stride;
-        });
-    const std::size_t maximum_descriptors = capacity_bytes_ / smallest->page_stride;
-    if (maximum_descriptors > std::numeric_limits<std::uint32_t>::max()) {
-        throw std::overflow_error("Host KV arena descriptor capacity exceeds uint32");
+bool HostKVArena::grow_bytes(std::size_t bytes) noexcept { return grow_span(bytes); }
+
+bool HostKVArena::grow_for(std::uint32_t pages, std::size_t page_stride) noexcept {
+    if (pages == 0U || page_stride > std::numeric_limits<std::size_t>::max() / pages) { return false; }
+    return grow_span(page_stride * static_cast<std::size_t>(pages));
+}
+
+std::size_t HostKVArena::smallest_stride() const noexcept {
+    std::size_t stride = std::numeric_limits<std::size_t>::max();
+    for (const HostKVPageLayout& layout : layouts_) { stride = std::min(stride, layout.page_stride); }
+    return stride == std::numeric_limits<std::size_t>::max() ? 1U : stride;
+}
+
+std::size_t HostKVArena::descriptor_hint_for(std::size_t bytes) const noexcept {
+    return bytes / smallest_stride();
+}
+
+std::size_t HostKVArena::span_bytes(std::uint32_t span) const noexcept {
+    return span < spans_.size() ? spans_[span].bytes : 0U;
+}
+
+bool HostKVArena::grow_span(std::size_t bytes) noexcept {
+    if (pool_ == nullptr || bytes == 0U) {
+        ++growth_refusals_;
+        return false;
     }
-    descriptors_.resize(maximum_descriptors);
-    free_descriptors_.reserve(maximum_descriptors);
-    for (std::size_t index = maximum_descriptors; index > 0; --index) {
-        free_descriptors_.push_back(static_cast<std::uint32_t>(index - 1));
+    const std::size_t wanted = std::max(bytes, span_growth_bytes_);
+    auto allocation         = pool_->allocate(wanted);
+    if (!allocation) {
+        ++growth_refusals_;  // could not pin: a refusal the caller can see, not an exception
+        return false;
     }
-    free_extents_.reserve(maximum_descriptors + 1);
-    free_extents_.push_back({0, capacity_bytes_});
+    const std::size_t actual = pool_->size_of(*allocation);  // what the pool really granted, not the request
+    spans_.push_back(Span{*allocation, actual});
+    capacity_bytes_ += actual;
+    // Descriptors for the new span, so the arena can hand out the pages it just gained. Sized by the
+    // SMALLEST stride, which is the most descriptors the span could ever need.
+    const std::size_t additional = descriptor_hint_for(actual);
+    if (descriptors_.size() + additional > std::numeric_limits<std::uint32_t>::max()) {
+        // Cannot describe the span: give the memory straight back rather than holding a span we cannot carve.
+        (void)pool_->release(*allocation);
+        spans_.pop_back();
+        capacity_bytes_ -= actual;
+        ++growth_refusals_;
+        return false;
+    }
+    const auto first_descriptor = static_cast<std::uint32_t>(descriptors_.size());
+    descriptors_.resize(descriptors_.size() + additional);
+    for (std::size_t index = additional; index > 0; --index) {
+        free_descriptors_.push_back(first_descriptor + static_cast<std::uint32_t>(index - 1U));
+    }
+    insert_free_extent(FreeExtent{static_cast<std::uint32_t>(spans_.size() - 1U), 0U, actual});
+    ++growth_count_;
+    bump_revision();  // a plan made before this span exists is stale
+    return true;
 }
 
 std::optional<std::uint32_t>
@@ -259,6 +305,33 @@ const HostKVPageLayout* HostKVArena::layout_for(const KVPageGeometry& geometry) 
             return candidate.geometry == geometry;
         });
     return layout == layouts_.end() ? nullptr : &*layout;
+}
+
+std::optional<HostKVAllocation> HostKVArena::allocate_growing(const HostKVPageLayout& layout,
+                                                              std::uint32_t pages) noexcept {
+    if (auto allocation = allocate(layout, pages); allocation) { return allocation; }
+    // No span could satisfy it: pin one more from the shared pool and retry ONCE. A second failure is final --
+    // retrying would spin, and the caller needs a definite answer to choose between demoting and evicting.
+    if (layout.page_stride > std::numeric_limits<std::size_t>::max() / (pages == 0 ? 1U : pages)) {
+        return std::nullopt;
+    }
+    if (!grow_span(layout.page_stride * static_cast<std::size_t>(pages == 0 ? 1U : pages))) {
+        return std::nullopt;
+    }
+    return allocate(layout, pages);
+}
+
+std::size_t HostKVArena::shortfall_for(std::uint32_t pages, std::size_t page_stride) const noexcept {
+    if (pages == 0U || page_stride > std::numeric_limits<std::size_t>::max() / pages) { return 0U; }
+    const std::size_t bytes = page_stride * static_cast<std::size_t>(pages);
+    const auto        best  = find_free_extent(bytes);
+    if (best) { return 0U; }
+    // The largest run that exists, per span: what is missing is the difference. NO PRODUCTION CALLER:
+    // nothing pre-grows from this today, so the "blocked plan becomes affordable" path it was written for
+    // does not exist -- the planner pre-grow was tried and removed (see the header). Tests read it only.
+    std::size_t largest = 0U;
+    for (const FreeExtent& extent : free_extents_) { largest = std::max(largest, extent.bytes); }
+    return bytes > largest ? bytes - largest : bytes;
 }
 
 std::optional<std::size_t> HostKVArena::find_free_extent(std::size_t bytes) const noexcept {
@@ -289,8 +362,9 @@ std::optional<HostKVAllocation> HostKVArena::allocate(const HostKVPageLayout& la
 
     const std::uint32_t descriptor_index = take_descriptor();
     if (descriptor_index == std::numeric_limits<std::uint32_t>::max()) { return std::nullopt; }
-    FreeExtent& free         = free_extents_[*free_index];
-    const std::size_t offset = free.offset;
+    FreeExtent& free             = free_extents_[*free_index];
+    const std::uint32_t span     = free.span;  // read BEFORE the extent may be erased below
+    const std::size_t offset     = free.offset;
     free.offset += bytes;
     free.bytes -= bytes;
     if (free.bytes == 0) {
@@ -298,6 +372,7 @@ std::optional<HostKVAllocation> HostKVArena::allocate(const HostKVPageLayout& la
     }
 
     Descriptor& descriptor = descriptors_[descriptor_index];
+    descriptor.span        = span;
     descriptor.offset      = offset;
     descriptor.bytes       = bytes;
     descriptor.layout      = *layout_index;
@@ -323,25 +398,12 @@ std::optional<HostKVAllocationRecipe> HostKVArena::plan_after_releases(
     recipe.targets_.reserve(target_allocations.size());
 
     std::vector<FreeExtent> simulated = free_extents_;
-    const auto insert_extent          = [&](FreeExtent extent) {
-        const auto position = std::lower_bound(simulated.begin(), simulated.end(), extent.offset,
-                                                        [](const FreeExtent& candidate, std::size_t offset) {
-                                                   return candidate.offset < offset;
-                                               });
-        auto inserted       = simulated.insert(position, extent);
-        if (inserted != simulated.begin()) {
-            auto previous = inserted - 1;
-            if (previous->offset + previous->bytes == inserted->offset) {
-                previous->bytes += inserted->bytes;
-                inserted = simulated.erase(inserted);
-                inserted = previous;
-            }
-        }
-        const auto next = inserted + 1;
-        if (next != simulated.end() && inserted->offset + inserted->bytes == next->offset) {
-            inserted->bytes += next->bytes;
-            simulated.erase(next);
-        }
+    // SPAN-AWARE through the SAME helper the real free list uses, so the two cannot drift. It has to be:
+    // extents in different spans are never adjacent, so an offset-only ordering would merge two pool
+    // extents into one simulated run and then hand out memory that is not contiguous. (This compiled while
+    // being wrong, because `span` default-initialises -- the compiler cannot see this class of mistake.)
+    const auto insert_extent = [&](FreeExtent extent) {
+        insert_extent_ordered(simulated, extent);
     };
 
     for (std::size_t index = 0; index < proposed_releases.size(); ++index) {
@@ -353,7 +415,11 @@ std::optional<HostKVAllocationRecipe> HostKVArena::plan_after_releases(
             return std::nullopt;
         }
         const Descriptor& descriptor = descriptors_[handle.descriptor_];
-        insert_extent({descriptor.offset, descriptor.bytes});
+        // Span FIRST. `FreeExtent` gained a span field, and the two-argument form that stood here
+        // aggregate-initialised span=offset, offset=bytes, bytes=0 -- so every released extent described zero
+        // bytes and NO recipe could be planned. The compiler cannot see this: a short initializer list is
+        // legal, not an error.
+        insert_extent({descriptor.span, descriptor.offset, descriptor.bytes});
         recipe.releases_.push_back(handle);
     }
 
@@ -370,13 +436,15 @@ std::optional<HostKVAllocationRecipe> HostKVArena::plan_after_releases(
             std::find_if(simulated.begin(), simulated.end(),
                          [&](const FreeExtent& free) { return free.bytes >= bytes; });
         if (extent == simulated.end()) { return std::nullopt; }
-        const std::size_t offset = extent->offset;
+        const std::uint32_t span   = extent->span;
+        const std::size_t   offset = extent->offset;
         extent->offset += bytes;
         extent->bytes -= bytes;
         if (extent->bytes == 0) { simulated.erase(extent); }
         recipe.targets_.push_back(HostKVAllocationRecipe::Target{
             .layout = *layout_index,
             .pages  = request.pages,
+            .span   = span,
             .offset = offset,
             .bytes  = bytes,
         });
@@ -390,25 +458,11 @@ bool HostKVArena::can_allocate_after_suballocation_releases(
     if (proposed_releases.empty() && target_allocations.empty()) { return true; }
 
     std::vector<FreeExtent> simulated = free_extents_;
-    const auto insert_extent          = [&](FreeExtent extent) {
-        const auto position = std::lower_bound(simulated.begin(), simulated.end(), extent.offset,
-                                                        [](const FreeExtent& candidate, std::size_t offset) {
-                                                   return candidate.offset < offset;
-                                               });
-        auto inserted       = simulated.insert(position, extent);
-        if (inserted != simulated.begin()) {
-            auto previous = inserted - 1;
-            if (previous->offset + previous->bytes == inserted->offset) {
-                previous->bytes += inserted->bytes;
-                inserted = simulated.erase(inserted);
-                inserted = previous;
-            }
-        }
-        const auto next = inserted + 1;
-        if (next != simulated.end() && inserted->offset + inserted->bytes == next->offset) {
-            inserted->bytes += next->bytes;
-            simulated.erase(next);
-        }
+    // SPAN-AWARE, through the SAME helper: this lambda was offset-only and coalesced across span
+    // boundaries, so it declared 8 contiguous pages available across two 4-page spans and a plan
+    // was called affordable that could not be allocated.
+    const auto insert_extent = [&](FreeExtent extent) {
+        insert_extent_ordered(simulated, extent);
     };
 
     for (std::size_t index = 0; index < proposed_releases.size(); ++index) {
@@ -428,6 +482,9 @@ bool HostKVArena::can_allocate_after_suballocation_releases(
         }
         const std::size_t stride = layouts_[descriptor.layout].page_stride;
         insert_extent(FreeExtent{
+            // Designated initialisers hide the other trap: a missing `.span` defaults to 0, which is correct
+            // only for a single-span arena and silently wrong for a grown one.
+            .span   = descriptor.span,
             .offset = checked_add(descriptor.offset,
                                   checked_mul(static_cast<std::size_t>(release.begin_page), stride,
                                               "Host KV suballocation release offset overflow"),
@@ -531,7 +588,10 @@ bool HostKVArena::apply_recipe(HostKVAllocationRecipe&& recipe,
             allocate(layouts_[target.layout], target.pages);
         if (!allocation) { std::terminate(); }
         const Descriptor& descriptor = descriptors_[allocation->descriptor_];
-        if (descriptor.offset != target.offset || descriptor.bytes != target.bytes) {
+        // The SPAN is part of the identity: same offset and bytes in a DIFFERENT pool extent is a different
+        // piece of memory, and accepting it would apply a plan to memory it was not planned against.
+        if (descriptor.span != target.span || descriptor.offset != target.offset ||
+            descriptor.bytes != target.bytes) {
             std::terminate();
         }
         target_allocations[index] = std::move(*allocation);
@@ -565,6 +625,10 @@ std::pair<HostKVAllocation, HostKVAllocation> HostKVArena::split(HostKVAllocatio
     right.layout = original.layout;
     right.pages  = right_pages;
     right.active = true;
+    // The SPAN, which this missed: without it the right half keeps whatever span its recycled descriptor
+    // last had, so its data pointer lands inside another live allocation and releasing it inserts a free
+    // extent into the wrong span -- a double allocation. Reproduced by the 2026-09-26 review.
+    right.span   = original.span;
 
     increment_generation(original.generation);
     original.pages                       = page_offset;
@@ -615,7 +679,12 @@ bool HostKVArena::release_descriptor(std::uint32_t descriptor_index,
     Descriptor& descriptor = descriptors_[descriptor_index];
     if (!descriptor.active || descriptor.generation != generation) { return false; }
 
-    const FreeExtent released{descriptor.offset, descriptor.bytes};
+    // Span FIRST, and this one mattered most: the two-argument form aggregate-initialised
+    // span=offset, offset=bytes, bytes=0, so EVERY release inserted a zero-byte extent at a bogus span. The
+    // simulation in `plan_after_releases` then disagreed with reality, recipes were "not planned", and once
+    // that was fixed the adoption hit this and terminated. A short initializer list is legal C++, not an
+    // error -- the compiler could not see either site.
+    const FreeExtent released{descriptor.span, descriptor.offset, descriptor.bytes};
     occupied_bytes_ -= descriptor.bytes;
     descriptor.active = false;
     descriptor.offset = 0;
@@ -628,29 +697,39 @@ bool HostKVArena::release_descriptor(std::uint32_t descriptor_index,
     return true;
 }
 
-void HostKVArena::insert_free_extent(FreeExtent extent) noexcept {
-    const auto position = std::lower_bound(
-        free_extents_.begin(), free_extents_.end(), extent.offset,
-        [](const FreeExtent& candidate, std::size_t offset) { return candidate.offset < offset; });
-    auto inserted = free_extents_.insert(position, extent);
-    if (inserted != free_extents_.begin()) {
+void HostKVArena::insert_extent_ordered(std::vector<FreeExtent>& extents, FreeExtent extent) noexcept {
+    // Ordering key is (SPAN, offset): extents in different spans are never adjacent, however their offsets
+    // compare, so coalescing across a span boundary would merge two pool extents into one run and hand out
+    // memory that is not contiguous.
+    const auto before = [](const FreeExtent& candidate, const FreeExtent& value) {
+        return candidate.span != value.span ? candidate.span < value.span : candidate.offset < value.offset;
+    };
+    auto inserted = extents.insert(std::lower_bound(extents.begin(), extents.end(), extent, before), extent);
+    if (inserted != extents.begin()) {
         auto previous = inserted - 1;
-        if (previous->offset + previous->bytes == inserted->offset) {
+        if (previous->span == inserted->span && previous->offset + previous->bytes == inserted->offset) {
             previous->bytes += inserted->bytes;
-            inserted = free_extents_.erase(inserted);
+            inserted = extents.erase(inserted);
             inserted = previous;
         }
     }
-    auto next = inserted + 1;
-    if (next != free_extents_.end() && inserted->offset + inserted->bytes == next->offset) {
+    const auto next = inserted + 1;
+    if (next != extents.end() && next->span == inserted->span &&
+        inserted->offset + inserted->bytes == next->offset) {
         inserted->bytes += next->bytes;
-        free_extents_.erase(next);
+        extents.erase(next);
     }
 }
 
+void HostKVArena::insert_free_extent(FreeExtent extent) noexcept {
+    insert_extent_ordered(free_extents_, extent);
+}
+
 std::byte* HostKVArena::allocation_data(const Descriptor& descriptor) const noexcept {
-    if (!backing_) { return nullptr; }
-    return static_cast<std::byte*>(backing_->data()) + descriptor.offset;
+    if (pool_ == nullptr || descriptor.span >= spans_.size()) { return nullptr; }
+    // Offset is SPAN-RELATIVE: a run never straddles two spans, so the address is always
+    // (this span's pool extent) + offset. The pool never moves an extent, which is what makes this stable.
+    return pool_->data(spans_[descriptor.span].allocation) + descriptor.offset;
 }
 
 void HostKVArena::bump_revision() noexcept {

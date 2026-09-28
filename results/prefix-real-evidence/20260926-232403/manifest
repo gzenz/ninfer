@@ -1,0 +1,18 @@
+binary=./build/tests/ninfer_qwen3_5_prefix_real_test
+binary_sha256=21556de3413a3950fff43adcaf3f7780d543c286ce08962f2997df9f0ece9008
+binary_mtime=2026-09-26T23:24:03+02:00
+artifact=/home/zenz/ninfer-models/swift15/qwen3_8_27b_nvfp4swift15.ninfer
+artifact_sha256=683f5086a0e24e9b7c5caad256d373e13eff4e0491564f5b8c2acde33e52a11e
+git_head=f7bcec872824f3cd9845a1ed7447437675df5a22
+git_head_tree=7a5d886afb77240a554207ccefa06ab8b72b8dd7
+tree_diff_sha256=41c7cdbae21ae6d3c6f4c9a04b47c36434db551f15fa5dbc530a340aa31e7b9a
+git_dirty_paths=3
+scenario=all (NINFER_PREFIX_REAL_SCENARIO); this proves state-image-restore runs INSIDE the battery
+started=2026-09-26T23:24:03+02:00   # hand-written: the FIRST window of the pair (the journal has the stop/start cycles); the value here used to record the second
+all-1 rc=0 log_sha256=1831cf183afea9e9d74bb47b06824042f58144280b8e352a46c1bcfa790ade08
+all-2 rc=0 log_sha256=1831cf183afea9e9d74bb47b06824042f58144280b8e352a46c1bcfa790ade08
+finished=2026-09-26T23:29:14+02:00
+# Both logs are BYTE-IDENTICAL (cmp -s), and each contains the new scenario's line:
+# [scenario] state-image restore via cross-session adoption: path=2 reused=305 outputs=5 state_h2d_delta=1 main_h2d_delta=3 backend_h2d_delta=2
+# NOT produced by tools/e2e/prefix-real-evidence.sh (which has no scenario parameter yet); recorded here as the
+# closer to its field set, with tree_diff_sha256 added so the binary is tied to a tree diff, not just a HEAD.

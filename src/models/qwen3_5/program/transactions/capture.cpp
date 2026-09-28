@@ -1,10 +1,12 @@
 #include "models/qwen3_5/program/program_impl.h"
+#include "core/diagnostics.h"
 #include "models/qwen3_5/program/context_work.h"
 #include "models/qwen3_5/program/planning/pressure_planner.h"
 
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <cstdio>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -33,7 +35,7 @@ CaptureAssessment
 ProgramImpl::inspect_capture(const CaptureOffer& offer, const SharedPrefixHandle* exact_shared,
                              const SharedPrefixHandle* replacement,
                              std::optional<runtime::CheckpointRef> private_replacement,
-                             bool permit_shared_publication) const {
+                             bool permit_shared_publication, const char* site) const {
     if (!valid_capture_offer(offer)) { throw std::logic_error("capture offer is stale"); }
     if (exact_shared != nullptr && replacement != nullptr) {
         throw std::invalid_argument("capture cannot deduplicate and replace simultaneously");
@@ -108,6 +110,52 @@ ProgramImpl::inspect_capture(const CaptureOffer& offer, const SharedPrefixHandle
     assessment.recycles_private_state =
         replaces_rewrite && *sequence.rewrite_state != sequence.state.write &&
         state_store->can_recycle_checkpoint_destination(*sequence.rewrite_state);
+    // Per-capture probe (NINFER_CAPTURE_PROBE): the five conditions above, read where they are computed
+    // rather than only at the one transfer-submitted site the abort probe reaches. Designing the
+    // scenario for #11(a) needs to know WHICH condition fails on each turn, and the previous design
+    // pass had only a single-hit reading to go on. Cheap, env-gated, and it needs no injector.
+    if (std::getenv("NINFER_CAPTURE_PROBE") != nullptr) {
+        const bool state_live =
+            sequence.rewrite_state.has_value() && state_store->valid(*sequence.rewrite_state);
+        // Reachability assert for #11(a), the plan's next action: if `recycles_private_state` can never
+        // be true, this fires zero times across every real-engine scenario, and the recycling branch is
+        // dead code rather than a latent hazard. Deliberately an abort, not a print: a print can be read
+        // as "did not happen" when the probe was skipped, which is the mistake that produced two wrong
+        // conclusions in this file's neighbourhood today.
+        if (assessment.recycles_private_state) {
+            std::fprintf(stderr, "[capture] ASSERT recycles_private_state is REACHABLE lane=%u\n",
+                         lane);
+            std::fflush(stderr);
+            std::abort();
+        }
+        std::fprintf(stderr,
+                     "[capture] assess site=%s lane=%u placement=%d dev_occ=%u dev_cap=%u host_images=%d "
+                     "shared_group=%d publish_shared=%d "
+                     "rewrite_group=%d rewrite_state_live=%d "
+                     "checkpoint_valid=%d slot_differs=%d can_recycle=%d replaces_rewrite=%d "
+                     "recycles=%d frontier=%u base=%u refs=%d\n",
+                     site != nullptr ? site : "?", lane, static_cast<int>(assessment.state_placement),
+                     state_store->device_occupied(),
+                     state_store->device_capacity(),
+                     static_cast<int>(host_state_images != nullptr),
+                     static_cast<int>(group.shared), static_cast<int>(publish_shared),
+                     static_cast<int>(group.rewrite.has_value()),
+                     static_cast<int>(state_live),
+                     static_cast<int>(sequence.rewrite_checkpoint.valid),
+                     static_cast<int>(state_live &&
+                                      *sequence.rewrite_state != sequence.state.write),
+                     static_cast<int>(state_live &&
+                                      state_store->can_recycle_checkpoint_destination(
+                                          *sequence.rewrite_state)),
+                     static_cast<int>(replaces_rewrite),
+                     static_cast<int>(assessment.recycles_private_state), group.frontier,
+                     sequence.rewrite_checkpoint.frontier,
+                     static_cast<int>(state_live
+                                          ? state_store->checkpoint_references(
+                                                *sequence.rewrite_state)
+                                          : -1));
+        std::fflush(stderr);
+    }
     detail::PhysicalResources added;
     detail::PhysicalResources active_removed;
     std::optional<KVActiveSnapshotShape> text_snapshot_shape;
@@ -190,6 +238,20 @@ ProgramImpl::inspect_capture(const CaptureOffer& offer, const SharedPrefixHandle
         // identity.  This preserves both logical checkpoints without assigning fixed slot roles.
         assessment.state_placement = qwen3_5::CaptureStatePlacement::HostSnapshot;
         added.host.state_slots     = 1;
+    }
+    if (std::getenv("NINFER_CAPTURE_PROBE") != nullptr) {
+        // Printed AT the decision, because the earlier probe cannot see these: `replaced_shared` is
+        // declared below it. The first three runs of the host-snapshot scenario read `placement=0` with
+        // `dev_occ == dev_cap`, which is only possible if a replacement frees a slot -- so read the
+        // value the decision actually uses instead of inferring it.
+        std::fprintf(stderr,
+                     "[capture] placement-decision lane=%u placement=%d occupied=%u capacity=%u "
+                     "replaced_shared_slots=%u after_preparation=%u host_images=%d\n",
+                     lane, static_cast<int>(assessment.state_placement), state_store->device_occupied(),
+                     state_store->device_capacity(), replaced_shared.device.state_slots,
+                     device_state_after_preparation,
+                     static_cast<int>(host_state_images != nullptr));
+        std::fflush(stderr);
     }
     const detail::PhysicalResources replaced =
         checked_resource_sum(replaced_private, replaced_shared);
@@ -354,16 +416,35 @@ runtime::ContextTransactionReserveStatus ProgramImpl::reserve_active_capture_imp
     const SharedPrefixHandle* replacement,
     std::optional<runtime::CheckpointRef> private_replacement, bool permit_shared_publication,
     std::optional<CapturePressureCandidate> pressure, runtime::CancellationFlagView cancellation) {
-    if (has_context_transaction() || has_unsettled_state_fork() || !valid_capture_offer(offer)) {
-        throw std::logic_error("capture transaction is not reservable");
+    // Contention is not corruption. Another context transaction, or an unsettled state
+    // fork left by a shared-prefix reuse, owns the program; a capture is optional
+    // retention, and §12 invariant 15 requires a retention/capture failure to degrade to
+    // skip so the active lane still reaches a finite terminal state. Throwing here failed
+    // the whole batch with HTTP 500 (reproduced: 4 concurrent sessions sharing a large
+    // prefix, all four killed by "WORKER RECOVER: capture transaction is not reservable").
+    if (has_context_transaction() || has_unsettled_state_fork()) {
+        note_capture_skip(CaptureSkipReason::TransactionOrFork);
+        skip_capture(std::move(offer));
+        return runtime::ContextTransactionReserveStatus::Aborted;
+    }
+    if (!valid_capture_offer(offer)) {
+        // A DISTINCT message on purpose. The contention branch above and this one used to share
+        // "capture transaction is not reservable", which is the string the pre-fix HTTP 500 was
+        // reported as ("WORKER RECOVER: capture transaction is not reservable") -- so the evidence
+        // "that line no longer appears" could not tell the fixed branch from this one, which still
+        // throws. A stale offer is an internal-consistency failure, not contention, and it is not
+        // expected on this path; keep it loud and separable.
+        throw std::logic_error("capture offer is stale (invalid for this program state)");
     }
     if (cancellation.requested()) {
+        note_capture_skip(CaptureSkipReason::Cancelled);
         skip_capture(std::move(offer));
         return runtime::ContextTransactionReserveStatus::Aborted;
     }
     const CaptureAssessment assessment = inspect_capture(
-        offer, exact_shared, replacement, private_replacement, permit_shared_publication);
+        offer, exact_shared, replacement, private_replacement, permit_shared_publication, "reserve");
     if (!assessment.publishes_private && !assessment.publishes_shared) {
+        note_capture_skip(CaptureSkipReason::NothingToPublish);
         skip_capture(std::move(offer));
         return runtime::ContextTransactionReserveStatus::Aborted;
     }
@@ -374,10 +455,12 @@ runtime::ContextTransactionReserveStatus ProgramImpl::reserve_active_capture_imp
          pressure_details->summary.prompt_tokens != assessment.frontier ||
          pressure_details->blocked_host_allocation_bytes != 0 ||
          !physical_peak_fits(pressure_details->demand.physical_peak_additional))) {
+        note_capture_skip(CaptureSkipReason::StalePressurePlan);
         skip_capture(std::move(offer));
         return runtime::ContextTransactionReserveStatus::Aborted;
     }
     if (!pressure && !assessment.physically_feasible) {
+        note_capture_skip(CaptureSkipReason::NotFeasibleNoPressure);
         skip_capture(std::move(offer));
         return runtime::ContextTransactionReserveStatus::Aborted;
     }
@@ -476,6 +559,13 @@ runtime::ContextTransactionReserveStatus ProgramImpl::reserve_active_capture_imp
                 transaction.replaces_shared        = true;
                 transaction.replacement_generation = shared_prefix_slots[index].generation;
                 shared_prefix_slots[index].role    = SharedPrefixSlotRole::ReservedReplacement;
+                // Counted HERE, at the decision, because this is the only place that knows a catalogued
+                // shared owner is being displaced. Nothing else reported it -- see the field's comment.
+                // Consequence, stated so this counter is not read as more than it is: the abort path
+                // (`abort_prepared_capture`, the `Catalogue` arm below) puts the slot back without
+                // decrementing, so this counts reservations that reached the path, and a reservation
+                // that was undone is included.
+                ++shared_replacements_;
             } else {
                 for (std::uint32_t index = 0; index < shared_prefix_capacity; ++index) {
                     if (shared_prefix_slots[index].role == SharedPrefixSlotRole::Free) {
@@ -534,15 +624,35 @@ ProgramImpl::install_private_capture(SequenceState& sequence, const CaptureGroup
     detail::PhysicalResources removed;
     if (group.rewrite) {
         if (sequence.rewrite_state && *sequence.rewrite_state != checkpoint) {
+            if (std::getenv("NINFER_CAPTURE_PROBE") != nullptr) {
+                std::fprintf(stderr,
+                             "[capture] install replaces an existing rewrite_state "
+                             "frontier=%u new_frontier=%u refs=%d\n",
+                             sequence.rewrite_checkpoint.frontier, group.frontier,
+                             static_cast<int>(
+                                 state_store->checkpoint_references(*sequence.rewrite_state)));
+                std::fflush(stderr);
+            }
             removed = checked_resource_sum(removed,
                                            release_checkpoint_reference(*sequence.rewrite_state));
         }
         state_store->retain_checkpoint_reference(checkpoint);
+        if (std::getenv("NINFER_CAPTURE_PROBE") != nullptr) {
+            std::fprintf(stderr,
+                         "[capture] install rewrite_state=set refs=%d residency=%d aliases_write=%d "
+                         "aliases_read=%d frontier=%u\n",
+                         static_cast<int>(state_store->checkpoint_references(checkpoint)),
+                         static_cast<int>(state_store->residency(checkpoint)),
+                         static_cast<int>(checkpoint == sequence.state.write),
+                         static_cast<int>(checkpoint == sequence.state.read), group.frontier);
+            std::fflush(stderr);
+        }
         sequence.rewrite_state      = checkpoint;
         sequence.rewrite_checkpoint = RewriteCheckpoint{
             .valid        = true,
             .kind         = *group.rewrite,
             .frontier     = group.frontier,
+            .state_epoch  = state_store->content_epoch(checkpoint),
             .rebuild_work = validated_rebuild_work(group.identity->rebuild_work, group.frontier),
         };
     }
@@ -588,6 +698,7 @@ ProgramImpl::install_private_capture(SequenceState& sequence, const CaptureGroup
             .state        = checkpoint,
             .frontier     = group.frontier,
             .ordinal      = ordinal,
+            .state_epoch  = state_store->content_epoch(checkpoint),
             .rebuild_work = validated_rebuild_work(group.identity->rebuild_work, group.frontier),
         });
         validate_long_anchor_ordinals(sequence.long_anchors, capacity_limit);
@@ -637,7 +748,11 @@ void ProgramImpl::prepare_active_capture(ActiveCaptureTransaction& transaction) 
         if (transaction.recycles_private_state || host_state_images == nullptr) {
             throw std::logic_error("Host capture placement has no valid backing");
         }
-        std::optional<StateImageHandle> destination = state_store->reserve_logical_destination();
+        // GROWING (2026-09-27): the pure form threw here whenever the pool was full, which is what made
+        // `--host-state-slots` load-bearing and cost an in-flight request per recovery under concurrency.
+        // The pool is elastic; this is the capture path finally using that.
+        std::optional<StateImageHandle> destination =
+            state_store->reserve_logical_destination_growing();
         if (!destination) {
             throw std::logic_error("selected capture has no prepared logical State capacity");
         }
@@ -647,8 +762,7 @@ void ProgramImpl::prepare_active_capture(ActiveCaptureTransaction& transaction) 
             throw std::logic_error("recycled rewrite destination is unavailable");
         }
         transaction.destination_state = *sequence.rewrite_state;
-        transaction.recycled_state_epoch =
-            state_store->recycle_checkpoint_destination(transaction.destination_state);
+        (void)state_store->recycle_checkpoint_destination(transaction.destination_state);
     } else {
         std::optional<StateImageHandle> destination = state_store->reserve_destination();
         if (!destination) {
@@ -681,9 +795,32 @@ void ProgramImpl::prepare_active_capture(ActiveCaptureTransaction& transaction) 
         }
     }
 
+    // W1-B: record the position the state is frozen at, before anything can move it. This is the
+    // value the published entry's advertised frontier is compared against.
+    //
+    // `sequence.text_kv_valid`, NOT `execution_frontier`. A shared capture is offered and frozen
+    // *mid-prefill*, and `execution_frontier` is written only at decode and forced commits -- during
+    // a prompt prefill it is still 0. Comparing the advertised frontier against it therefore
+    // counted every mid-prefill capture as a mismatch: the first version of this counter read 1/1
+    // in the canary workload and I read that as a live hazard. The counter was measuring the wrong
+    // quantity, not the engine doing something wrong. `text_kv_valid` is the position the
+    // sequence's KV has been written to, i.e. what the frozen state corresponds to.
+    //
+    // Scope, per a 2026-09-25 review: every offer path triggers on the same cursor this holds, so
+    // the comparison is equal by construction and can fire only on drift between offer and freeze.
+    // It is a drift detector, not a check that the state matches the frontier it advertises.
+    transaction.frozen_text_frontier = sequence.text_kv_valid;
     state_store->freeze(transaction.source_state);
     if (transaction.state_placement == qwen3_5::CaptureStatePlacement::DeviceFork) {
-        (void)state_store->begin_fork(transaction.source_state, transaction.destination_state);
+        const StateImageSelectors capture_fork =
+            state_store->begin_fork(transaction.source_state, transaction.destination_state);
+        // Fork completeness control (NINFER_FORK_COPY=1): the publishing lane continues in the
+        // fork destination, and the ops that consume the selector pair write only the regions
+        // they own -- anything else keeps the previous occupant's bytes. This site is the
+        // *publisher's* continuation fork (the consumer-side sites are in prefill.cpp).
+        if (diagnostic_control_enabled("NINFER_FORK_COPY")) {
+            state_images->copy_slot(capture_fork.source, capture_fork.destination, device.stream);
+        }
         sequence.state = ActiveStateBinding{.read         = transaction.source_state,
                                             .write        = transaction.destination_state,
                                             .fork_pending = true};
@@ -761,11 +898,15 @@ void ProgramImpl::abort_active_capture(ActiveCaptureTransaction& transaction) no
         }
         if (transaction.active_backend_destination &&
             backend_kv_addresses->valid(*transaction.active_backend_destination)) {
-            (void)backend_kv_addresses->release(*transaction.active_backend_destination);
+            if (!backend_kv_addresses->release(*transaction.active_backend_destination)) {
+                note_nonstrict_release_refusal("abort-backend-destination");
+            }
         }
         if (transaction.active_text_destination &&
             text_kv_addresses->valid(*transaction.active_text_destination)) {
-            (void)text_kv_addresses->release(*transaction.active_text_destination);
+            if (!text_kv_addresses->release(*transaction.active_text_destination)) {
+                note_nonstrict_release_refusal("abort-text-destination");
+            }
         }
         if (transaction.state_snapshot) {
             state_store->abort_transfer(std::move(*transaction.state_snapshot));
@@ -775,7 +916,9 @@ void ProgramImpl::abort_active_capture(ActiveCaptureTransaction& transaction) no
             state_store->valid(transaction.destination_state)) {
             try {
                 if (transaction.state_placement == qwen3_5::CaptureStatePlacement::HostSnapshot) {
-                    (void)state_store->release(transaction.destination_state);
+                    if (!state_store->release(transaction.destination_state)) {
+                        note_nonstrict_release_refusal("abort-snapshot-destination");
+                    }
                 } else {
                     if (sequence.state.fork_pending &&
                         sequence.state.read == transaction.source_state &&
@@ -786,10 +929,67 @@ void ProgramImpl::abort_active_capture(ActiveCaptureTransaction& transaction) no
                                                             .write = transaction.source_state};
                     }
                     if (transaction.recycles_private_state) {
-                        state_store->restore_recycled_checkpoint(transaction.destination_state,
-                                                                 transaction.recycled_state_epoch);
+                        // W1-B, and now #11(a)'s disposal. The fork destination IS the sequence's rewrite
+                        // checkpoint (`destination_state = *sequence.rewrite_state`), so an abort used to
+                        // restore the checkpoint's *old* content epoch -- over content the fork may have
+                        // written, which is the hazard W1-B named. It no longer does: the checkpoint is
+                        // DROPPED here instead. The branch is unreachable by
+                        // construction (plan.md §2 item 3), and the epoch restore is the hazard the
+                        // counter here used to watch for; dropping is safe whether or not the branch is
+                        // ever entered, and costs at most one cache entry -- a checkpoint whose bytes may
+                        // be dirty is worth less than one whose bytes are known good.
+                        //
+                        // "Release" is spelled out because the literal version is unsafe: after
+                        // `recycle_checkpoint_destination` the object is `ReservedDestination` with
+                        // `checkpoint_references == 0`, so a bare release would leave
+                        // `sequence.rewrite_state` pointing at it with `rewrite_checkpoint.valid` still
+                        // true -- and this file's own guard tests exactly those two fields, without a
+                        // `valid()` check, so a later `release_checkpoint_reference` would `require()` a
+                        // stale handle.
+                        const StateImageHandle recycled = transaction.destination_state;
+                        // The reset and the count hang on the release SUCCEEDING. Resetting the sequence's
+                        // handle after a refused release would drop the handle while the occupancy stayed
+                        // -- #9's exact shape, created by the fix -- and counting a "drop" that did not
+                        // happen is the kind of instrument this change removes elsewhere.
+                        //
+                        // `recycled_checkpoint_drops_` can only read zero: this branch is unreachable
+                        // (`recycles_private_state` requires a state the planner never produces). It has no
+                        // denominator -- it is not an instrument that can report a rate -- and it is kept
+                        // for one reason only: if the reachability argument is ever refuted, the first
+                        // evidence will be this counter firing. Named here as unreachable rather than
+                        // presented as something that measures.
+                        if (state_store->release(recycled)) {
+                            if (sequence.rewrite_state && *sequence.rewrite_state == recycled) {
+                                sequence.rewrite_state.reset();
+                                sequence.rewrite_checkpoint = {};
+                            }
+                            ++recycled_checkpoint_drops_;
+                            if (recycled_checkpoint_drops_ <= 8ULL ||
+                                recycled_checkpoint_drops_ % 512ULL == 0ULL) {
+                                std::fprintf(stderr,
+                                             "[capture] recycled-checkpoint DROPPED on abort lane=%u "
+                                             "count=%llu (not restored: its bytes may hold the fork's "
+                                             "writes)\n",
+                                             sequence.lane,
+                                             static_cast<unsigned long long>(recycled_checkpoint_drops_));
+                                std::fflush(stderr);
+                            }
+                        } else {
+                            // A refused release leaves an inconsistent binding that this arm does NOT
+                            // repair: `recycle_checkpoint_destination` has already turned the object into
+                            // `ReservedDestination` with `checkpoint_references == 0`, so
+                            // `sequence.rewrite_state` still names it while `rewrite_checkpoint.valid` stays
+                            // true -- and a later `release_checkpoint_reference` would `require()` a role
+                            // and refcount that no longer match. The gating above is still right (dropping
+                            // the handle on a refusal is #9's shape), but the residual risk is named here
+                            // rather than left to be discovered. Unreachable in practice: the arm requires
+                            // a state the planner never produces.
+                            note_nonstrict_release_refusal("abort-recycled-checkpoint");
+                        }
                     } else {
-                        (void)state_store->release(transaction.destination_state);
+                        if (!state_store->release(transaction.destination_state)) {
+                            note_nonstrict_release_refusal("abort-destination");
+                        }
                     }
                 }
                 state_store->thaw(transaction.source_state);
@@ -799,17 +999,26 @@ void ProgramImpl::abort_active_capture(ActiveCaptureTransaction& transaction) no
     }
     if (transaction.shared_index && *transaction.shared_index < shared_prefix_capacity) {
         SharedPrefixSlot& slot = shared_prefix_slots[*transaction.shared_index];
-        if (transaction.replaces_shared && transaction.replacement_removed &&
-            slot.role == SharedPrefixSlotRole::ReservedCapture &&
-            slot.generation == transaction.replacement_generation) {
-            slot.role = SharedPrefixSlotRole::Free;
-        } else if (transaction.replaces_shared && !transaction.replacement_removed &&
-                   slot.role == SharedPrefixSlotRole::ReservedReplacement &&
-                   slot.generation == transaction.replacement_generation) {
-            slot.role = SharedPrefixSlotRole::Catalogued;
-        } else if (!transaction.replaces_shared &&
-                   slot.role == SharedPrefixSlotRole::ReservedCapture) {
-            slot.role = SharedPrefixSlotRole::Free;
+        // A reserved role belonging to a transaction that is going away is never left reserved
+        // (shared_slot_release.h, enumerated and unit-tested). The chain this replaces matched only
+        // three combinations of (replaces_shared, replacement_removed, role): a slot in either of the
+        // other two kept its KV addresses and its state checkpoint reference with no owner, and
+        // `fail_all_cleanup` releases only `Catalogued` slots, so nothing could free it -- the
+        // 2026-09-25 leak candidate (#9).
+        //
+        // The generation guard is kept where the old chain had it: for a replacement flow the slot may
+        // have been re-reserved by a later transaction, and touching that one would corrupt it.
+        const bool ours = !transaction.replaces_shared ||
+                          slot.generation == transaction.replacement_generation;
+        if (ours) {
+            switch (resolve_shared_slot_release(transaction.replaces_shared,
+                                                transaction.replacement_removed, slot.role)) {
+            case SharedSlotReleaseAction::Free: slot.role = SharedPrefixSlotRole::Free; break;
+            case SharedSlotReleaseAction::Catalogue:
+                slot.role = SharedPrefixSlotRole::Catalogued;
+                break;
+            case SharedSlotReleaseAction::Leave: break;
+            }
         }
     }
     transaction.prepared = false;
@@ -945,8 +1154,57 @@ ActiveCaptureResult ProgramImpl::publish_active_capture(ActiveCaptureTransaction
         }
         shared.kv       = *shared_bundle;
         shared.state    = transaction.source_state;
+        // W1-B (plan form): the epoch this entry's state is frozen at, recorded with the entry.
+        shared.state_epoch = state_store->content_epoch(transaction.source_state);
         shared.identity = transaction.group.identity;
         shared.frontier = transaction.group.frontier;
+        // Frontier audit (NINFER_MAT_DEBUG=1). CORRECTED 2026-09-25: this said the frozen state's
+        // position "is the sequence's execution frontier", and that a difference meant cross-session
+        // bleed "reproduced by tools/e2e/canary-e2e.py". Both halves were wrong. A shared capture is
+        // frozen mid-prefill, where `execution_frontier` is still 0 -- so this print showed
+        // `exec_frontier=0` beside a non-zero `group_frontier` for every mid-prefill capture, which
+        // is not a mismatch but two different quantities. The position the state corresponds to is
+        // the prefill cursor, and against it the recorded corpus is 62 of 62 agreeing
+        // (`group_frontier == prefill_cursor`, `exec_frontier == 0` in all 62). No bleed was
+        // reproduced from this condition by that suite, and the bleed it did reproduce is
+        // attributable to the KV row selector (479c92c4).
+        if (std::getenv("NINFER_MAT_DEBUG")) {
+            std::fprintf(stderr,
+                         "[mat-debug] SHARED-PUBLISH group_frontier=%u exec_frontier=%u "
+                         "identity_frontier=%u prefill_cursor=%u prefill_prompt=%u\n",
+                         transaction.group.frontier, sequence.execution_frontier,
+                         transaction.group.identity ? transaction.group.identity->shortlist_key.frontier : 0U,
+                         prefill.cursor, prefill.prompt_tokens);
+            std::fflush(stderr);
+        }
+        // W1-B: the same condition, counted in every build. The entry advertises
+        // `group.frontier` while its state was frozen at the sequence's execution frontier; when
+        // those differ the entry does not correspond to the state behind it, and a session matching
+        // only the shorter common boundary forks another session's later tokens. That was visible
+        // only under NINFER_MAT_DEBUG, so the rate was never measured in a served run -- counted
+        // here with its denominator, and deliberately NOT enforced: suppression is a cache-behaviour
+        // change that needs the rate first, and a throw here would kill the worker (the wedge,
+        // 2026-09-25).
+        ++shared_publishes_;
+        const bool frontier_matches =
+            transaction.group.frontier == transaction.frozen_text_frontier;
+        if (!frontier_matches) { ++shared_publish_frontier_mismatches_; }
+        // The denominator prints too, and on a schedule that cannot swallow it: a mismatch-only
+        // print leaves "no line" meaning either "no mismatch" or "no publishes", which is the one
+        // distinction this counter exists to make.
+        if (shared_publishes_ == 1U || shared_publishes_ % 512U == 0U || !frontier_matches) {
+            std::fprintf(stderr,
+                         "[capture] SHARED-FRONTIER advertised=%u frozen=%u exec=%u lane=%u "
+                         "identity=%u mismatches=%llu/%llu\n",
+                         transaction.group.frontier, transaction.frozen_text_frontier,
+                         sequence.execution_frontier, transaction.lane,
+                         transaction.group.identity
+                             ? transaction.group.identity->shortlist_key.frontier
+                             : 0U,
+                         static_cast<unsigned long long>(shared_publish_frontier_mismatches_),
+                         static_cast<unsigned long long>(shared_publishes_));
+            std::fflush(stderr);
+        }
         shared.backend_frontier =
             speculative_backend == SpeculativeBackend::Mtp      ? transaction.group.frontier - 1U
             : speculative_backend == SpeculativeBackend::DFlash ? transaction.group.frontier
@@ -1024,6 +1282,14 @@ ProgramImpl::progress_active_capture_transaction(runtime::CancellationFlagView c
                 ? std::numeric_limits<std::uint64_t>::max()
                 : transaction.operations.pressure_spill_pages + work.spill_pages;
         work.spill_pages = 0;
+        if (work.kv_demoted_to_host && !work.shared_owner) {
+            ++transaction.operations.pressure_private_owners_demoted_kv;
+            if (!work.state_transfer_published) {
+                ++transaction.operations.pressure_private_owners_demoted_kv_only;
+            }
+        }
+        work.kv_demoted_to_host       = false;
+        work.state_transfer_published = false;
     };
 
     if (has_pressure() && pressure_transition.phase == PressureTransitionPhase::HostReleases) {
@@ -1272,6 +1538,64 @@ ProgramImpl::progress_active_capture_transaction(runtime::CancellationFlagView c
             abort_active_capture(transaction);
             transaction.published = true;
             throw;
+        }
+        // Fault injection (NINFER_INJECT_THROW=capture-submitted-host): the same instant as
+        // `capture-submitted`, restricted to a HOST-SNAPSHOT capture -- the only placement that reaches
+        // `abort_active_capture`'s `abort-snapshot-destination` release, a NON-STRICT release whose
+        // refusal is exactly the #9 leak's shape (the handle is dropped while its host state slot and
+        // host KV stay allocated). `capture-submitted` cannot target it: in the host-snapshot scenario
+        // the occupying lane's earlier DeviceFork captures consume the injections first -- observed
+        // 2026-09-26, where the plain site fired on lane 0 (the occupant) and the host-snapshot capture
+        // on lane 1 was never aborted.
+        if (transaction.state_placement == qwen3_5::CaptureStatePlacement::HostSnapshot &&
+            ninfer::harmful_inject_throw("capture-submitted-host")) {
+            throw std::bad_alloc();
+        }
+        // Fault injection (NINFER_INJECT_THROW=capture-submitted, harmful-controls build). Placed AFTER
+        // the enqueue succeeded, so `transfer_submitted` is true and the fork's copy into the recycled
+        // rewrite-checkpoint slot has been issued -- the precondition `abort_active_capture`'s recycling
+        // branch was written for. Throwing here unwinds to the engine, whose failure path runs
+        // `abort_active_capture` with that state in flight.
+        //
+        // That branch is unreachable by construction (plan.md §2 item 3: the planner strips
+        // `group.rewrite` unless the disposition is `ReplaceAtCommittedFrontier`, and every `Replace`
+        // activation clears the checkpoint first), and its epoch restore was replaced by a DROP when the
+        // disposal was implemented. (`restore_recycled_checkpoint` still exists in the store: it is a
+        // primitive with its own test, and only its use here was removed.) The injection is
+        // kept because it is the control for the reachability claim: the probe in `inspect_capture`
+        // aborts if `recycles_private_state` is ever true, and this is the site that would run next.
+        // Probe before throwing, not after the abort: the first version of this probe sat inside
+        // `abort_active_capture`, *after* that function's state restoration had already released the
+        // rewrite checkpoint -- so it reported `rewrite_state_live=0` for a value it had destroyed the
+        // ability to observe, and three windows were spent on a reading that could not vary. Here the
+        // five conditions `recycles_private_state` is built from (capture.cpp:110-112) are measured as
+        // the abort will find them.
+        if (std::getenv("NINFER_ABORT_PROBE") != nullptr &&
+            transaction.lane < max_concurrency &&
+            active_continuations[transaction.lane] < continuation_capacity) {
+            SequenceState& probe_sequence = active_sequence(transaction.lane);
+            const bool state_live =
+                probe_sequence.rewrite_state.has_value() &&
+                state_store->valid(*probe_sequence.rewrite_state);
+            std::fprintf(stderr,
+                         "[capture] pre-abort probe lane=%u recycling=%d rewrite_group=%d "
+                         "rewrite_state_live=%d checkpoint_valid=%d slot_differs=%d can_recycle=%d "
+                         "transfer_submitted=%d\n",
+                         transaction.lane, static_cast<int>(transaction.recycles_private_state),
+                         static_cast<int>(transaction.group.rewrite.has_value()),
+                         static_cast<int>(state_live),
+                         static_cast<int>(probe_sequence.rewrite_checkpoint.valid),
+                         static_cast<int>(state_live &&
+                                          *probe_sequence.rewrite_state !=
+                                              probe_sequence.state.write),
+                         static_cast<int>(state_live &&
+                                          state_store->can_recycle_checkpoint_destination(
+                                              *probe_sequence.rewrite_state)),
+                         static_cast<int>(transaction.transfer_submitted));
+            std::fflush(stderr);
+        }
+        if (ninfer::harmful_inject_throw("capture-submitted")) {
+            throw std::bad_alloc();
         }
         return ActiveCaptureResult{.status = runtime::ContextTransactionStatus::InProgress};
     }

@@ -97,18 +97,31 @@ public:
     StateImageStore(qwen3_5::StateImageDevicePool& device, qwen3_5::HostStatePool* host,
                     std::uint32_t logical_capacity)
         : device_(&device), host_(host), objects_(logical_capacity),
-          free_objects_(logical_capacity),
+          free_objects_(),
           free_device_slots_(static_cast<std::size_t>(device.slot_count())),
-          free_object_count_(logical_capacity),
           free_device_count_(static_cast<std::uint32_t>(device.slot_count())) {
+        // The check covers the INITIAL reservation; the table then FOLLOWS the host pool, because the pool is
+        // elastic now and every host-resident image needs its own object entry -- without that the table, not
+        // the pool, is the ceiling, and the elasticity buys nothing (`ensure_host_object_capacity`).
+        // **AND THE POOL MUST BE GROWN BY WHOEVER NEEDS AN ENTRY (2026-09-27).** Following the pool is only
+        // half: a caller that needs a logical destination when the table is full has to make room. The
+        // demote path always did (`allocate_growing`); the capture path did not, and threw instead, which is
+        // what kept `--host-state-slots` load-bearing and cost an in-flight request per recovery under
+        // concurrency. See `reserve_logical_destination_growing` -- the operator's "no fixed slots" needs
+        // both halves, and for a week it had one.
         if (logical_capacity == 0 || device.slot_count() <= 0 ||
             logical_capacity < static_cast<std::uint32_t>(device.slot_count()) ||
             (host != nullptr && logical_capacity < static_cast<std::uint32_t>(device.slot_count()) +
                                                        host->capacity())) {
             throw std::invalid_argument("StateImageStore capacity is inconsistent");
         }
+        // A STACK, maintained with push_back/pop_back throughout. It used to be a pre-sized vector written by
+        // index (`free_objects_[free_object_count_++] = ...`), which is only valid while the vector is never
+        // resized -- and this table now grows. (The same pattern in HostStatePool produced a double
+        // allocation when its container became dynamic; that is why this is converted rather than extended.)
+        free_objects_.reserve(logical_capacity);
         for (std::uint32_t index = 0; index < logical_capacity; ++index) {
-            free_objects_[index] = logical_capacity - 1U - index;
+            free_objects_.push_back(logical_capacity - 1U - index);
         }
         for (std::uint32_t index = 0; index < free_device_slots_.size(); ++index) {
             free_device_slots_[index] =
@@ -126,7 +139,7 @@ public:
     }
 
     [[nodiscard]] std::uint32_t occupied() const noexcept {
-        return capacity() - free_object_count_;
+        return capacity() - static_cast<std::uint32_t>(free_objects_.size());
     }
 
     [[nodiscard]] std::uint32_t device_occupied() const noexcept {
@@ -147,6 +160,27 @@ public:
 
     [[nodiscard]] std::optional<StateImageHandle> reserve_logical_destination() noexcept {
         return allocate(StateImageRole::ReservedDestination, false);
+    }
+
+    // THE GROWING FORM, and it is the half that was missing from "no fixed slots".
+    //
+    // `reserve_logical_destination` is PURE and fails when the object table has no free entry, which is
+    // exactly when `--host-state-slots` was still load-bearing: the capture path threw
+    // `selected capture has no prepared logical State capacity`, the worker recovered, and the in-flight
+    // request 500ed -- repeatedly under the operator's concurrent workload (2026-09-27: three in eleven
+    // minutes, then three more after the search-budget override was removed, so the recoveries track queued
+    // concurrency and NOT that override).
+    //
+    // The pool can already grow -- the demote path has used `host_->allocate_growing()` all along -- and the
+    // ONLY reason a logical destination needed pre-existing capacity is that nobody asked. `reserve_slots`
+    // pins one more slot and leaves it FREE, so the object table (sized `device slots + host capacity`)
+    // gains an entry and the reservation can proceed; the pool's budget is fail-closed, so a refusal here
+    // simply returns nullopt and the caller behaves exactly as before.
+    [[nodiscard]] std::optional<StateImageHandle> reserve_logical_destination_growing() noexcept {
+        std::optional<StateImageHandle> handle = reserve_logical_destination();
+        if (handle || host_ == nullptr) { return handle; }
+        (void)host_->reserve_slots(1U);
+        return reserve_logical_destination();
     }
 
     [[nodiscard]] std::optional<StateImageHandle> reserve_reset(cudaStream_t stream = nullptr) {
@@ -172,6 +206,21 @@ public:
         device_->zero_slot(*object.device_slot, stream);
         object.content_epoch = next_epoch();
         object.role          = StateImageRole::ActiveMutable;
+    }
+
+    // Zero a reserved Device replica without touching its role or content epoch. A fork
+    // destination is filled by the ops that consume the selector pair, and an op that covers
+    // only part of the image leaves the rest holding the previous occupant's bytes; a root
+    // admission zeroes its slot for that reason (activate_reset) while a fork does not. This
+    // is the fork-side equivalent, used to make a fork destination's untouched regions
+    // deterministic instead of inheriting another sequence's state.
+    void zero_reserved_device_replica(StateImageHandle handle, cudaStream_t stream = nullptr) {
+        Object& object = require(handle);
+        if (object.role != StateImageRole::ReservedDestination || !object.device_slot ||
+            object.source_pins != 0 || object.destination_pinned || has_pending_replica(object)) {
+            throw std::logic_error("StateImage reserved destination is not zeroable");
+        }
+        device_->zero_slot(*object.device_slot, stream);
     }
 
     [[nodiscard]] bool valid(StateImageHandle handle) const noexcept {
@@ -203,6 +252,17 @@ public:
 
     [[nodiscard]] std::uint32_t source_pins(StateImageHandle handle) const {
         return require(handle).source_pins;
+    }
+
+    // Does THIS handle hold a slot in each tier? A pool total cannot answer "was this victim already
+    // demoted", which is what separates a genuinely premature eviction from one where the host tier merely
+    // had room -- and `demotable` is a pool comparison taken BEFORE release, so it counts the victim's own
+    // space as free.
+    [[nodiscard]] bool holds_host_slot(StateImageHandle handle) const noexcept {
+        return valid(handle) && objects_[handle.index_].host_slot.has_value();
+    }
+    [[nodiscard]] bool holds_device_slot(StateImageHandle handle) const noexcept {
+        return valid(handle) && objects_[handle.index_].device_slot.has_value();
     }
 
     [[nodiscard]] std::uint32_t checkpoint_references(StateImageHandle handle) const {
@@ -338,6 +398,11 @@ public:
         return epoch;
     }
 
+    // Still here, and still tested (`test_context_store.cpp` covers the rotation contract). The abort arm
+    // no longer calls it -- it DROPS the recycled checkpoint instead of restoring the epoch, because the
+    // branch is unreachable and the epoch restore is the hazard -- but deleting the primitive deleted a
+    // tested behaviour and broke that test's build, which is not what a disposal should do. The primitive
+    // and the policy that stops using it are separate changes.
     void restore_recycled_checkpoint(StateImageHandle handle, std::uint64_t content_epoch) {
         Object& object = require(handle);
         if (content_epoch == 0 || object.role != StateImageRole::ReservedDestination ||
@@ -348,6 +413,28 @@ public:
         object.content_epoch         = content_epoch;
         object.checkpoint_references = 1;
         object.role                  = StateImageRole::CheckpointImmutable;
+    }
+
+    // #11(b): invariant #6's completeness half. The KV side walks every required page of a checkpoint and
+    // throws when one is missing (`context.cpp:609-679`, `checkpoint_recovery.cpp:127`); nothing
+    // equivalent existed for the StateImage half -- an image could be valid, referenced and role-correct
+    // while having no replica to restore from, and every check would pass until something tried to read
+    // it. This expresses it. A replica in flight is NOT incompleteness: what matters is whether any
+    // replica is settled, which the two slot tests below decide.
+    [[nodiscard]] bool complete(StateImageHandle handle) const noexcept {
+        if (!valid(handle)) { return false; }
+        const Object& object = objects_[handle.index_];
+        // A restorable checkpoint, precisely: immutable (an ActiveMutable image with a slot is not a
+        // checkpoint), with a replica that is present and settled.
+        if (object.role != StateImageRole::CheckpointImmutable) { return false; }
+        if (!object.device_slot && !object.host_slot) { return false; }
+        // A replica in flight is NOT incompleteness: what matters is whether any replica is settled, and
+        // the two slot tests above decide that. The first version tested `has_pending_replica` instead,
+        // which includes an in-flight Device-to-Host demotion (`reserve_device_to_host` sets
+        // `pending_host_slot`, `transfer_id` and `destination_pinned`) -- a checkpoint mid-demotion still
+        // has a readable device slot, so rejecting it would have failed pricing for the whole owner on
+        // healthy traffic.
+        return object.content_epoch != 0;
     }
 
     [[nodiscard]] StateImageSelectors begin_fork(StateImageHandle source,
@@ -459,6 +546,86 @@ public:
                 .destination = *destination_object.device_slot};
     }
 
+    // WOULD A DEMOTE OF THIS IMAGE BE CONSTRUCTIBLE? Non-mutating, and it mirrors
+    // `reserve_device_to_host`'s preconditions exactly WITHOUT taking a host slot -- the seven checks below
+    // are the same seven, in the same order.
+    //
+    // WHY IT EXISTS (2026-09-27): the eviction line reports `demotable=1` from a POOL-level comparison
+    // (`host_state_slots < capacity && host_kv_bytes < capacity`), which cannot say whether THIS victim
+    // could have been demoted. On prod that left bursts unclassifiable -- thirteen restorable victims
+    // evicted with the state pool 8/16 FREE and host KV at 2.03 GB of 32.2, and no way to tell "a demote
+    // was possible and the plan still evicted" from "no demote was possible at all". That distinction is
+    // the operator's ruling, so it needs an instrument rather than an inference.
+    //
+    // The last precondition is deliberately reported as "a host slot exists NOW": whether the pool may GROW
+    // one is the budget's decision, not this predicate's, and conflating the two would make the answer a
+    // guess. `reserve_device_to_host` does grow -- that is the one place it is allowed to -- so a `false`
+    // here means the demote needs a growth whose approval is unknowable from here, and `true` means it can
+    // proceed without one.
+    // WHY a victim could not be demoted, one enumeration for the same nine conditions the execution path
+    // tests. It exists because the boolean made two different failures indistinguishable: an eviction line
+    // reading `demote_possible=0` could not say whether demotion was IMPOSSIBLE (a precondition) or simply
+    // never generated as an option -- and prod showed a victim with `victim_room=1` (its own slots fitted,
+    // there was room) being evicted with `demote_possible=0` in five of eight cases of one burst
+    // (2026-09-27). Without which condition failed, every fix for that is a guess, and this repo has already
+    // aborted the engine once on a guessed change to this decision (`preserving_root_target`, rc=134).
+    enum class DemoteRefusal : std::uint8_t {
+        None,
+        HostTierDisabled,   // no host pool at all (--host-kv-mib 0 / --host-state-slots 0)
+        InvalidHandle,
+        StaleGeneration,    // the handle's generation no longer names this object
+        NotImmutableCheckpoint,  // only an immutable checkpoint may be demoted
+        NotDeviceResident,  // nothing on the device to move
+        AlreadyOnHost,
+        PendingReplica,     // a transfer is already in flight for it
+        PinSaturated,       // source_pins at its maximum
+        NoHostCapacity,     // the pool could not take it
+    };
+
+    [[nodiscard]] DemoteRefusal demote_refusal(StateImageHandle source) const noexcept {
+        if (host_ == nullptr) { return DemoteRefusal::HostTierDisabled; }
+        if (!valid(source)) { return DemoteRefusal::InvalidHandle; }
+        const Object& object = objects_[source.index_];
+        if (object.generation != source.generation_) { return DemoteRefusal::StaleGeneration; }
+        if (object.role != StateImageRole::CheckpointImmutable) {
+            return DemoteRefusal::NotImmutableCheckpoint;
+        }
+        // ALREADY-ON-HOST IS CHECKED BEFORE NOT-DEVICE-RESIDENT, and the order matters for reading, not for
+        // behaviour: both are refusals, but an image whose state sits on the HOST has no device slot, so the
+        // execution path's order (device first) labels it `not-device-resident` -- which reads as "nothing to
+        // move, nowhere near a demote" when the truth is "there is nothing to demote because it was ALREADY
+        // demoted". The first burst after this instrument went live had six of eight victims in exactly that
+        // state (`victim_host_slots=3 victim_dev_slots=0`) and the label made them look unrelated to demotion.
+        if (object.host_slot) { return DemoteRefusal::AlreadyOnHost; }
+        if (!object.device_slot) { return DemoteRefusal::NotDeviceResident; }
+        if (has_pending_replica(object)) { return DemoteRefusal::PendingReplica; }
+        if (object.source_pins == std::numeric_limits<std::uint32_t>::max()) {
+            return DemoteRefusal::PinSaturated;
+        }
+        if (!(host_->capacity() > host_->occupied())) { return DemoteRefusal::NoHostCapacity; }
+        return DemoteRefusal::None;
+    }
+
+    [[nodiscard]] static const char* demote_refusal_name(DemoteRefusal refusal) noexcept {
+        switch (refusal) {
+            case DemoteRefusal::None: return "none";
+            case DemoteRefusal::HostTierDisabled: return "host-tier-disabled";
+            case DemoteRefusal::InvalidHandle: return "invalid-handle";
+            case DemoteRefusal::StaleGeneration: return "stale-generation";
+            case DemoteRefusal::NotImmutableCheckpoint: return "not-immutable-checkpoint";
+            case DemoteRefusal::NotDeviceResident: return "not-device-resident";
+            case DemoteRefusal::AlreadyOnHost: return "already-on-host";
+            case DemoteRefusal::PendingReplica: return "pending-replica";
+            case DemoteRefusal::PinSaturated: return "pin-saturated";
+            case DemoteRefusal::NoHostCapacity: return "no-host-capacity";
+        }
+        return "unknown";
+    }
+
+    [[nodiscard]] bool can_demote_to_host(StateImageHandle source) const noexcept {
+        return demote_refusal(source) == DemoteRefusal::None;
+    }
+
     [[nodiscard]] std::optional<StateImageTransfer>
     reserve_device_to_host(StateImageHandle source) {
         Object& object = require(source);
@@ -467,7 +634,10 @@ public:
             object.source_pins == std::numeric_limits<std::uint32_t>::max()) {
             return std::nullopt;
         }
-        std::optional<qwen3_5::HostStateSlotHandle> target = host_->allocate();
+        // GROWING, and only here: this is the demote path, the one place that should be able to take room
+        // the KV arena is not using rather than failing and letting the caller evict restorable state
+        // (2026-09-26). Every pure path keeps the pure `allocate()`.
+        std::optional<qwen3_5::HostStateSlotHandle> target = host_->allocate_growing();
         if (!target) { return std::nullopt; }
         const std::uint64_t transfer = next_transfer();
         object.pending_host_slot     = *target;
@@ -654,15 +824,50 @@ public:
         object.role          = StateImageRole::Free;
         object.content_epoch = 0;
         if (++object.generation == 0) { ++object.generation; }
-        free_objects_[free_object_count_++] = handle.index_;
+        free_objects_.push_back(handle.index_);
         return true;
     }
 
-    [[nodiscard]] bool can_release(StateImageHandle handle) const noexcept {
-        if (!valid(handle)) { return false; }
+    // WHY a release would be refused, named, so a caller can say which condition held instead of
+    // asserting a leak shape it has not classified. Three of these mean the state image is still OWNED
+    // (a checkpoint references it, or a fork pins it): the release was premature, and the slot is not
+    // unowned. `PendingReplica` and the post-gate `host-release-failed` case are the shapes that could
+    // actually strand a slot.
+    enum class ReleaseBlocker : std::uint8_t {
+        None,
+        InvalidHandle,
+        CheckpointReferences,
+        SourcePins,
+        DestinationPinned,
+        PendingReplica,
+    };
+
+    [[nodiscard]] ReleaseBlocker release_blocker(StateImageHandle handle) const noexcept {
+        if (!valid(handle)) { return ReleaseBlocker::InvalidHandle; }
         const Object& object = objects_[handle.index_];
-        return object.checkpoint_references == 0 && object.source_pins == 0 &&
-               !object.destination_pinned && !has_pending_replica(object);
+        if (object.checkpoint_references != 0) { return ReleaseBlocker::CheckpointReferences; }
+        if (object.source_pins != 0) { return ReleaseBlocker::SourcePins; }
+        if (object.destination_pinned) { return ReleaseBlocker::DestinationPinned; }
+        if (has_pending_replica(object)) { return ReleaseBlocker::PendingReplica; }
+        return ReleaseBlocker::None;
+    }
+
+    [[nodiscard]] const char* release_blocker_name(ReleaseBlocker blocker) const noexcept {
+        switch (blocker) {
+            case ReleaseBlocker::None:                return "none -- the gate passed, so the HOST release failed and the slot was NOT freed";
+            case ReleaseBlocker::InvalidHandle:       return "invalid-handle";
+            case ReleaseBlocker::CheckpointReferences: return "checkpoint-references (still owned)";
+            case ReleaseBlocker::SourcePins:          return "source-pins (still owned)";
+            case ReleaseBlocker::DestinationPinned:   return "destination-pinned (still owned)";
+            case ReleaseBlocker::PendingReplica:      return "pending-replica (may be unowned)";
+        }
+        return "unknown";
+    }
+
+    // Implemented IN TERMS OF the blocker so the two cannot drift apart -- a second copy of this
+    // predicate is how a classifier ends up disagreeing with the thing it classifies.
+    [[nodiscard]] bool can_release(StateImageHandle handle) const noexcept {
+        return release_blocker(handle) == ReleaseBlocker::None;
     }
 
     [[nodiscard]] bool
@@ -701,13 +906,26 @@ private:
                object.transfer_id != 0;
     }
 
+    // Grow the handle table so it covers the host pool's CURRENT capacity. Called before an object is handed
+    // out, never while a reference to an Object is held (the vector may reallocate).
+    void ensure_host_object_capacity() noexcept {
+        if (host_ == nullptr) { return; }
+        const std::size_t required = static_cast<std::size_t>(device_->slot_count()) + host_->capacity();
+        while (objects_.size() < required) {
+            objects_.push_back(Object{});
+            free_objects_.push_back(static_cast<std::uint32_t>(objects_.size() - 1U));
+        }
+    }
+
     [[nodiscard]] std::optional<StateImageHandle> allocate(StateImageRole role,
                                                            bool with_device) noexcept {
-        if (free_object_count_ == 0 || role == StateImageRole::Free ||
+        ensure_host_object_capacity();
+        if (free_objects_.empty() || role == StateImageRole::Free ||
             (with_device && free_device_count_ == 0)) {
             return std::nullopt;
         }
-        const std::uint32_t index = free_objects_[--free_object_count_];
+        const std::uint32_t index = free_objects_.back();
+        free_objects_.pop_back();
         Object& object            = objects_[index];
         object                    = Object{.generation = object.generation, .role = role};
         if (with_device) { object.device_slot = free_device_slots_[--free_device_count_]; }
@@ -768,7 +986,6 @@ private:
     std::vector<Object> objects_;
     std::vector<std::uint32_t> free_objects_;
     std::vector<std::int32_t> free_device_slots_;
-    std::uint32_t free_object_count_  = 0;
     std::uint32_t free_device_count_  = 0;
     std::uint64_t next_content_epoch_ = 0;
     std::uint64_t next_transfer_id_   = 0;

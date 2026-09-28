@@ -13,6 +13,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <span>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -112,6 +114,79 @@ struct ChatTurn {
                                    // template)
     std::optional<CacheBoundary> cache_boundary_after;
 };
+
+// DERIVE A SESSION KEY FOR REQUESTS THAT CARRY NONE -- the V2 fix (613171bd, 2026-09-18) PORTED TO V3.
+//
+// WHY IT IS NEEDED, in V2's own words, because the V3 rewrite reproduced the condition it describes: "the
+// session key is a client-provided hint that only the OpenAI Responses path populates; the anthropic
+// Messages handler never does." V3 today: `ContextCacheHints` on the Messages path is default-constructed,
+// so `out.session_key` is empty, and with it
+//   * `reuse_domain()` falls back to `publication_order` -- PER REQUEST -- so no request can ever share a
+//     reuse domain with an earlier turn of its own conversation, and
+//   * retention is chosen `RecentPrivate` instead of `LiveSession` (`frontend.cpp:434`), so a live session's
+//     units are not protected in the catalog.
+// Measured on prod 2026-09-27 before this: 559 distinct incoming identities against 74 stored ones, and every
+// private-candidate refusal labelled XSESSION-MISMATCH -- a label the candgen guard cannot make meaningful
+// without a key, since its `own_session` test requires one on BOTH sides.
+//
+// THE PREIMAGE IS V2'S, unchanged: FNV-1a (the net's own constants) over the system-prompt text plus the
+// FIRST user turn's text, with a unit separator so a system/user boundary is unambiguous. The system prompt
+// is constant within a deployment and the first user turn is fixed for the life of a conversation, so the key
+// is stable across its turns and changes after a client compaction -- correct, because pre-compaction units
+// no longer match the post-compaction prompt. A conversation with no user text (an image-only first turn)
+// gets NO key and keeps the pre-fix behaviour rather than getting an arbitrary one.
+// THE OTHER HALF OF A JOIN the engine side has been waiting for. `prefill.cpp` hashes the session key onto
+// the sequence (`session_key_hash`, with 0 remapped to 1 so "no key" is distinguishable from a hash that came
+// out zero), and the eviction line prints it as `session=%016llx`. The request log recorded no matching field,
+// so an eviction could not be tied to the request whose state it destroyed -- which is exactly the link that
+// would say whether #6's evictions are what caps reuse at ~31k. This computes the SAME hash over the SAME
+// bytes, so the two logs can be joined on it. Must stay byte-identical to `prefill.cpp`'s loop.
+[[nodiscard]] inline std::uint64_t session_key_hash_of(const std::string& session_key) noexcept {
+    std::uint64_t owner = 1469598103934665603ULL;
+    for (const char byte : session_key) {
+        owner ^= static_cast<std::uint8_t>(byte);
+        owner *= 1099511628211ULL;
+    }
+    return owner == 0 ? 1 : owner;
+}
+
+[[nodiscard]] inline std::optional<std::string> derive_session_key(std::span<const ChatTurn> messages) {
+    const auto text_of = [](const ChatTurn& turn) {
+        std::string out;
+        for (const ContentPart& part : turn.content) {
+            if (part.kind == ContentKind::Text) { out += part.text; }
+        }
+        return out;
+    };
+    std::string preimage;
+    for (const ChatTurn& turn : messages) {
+        if (turn.role == ChatRole::System) {
+            preimage += text_of(turn);
+            preimage += '\x1f';
+        }
+    }
+    std::string first_user;
+    for (const ChatTurn& turn : messages) {
+        if (turn.role == ChatRole::User) {
+            first_user = text_of(turn);
+            break;
+        }
+    }
+    if (first_user.empty()) { return std::nullopt; }
+    preimage += first_user;
+
+    std::uint64_t hash = 1469598103934665603ULL;  // FNV-1a offset basis, the net's own constant
+    for (const unsigned char byte : preimage) {
+        hash ^= static_cast<std::uint64_t>(byte);
+        hash *= 1099511628211ULL;                 // FNV-1a prime
+    }
+    char key[32];
+    const int written = std::snprintf(key, sizeof(key), "derived-%016llx",
+                                      static_cast<unsigned long long>(hash));
+    if (written <= 0 || static_cast<std::size_t>(written) >= sizeof(key)) { return std::nullopt; }
+    return std::string(key, static_cast<std::size_t>(written));
+}
+
 
 // Sampling overrides that have an executable Engine meaning. Protocol-only
 // fields are normalized or rejected before this value is constructed.

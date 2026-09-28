@@ -219,7 +219,10 @@ std::size_t merger_hidden_bytes(const VisionConfig& config, std::size_t merged_t
 
 void copy_host(const void* src, Tensor& dst, cudaStream_t stream) {
     if (dst.bytes() == 0) { return; }
+    // Async on the caller's stream, then settle: the async copy is capture-recordable, the settle
+    // is eager-only, and the caller's buffer is not read after this returns.
     CUDA_CHECK(cudaMemcpyAsync(dst.data, src, dst.bytes(), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
 }
 
 } // namespace

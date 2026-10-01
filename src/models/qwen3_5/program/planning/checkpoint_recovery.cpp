@@ -942,6 +942,19 @@ void note_probe_index(Split& split) {
     split.probe_index = static_cast<std::uint32_t>(split.tokens);
 }
 
+// `probe_index` localises a divergence to a token, and a token index is unreadable on its own: the
+// prompt's per-message layout is not retained anywhere a reader can consult. This maps it onto the
+// prompt's OWN message frontiers, so "the match stopped at token 23,401" becomes "the match stopped
+// 8 tokens into message 3, a user turn". Set on the same condition as `probe_index` -- attribution
+// is meaningless when the match did not diverge -- and PROMPT-SIDE ONLY, because the stored
+// ledger's boundaries are not retained: it says nothing about where the STORED render sat.
+template <typename Split>
+void note_divergence_message(const PreparedPromptData& prompt, Split& split) {
+    if (split.match_end != static_cast<std::uint8_t>(MatchEnd::Diverged)) { return; }
+    split.divergence = runtime::attribute_divergence(prompt.identity.message_frontiers,
+                                                     prompt.identity.message_roles, split.tokens);
+}
+
 [[nodiscard]] inline TokenMatch deepest_token_match(std::span<const TokenId> prompt,
                                                     std::span<const TokenId> stored) {
     const std::size_t limit = std::min(prompt.size(), stored.size());
@@ -962,6 +975,7 @@ ProgramImpl::PrefixSplit ProgramImpl::prefix_split(const ContinuationHandle& own
     split.match_end                     = static_cast<std::uint8_t>(continuation_match.end);
     split.stored                        = static_cast<std::uint32_t>(sequence.ledger.size());
     note_probe_index(split);
+    note_divergence_message(prompt, split);
     if (split.match_end == static_cast<std::uint8_t>(MatchEnd::Diverged)) {
         probe_divergence(prompt.token_ids, sequence.ledger, split.tokens);
     }
@@ -1007,6 +1021,7 @@ ProgramImpl::PrefixSplit ProgramImpl::prefix_split(const SharedPrefixHandle& own
     split.match_end               = static_cast<std::uint8_t>(shared_match.end);
     split.stored                  = static_cast<std::uint32_t>(shared.identity->ledger().size());
     note_probe_index(split);
+    note_divergence_message(prompt, split);
     if (split.match_end == static_cast<std::uint8_t>(MatchEnd::Diverged)) {
         probe_divergence(prompt.token_ids, shared.identity->ledger(), split.tokens);
     }

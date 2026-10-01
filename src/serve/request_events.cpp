@@ -31,6 +31,7 @@ RequestLogContext make_request_log_context(std::uint64_t id, std::string protoco
     context.session_key                       = metadata.session_key;
     context.client_session_id                 = metadata.client_session_id;
     context.session_key_hash                  = metadata.session_key_hash;
+    context.explicit_cache_markers            = metadata.explicit_cache_markers;
     context.sampling                          = prepared.sampling;
     context.acquisition_seconds               = prepared.acquisition_seconds;
     context.preparation                       = prepared.preparation;
@@ -56,6 +57,17 @@ RequestRejectionLogContext make_request_rejection_log_context(std::uint64_t id,
     context.has_tool_history                   = request.has_tool_history();
     context.requested_reasoning_effort         = request.reasoning_effort;
     context.error                              = std::move(error);
+    return context;
+}
+
+RequestRejectionLogContext make_unparsed_request_rejection_log_context(std::uint64_t id,
+                                                                        std::string protocol,
+                                                                        ApiError error) {
+    RequestRejectionLogContext context;
+    context.id       = id;
+    context.protocol = std::move(protocol);
+    context.error    = std::move(error);
+    context.parsed   = false;   // the body never parsed: every other field here is a default, not a reading
     return context;
 }
 

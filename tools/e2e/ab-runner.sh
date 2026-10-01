@@ -23,10 +23,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 #
 #   BIN=/home/zenz/ninfer-serve-CANDIDATE TAG=ab-cand CTX=32k \
 #     HOST_KV_MIB=6144 HOST_STATE_SLOTS=32 SPEC=none \
-#     START=$HOME/ninfer-e2e/ninfer-start-test-yarn.sh \
-#     WORKLOAD="$HOME/ninfer-e2e/cmp-e2e.py --profile trash" \
+#     START=$HOME/ninfer/tools/e2e/ninfer-start-test-yarn.sh \
+#     WORKLOAD="$HOME/ninfer/tools/e2e/cmp-e2e.py --profile trash" \
 #     TRASH_SESSIONS=6 TRASH_SEED=15000 TRASH_TURN=1500 TRASH_ROUNDS=3 TRASH_OUT=48 \
-#     bash $HOME/ninfer-e2e/ab-runner.sh
+#     bash $HOME/ninfer/tools/e2e/ab-runner.sh
 #
 # After it returns (or a Monitor fires on the sentinel), read:
 #   /tmp/ninfer-ab-serve-$TAG.log   serve log (restore signature: cand>0/reused_tok>0)

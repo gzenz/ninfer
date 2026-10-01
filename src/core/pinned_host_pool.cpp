@@ -37,14 +37,21 @@ bool PinnedHostPool::grow(std::size_t bytes) noexcept {
     const bool allowed =
         policy_ ? policy_(wanted)
                 : (config_.max_bytes == 0U || capacity_ + wanted <= config_.max_bytes);
+    // THE TWO REFUSALS ARE NOT THE SAME EVENT, and counting them together made the difference unreadable:
+    // "the growth policy said no" is a POLICY fact (the reserve, a ceiling, or a failed /proc/meminfo read)
+    // while "pinning actually failed" is a MACHINE fact -- `cudaMallocHost` returning null. Diagnosing one
+    // as the other sends the fix to the wrong place, so they are counted apart and the policy half also
+    // records WHY (see `HostMemoryBudget::last_veto`).
     if (!allowed) {
         ++growth_refusals_;
+        ++growth_policy_refusals_;
         return false;
     }
     const std::size_t slack = config_.alignment - 1U;
     void* const raw = source_ ? source_(wanted + slack) : nullptr;
     if (raw == nullptr) {
-        ++growth_refusals_;  // could not pin: the same outcome for the caller, and counted the same way
+        ++growth_refusals_;
+        ++growth_pin_failures_;
         return false;
     }
     // Align the base HERE rather than trusting the source: `cudaMallocHost` happens to be page-aligned, but
@@ -105,9 +112,28 @@ std::optional<PinnedHostPool::Handle> PinnedHostPool::try_allocate(std::size_t a
     for (std::size_t c = 0; c < chunks_.size(); ++c) {
         Chunk& chunk = chunks_[c];
         if (chunk.base == nullptr) { continue; }
+        // BEST-FIT WITHIN THE CHUNK -- the SMALLEST extent that fits, not the first one met.
+        // First-fit splits from the FRONT of whichever extent it reaches first, so a small request eats into
+        // the largest run: that is how the pool ends up with 2175 MiB free and a 290 MiB largest run, which
+        // cost 25 placement refusals on live traffic (measured 2026-10-01) while a state image needs ~187
+        // MiB. Taking the tightest fitting extent leaves the large runs intact, at the same O(n) cost.
+        //
+        // DELIBERATELY PER-CHUNK, NOT GLOBAL. Chunks must still be consumed in ASCENDING order, because that
+        // is what keeps the newest chunk empty longest and makes `shrink_idle` useful rather than a coin
+        // flip (see the invariant in the header). A global best-fit would scatter allocations into older
+        // chunks with room and strand the newest one PARTLY filled, so `shrink_idle` -- which frees only a
+        // FULLY free chunk -- would stop finding one. That trades a real capability for a local packing win,
+        // and the existing chunk-order test would not have caught it.
+        std::size_t best = chunk.free.size();
         for (std::size_t e = 0; e < chunk.free.size(); ++e) {
+            const Extent& candidate = chunk.free[e];
+            if (candidate.size < aligned_bytes) { continue; }
+            if (best == chunk.free.size() || candidate.size < chunk.free[best].size) { best = e; }
+        }
+        if (best == chunk.free.size()) { continue; }  // nothing in THIS chunk fits; try the next
+        {
+            const std::size_t e = best;
             Extent& extent = chunk.free[e];
-            if (extent.size < aligned_bytes) { continue; }
             const std::size_t offset = extent.offset;
             if (extent.size == aligned_bytes) {
                 chunk.free.erase(chunk.free.begin() + static_cast<std::ptrdiff_t>(e));
@@ -141,12 +167,28 @@ std::optional<PinnedHostPool::Handle> PinnedHostPool::allocate(std::size_t bytes
     if (auto handle = try_allocate(aligned_bytes); handle) { return handle; }
     // Free space could not satisfy it: pin another chunk and retry once. A second failure is final --
     // retrying would spin, and the caller needs a definite answer to decide between demoting and evicting.
+    // (1) THE FIRST ATTEMPT FAILED. If the pool still holds at least `aligned_bytes` FREE, then the failure
+    // was PLACEMENT and not size -- that is the fragmentation signature, and it is the counter that can
+    // prove it. The first version of this instrument counted the POST-GROW failure instead and called that
+    // the proof; a review showed that path is UNREACHABLE (`grow()` pins a fresh extent of at least
+    // `aligned_bytes`, so the retry always fits), which meant the counter asserting "fragmentation is real"
+    // could never fire while the real fragmentation path was counted nowhere. Measured 2026-10-01:
+    // `free_bytes` 1798 MiB against `largest_free_run` 90 MiB, with a state image needing ~187 MiB -- the
+    // pool held far more than enough BYTES and no single place to put one.
+    if (free_bytes() >= aligned_bytes) { ++allocation_fragmented_misses_; }
     if (!grow(aligned_bytes)) {
+        // (2) NO ROOM AND GROWTH REFUSED -- a RAM/policy fact: the pool could neither place it nor grow.
         ++allocation_refusals_;
+        ++allocation_ram_refusals_;
         return std::nullopt;
     }
     if (auto handle = try_allocate(aligned_bytes); handle) { return handle; }
+    // (3) GREW AND STILL COULD NOT PLACE IT. Believed UNREACHABLE -- see (1); kept as a contract check
+    // rather than as evidence, because if it ever fires the growth guarantee is broken and that is worth
+    // knowing. Do NOT read it as fragmentation: it would mean the pool could not use a chunk it had just
+    // pinned, which is a different and much worse fault.
     ++allocation_refusals_;
+    ++allocation_post_grow_failures_;
     return std::nullopt;
 }
 

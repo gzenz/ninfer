@@ -5,11 +5,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # MUST run as ONE blocking foreground command (this session runs on prod;
 # the e2e server 400s on its prompts, so the session is frozen for the swap).
 #
-#   bash ~/ninfer-e2e/e2e-swap-cmp.sh
+#   bash tools/e2e/e2e-swap-cmp.sh
 #     -> OURS + official v2 artifact, window A (focused+p13+p14, 32k ctx)
-#   START=~/ninfer-e2e/ninfer-start-test-upstream.sh bash ~/ninfer-e2e/e2e-swap-cmp.sh
+#   START=tools/e2e/ninfer-start-test-upstream.sh bash tools/e2e/e2e-swap-cmp.sh
 #     -> UPSTREAM + official v3 artifact, window A
-#   CTX=200k WORKLOAD=~/ninfer-e2e/c1-probe.py bash ~/ninfer-e2e/e2e-swap-cmp.sh
+#   CTX=200k WORKLOAD=tools/e2e/c1-probe.py bash tools/e2e/e2e-swap-cmp.sh
 #     -> C1 probe (2x200k anthropic, prod-parity sizing)
 #
 # Env:

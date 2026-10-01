@@ -990,6 +990,99 @@ int test_adjacent_tool_message_boundary() {
                  "adjacent Tool messages lost their exact intermediate message boundary");
 }
 
+// THE IDENTITY'S MESSAGE BOUNDARIES. The split records WHERE in the prompt a token divergence
+// falls, by mapping the divergence token onto these frontiers -- so if this carry is empty or the
+// roles are misaligned, every divergence in the request log is attributed to "message 0, a system
+// turn", which is exactly what an unwired field reads like. Asserted through `Frontend::prepare`,
+// not through the encoder, because the encoder's own boundaries are covered above and it is the
+// PREPARE path onto `identity` that nothing exercised.
+int test_identity_message_boundaries() {
+    const Frontend frontend = make_frontend(resources(), false);
+    ninfer::PromptInput input;
+    for (const auto role : {ninfer::ChatRole::User, ninfer::ChatRole::Assistant,
+                            ninfer::ChatRole::Tool}) {
+        ninfer::ChatMessage message;
+        message.role = role;
+        message.parts.push_back({.text = "content"});
+        input.messages.push_back(std::move(message));
+    }
+    const auto prepared = frontend.prepare(std::move(input));
+    const auto& identity = FrontendFactory::inspect(prepared).identity;
+
+    int failures = check(identity.message_roles.size() == 3 &&
+                             identity.message_roles[0] == ninfer::ChatRole::User &&
+                             identity.message_roles[1] == ninfer::ChatRole::Assistant &&
+                             identity.message_roles[2] == ninfer::ChatRole::Tool,
+                         "the prompt identity did not carry the input messages' roles in order");
+    failures += check(identity.message_frontiers.size() == 4,
+                      "the message frontiers must be one per message plus the end of the prompt");
+    std::optional<std::uint32_t> previous;
+    for (const std::optional<std::uint32_t>& frontier : identity.message_frontiers) {
+        if (!frontier) { continue; }
+        if (previous && *frontier <= *previous) {
+            return failures + check(false, "message frontiers must be strictly increasing");
+        }
+        previous = frontier;
+    }
+    failures += check(previous.has_value(),
+                      "no message frontier was carried at all -- the divergence attribution would "
+                      "report message 0 for every prompt");
+    // `!previous` is already reported above; asserting it again here would print a second failure
+    // for the same cause and read as two independent defects.
+    failures += check(!previous || *previous <= FrontendFactory::inspect(prepared).token_ids.size(),
+                      "a message frontier lies beyond the prompt it indexes");
+
+    // THE PROCESSOR'S OWN OUTPUT, driven directly. `Frontend::prepare` has TWO branches and the test
+    // above only reaches the encoder one; the media branch assembles `ProcessedInput` through
+    // `Processor::process`, and its role carry was a separate assignment -- the copy this test exists
+    // because it was MISSING there. Text-only messages are enough: the branch is about which producer
+    // runs, not about media.
+    {
+        auto media_cache = std::make_shared<fi::MediaPreprocessCache>(1U << 20, 1U << 20);
+        const fi::Processor processor(fixture_tokenizer(), thinking_toggle_template(),
+                                      fi::ProcessorOptions{}, std::move(media_cache));
+        std::vector<fi::ChatMessage> messages;
+        for (const auto role : {ninfer::ChatRole::System, ninfer::ChatRole::User}) {
+            messages.push_back(chat_message(role, "content"));
+        }
+        const fi::ProcessedInput processed = processor.process(messages);
+        failures += check(processed.message_roles.size() == 2 &&
+                              processed.message_roles[0] == ninfer::ChatRole::System &&
+                              processed.message_roles[1] == ninfer::ChatRole::User,
+                          "Processor::process did not carry the input messages' roles");
+        failures += check(processed.message_boundaries.size() == 3,
+                          "Processor::process did not carry one message boundary per message plus the "
+                          "end of the prompt");
+    }
+
+    // THE OTHER BRANCH OF `Frontend::prepare` -- the one that runs on every MEDIA request. Driving
+    // `Processor::process` directly (above) covers the producer but NOT this branch's own two
+    // assignments, and a review demonstrated it: removing `identity.message_frontiers = message_boundaries`
+    // and removing `identity.message_roles = std::move(processed.message_roles)` from the media branch
+    // both SURVIVED this whole file. The test's own comment claimed the branch is why it exists; this is
+    // that branch, reached the way production reaches it.
+    {
+        const Frontend media = make_frontend(resources());  // vision enabled
+        const auto prepared_media = media.prepare(image_input());
+        const auto& identity = FrontendFactory::inspect(prepared_media).identity;
+        failures += check(identity.message_roles.size() == 1 &&
+                              identity.message_roles[0] == ninfer::ChatRole::User,
+                          "the MEDIA branch of Frontend::prepare did not carry the input roles, so every "
+                          "divergence on an image request reports no role");
+        failures += check(identity.message_frontiers.size() == 2,
+                          "the MEDIA branch of Frontend::prepare did not carry one message frontier per "
+                          "message plus the end of the prompt");
+        std::optional<std::uint32_t> seen;
+        for (const std::optional<std::uint32_t>& frontier : identity.message_frontiers) {
+            if (frontier) { seen = frontier; }
+        }
+        failures += check(seen.has_value(),
+                          "the MEDIA branch carried no message frontier at all -- the divergence "
+                          "attribution would report message 0 for every image request");
+    }
+    return failures;
+}
+
 int test_literal_cache_boundary() {
     const auto compiled = fi::CompiledChatTemplate::resolve(
         "{{ '<think>' if messages|length == 1 else messages[0].content }}"
@@ -2173,6 +2266,7 @@ int main() {
     failures += test_assistant_continuation();
     failures += test_rewrite_checkpoint_trace();
     failures += test_adjacent_tool_message_boundary();
+    failures += test_identity_message_boundaries();
     failures += test_literal_cache_boundary();
     failures += test_selected_template_recovery_boundary();
     failures += test_official_resource_guards();

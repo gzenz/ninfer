@@ -23,6 +23,9 @@ std::string sse_error_event(const ApiError& error) {
 } // namespace
 
 void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::Response& res) {
+    // TAKEN BEFORE THE PARSE, so a request rejected on the way in still carries an id.
+    const std::uint64_t req_id = ++request_seq_;
+
     OpenAIChatRequest request;
     try {
         RequestLimits limits;
@@ -30,11 +33,18 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
         request                   = parse_chat_completion_request(parse_json_body(req), limits);
         validate_openai_model(request.model, public_model_id_);
     } catch (const ApiException& exception) {
-        write_openai_error(res, exception.error());
+        // LOGGED, WHICH IT WAS NOT BEFORE -- the same silence the anthropic handler had: the error went to
+        // the client and NOTHING was recorded, so a parse-time rejection left the journal and the request
+        // log looking idle while the client saw a 4xx. The generic branch below always logged.
+        const ApiError error = exception.error();
+        record_request_rejected(
+            make_unparsed_request_rejection_log_context(req_id, "openai_chat_completions", error));
+        operational_log_.http_failure(
+            "openai_chat_completions",
+            make_request_failure(RequestFailurePhase::Http, error));
+        write_openai_error(res, error);
         return;
     }
-
-    const std::uint64_t req_id = ++request_seq_;
     const RequestLogMetadata metadata{.model                  = request.model,
                                       .stream                 = request.stream,
                                       .output_tokens_explicit = request.output_tokens_explicit};

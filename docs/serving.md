@@ -5,6 +5,8 @@ Anthropic-compatible HTTP endpoints over one resident NInfer Engine.
 
 ## Start the server
 
+See [CUDA synchronization](cli.md#cuda-synchronization) for the shared `NINFER_CUDA_SYNC` setting.
+
 ```bash
 ./build/apps/ninfer-serve models/qwen3_8_27b_nvfp4.ninfer \
   --host 127.0.0.1 \
@@ -908,6 +910,30 @@ wait. The nested `decode` object reports the request's decode-class Host exposur
 round count; `units` reports its prefill/control unit counts. In a compact batch every participating
 request is delayed by the full round, so these values explain request latency but **must not be
 summed across concurrent requests**.
+
+`request_done.engine_timing.ttft_window` is the only object in the record scoped to the **first-token
+window**, which is the window `ttft` — and therefore `proc = ttft - queue`, the number the monitor reports —
+is defined over. `host_exposed_seconds.total` and `device_wait_exposed_seconds` above are whole-request
+figures, so subtracting them from `ttft` compares two different windows; measured on 290 e2e records that
+mixed residual had a median of -7 ms while 33 records carried a median 3.5 s, and the host term in it was
+whole-request. `ttft_window` carries `host_exposed_seconds` and `device_wait_seconds` as copies of those
+accumulators taken **where `first_token` is set**, which is after that round's `program_call.finish()` has
+recorded the round's device wait — plus the
+`prefill_seconds` the record already reports and
+`unaccounted_seconds = ttft - queue_wait_seconds - host_exposed_seconds - device_wait_seconds`.
+**The subtrahend is the DEVICE WAIT, not `prefill_seconds`, and that is a correction**: `prefill_seconds` is program wall time and already contains the same `program_submit`/`program_post` host time `host_exposed_seconds` does, so subtracting both double-counted the host term and drove the value negative (measured: min -622 ms, 78 of 290 below -10 ms). With the device-wait form the same records read min +0.6 ms. **Non-negative means NOT OVER-INCLUSIVE, not complete** -- anything the window misses inflates it, and 65 of 290 records exceed 50 ms (range 61-428 ms, 47 of them clustered at the ~400 ms planner search budget), unattributed.
+`unaccounted_seconds` is **`null`, not zero**, when the window was never frozen (a request that produced no
+token); do not read null as a clean zero residual.
+
+`request_done.engine_timing.transfers` is the exception to that rule: `restore_seconds` /
+`restore_pages` (HostToDevice -- resuming a checkpoint) and `demote_seconds` / `demote_pages`
+(DeviceToHost -- parking a victim to make room) are a per-request *volume*, summed from the
+materialization's own `ContextTransferObservation`s, so they **are** additive across requests.
+They exist because the restore runs before prefill starts and therefore lands inside `proc`
+(`ttft - queue`) under no host phase -- a request that resumed a checkpoint otherwise shows a
+proc it cannot account for. `pages` counts KV pages only: the State transfer site reports no page
+count, so a state-only restore is non-zero `restore_seconds` against `restore_pages == 0`, and
+`pages` must not be used as a denominator for `seconds`.
 
 The JSONL file contains no generated response text and never records an API-key value; `argv`
 replaces that value with `<redacted>`. Operational stderr summaries are rounded and are not the

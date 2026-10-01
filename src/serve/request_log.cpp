@@ -203,6 +203,13 @@ Json request_json(const RequestLogContext& context) {
                 {"model", context.model},
                 {"stream", context.stream},
                 {"message_count", context.message_count},
+                // HOW MANY EXPLICIT `cache_control` BREAKPOINTS THE CLIENT SENT. The denominator for the
+                // 2026-10-01 regression: explicit markers become shared-prefix candidates, so "is the
+                // planner's work proportional to the markers?" has no per-request answer without it --
+                // which is what made that regression unattributable between the input and the engine.
+                // ANTHROPIC PATH ONLY: the OpenAI translators do not separate explicit from automatic
+                // markers, so they log 0 -- read that as "not counted", never as "the client sent none".
+                {"explicit_cache_markers", context.explicit_cache_markers},
                 {"media_item_count", context.media_item_count},
                 {"requested_output_tokens", context.requested_output_tokens},
                 {"requested_output_tokens_source",
@@ -249,7 +256,15 @@ Json preparation_json(const RequestLogContext& context) {
 }
 
 Json rejected_request_json(const RequestRejectionLogContext& context) {
+    // A RECORD THAT SAYS WHAT IT DOES NOT KNOW. Every field below is rendered with its DEFAULT when the
+    // body never parsed -- so `tool_choice: "auto"` and `requested_output_tokens_source: "server_default"`
+    // are INVENTED values, not observations, and the record read as a request that happened to have zero
+    // messages rather than one that was never parsed at all. `parsed:false` and the `phase` beside it are
+    // what let a reader tell those apart; the comment on the producer claimed the record "says so" when it
+    // did not (measured 2026-10-01).
     return Json{{"request_id", context.id},
+                {"parsed", context.parsed},
+                {"phase", context.parsed ? "prepare" : "parse"},
                 {"protocol", context.protocol},
                 {"model", context.model},
                 {"stream", context.stream},
@@ -316,13 +331,30 @@ Json materialization_json(const ninfer::MaterializationDiagnostics& diagnostics)
         {"budget_exhausted", diagnostics.budget_exhausted},
         {"selected_degradation_units", diagnostics.selected_degradation_units},
         {"selected_maximal_fallback", diagnostics.selected_maximal_fallback},
-        // #6 (2026-09-27): the decisive pair. Both non-zero in one request means a plan that preserved a
+        // #6 (2026-09-27): the pair, with its denominator below. Both non-zero in one request means a plan that preserved a
         // restorable checkpoint was assessed FEASIBLE and a plan that destroyed one was taken anyway --
         // the defect surviving. `chosen_restorable_evictions > 0` with the other at 0 is the honest other
         // case: nothing feasible preserved, which is what the KV-saturated prod evictions looked like.
         {"feasible_preserving_alternatives", diagnostics.feasible_preserving_alternatives},
+        // ITS DENOMINATOR: assessed preserving targets, goal or no goal. Without it a 0 in the field above
+        // cannot be told from "no preserving option was ever assessed" -- which is the #6 shape.
+        {"preserving_alternatives_assessed", diagnostics.preserving_alternatives_assessed},
+        // WHERE the run's goal probes came from, by planner call site, plus how many targets it visited.
+        // Without these, "4,630 probes" is a total with no shape.
+        {"goal_probes_by_site",
+         Json::array({diagnostics.goal_probes_by_site[0], diagnostics.goal_probes_by_site[1],
+                      diagnostics.goal_probes_by_site[2], diagnostics.goal_probes_by_site[3],
+                      diagnostics.goal_probes_by_site[4]})},
+        {"targets_assessed", diagnostics.targets_assessed},
         {"chosen_restorable_evictions", diagnostics.chosen_restorable_evictions},
+        // The total WITH its split, because the total alone conflates two opposite populations: a target
+        // that was never physically feasible (no probe was made, the refusal is CAPACITY) and one that was
+        // feasible and refused by the goal gate (the refusal is the CATALOG). See the header comment.
         {"assessed_targets_without_goal", diagnostics.assessed_targets_without_goal},
+        {"assessed_targets_without_goal_infeasible",
+         diagnostics.assessed_targets_without_goal_infeasible},
+        {"assessed_targets_without_goal_unadoptable",
+         diagnostics.assessed_targets_without_goal_unadoptable},
         // THE CANDIDATE SET, per request. `longer_lost` true beside a `best_loser_reuse` above
         // `chosen_reuse` is the defect: a longer source was available and refused. Each row then says what
         // happened to that candidate -- how many goal probes it got, how many produced an adoptable goal,
@@ -358,6 +390,18 @@ Json materialization_json(const ninfer::MaterializationDiagnostics& diagnostics)
         // WHERE THE DEEPEST MATCH STOPPED, as an index. The 12-id windows that used to be emitted beside it
         // were removed 2026-09-28: they had answered their question and they carried user content.
         {"split_probe_index", diagnostics.split_probe_index},
+        // WHICH TURN OF THE PROMPT'S OWN HISTORY that stop fell in, and its role (a ChatRole value;
+        // 255 means no message starts at that index -- the end-of-prompt boundary). PROMPT-SIDE ONLY,
+        // and meaningful only when split_ended_by is 0 (a divergence); see the diagnostics comment.
+        {"split_message_index", diagnostics.split_message_index},
+        {"split_message_offset", diagnostics.split_message_offset},
+        {"split_message_role", diagnostics.split_message_role},
+        {"split_past_last_message", diagnostics.split_past_last_message},
+        // THE ARENA CEILING, in the request's own record. `http_server.cpp`'s delta gate says this must
+        // reach the record "or the per-request story cannot say why the plan was short" -- and it did NOT:
+        // the flag went to the aggregate counter only, so the comment described an emission that did not
+        // exist. It is emitted here now.
+        {"target_arena_truncated", diagnostics.target_arena_truncated},
         {"session_cell_frontier", diagnostics.session_cell_frontier},
         {"session_cell_offered", diagnostics.session_cell_offered},
         {"session_cell_skip", diagnostics.session_cell_skip},
@@ -395,7 +439,37 @@ double request_host_exposed_seconds(const ninfer::GenerationEngineTiming& timing
            timing.engine_maintenance_exposed_seconds;
 }
 
-Json request_engine_timing_json(const ninfer::GenerationEngineTiming& timing) {
+Json request_engine_timing_json(const ninfer::GenerationEngineTiming& timing, double ttft_seconds,
+                                double prefill_seconds) {
+    // THE FIRST-TOKEN WINDOW, and the residual over it. `proc = ttft - queue` is what the monitor reads,
+    // and no field in the record shared its window until these: `host_exposed_seconds.total` and
+    // `device_wait_exposed_seconds` both run for the WHOLE request, so subtracting them from `ttft` mixed
+    // two windows. These are all scoped to the first token.
+    //
+    // **THE SUBTRAHEND IS `ttft_device_wait_seconds`, NOT `prefill_seconds`, AND THAT IS A CORRECTION.**
+    // The first version subtracted `prefill_seconds`, whose value is program WALL time -- it ALREADY
+    // contains the `program_submit`/`program_post` host time that `ttft_host_exposed_seconds` also
+    // contains, so the host term was subtracted TWICE and the "residual" went negative. Measured on the
+    // 2026-10-01 run: the emitted field had min **-622 ms with 78 of 290 records below -10 ms**, while the
+    // same records' `ttft - queue - ttft_host - ttft_device_wait` had min **+0.6 ms and 0 below -10**. The
+    // verification used the second form and the record emitted the first -- **the check and the artifact
+    // were different quantities**, which is how a broken residual passed as a verified one. `plan.md` drew
+    // a conclusion from the broken form ("no residual left to explain on QA") and that conclusion is void.
+    //
+    // WHAT THIS NUMBER IS AND IS NOT: with the placement correct it is NON-NEGATIVE, because the window's
+    // terms cannot exceed the wall it sits in. **So a non-negative value means NOT OVER-INCLUSIVE and
+    // nothing more -- it is NOT evidence of completeness.** Anything the window misses inflates it, so an
+    // early or incomplete window also reads non-negative; completeness would require the value to equal the
+    // known unattributed terms (planner search inside the first-token window, and the commit phase's own
+    // host time before the token). Measured: 65 of 290 records exceed 50 ms (range 61-428 ms), 47 of them
+    // clustered at the ~400 ms planner search budget, which is one such term and is NOT attributed.
+    // `nullopt` -- emitted as null -- when the window was never frozen (no token); do NOT read null as zero.
+    const std::optional<double> ttft_residual =
+        timing.ttft_window_frozen
+            ? std::optional<double>(ttft_seconds - timing.queue_wait_seconds -
+                                    timing.ttft_host_exposed_seconds -
+                                    timing.ttft_device_wait_seconds)
+            : std::nullopt;
     return Json{
         {"queue_wait_seconds", timing.queue_wait_seconds},
         {"host_exposed_seconds",
@@ -405,6 +479,21 @@ Json request_engine_timing_json(const ninfer::GenerationEngineTiming& timing) {
               {"engine_commit_output", timing.engine_commit_output_exposed_seconds},
               {"engine_maintenance", timing.engine_maintenance_exposed_seconds},
               {"total", request_host_exposed_seconds(timing)}}},
+        // Context transfers this request's own admission caused: the HostToDevice restore
+        // that resumed its checkpoint, and the DeviceToHost demotes it forced to make room.
+        // Reported as volume (additive across requests), unlike the host-exposed figures
+        // above, which are latency exposure and must not be summed.  It is the only place
+        // the restore appears: it runs before prefill starts, so it is inside `proc` and
+        // under no host phase.
+        {"ttft_window",
+         Json{{"host_exposed_seconds", timing.ttft_host_exposed_seconds},
+              {"device_wait_seconds", timing.ttft_device_wait_seconds},
+              {"prefill_seconds", prefill_seconds},
+              {"unaccounted_seconds", ttft_residual}}},
+        {"transfers", Json{{"restore_seconds", timing.restore_seconds},
+                           {"restore_pages", timing.restore_pages},
+                           {"demote_seconds", timing.demote_seconds},
+                           {"demote_pages", timing.demote_pages}}},
         {"device_wait_exposed_seconds", timing.device_wait_exposed_seconds},
         {"decode", Json{{"host_exposed_seconds", timing.decode_host_exposed_seconds},
                         {"device_wait_exposed_seconds", timing.decode_device_wait_exposed_seconds},
@@ -602,7 +691,10 @@ std::string format_request_rejected_json(const std::string& server_instance_id,
                                          std::uint64_t timestamp,
                                          const RequestRejectionLogContext& context) {
     Json record       = event_base(server_instance_id, timestamp, "request_rejected");
-    record["phase"]   = "prepare";
+    // DERIVED, so the top-level phase and the one inside `request` cannot disagree. It was hardcoded
+    // "prepare" while the nested field said "parse" for an unparsed body -- one record, two phases, and a
+    // reader had no way to tell which was meant.
+    record["phase"]   = context.parsed ? "prepare" : "parse";
     record["request"] = rejected_request_json(context);
     record["error"]   = error_json(context.error);
     return record.dump();
@@ -634,7 +726,8 @@ std::string format_request_done_json(const std::string& server_instance_id, std:
         {"prepare", outcome.metrics.prepare_seconds}, {"ttft", outcome.metrics.ttft_seconds},
         {"vision", outcome.metrics.vision_seconds},   {"prefill", outcome.metrics.prefill_seconds},
         {"decode", outcome.metrics.decode_seconds},   {"total", outcome.metrics.total_seconds}};
-    record["engine_timing"]   = request_engine_timing_json(outcome.metrics.engine_timing);
+    record["engine_timing"]   = request_engine_timing_json(
+        outcome.metrics.engine_timing, outcome.metrics.ttft_seconds, outcome.metrics.prefill_seconds);
     record["speculative"]     = speculative_json(outcome.metrics);
     record["materialization"] = materialization_json(outcome.metrics.materialization);
     return record.dump();
@@ -830,6 +923,9 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
              {"search_budget_exhaustions",
               monotonic_delta(previous.pressure_search_budget_exhaustions,
                               current.pressure_search_budget_exhaustions)},
+             {"target_arena_truncations",
+              monotonic_delta(previous.pressure_target_arena_truncations,
+                              current.pressure_target_arena_truncations)},
              {"maximal_fallback_selections",
               monotonic_delta(previous.pressure_maximal_fallback_selections,
                               current.pressure_maximal_fallback_selections)},

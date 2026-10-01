@@ -413,6 +413,10 @@ private:
                                                current_decode_contains(exposure.lane));
         }
         worker_accounted_elapsed_ns_ += timing.elapsed_ns();
+        // The freeze is NOT here -- see `record_committed_output`. This function runs BEFORE the commit
+        // that sets `first_token` (`program_call.finish` in `commit_pending` precedes
+        // `record_committed_output`), so the loop that lived here
+        // could only ever fire a round late.
     }
 
     void finish_program_call(const HostPhaseMeasurement& measurement,
@@ -675,6 +679,13 @@ private:
         BackfillClass backfill_class   = BackfillClass::None;
         std::uint64_t protection_epoch = 0;
         Clock::time_point started;
+        // Process-wide transfer totals as they stood BEFORE this request's materialization
+        // reserve.  The reserve is itself transfer-producing (it demotes victims to make
+        // room) and so is the restore that follows it, so the baseline has to be taken here
+        // rather than at adoption -- adoption is on the far side of every transfer the
+        // request's admission causes.  The difference is attributed to the request for the
+        // same reason `proc` is: it is time this request waited for.
+        ContextTransferTotals transfer_baseline;
     };
 
     [[nodiscard]] std::optional<GenerationTimingObservation>
@@ -685,7 +696,32 @@ private:
             request->observation.phase_timings || request->observation.live_timings;
         const bool need_now         = !request->first_token || observe_wall;
         const Clock::time_point now = need_now ? Clock::now() : Clock::time_point{};
-        if (!request->first_token) { request->first_token = now; }
+        if (!request->first_token) {
+            request->first_token = now;
+            // FREEZE THE FIRST-TOKEN WINDOW HERE, and the placement is the whole correctness argument.
+            // The first version froze in `finish_program_call`, on the premise that the commit happens
+            // inside the program call -- the code says otherwise. `program_call.finish()` runs BEFORE this
+            // function on both commit paths, so a freeze inside `finish_program_call` could never fire in the
+            // round that produced the token; it fired at the NEXT program call of any kind that had the
+            // request exposed, absorbing that round's remaining commit phase and possibly a whole
+            // `advance_prefill` of an unrelated lane. MEASURED over-inclusion was TENS OF MILLISECONDS, not
+            // seconds (worst -28.0/-20.1/-23.4/-48.9 ms across the four old-placement instances); an
+            // earlier version of this comment said "seconds", which overstated it.
+            // Here the round's `device_wait_ns` is already accumulated and nothing between adds any, so the
+            // window is complete FOR DEVICE WAIT at exactly the right moment. Cite FUNCTIONS, not line
+            // numbers: every citation in the first version was wrong within the hour, because the edits that
+            // added them moved the lines they named.
+            // BIAS, measured and one-sided: this sits INSIDE the CommitOutput `EnginePhaseScope`, and that
+            // phase's own host time reaches the request only at `phase.finish()`. So the
+            // round's commit host time BEFORE `now` is inside the ttft wall but NOT inside
+            // `ttft_host_exposed`, which means it lands in `unaccounted`. The bias can only INFLATE
+            // `unaccounted`, never make it negative, and its size is unmeasured (milliseconds).
+            // It also covers both call sites by construction, and it fixes a case the old placement could
+            // not: a request whose FIRST commit is terminal is removed by `remove_completed_slot` before any
+            // later program call, so it was never frozen at all and reported `null` -- which the request log
+            // documents as "produced no token", the opposite of what it meant.
+            request->host_timing.freeze_ttft_window();
+        }
         if (!observe_wall) { return std::nullopt; }
         if (!request->admitted_at || !request->first_token) {
             throw std::logic_error("committed output has no observed admission boundary");
@@ -1598,6 +1634,23 @@ private:
                     request->backfill_epoch              = control.protection_epoch;
                     request->backfill_class              = control.backfill_class;
                     request->materialization_diagnostics = terminal.diagnostics;
+                    {
+                        // What this request's admission cost in context transfers.  The
+                        // totals are process-monotonic and at most one materialization is
+                        // in flight (the context transaction is a single variant), so the
+                        // difference belongs to this request.  Without this split the
+                        // restore is invisible: it runs before prefill starts and therefore
+                        // lands in `proc` under no host-phase counter.
+                        const ContextTransferTotals now = resources_.transfer_totals();
+                        request->host_timing.restore_ns +=
+                            now.host_to_device_ns - control.transfer_baseline.host_to_device_ns;
+                        request->host_timing.demote_ns +=
+                            now.device_to_host_ns - control.transfer_baseline.device_to_host_ns;
+                        request->host_timing.restore_pages +=
+                            now.host_to_device_pages - control.transfer_baseline.host_to_device_pages;
+                        request->host_timing.demote_pages +=
+                            now.device_to_host_pages - control.transfer_baseline.device_to_host_pages;
+                    }
                     request->model_state                 = EngineRequestState::Prefill;
                     request->host_timing.queue_wait_ns =
                         elapsed_ns(request->submitted, Clock::now());
@@ -1679,6 +1732,7 @@ private:
             .backfill_class   = grant.backfill_class(),
             .protection_epoch = grant.protection_epoch(),
             .started          = Clock::now(),
+            .transfer_baseline = resources_.transfer_totals(),
         };
 
         typename ResourceManagement::MaterializationReserveResult reserved;

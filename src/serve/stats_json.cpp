@@ -105,6 +105,21 @@ std::string format_stats_json(const ninfer::RuntimeStats& s, const ninfer::Memor
         {"shared_owners_degraded", s.pressure_shared_owners_degraded},
         {"shared_owners_evicted", s.pressure_shared_owners_evicted},
         {"shared_owners_replaced", s.pressure_shared_owners_replaced},
+        // THE TWO HALVES, SUMMED. `private_owners_evicted` and `shared_owners_evicted` are BOTH private-or-
+        // shared-scoped, and the `private victim evicted:` journal line is PRIVATE-ONLY (its loop runs over
+        // `transaction.victim_count`), so this is the number to compare against a whole-engine total.
+        // **DO NOT compare it against the request log's `chosen_restorable_evictions` and expect agreement
+        // -- they are DIFFERENT POPULATIONS.** This counts owners COMMITTED as `Evicted`, restorable or not.
+        // That one counts the chosen PLAN's predicted evictions that held a recoverable checkpoint. The
+        // relation is plan-vs-committed, not two scopes of one count, and the disconnect is documented in
+        // the repo (the plan count UNDERCOUNTS the committed set).
+        // **An earlier comment here claimed the halves "add up to what the plan counted", on 13 + 5 = 18 in
+        // one request. A review found a second coincidence (60 and 60) and killed the inference: two
+        // coincidences are not a mechanism.** This field is DERIVED rather than stored, because a third
+        // counter that can drift from its halves is worse than an addition done where they are serialized.
+        {"owners_evicted_total", s.pressure_private_owners_evicted + s.pressure_shared_owners_evicted},
+        // The halves keep their scope-naming and are NOT renamed: `demotable` is the monitor's alert token
+        // and moving what it counts would silently change the meaning of every past reading.
         {"private_evictions_demotable", s.pressure_private_evictions_demotable},
         {"evictions_with_victim_room", s.pressure_evictions_with_victim_room},
         {"private_eviction_checks", s.pressure_private_eviction_checks},
@@ -120,12 +135,18 @@ std::string format_stats_json(const ninfer::RuntimeStats& s, const ninfer::Memor
         {"publication_cell_probes", s.pressure_publication_cell_probes},
         // Uncapped, because the journal line that reports these is rate-limited to 8 then every 512th.
         {"publication_cell_at_risk_runs", s.pressure_publication_cell_at_risk_runs},
+        // WHY GOALS FAILED, UNCONDITIONALLY -- see the RuntimeStats comment. The `veto_*` fields below are
+        // gated on `at_risk != 0` and read 0 on a run where nothing out-reuses the winner, while thousands of
+        // goals can still be refused; these two are the ungated version of the same split.
+        {"goal_blocked_cell_only", s.pressure_goal_blocked_cell_only},
+        {"goal_blocked_other", s.pressure_goal_blocked_other},
         {"publication_cell_veto_goals", s.pressure_publication_cell_veto_goals},
         {"publication_cell_veto_other", s.pressure_publication_cell_veto_other},
         {"publication_cell_veto_reuse", s.pressure_publication_cell_veto_reuse},
         {"checkpoints_dropped", s.pressure_checkpoints_dropped},
         {"searches", s.pressure_searches},
         {"search_budget_exhaustions", s.pressure_search_budget_exhaustions},
+        {"target_arena_truncations", s.pressure_target_arena_truncations},
         {"maximal_fallback_selections", s.pressure_maximal_fallback_selections},
         {"shared_active_references", s.shared_active_references},
         {"actual_context_transfer_seconds", s.actual_context_transfer_seconds},
@@ -166,6 +187,27 @@ std::string format_stats_json(const ninfer::RuntimeStats& s, const ninfer::Memor
         {"host_pinned_chunks", m.host_pinned_chunks},
         {"host_pinned_grows", m.host_pinned_grows},
         {"host_pinned_grow_refusals", m.host_pinned_grow_refusals},
+        // FRAGMENTATION, AND THE REASON A GROWTH WAS REFUSED. The first is the only figure that separates
+        // "full" from "fragmented" -- free bytes can be large while nothing large can be placed -- and the
+        // pool has computed it since the elastic change without exporting it. The rest turn
+        // `host_pinned_grow_refusals` from a total into a diagnosis: policy-vs-pin is where a fix belongs,
+        // and `last_veto` with the reading it came from says whether the machine was short, the policy was
+        // strict, or /proc/meminfo was unreadable (the fail-closed path, which otherwise hides inside the
+        // same number as a full machine).
+        {"host_pinned_largest_free_run_bytes", m.host_pinned_largest_free_run_bytes},
+        {"host_pinned_growth_policy_refusals", m.host_pinned_growth_policy_refusals},
+        {"host_pinned_growth_pin_failures", m.host_pinned_growth_pin_failures},
+        // Allocation failures. `fragmented_misses` is the fragmentation proof -- the first placement failed
+        // while free BYTES were sufficient -- and it is the reachable one; `post_grow_failures` is believed
+        // unreachable and is a growth-contract check, NOT evidence. Neither was exported before.
+        {"host_pinned_allocation_refusals", m.host_pinned_allocation_refusals},
+        {"host_pinned_allocation_ram_refusals", m.host_pinned_allocation_ram_refusals},
+        {"host_pinned_allocation_post_grow_failures", m.host_pinned_allocation_post_grow_failures},
+        {"host_pinned_allocation_fragmented_misses", m.host_pinned_allocation_fragmented_misses},
+        {"host_pinned_reserve_bytes", m.host_pinned_reserve_bytes},
+        {"host_pinned_last_veto", m.host_pinned_last_veto},
+        {"host_pinned_last_wanted_bytes", m.host_pinned_last_wanted_bytes},
+        {"host_pinned_last_veto_mem_available_bytes", m.host_pinned_last_veto_mem_available_bytes},
         {"host_state_pregrow_attempts", m.host_state_pregrow_attempts},
         {"host_state_pregrows", m.host_state_pregrows},
         {"host_state_pregrow_refusals", m.host_state_pregrow_refusals},

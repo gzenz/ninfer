@@ -105,6 +105,10 @@ bool report_has_activity(const ThroughputReport& report) {
                report.previous.pressure_search_budget_exhaustions ||
            report.current.pressure_maximal_fallback_selections !=
                report.previous.pressure_maximal_fallback_selections ||
+           // A capacity ceiling must reach the record too, or a truncated search is only visible in
+           // /stats and the per-request story cannot say why the plan was short.
+           report.current.pressure_target_arena_truncations !=
+               report.previous.pressure_target_arena_truncations ||
            report.current.historical_fork_hits != report.previous.historical_fork_hits ||
            report.current.device_state_occupied_slots !=
                report.previous.device_state_occupied_slots ||

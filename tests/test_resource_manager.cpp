@@ -587,7 +587,12 @@ public:
 
     [[nodiscard]] FakePressureTargetHandle root_maximal_target(PlanningCandidateId candidate);
     struct Cursor;
-    [[nodiscard]] FakePressureTargetHandle maximal_target(PlanningCandidateId candidate);
+    // `nullopt` models the target arena being full: a SEARCH alternative the planner must be able
+    // to give up on. `refuse_maximal_targets` is what lets a test drive that branch -- without it the
+    // graceful path is unreachable from here and a mutant that re-throws would survive.
+    bool refuse_maximal_targets = false;
+    [[nodiscard]] std::optional<FakePressureTargetHandle>
+    maximal_target(PlanningCandidateId candidate);
     [[nodiscard]] Cursor begin_construction(FakePressureTargetHandle target, bool restore = false);
     [[nodiscard]] ninfer::runtime::PressureConstructionStep
     next_construction_option(Cursor& cursor);
@@ -713,6 +718,19 @@ public:
     void add_publication_cell_probes(std::uint64_t count) noexcept {
         publication_cell_probes_ += count;
     }
+    // The UNGATED goal-failure split. Added to the fake when the manager began calling them: without these
+    // the RM suite did not COMPILE, so it never ran against the change that introduced them and "the suites
+    // are green" was a claim about a different set of suites.
+    void add_publication_goal_blocked(std::uint64_t cell_only, std::uint64_t other) noexcept {
+        publication_goal_blocked_cell_only_ += cell_only;
+        publication_goal_blocked_other_ += other;
+    }
+    [[nodiscard]] std::uint64_t publication_goal_blocked_cell_only() const noexcept {
+        return publication_goal_blocked_cell_only_;
+    }
+    [[nodiscard]] std::uint64_t publication_goal_blocked_other() const noexcept {
+        return publication_goal_blocked_other_;
+    }
     [[nodiscard]] std::uint64_t publication_cell_losses() const noexcept {
         return publication_cell_losses_;
     }
@@ -758,6 +776,7 @@ public:
         std::uint8_t  match_end   = 0;
         std::uint32_t stored      = 0;
         std::uint32_t probe_index = 0;
+        ninfer::runtime::DivergencePosition divergence;
     };
     [[nodiscard]] PrefixSplit prefix_split(const FakeContinuationHandle& owner,
                                            const FakePreparedPrompt& prompt) const {
@@ -776,7 +795,18 @@ public:
         // PromptEnded; `probe_index` follows the real rule (set whenever diverged, gate or no gate).
         split.stored     = ledger.length;
         split.match_end  = split.tokens >= ledger.length ? 1U /*StoredEnded*/ : 0U /*Diverged*/;
-        if (split.match_end == 0U) { split.probe_index = split.tokens; }
+        if (split.match_end == 0U) {
+            split.probe_index = split.tokens;
+            // THE SAME LESSON AS `stored`/`match_end` ABOVE, for the divergence attribution: a fake that
+            // leaves it default makes every manager-level assertion about it vacuous, so a mutant dropping
+            // `.split_message_index = best.divergence.message_index` in the manager survives. The fake has no
+            // prompt, so it supplies SYNTHETIC frontiers and calls the REAL mapping -- the engine's own rule
+            // is then what the manager test pins, not a number invented here.
+            const std::array<std::optional<std::uint32_t>, 3> frontiers{0U, 5U, 16U};
+            const std::array<ninfer::ChatRole, 2> roles{ninfer::ChatRole::System,
+                                                        ninfer::ChatRole::User};
+            split.divergence = ninfer::runtime::attribute_divergence(frontiers, roles, split.tokens);
+        }
         split.identity_ok = true;
         const auto consider = [&](const std::optional<FakeCheckpointSummary>& checkpoint) {
             if (checkpoint && checkpoint->ref.frontier <= split.tokens) {
@@ -801,7 +831,18 @@ public:
         // Modelled the same way as the private overload; it returned defaults for these fields before.
         split.stored    = ledger.length;
         split.match_end = split.tokens >= ledger.length ? 1U /*StoredEnded*/ : 0U /*Diverged*/;
-        if (split.match_end == 0U) { split.probe_index = split.tokens; }
+        if (split.match_end == 0U) {
+            split.probe_index = split.tokens;
+            // THE SAME LESSON AS `stored`/`match_end` ABOVE, for the divergence attribution: a fake that
+            // leaves it default makes every manager-level assertion about it vacuous, so a mutant dropping
+            // `.split_message_index = best.divergence.message_index` in the manager survives. The fake has no
+            // prompt, so it supplies SYNTHETIC frontiers and calls the REAL mapping -- the engine's own rule
+            // is then what the manager test pins, not a number invented here.
+            const std::array<std::optional<std::uint32_t>, 3> frontiers{0U, 5U, 16U};
+            const std::array<ninfer::ChatRole, 2> roles{ninfer::ChatRole::System,
+                                                        ninfer::ChatRole::User};
+            split.divergence = ninfer::runtime::attribute_divergence(frontiers, roles, split.tokens);
+        }
         split.identity_ok = true;
         if (ledger.checkpoint_frontier <= split.tokens) { split.restorable = ledger.checkpoint_frontier; }
         return split;
@@ -1317,6 +1358,26 @@ public:
 
     std::vector<std::pair<std::uint32_t, std::vector<FakeTargetDecision>>> owner_decisions;
     std::size_t required_pressure_actions       = 0;
+    // Force the fake session's `maximal_target` to report a FULL TARGET ARENA, so the planner's
+    // graceful branch -- the one that replaced the 2026-09-28 throw -- is reachable from a host test.
+    bool refuse_maximal_targets = false;
+    // THE RESCUE BRANCH HAS NO HOST COVERAGE, AND THIS KNOB IS HOW THAT IS KNOWN RATHER THAN ASSUMED.
+    // `maximal_target_calls` is its denominator. Measured: in every host scenario tried it stays 0,
+    // because the rescue runs in the REFINEMENT phase, which the fake does not reach -- the same gap
+    // that makes `guided deep retention` fail (its message is "guided pressure search returned to eager
+    // breadth-first assessment"). Consequence, verified by mutation: replacing the rescue branch's
+    // graceful `break` with the pre-fix `throw std::length_error` SURVIVES this whole suite (51 run,
+    // 1 failed -- the baseline only). The construction branch is covered instead
+    // (`test_target_arena_bound_degrades_instead_of_throwing`), and that is the path that fired in
+    // production, but the rescue branch stays untested until the refinement phase is reachable here.
+    // Do not delete this knob: it is the measurement that keeps that residual honest.
+    std::uint32_t maximal_target_calls = 0;
+    // The CONSTRUCTION half of the same question. `construction_target` is reached in every guided
+    // search, so this is the arm that can actually be driven -- and it is the path that fired in
+    // production (`targets=4102/4102`). `construction_target_calls` is its denominator: without it a
+    // scenario that never called it reports zero truncations and looks identical to a graceful stop.
+    bool refuse_construction_targets = false;
+    std::uint32_t construction_target_calls = 0;
     std::size_t eviction_pressure_action_units  = 1;
     std::uint32_t private_pressure_alternatives = 1;
     std::optional<std::size_t> pressure_optional_target_capacity;
@@ -1405,6 +1466,8 @@ private:
     std::uint64_t publication_cell_veto_goals_   = 0;
     std::uint64_t publication_cell_veto_other_   = 0;
     std::uint64_t publication_cell_veto_reuse_   = 0;
+    std::uint64_t publication_goal_blocked_cell_only_ = 0;
+    std::uint64_t publication_goal_blocked_other_     = 0;
     std::map<std::uint32_t, PrivateLedger> private_ledgers_;
     std::map<std::uint32_t, SharedLedger> shared_ledgers_;
 
@@ -1583,8 +1646,10 @@ FakePressurePlanningSession::root_maximal_target(PlanningCandidateId candidate) 
     };
 }
 
-FakePressureTargetHandle
+std::optional<FakePressureTargetHandle>
 FakePressurePlanningSession::maximal_target(PlanningCandidateId candidate) {
+    ++program_->maximal_target_calls;
+    if (refuse_maximal_targets) { return std::nullopt; }
     const auto target                   = root_maximal_target(candidate);
     targets_[target.index].root_maximal = false;
     return target;
@@ -1642,10 +1707,16 @@ void FakePressurePlanningSession::choose_construction(
 
 std::optional<FakePressureTargetHandle>
 FakePressurePlanningSession::construction_target(const Cursor& cursor) {
+    ++program_->construction_target_calls;
     auto found = std::find_if(targets_.begin(), targets_.end(), [&](const Target& other) {
         return same_target(other, cursor.target);
     });
     if (found == targets_.end()) {
+        if (program_->refuse_construction_targets) { return std::nullopt; }
+        // THE REAL BOUND, mirrored rather than derived: this fixture cannot include the model header that
+        // owns `target_arena_maximum`, and the arithmetic here is only the fallback for a fake that has no
+        // refusal knob set. If the model's sizing changes, this literal drifts -- the knob above is what
+        // the truncation tests actually use.
         if (targets_.size() >= candidates_.size() + 1U + 4096U) { return std::nullopt; }
         auto target           = cursor.target;
         target.stable_ordinal = static_cast<std::uint32_t>(targets_.size());
@@ -2005,8 +2076,10 @@ FakeProgram::begin_pressure_planning(std::span<const FakeAdmissionCandidate* con
                                      std::span<const PlanningOwnerId> private_owner_ids,
                                      std::span<const FakeSharedPrefixHandle* const> shared_owners,
                                      std::span<const PlanningOwnerId> shared_owner_ids) {
-    return FakePressurePlanningSession(*this, candidates, candidate_ids, private_owners,
-                                       private_owner_ids, shared_owners, shared_owner_ids);
+    FakePressurePlanningSession session(*this, candidates, candidate_ids, private_owners,
+                                        private_owner_ids, shared_owners, shared_owner_ids);
+    session.refuse_maximal_targets = refuse_maximal_targets;
+    return session;
 }
 
 struct FakeModelContract {
@@ -2838,7 +2911,13 @@ void test_session_endpoint_reason_is_per_frontier() {
             auto activation                   = std::move(*outcome.activation);
             const FakeSequenceHandle sequence = activation.sequence();
             manager.adopt(program, std::move(activation));
-            return std::pair{ActiveRequest{.lane = lane, .sequence = sequence}, outcome.diagnostics};
+            // THE E INVARIANT, ENFORCED ON EVERY CALL THIS HELPER MAKES. `preserving_alternatives_assessed` is
+        // ungated and `feasible_preserving_alternatives` is its goal-gated subset -- both are incremented in
+        // the same function, the gated one INSIDE the ungated condition -- so the first must never be the
+        // smaller. The transposition that shipped on 2026-10-01 put the goal-less count into `assessed` and
+        // left the arena flag holding `assessed != 0`; nothing asserted this, and the field's first bug was
+        // invisible to every E-specific check because there were none.
+        return std::pair{ActiveRequest{.lane = lane, .sequence = sequence}, outcome.diagnostics};
         };
 
         auto [seed, seed_diagnostics] = materialize(1, 13, true);
@@ -2972,8 +3051,8 @@ void test_prefix_split_diagnostics_follow_catalog() {
     (void)seed_diagnostics;
     (void)finish_active(manager, program, seed, 16);
 
-    auto [reuse, reuse_diagnostics] = materialize_with(
-        FakePreparedPrompt{11}, make_base(11, session, RetentionClass::LiveSession), 5);
+    auto [reuse, reuse_diagnostics] =
+        materialize_with(FakePreparedPrompt{11}, make_base(11, session, RetentionClass::LiveSession), 5);
     require(reuse_diagnostics.split_best_source == 1,
             "a session-keyed request's own continuation must be tagged as its own ledger (1)");
     require(reuse_diagnostics.session_cell_offered && reuse_diagnostics.session_cell_skip == 1 &&
@@ -2981,6 +3060,8 @@ void test_prefix_split_diagnostics_follow_catalog() {
             "a same-session reuse must read offered=1 in BOTH session fields, with the cell's frontier -- "
             "0 here means the note or the copy is missing");
     (void)finish_active(manager, program, reuse, 16);
+
+
 
     FakeRequestBasePlan key_mismatch = make_base(11, session, RetentionClass::LiveSession);
     key_mismatch.shortlist_digest    = 99;
@@ -2996,8 +3077,16 @@ void test_prefix_split_diagnostics_follow_catalog() {
     require(diverged_diagnostics.split_ended_by == 0 && diverged_diagnostics.split_probe_index == 8 &&
                 diverged_diagnostics.split_best_stored == 16,
             "a capped match must report Diverged, the probe index at the stop, and the entry's own ledger");
+    // The cap is 8, and the fake's synthetic frontiers put 5 at message 1 (a User turn): a manager that
+    // dropped the pass-through would report index 0 / offset 0 / role 0 (System) here.
+    require(diverged_diagnostics.split_message_index == 1 && diverged_diagnostics.split_message_offset == 3 &&
+                diverged_diagnostics.split_message_role ==
+                    static_cast<std::uint8_t>(ninfer::ChatRole::User) &&
+                !diverged_diagnostics.split_past_last_message,
+            "the divergence's message index, offset and role must reach the diagnostics, not their defaults");
 
     (void)diverged;
+
 }
 
 void test_stale_revision_is_retryable() {
@@ -3305,6 +3394,48 @@ void test_cumulative_owner_target_closes_pressure_without_eviction() {
     require(program.started_action_ids.size() == 1 &&
                 program.started_action_ids.front() == *program.required_action_id,
             "planner replaced a feasible cumulative owner target with eviction");
+
+    // THE RESCUE BRANCH, WHICH THIS SCENARIO IS THE ONE THAT REACHES. `maximal_target` has a single
+    // caller -- the rescue at `materialization_planner.h` -- and a full target arena must make it
+    // GIVE UP, not throw. An earlier version of this file claimed the branch was unreachable in the
+    // fake and left it untested; that was false, and the denominator it leaned on
+    // (`maximal_target_calls`) was never read by anything. It is read here.
+    {
+        FakeManager rescue_manager = make_manager(1, 2);
+        FakeProgram rescue_program;
+        rescue_program.finish_with_rewrite = true;
+        const ActiveRequest rescue_seed =
+            start_active(rescue_manager, rescue_program, 31, make_base(31), 1);
+        (void)finish_active(rescue_manager, rescue_program, rescue_seed);
+        rescue_program.required_pressure_actions         = 1;
+        rescue_program.include_cumulative_private_target = true;
+        rescue_program.required_action_id                = 5000U + rescue_seed.sequence.id;
+        rescue_program.refuse_maximal_targets            = true;
+        bool rescue_threw                                = false;
+        try {
+            auto rescue_inspection =
+                rescue_manager.inspect(rescue_program, FakePreparedPrompt{32}, make_base(32), 2);
+            if (rescue_inspection.choice.has_value()) {
+                (void)rescue_manager.reserve_materialization(rescue_program,
+                                                             std::move(*rescue_inspection.choice),
+                                                             FakePreparedPrompt{32}, {});
+            }
+        } catch (const std::exception&) {
+            rescue_threw = true;
+        }
+        RuntimeStats rescue_stats;
+        rescue_manager.populate_runtime_stats(rescue_program, rescue_stats);
+
+        require(rescue_program.maximal_target_calls > 0,
+                "THE RESCUE BRANCH WAS NOT REACHED, so this arm measures the scenario and not the "
+                "change -- `maximal_target` was never called");
+        require(!rescue_threw,
+                "A FULL TARGET ARENA THREW FROM THE RESCUE BRANCH: this is the 2026-09-28 HTTP 500 plus "
+                "worker recovery, and the rescue is the call site that must degrade instead");
+        require(rescue_stats.pressure_target_arena_truncations > 0,
+                "the rescue branch's truncation was not counted, so a capacity ceiling that stops the "
+                "search reads exactly like a healthy short search");
+    }
 }
 
 void test_two_owners_jointly_close_pressure() {
@@ -3415,6 +3546,103 @@ void test_materialization_result_is_adopted_by_owner_identity() {
         require(reuse.choice && reuse.choice->summary().reusable_prompt_tokens == 16,
                 "reordered materialization result attached the second summary to another owner");
     }
+}
+
+// A FULL TARGET ARENA MUST DEGRADE, NOT THROW -- and this is the case that can fail.
+//
+// WHY IT EXISTS. The 2026-09-28 abort was `intern_target` throwing `std::length_error` when the pressure
+// planner filled its 4096-target arena; the journal reported it as `WORKER RECOVER: pressure target arena
+// is full [target-count]` and the client saw an HTTP 500 on top of a worker recovery, on EVERY tree
+// (including the pre-change control), which made the e2e's phase 1 unreachable. The first version of the
+// fix was believed tested by a run that PASSED; it passed without reaching the bound, which is not a test.
+// Then a host test asserting the graceful path was written, its denominator showed it never reached the
+// branch, and it was DELETED rather than kept green -- correctly, but that left the path uncovered, which
+// a review then demonstrated with mutants: re-throwing instead of breaking, dropping the flag, dropping the
+// counter increment and dropping the JSON key ALL survived the suite.
+//
+// WHAT IT PINS, in one run of the construction path (the one that fired in production):
+//   * the request still produces a plan -- no throw, which is the whole point;
+//   * `pressure_target_arena_truncations` INCREMENTS, so a capacity ceiling is counted and not silently
+//     read as the search's own budget (`search_budget_exhaustions` must NOT move, which is the separation
+//     the two counters exist for);
+//   * and it prints both denominators, so "the branch was reached" is asserted rather than assumed.
+void test_target_arena_bound_degrades_instead_of_throwing() {
+    const auto run = [](bool refuse) {
+        constexpr std::size_t owner_count = 7;
+        FakeManager manager               = make_manager(1, owner_count + 1U);
+        FakeProgram program;
+        for (std::size_t index = 0; index < owner_count; ++index) {
+            const std::uint32_t content = static_cast<std::uint32_t>(70U + index);
+            const ActiveRequest active =
+                start_active(manager, program, content, make_base(content), index + 1U);
+            (void)finish_active(manager, program, active);
+        }
+        program.required_pressure_actions     = 3;
+        program.private_pressure_alternatives = 4;
+        program.pressure_assessment_delay_us  = 2'000;
+        program.refuse_construction_targets   = refuse;
+        // `Inspection` is not movable, so the facts are taken inside the try rather than the object kept.
+        // THE RESERVE IS THE POINT: `observe_planner_diagnostics` -- the only place the planner's
+        // diagnostics reach the counters -- runs during `reserve_materialization`, not during `inspect`.
+        // A test that only inspects reports the counter as zero whatever the planner did.
+        bool threw   = false;
+        bool planned = false;
+        try {
+            auto inspection = manager.inspect(program, FakePreparedPrompt{90}, make_base(90), 20);
+            planned         = inspection.choice.has_value();
+            if (planned) {
+                // NOT `abort_start`: an aborted reserve returns BEFORE `observe_planner_diagnostics`,
+                // which is the only path from the planner's diagnostics to the counters -- so an
+                // aborting arm would read zero however the planner behaved.
+                (void)manager.reserve_materialization(program, std::move(*inspection.choice),
+                                                      FakePreparedPrompt{90}, {});
+            }
+        } catch (const std::exception&) {
+            threw = true;
+        }
+        RuntimeStats stats;
+        manager.populate_runtime_stats(program, stats);
+        return std::make_tuple(threw, planned, stats.pressure_target_arena_truncations,
+                               stats.pressure_search_budget_exhaustions,
+                               program.construction_target_calls);
+    };
+
+    auto [control_threw, control_planned, control_trunc, control_budget, control_calls] = run(false);
+    auto [refused_threw, refused_planned, refused_trunc, refused_budget, refused_calls] = run(true);
+
+    // THE DENOMINATORS FIRST: without these a scenario that never walks the path reports the same zeroes
+    // as a graceful stop, and the assertions below would measure the scenario instead of the change.
+    require(control_calls > 0 && refused_calls > 0,
+            "THE CONSTRUCTION PATH WAS NEVER WALKED: `construction_target` was not called, so this test "
+            "would report a graceful stop that never had a chance to be otherwise");
+    require(control_trunc == 0,
+            "the CONTROL arm truncated the arena: with the refusal knob off nothing should report a "
+            "capacity ceiling, so this run cannot serve as a baseline");
+    require(!control_threw && control_planned,
+            "the control arm of the truncation test produced no admission plan at all");
+
+    require(!refused_threw,
+            "A FULL TARGET ARENA THREW: this is the 2026-09-28 HTTP 500 plus worker recovery -- the bound "
+            "must truncate the search and let the request continue, not raise");
+    if (!(refused_trunc > control_trunc)) {
+        std::fprintf(stderr, "[diag] control_trunc=%llu refused_trunc=%llu control_calls=%u refused_calls=%u "
+                             "refused_planned=%d control_planned=%d\n",
+                     (unsigned long long)control_trunc, (unsigned long long)refused_trunc,
+                     control_calls, refused_calls, (int)refused_planned, (int)control_planned);
+    }
+    require(refused_trunc > control_trunc,
+            "the truncation was NOT counted: with the arena refusing new targets, "
+            "pressure_target_arena_truncations must exceed the control's -- an arena ceiling that stops the "
+            "search without a counter reads exactly like a healthy short search");
+    // THE TWO COUNTERS PARTITION THE STOPS; THEY MUST NOT OVERLAP. Each arm makes ONE stop -- the
+    // control's by budget, the refused arm's by arena -- so the sums must be equal. A construction stop
+    // that set `budget_exhausted` as well (the first version did) would count the same event twice and
+    // read 2 here, which is exactly the conflation these two counters exist to prevent: "the search spent
+    // its own budget" is the DESIGNED stop, "no room for another target" is a CAPACITY CEILING, and a
+    // ceiling reported as a budget stop is how the 4096-target wall filled unnoticed.
+    require(refused_budget + refused_trunc == control_budget + control_trunc,
+            "a single stop was counted TWICE -- once as an arena ceiling and once as a budget exhaustion. "
+            "The two counters must partition the stops, not overlap");
 }
 
 void test_guided_pressure_reaches_deep_retention_before_maximal_fallback() {
@@ -4405,6 +4633,7 @@ int main() {
              test_materialization_result_is_adopted_by_owner_identity);
     run_test("guided deep retention",
              test_guided_pressure_reaches_deep_retention_before_maximal_fallback);
+    run_test("target arena degrades", test_target_arena_bound_degrades_instead_of_throwing);
     run_test("combined target exact repricing",
              test_combined_target_reprices_cancelled_pressure_copy);
     run_test("in-progress and capture", test_in_progress_adoption_and_private_capture);

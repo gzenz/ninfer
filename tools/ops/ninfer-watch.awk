@@ -81,5 +81,13 @@ function alert(line) { print line; fflush(); keep(line) }
 # 2026-09-25 wedge invisible.
 /host-arena|single_alloc|admission stalled|admission rejected|subtraction underflow/ { alert($0); next }
 
+# THE FORMERLY FATAL CONDITION, NOW GRACEFUL -- and therefore invisible unless it is alerted on. Until
+# 2026-09-28 a full target arena made `intern_target` throw, which reached the journal as
+# `WORKER RECOVER: pressure target arena is full` and took the request down as an HTTP 500; it is now a
+# SEARCH STOP with its own counter (`pressure_target_arena_truncations`). The alert set is the only place
+# that change is visible during a soak: the counter is in /stats, this line is in the journal, and a
+# truncation that nobody alerts on reads exactly like a healthy short search.
+/pressure search truncated/ { alert($0); next }
+
 # #9's leak shape, #11(a)'s abort branch, #11(b)'s alerting line.
 /non-strict release REFUSED|recycled-checkpoint|checkpoint StateImage INCOMPLETE/ { alert($0); next }

@@ -105,6 +105,44 @@ int main() {
                           batch_row_b.device_wait_exposed_ns == 20,
                       "compact-batch rows did not each receive full elapsed exposure");
 
+    // THE FIRST-TOKEN WINDOW. No test referenced `freeze_ttft_window` or the window's fields, so the
+    // instrument the whole `ttft_window` object exists for had no host coverage at all.
+    {
+        ninfer::runtime::RequestHostTiming row;
+        row.expose_engine(ninfer::runtime::RequestEngineHostPhase::Boundary, 100, false);
+        row.expose_program(shared_program, false);  // submit 10 + device wait 20
+        failures += check(!row.ttft_window_frozen, "the window starts unfrozen");
+        row.freeze_ttft_window();
+        failures += check(row.ttft_window_frozen, "freeze marks the window");
+        // THE EXPECTATION COMES FROM THE FIXTURE'S OWN INPUTS, NOT FROM `host_exposed_ns()`.
+        // The first version asserted a hard-coded 100 (wrong: it forgot `post_host_ns`); the second read
+        // `frozen_host_expected = row.host_exposed_ns()`, which is CIRCULAR -- `freeze_ttft_window` sets
+        // `ttft_host_exposed_ns = host_exposed_ns()`, so both sides called the same function and a dropped
+        // term agreed with itself. The commit review proved it: deleting `program_post_exposed_ns` from
+        // `host_exposed_ns()` left this test GREEN. So the expected value is written out here from the
+        // inputs this block feeds in (a `Boundary` exposure of 100 and `shared_program`'s submit + post),
+        // and `host_exposed_ns()` is asserted against it -- which is what makes a dropped term fail.
+        constexpr std::uint64_t kBoundaryNs = 100;
+        const std::uint64_t frozen_host_expected =
+            kBoundaryNs + shared_program.submit_host_ns + shared_program.post_host_ns;
+        failures += check(row.host_exposed_ns() == frozen_host_expected,
+                          "host_exposed_ns sums all of its terms (a dropped term fails HERE, not silently)");
+        failures += check(row.ttft_host_exposed_ns == frozen_host_expected,
+                          "the frozen host term is the accumulators at the freeze");
+        failures += check(row.ttft_device_wait_ns == 20, "and the device wait likewise");
+        // IDEMPOTENT: a later freeze must NOT move the window, even after more exposure lands. Without this
+        // assertion, a second `freeze_ttft_window()` call overwriting the copy would go unnoticed.
+        row.expose_engine(ninfer::runtime::RequestEngineHostPhase::Boundary, 999, false);
+        row.expose_program(shared_program, false);
+        row.freeze_ttft_window();
+        failures += check(row.ttft_host_exposed_ns == frozen_host_expected,
+                          "a second freeze does NOT move the window (idempotent)");
+        failures += check(row.ttft_device_wait_ns == 20, "nor the device wait");
+        // The LIVE accumulators did move -- the window is a copy, not a view.
+        failures += check(row.host_exposed_ns() > frozen_host_expected,
+                          "the live accumulators keep running after the freeze");
+    }
+
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

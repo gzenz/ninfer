@@ -134,7 +134,7 @@ PressurePlanningSession::root_maximal_target(runtime::PlanningCandidateId root_c
     return impl_->root_maximal_target(root_candidate);
 }
 
-PressureTargetHandle
+std::optional<PressureTargetHandle>
 PressurePlanningSession::maximal_target(runtime::PlanningCandidateId candidate) {
     return impl_->maximal_target(candidate);
 }
@@ -505,6 +505,15 @@ std::uint64_t Program::publication_cell_veto_other() const noexcept {
 std::uint64_t Program::publication_cell_veto_reuse() const noexcept {
     return impl_->publication_cell_veto_reuse();
 }
+void Program::add_publication_goal_blocked(std::uint64_t cell_only, std::uint64_t other) noexcept {
+    impl_->add_publication_goal_blocked(cell_only, other);
+}
+std::uint64_t Program::publication_goal_blocked_cell_only() const noexcept {
+    return impl_->publication_goal_blocked_cell_only();
+}
+std::uint64_t Program::publication_goal_blocked_other() const noexcept {
+    return impl_->publication_goal_blocked_other();
+}
 void Program::add_publication_cell_probes(std::uint64_t count) noexcept {
     impl_->add_publication_cell_probes(count);
 }
@@ -515,7 +524,8 @@ Program::PrefixSplit Program::prefix_split(const ContinuationHandle& owner,
     return PrefixSplit{.tokens = split.tokens, .restorable = split.restorable,
                        .identity_ok = split.identity_ok, .match_end = split.match_end,
                        .stored = split.stored,
-                       .probe_index = split.probe_index};
+                       .probe_index = split.probe_index,
+                       .divergence = split.divergence};
 }
 Program::PrefixSplit Program::prefix_split(const SharedPrefixHandle& owner,
                                           const PreparedPrompt& prompt) const {
@@ -524,7 +534,8 @@ Program::PrefixSplit Program::prefix_split(const SharedPrefixHandle& owner,
     return PrefixSplit{.tokens = split.tokens, .restorable = split.restorable,
                        .identity_ok = split.identity_ok, .match_end = split.match_end,
                        .stored = split.stored,
-                       .probe_index = split.probe_index};
+                       .probe_index = split.probe_index,
+                       .divergence = split.divergence};
 }
 std::uint64_t Program::publication_cell_losses() const noexcept {
     return impl_->publication_cell_losses();

@@ -127,7 +127,24 @@ public:
     // refusal is indistinguishable from a pool that never needed to grow.
     [[nodiscard]] std::uint64_t growth_count() const noexcept { return growth_count_; }
     [[nodiscard]] std::uint64_t growth_refusals() const noexcept { return growth_refusals_; }
+    // The halves of `growth_refusals`, which were one number and meant two different things:
+    // `policy` = the growth policy said no (reserve / ceiling / unreadable meminfo), `pin` = the policy
+    // allowed it and `cudaMallocHost` still failed. Sum is the total.
+    [[nodiscard]] std::uint64_t growth_policy_refusals() const noexcept { return growth_policy_refusals_; }
+    [[nodiscard]] std::uint64_t growth_pin_failures() const noexcept { return growth_pin_failures_; }
     [[nodiscard]] std::uint64_t allocation_refusals() const noexcept { return allocation_refusals_; }
+    // The halves of `allocation_refusals`, which were one number for two different failures:
+    // `ram` = no room and growth refused (RAM/policy), `post_grow` = grew and still could not place it
+    // (believed unreachable; a broken growth contract if it ever fires). Sum is the total.
+    [[nodiscard]] std::uint64_t allocation_ram_refusals() const noexcept { return allocation_ram_refusals_; }
+    [[nodiscard]] std::uint64_t allocation_post_grow_failures() const noexcept {
+        return allocation_post_grow_failures_;
+    }
+    // THE FRAGMENTATION COUNTER: the first placement attempt failed while the pool held at least this much
+    // free. It is the only one that proves the free list, and not memory, refused the request.
+    [[nodiscard]] std::uint64_t allocation_fragmented_misses() const noexcept {
+        return allocation_fragmented_misses_;
+    }
 
 private:
     struct Allocation {
@@ -166,7 +183,12 @@ private:
     std::size_t                       occupied_            = 0;
     std::uint64_t                     growth_count_        = 0;
     std::uint64_t                     growth_refusals_     = 0;
+    std::uint64_t                     growth_policy_refusals_ = 0;
+    std::uint64_t                     growth_pin_failures_    = 0;
     std::uint64_t                     allocation_refusals_ = 0;
+    std::uint64_t                     allocation_ram_refusals_   = 0;
+    std::uint64_t                     allocation_post_grow_failures_ = 0;
+    std::uint64_t                     allocation_fragmented_misses_  = 0;
     std::uint64_t                     revision_            = 1;
 };
 

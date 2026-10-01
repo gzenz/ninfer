@@ -111,6 +111,7 @@ struct ProcessedInput {
     std::optional<RewriteCheckpointSpec> rewrite_checkpoint;
     std::vector<std::uint32_t> rewrite_execution_frontiers;
     std::vector<std::optional<std::uint32_t>> message_boundaries;
+    std::vector<ChatRole> message_roles;
     std::vector<std::optional<std::uint32_t>> cache_boundaries;
     PreprocessStats stats;
 
@@ -131,6 +132,7 @@ struct EncodedChat {
     std::optional<RewriteCheckpointSpec> rewrite_checkpoint;
     std::vector<std::uint32_t> rewrite_execution_frontiers;
     std::vector<std::optional<std::uint32_t>> message_boundaries;
+    std::vector<ChatRole> message_roles;
     std::vector<std::optional<std::uint32_t>> cache_boundaries;
 };
 

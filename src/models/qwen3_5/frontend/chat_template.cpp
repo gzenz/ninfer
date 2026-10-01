@@ -278,6 +278,8 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
     result.media_placeholders           = layout.media_placeholders;
     result.rewrite_execution_boundaries = layout.execution_boundaries;
     result.message_boundaries.resize(messages.size() + 1);
+    result.message_roles.reserve(messages.size());
+    for (const ChatMessage& message : messages) { result.message_roles.push_back(message.role); }
     result.cache_boundaries.resize(options.cache_markers.size());
 
     // Only requested/structural boundaries need proof, independent of history length.

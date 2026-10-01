@@ -4,6 +4,9 @@
 #include "runtime/contract/execution.h"
 #include "runtime/contract/resources.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
+// For `runtime::DivergencePosition`, carried by `PrefixSplit` beside its probe index. Header-only,
+// and it itself includes only ninfer/types.h.
+#include "runtime/engine/context_cache/materialization_budget.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -568,7 +571,10 @@ public:
     identity_target(runtime::PlanningCandidateId candidate) const;
     [[nodiscard]] PressureTargetHandle
     root_maximal_target(runtime::PlanningCandidateId root_candidate);
-    [[nodiscard]] PressureTargetHandle maximal_target(runtime::PlanningCandidateId candidate);
+    // `nullopt` = the target arena is full. A SEARCH alternative, not a required target: the caller
+    // stops searching rather than failing the request (see `intern_target`).
+    [[nodiscard]] std::optional<PressureTargetHandle>
+    maximal_target(runtime::PlanningCandidateId candidate);
     [[nodiscard]] PressureConstructionCursor begin_construction(PressureTargetHandle target,
                                                                 bool restore = false);
     [[nodiscard]] runtime::PressureConstructionStep
@@ -965,6 +971,10 @@ public:
     [[nodiscard]] std::uint64_t publication_cell_veto_goals() const noexcept;
     [[nodiscard]] std::uint64_t publication_cell_veto_other() const noexcept;
     [[nodiscard]] std::uint64_t publication_cell_veto_reuse() const noexcept;
+    // Ungated goal-failure split; see the RuntimeStats comment for why the `veto_*` totals cannot answer it.
+    void add_publication_goal_blocked(std::uint64_t cell_only, std::uint64_t other) noexcept;
+    [[nodiscard]] std::uint64_t publication_goal_blocked_cell_only() const noexcept;
+    [[nodiscard]] std::uint64_t publication_goal_blocked_other() const noexcept;
     void add_publication_cell_probes(std::uint64_t count) noexcept;
     struct PrefixSplit {
         std::uint32_t tokens      = 0;
@@ -973,6 +983,11 @@ public:
         std::uint8_t  match_end   = 0;  // 0 = diverged, 1 = the stored ledger ended, 2 = the prompt ended
         std::uint32_t stored      = 0;  // THIS entry's ledger length: the denominator `match_end` needs
         std::uint32_t probe_index = 0;  // where the match stopped; 0 unless it diverged
+        // WHICH TURN OF THE PROMPT'S OWN HISTORY the divergence falls in, and its role. `probe_index`
+        // localises the stop to a token, which is unreadable on its own: the prompt's per-message token
+        // layout is not retained anywhere a reader can consult. PROMPT-SIDE ONLY -- the stored ledger's
+        // boundaries are not kept, so this does not say where the STORED render sat.
+        runtime::DivergencePosition divergence;
     };
     // Takes the PROMPT, not a token span: reading the prompt's tokens requires the frontend's
     // `PreparedPromptAccess`, and doing that in the caller forced the model-agnostic `ResourceManager` to

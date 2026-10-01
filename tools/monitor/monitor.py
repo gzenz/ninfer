@@ -1258,6 +1258,19 @@ function renderKvBars(latest){
     h+=bar([{pct:poolPct,color:C.kv[2],label:'used'},{pct:100-poolPct,color:'#30363d',label:'free'}]);
     h+='<div style="font-size:12px;color:var(--muted);margin:2px 0 2px">growth: state '+(mem.host_pinned_grows||0)+' · kv '+(mem.host_kv_grows||0)+' · refusals '+(mem.host_pinned_grow_refusals||0)+'/'+(mem.host_kv_grow_refusals||0)+'</div>';
     h+='<div style="font-size:12px;color:var(--muted);margin:2px 0 2px">demotable evictions '+(pstats.private_evictions_demotable||0)+' / '+(pstats.private_eviction_checks||0)+' checked · maximal fallback '+(pstats.maximal_fallback_selections||0)+'</div>';
+    // FRAGMENTATION, as a bar in the same idiom as the pool bar above. `free` alone is misleading: the pool
+    // can hold gigabytes while no single run is large enough to place anything (measured 2026-10-01:
+    // 2175 MiB free, 290 MiB largest run, a state image needing ~187 MiB). The bar splits the pool's FREE
+    // space into the part usable as ONE contiguous run and the part scattered smaller. `misses` is what the
+    // scattered part COST -- first-attempt placement failures with sufficient free bytes.
+    const frFree=mem.host_pinned_free_bytes||0, frRun=mem.host_pinned_largest_free_run_bytes||0;
+    const frPct = frFree>0 ? frRun/frFree*100 : 100;
+    const frMiss = mem.host_pinned_allocation_fragmented_misses||0;
+    if(frFree>0){
+      h+='<div style="font-size:12px;color:var(--muted);margin:6px 0 2px">pool free space: largest contiguous run vs scattered · misses '+frMiss+'</div>';
+      h+=bar([{pct:frPct,color:frMiss>0?'#d29922':C.kv[2],label:'largest run '+gb(frRun)},
+              {pct:100-frPct,color:'#30363d',label:'scattered'}]);
+    }
   }
   h+='<div style="font-size:12px;color:var(--muted);margin:6px 0 2px">pressure (cum): evict '+evict+' · demote '+demoted+' · spill '+spill+' · ckpt_drop '+ckptDrop+'</div>';
   $('kvbars').innerHTML=h;

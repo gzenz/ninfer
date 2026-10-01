@@ -117,8 +117,13 @@ EngineOptions normalize_engine_options(EngineOptions options) {
     const std::uint64_t default_private = 2ULL * concurrency;
     cache.max_private_continuations =
         cache.max_private_continuations.value_or(static_cast<std::uint32_t>(default_private));
-    cache.max_shared_prefixes = cache.max_shared_prefixes.value_or(
-        std::max(concurrency, static_cast<std::uint32_t>(kMaximumExplicitPromptCacheMarkers)));
+    // DECOUPLED FROM THE MARKER CAP (2026-10-01). It read `max(concurrency, kMaximumExplicitPromptCache
+    // Markers)`, so raising that cap would have raised this DEFAULT shared-prefix count with it -- by 8x at
+    // the concurrency this host runs (c=4), not by a fixed factor, which is why one comment here said
+    // "quadrupled" and another said "eight fold" and both were wrong. The floor is a named constant now so
+    // the test that asserts this default and this line cannot drift apart.
+    cache.max_shared_prefixes =
+        cache.max_shared_prefixes.value_or(std::max(concurrency, kDefaultSharedPrefixFloor));
     cache.max_long_anchors_per_continuation = cache.max_long_anchors_per_continuation.value_or(2U);
 
     if (*cache.max_private_continuations < concurrency) {

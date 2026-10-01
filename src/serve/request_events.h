@@ -33,6 +33,15 @@ struct RequestLogContext {
     std::optional<std::string> session_key;
     std::optional<std::string> client_session_id;
     std::optional<std::string> session_key_hash;
+    // HOW MANY EXPLICIT `cache_control` BREAKPOINTS THE REQUEST CARRIED. This is the denominator for the
+    // cost question the 2026-10-01 regression raised: explicit markers become shared-prefix candidates, so
+    // "is the planner's work proportional to the markers?" cannot be asked of any log without it -- and the
+    // two candidates for that regression (this input vs the engine) are indistinguishable per request
+    // without it. Counted on the request, not on the prepared prompt, so it describes what the CLIENT sent.
+    // ANTHROPIC PATH ONLY (as of 2026-10-01). The OpenAI translators synthesise a MIX of explicit and
+    // automatic markers and do not separate them, so that path logs 0 -- which means "not counted
+    // here", NOT "the client sent none". Read 0 as absent, never as zero.
+    std::size_t explicit_cache_markers = 0;
 };
 
 struct RequestLogMetadata {
@@ -53,6 +62,12 @@ struct RequestLogMetadata {
     // THE SAME HASH `prefill.cpp` puts on the sequence and the eviction line prints as `session=%016llx`, so an
     // eviction can be tied to the request whose state it destroyed. Rendered as 16 hex digits for that match.
     std::optional<std::string> session_key_hash;
+    // HOW MANY EXPLICIT `cache_control` BREAKPOINTS THE REQUEST CARRIED. This is the denominator for the
+    // cost question the 2026-10-01 regression raised: explicit markers become shared-prefix candidates, so
+    // "is the planner's work proportional to the markers?" cannot be asked of any log without it -- and the
+    // two candidates for that regression (this input vs the engine) are indistinguishable per request
+    // without it. Counted on the request, not on the prepared prompt, so it describes what the CLIENT sent.
+    std::size_t explicit_cache_markers = 0;
 };
 
 // A parsed generation request that failed during synchronous preparation. It intentionally has a
@@ -71,6 +86,10 @@ struct RequestRejectionLogContext {
     bool has_tool_history = false;
     std::optional<RequestedReasoningEffort> requested_reasoning_effort;
     ApiError error;
+    // DID THE BODY PARSE? False on the pre-parse rejection path, where every other field in this context
+    // is a DEFAULT rather than a measurement -- and a reader must be able to tell those apart, which a
+    // record of zeroed fields does not do. The emitter renders `parsed` and a `phase` derived from it.
+    bool parsed = true;
 };
 
 enum class RequestFailurePhase : std::uint8_t {
@@ -123,6 +142,16 @@ RequestRejectionLogContext make_request_rejection_log_context(std::uint64_t id,
                                                               const GenerationRequest& request,
                                                               const RequestLogMetadata& metadata,
                                                               ApiError error);
+
+// A REJECTION THAT HAPPENS BEFORE THE BODY PARSES. The overload above needs a parsed request and its
+// metadata, so the parse-time catch could not use it -- and nothing was logged at all, which is how a
+// client sending five cache_control breakpoints saw a 400 from a server whose journal and request log
+// were both empty (measured 2026-10-01). Everything the parsed overload reads is genuinely unknown here,
+// so only the identity, the protocol and the error are carried, and the reader is told that by the record
+// itself rather than by an absence of fields that looks the same as a request that had none.
+[[nodiscard]] RequestRejectionLogContext make_unparsed_request_rejection_log_context(std::uint64_t id,
+                                                                                    std::string protocol,
+                                                                                    ApiError error);
 
 [[nodiscard]] RequestFailure make_request_failure(RequestFailurePhase phase, const ApiError& error);
 [[nodiscard]] RequestFailure make_generation_request_failure(const ApiError& error);

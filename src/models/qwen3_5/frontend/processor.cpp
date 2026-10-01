@@ -795,6 +795,7 @@ EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat&
             encoded.rewrite_execution_frontiers.push_back(*frontier);
         }
     }
+    encoded.message_roles = rendered.message_roles;
     encoded.message_boundaries.resize(rendered.message_boundaries.size());
     for (std::size_t index = 0; index < rendered.message_boundaries.size(); ++index) {
         if (rendered.message_boundaries[index]) {
@@ -1066,6 +1067,7 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
     output.input_ids                   = std::move(encoded.input_ids);
     output.rewrite_checkpoint          = encoded.rewrite_checkpoint;
     output.rewrite_execution_frontiers = std::move(encoded.rewrite_execution_frontiers);
+    output.message_roles               = std::move(encoded.message_roles);
     output.message_boundaries          = std::move(encoded.message_boundaries);
     output.cache_boundaries            = std::move(encoded.cache_boundaries);
     stats.prompt_tokens                = output.input_ids.size();

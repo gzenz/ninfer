@@ -133,6 +133,14 @@ void test_fragmentation_is_visible() {
     auto big = pool.allocate(2U << 20U);
     check(big.has_value(), "a 2 MiB request still succeeds (by growing)");
     check(pool.chunk_count() > chunks_before, "it grew rather than reporting failure");
+    // THE COUNTER, asserted here rather than in a parallel test because this is already the exact path: the
+    // FIRST placement attempt failed while free BYTES were sufficient, which is the only fragmentation
+    // signature that is reachable. Delete the increment and this line fails.
+    check(pool.allocation_fragmented_misses() == 1U,
+          "the first-attempt miss with sufficient free bytes is counted");
+    check(pool.allocation_post_grow_failures() == 0U,
+          "and the post-grow path did NOT fire (it is believed unreachable)");
+    check(pool.allocation_ram_refusals() == 0U, "nor was this a RAM refusal -- it grew successfully");
 }
 
 void test_shrink_refuses_while_live() {
@@ -197,6 +205,17 @@ void test_policy_refusal_is_counted() {
     check(!refused.has_value(), "a policy refusal reaches the caller as a refusal");
     check(pool.growth_refusals() == 1U, "the refusal is counted (not indistinguishable from 'never needed')");
     check(pool.allocation_refusals() == 1U, "the allocation refusal is counted too");
+    // THE SPLIT: a policy refusal is NOT a failed pin. These two shared one counter, and swapping the
+    // increments now fails here.
+    check(pool.growth_policy_refusals() == 1U, "counted as a POLICY refusal");
+    check(pool.growth_pin_failures() == 0U, "and not as a pin failure");
+    // AND THE ALLOCATION HALF, which nothing asserted: without these, a mutation making ram->post_grow (or
+    // deleting the ram increment) survived, because the total is the same either way. This is the
+    // no-room-and-could-not-grow case, so it is the RAM half and NOT the fragmentation one.
+    check(pool.allocation_ram_refusals() == 1U, "the allocation refusal is the RAM half");
+    check(pool.allocation_post_grow_failures() == 0U, "not the post-grow half");
+    check(pool.allocation_fragmented_misses() == 0U,
+          "and not a fragmentation miss -- the pool was empty, so nothing was fragmented");
     check(chunks.pins == 0U, "nothing was pinned against the policy");
 }
 
@@ -207,6 +226,8 @@ void test_pin_failure_is_not_a_crash() {
     auto refused = pool.allocate(1U << 20U);
     check(!refused.has_value(), "a failed pin is a refusal, not a throw");
     check(pool.growth_refusals() == 1U, "the failed pin is counted");
+    check(pool.growth_pin_failures() == 1U, "counted as a PIN failure");
+    check(pool.growth_policy_refusals() == 0U, "and not as a policy refusal");
 }
 
 void test_release_semantics() {
@@ -292,6 +313,27 @@ void test_revision_marks_size_changes() {
 
 // The ordering `shrink_idle` depends on: first-fit consumes the OLDEST chunk first, so the NEWEST chunk is
 // the one that goes idle and can be given back.
+// BEST-FIT WITHIN A CHUNK, pinned so the policy cannot silently revert. The fixture is built so the two
+// policies give DIFFERENT answers: after the frees below the chunk holds a 512 KiB run at offset 0 and a
+// 256 KiB run at 768 KiB, and a 128 KiB request fits both. First-fit takes the one it meets first (512 KiB,
+// and splits its FRONT, cutting it to 384 KiB); best-fit takes the tightest (256 KiB) and leaves the 512 KiB
+// run whole. `largest_free_run` distinguishes them, 512 KiB against 384 KiB.
+void test_best_fit_protects_the_large_run() {
+    FakeChunks chunks;
+    ninfer::PinnedHostPool pool = make_pool(chunks, 1U << 20U);  // 1 MiB chunk
+    auto a = pool.allocate(512U << 10U);
+    auto b = pool.allocate(256U << 10U);
+    check(a && b, "two allocations to carve the chunk");
+    check(pool.release(*a), "release the first, leaving a 512 KiB run at the front");
+    const std::size_t before = pool.largest_free_run();
+    check(before == (512U << 10U), "the front run is 512 KiB before the tight allocation");
+    auto c = pool.allocate(128U << 10U);
+    check(c.has_value(), "a 128 KiB request is served");
+    check(c->chunk == a->chunk, "and it stays in the same chunk (chunks are consumed in order)");
+    check(pool.largest_free_run() == (512U << 10U),
+          "BEST-FIT: the 512 KiB run is untouched -- first-fit would have cut it to 384 KiB");
+}
+
 void test_first_fit_consumes_the_oldest_chunk_first() {
     FakeChunks chunks;
     ninfer::PinnedHostPool pool = make_pool(chunks, 1U << 20U);
@@ -324,6 +366,7 @@ int main() {
     test_can_serve_and_shortfall();
     test_carve_exact_is_pure_and_strict();
     test_revision_marks_size_changes();
+    test_best_fit_protects_the_large_run();
     test_first_fit_consumes_the_oldest_chunk_first();
 
     if (failures != 0) { std::printf("%d FAILURE(S)\n", failures); return 1; }

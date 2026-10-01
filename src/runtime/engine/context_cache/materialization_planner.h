@@ -41,6 +41,15 @@ struct MaterializationOwnerPolicy {
     bool explicit_shared_credit            = false;
 };
 
+// THE PRESSURE SEARCH'S TARGET BUDGET, at namespace scope so the ARENA'S sizing can be compile-checked
+// against it. The search stops here; the model's target arena is sized to hold this PLUS the room the
+// post-search calls need, so the reserve is only unreachable while this <= the arena's search budget.
+// The coupling spans the runtime/model boundary, which is why the guard lives in a test TU: this header
+// cannot include a model header without inverting the layering that keeps `ResourceManager`
+// model-agnostic. Namespace scope rather than a class member because the class is a template, and a
+// static member cannot be named without its template arguments.
+inline constexpr std::uint32_t kPlannerTargetBudget = 4096;
+
 template <class ModelContract, class SearchClock = std::chrono::steady_clock>
 class MaterializationPlanner {
 public:
@@ -107,7 +116,11 @@ public:
         // outlives a request, so it accumulated -- which is how two different requests reported the same
         // 607. Reset here, at the only point a planning run begins, so the number means "in THIS run".
         feasible_preserving_alternatives_ = 0;
+        preserving_alternatives_assessed_ = 0;
+        goal_probes_by_site_.fill(0);
         assessed_targets_without_goal_    = 0;
+        assessed_targets_without_goal_infeasible_  = 0;
+        assessed_targets_without_goal_unadoptable_ = 0;
         for (std::size_t index = 0; index < candidates.size(); ++index) {
             if (candidates[index].candidate == nullptr ||
                 std::find_if(candidates.begin(), candidates.begin() + index,
@@ -160,6 +173,7 @@ public:
             }
             std::optional<LogicalGoal> goal;
             if (identity.physical_status == MaterializationPhysicalStatus::Feasible) {
+++goal_probes_by_site_[0];
                 goal = logical_goal(input.id, identity.source_mode,
                                     std::span<const PressureOwnerOutcome>{});
             }
@@ -294,6 +308,7 @@ public:
             planning_saturating_add(projection_work, assessment.projection_work);
             std::optional<LogicalGoal> goal;
             if (assessment.physical_status == MaterializationPhysicalStatus::Feasible) {
+++goal_probes_by_site_[1];
                 goal = logical_goal(assessment.candidate, assessment.source_mode,
                                     assessment.owner_outcomes);
             }
@@ -367,6 +382,10 @@ public:
         std::uint32_t optional_targets        = 0;
         MaterializationStopReason stop_reason = MaterializationStopReason::QueueExhausted;
         bool budget_exhausted                 = false;
+        // THE TARGET ARENA WAS FULL. Its own flag, because `budget_exhausted` already means "the
+        // search ran out of ITS budget" -- the designed stop -- and a capacity ceiling read as that
+        // is a wall reported as a healthy bounded search. See `intern_target`.
+        bool target_arena_truncated           = false;
         auto search_phase                     = MaterializationSearchPhase::Setup;
         const auto allow_work = [&](std::uint64_t operation, std::uint64_t completion,
                                     std::uint64_t gain, bool complete,
@@ -468,13 +487,28 @@ public:
                                 pressure.checkpoint_policy, machine_cost);
             std::optional<LogicalGoal> goal;
             if (assessment.physical_status == MaterializationPhysicalStatus::Feasible) {
+++goal_probes_by_site_[2];
                 goal = logical_goal(assessment.candidate, assessment.source_mode,
                                     assessment.owner_outcomes);
             }
             // COUNTED HERE, beside the goal decision: a target with no goal is one that was ASSESSED and
             // could not be adopted -- which is what separates "the relief step was generated and rejected"
             // from "it was never reached in the arena".
-            if (!goal) { ++assessed_targets_without_goal_; }
+            if (cost.restorable_evictions == 0) { ++preserving_alternatives_assessed_; }
+            if (!goal) {
+                ++assessed_targets_without_goal_;
+                // SPLIT BY WHY, BECAUSE THE TWO MEAN OPPOSITE THINGS AND THE TOTAL CANNOT TELL THEM APART.
+                // `logical_goal` is called only for a PHYSICALLY FEASIBLE assessment (above), so a target
+                // that is not feasible reaches this line with no goal and NEVER HAD A PROBE TO FAIL. Counting
+                // both populations in one number is what let "~4000 of ~4080 targets had no goal" be read as
+                // "the goal gate refused them" when the goal-probe split measured 0 refusals against 417,152
+                // probes on live QA: the cell refused nothing, and the population was infeasibility.
+                if (assessment.physical_status != MaterializationPhysicalStatus::Feasible) {
+                    ++assessed_targets_without_goal_infeasible_;
+                } else {
+                    ++assessed_targets_without_goal_unadoptable_;
+                }
+            }
             if (goal) {
                 mark_target(assessment.stable_target_ordinal, kTargetFeasible);
                 candidate_seeded[expected_candidate] = true;
@@ -547,6 +581,7 @@ public:
                 GuidanceCost cost =
                     fold_guidance(candidates[candidate_index], guidance, pressure.owner_policy,
                                   pressure.checkpoint_policy, machine_cost);
+++goal_probes_by_site_[3];
                 cost.logical_ready = logical_goal(candidates[candidate_index].id,
                                                   guidance.source_mode, guidance.owner_outcomes)
                                          .has_value();
@@ -586,9 +621,10 @@ public:
         const auto rank_guidance = [&](std::uint32_t index, const PressureTargetGuidance& guide) {
             auto cost = fold_guidance(candidates[index], guide, pressure.owner_policy,
                                       pressure.checkpoint_policy, machine_cost);
-            cost.logical_ready =
-                logical_goal(candidates[index].id, guide.source_mode, guide.owner_outcomes)
-                    .has_value();
+            ++goal_probes_by_site_[4];
+            cost.logical_ready = logical_goal(candidates[index].id, guide.source_mode,
+                                              guide.owner_outcomes)
+                                     .has_value();
             if (!cost.logical_ready) {
                 ++cost.unsatisfied_constraints;
                 cost.normalized_residual_q20 += 1ULL << 20U;
@@ -636,14 +672,29 @@ public:
                         search_phase = MaterializationSearchPhase::Assessment;
                         if (allow_work(assessment_step_ns, assessment_step_ns, gain, false)) {
                             const auto rescue = session.maximal_target(candidates[candidate].id);
-                            const auto guide  = session.guidance(rescue);
+                            if (!rescue) {
+                                // THE TARGET ARENA IS FULL. This is a SEARCH alternative -- the
+                                // "evict everything for this candidate" rescue -- so the answer is to
+                                // stop searching, not to fail the request. It used to throw here
+                                // (`std::length_error` -> HTTP 500 + a worker recovery), which is what
+                                // made the e2e's phase 1 unreachable on every tree (2026-09-28).
+                                // Counted separately from `budget_exhausted` because the two ask
+                                // different questions: "the search ran out of its own budget" is the
+                                // designed stop, "the planner had no room for another target" is a
+                                // capacity ceiling, and conflating them is how a capacity wall reads
+                                // as a healthy bounded search.
+                                target_arena_truncated = true;
+                                stop_reason            = MaterializationStopReason::ExpansionCapacity;
+                                break;
+                            }
+                            const auto guide  = session.guidance(*rescue);
                             if (!target_marked(guide.stable_target_ordinal, kTargetAssessed)) {
                                 if (!target_marked(guide.stable_target_ordinal,
                                                    kTargetDiscovered)) {
                                     ++optional_targets;
                                 }
                                 const auto started = Clock::now();
-                                (void)assess_target(rescue, candidate, guide.stable_target_ordinal);
+                                (void)assess_target(*rescue, candidate, guide.stable_target_ordinal);
                                 observe_step(assessment_step_ns, started);
                                 ++search_work;
                             }
@@ -707,8 +758,15 @@ public:
                     session.choose_construction(*path.cursor, path.best_option);
                     const auto target = session.construction_target(*path.cursor);
                     if (!target) {
-                        stop_reason      = MaterializationStopReason::ExpansionCapacity;
-                        budget_exhausted = search_stopped = true;
+                        stop_reason = MaterializationStopReason::ExpansionCapacity;
+                        search_stopped = true;
+                        // AN ARENA CEILING, NOT A BUDGET STOP -- so `budget_exhausted` is deliberately NOT
+                        // set here. The first version set both, which also incremented
+                        // `search_budget_exhaustions` and contradicted the separation these two counters
+                        // exist to provide ("the search spent its own budget" vs "the planner had no room
+                        // for another target"). This is the path that fired in production
+                        // (`targets=4102/4102` before the throw).
+                        target_arena_truncated = true;
                         break;
                     }
                     auto chosen = rank_guidance(path.candidate_index, session.guidance(*target));
@@ -826,7 +884,16 @@ public:
                     break;
                 }
                 if (!expand_target(queue_pop())) {
-                    stop_reason      = MaterializationStopReason::ExpansionCapacity;
+                    // `expand_target` returns false for exactly two reasons and BOTH are the target
+                    // budget: `optional_targets >= kTargetBudget`, or an expansion whose canonical
+                    // count would exceed `kTargetBudget - optional_targets`. It cannot return false
+                    // on the arena ceiling -- `commit_expansion` is bounded by `target_arena_limit`,
+                    // reports that as `children.complete == false`, and the lambda handles it and
+                    // still returns true. So this was named `ExpansionCapacity` while measuring the
+                    // SEARCH BUDGET, which is the conflation the other two `ExpansionCapacity` sites
+                    // (both paired with `target_arena_truncated = true`) exist to avoid. The arena
+                    // bound keeps its own name and its own flag.
+                    stop_reason      = MaterializationStopReason::TargetBudget;
                     budget_exhausted = true;
                     break;
                 }
@@ -956,13 +1023,32 @@ public:
             dbg_flush();
         }
 
+        // THE ORDER MATCHES THE SIGNATURE. It did not: `preserving_alternatives_assessed_` was added to
+        // the signature BESIDE ITS SIBLING but appended at the END here, so four same-typed-ish arguments
+        // shifted by one -- `assessed` took the goal-less count, `without_goal` took the bool, and
+        // `target_arena_truncated` took `assessed != 0` through an implicit uint64->bool conversion inside
+        // a `noexcept` function. It compiled, it deployed, and it corrupted both counters on live traffic
+        // (2026-10-01). TWO guards now: this ordering, and the invariant assertions in
+        // `test_resource_manager.cpp` -- which are what caught it, via the arena test's CONTROL arm.
         MaterializationDiagnostics diagnostics = make_diagnostics(
             incumbent.cost, targets_evaluated, projection_work, planning_started, search_elapsed_ns,
             stop_reason, budget_exhausted, incumbent.degradation_units, incumbent.root_maximal,
-            feasible_preserving_alternatives_, assessed_targets_without_goal_);
-        // #6's decisive pair is `feasible_preserving_alternatives` (set above) against
-        // `chosen_restorable_evictions` (the incumbent's own count, filled by make_diagnostics). Both
-        // non-zero in one record means a preserving plan was available and a destroying one was taken.
+            feasible_preserving_alternatives_, preserving_alternatives_assessed_,
+            assessed_targets_without_goal_, target_arena_truncated);
+        // SET HERE, NOT AS ANOTHER ARGUMENT. This parameter list is what produced the 2026-10-01
+        // transposition (four arguments shifted by one and it still compiled), so the new fields
+        // are assigned to the struct directly instead of joining a positional list.
+        diagnostics.goal_probes_by_site = goal_probes_by_site_;
+        diagnostics.targets_assessed   = targets_evaluated;
+        diagnostics.assessed_targets_without_goal_infeasible  = assessed_targets_without_goal_infeasible_;
+        diagnostics.assessed_targets_without_goal_unadoptable = assessed_targets_without_goal_unadoptable_;
+        // #6's pair is `feasible_preserving_alternatives` against `chosen_restorable_evictions` (the
+        // incumbent's own count, filled by `make_diagnostics`). Both non-zero in one record means a
+        // preserving plan was assessed feasible and a destroying one was taken anyway.
+        //
+        // IT IS NOT DECISIVE ON ITS OWN. The first half is GOAL-GATED, so a 0 cannot be told from "no
+        // preserving target was ever assessed" -- and only the second is #6's shape. Read
+        // `preserving_alternatives_assessed`, the ungated denominator set above, beside it for that.
 
         diagnostics.initial_predicted_total_ns = initial_cost_ns;
         diagnostics.first_improvement_ns       = first_improvement_ns;
@@ -1011,7 +1097,8 @@ public:
     }
 
 private:
-    static constexpr std::uint32_t kTargetBudget = 4096;
+    // The namespace-scope constant above, kept as a short name for the uses inside this class.
+    static constexpr std::uint32_t kTargetBudget = kPlannerTargetBudget;
 
 
     struct Incumbent {
@@ -1534,7 +1621,9 @@ private:
                      bool budget_exhausted, std::uint32_t degradation_units,
                      bool maximal_fallback,
                      std::uint64_t feasible_preserving_alternatives = 0,
-                     std::uint64_t assessed_targets_without_goal = 0) noexcept {
+                     std::uint64_t preserving_alternatives_assessed = 0,
+                     std::uint64_t assessed_targets_without_goal = 0,
+                     bool target_arena_truncated = false) noexcept {
         return MaterializationDiagnostics{
             .predicted_now_ns           = cost.now_ns,
             .predicted_future_loss_ns   = cost.future_loss_ns,
@@ -1545,9 +1634,11 @@ private:
             .search_elapsed_ns          = search_elapsed_ns,
             .stop_reason                = reason,
             .budget_exhausted           = budget_exhausted,
+            .target_arena_truncated     = target_arena_truncated,
             .selected_degradation_units = degradation_units,
             .selected_maximal_fallback        = maximal_fallback,
             .feasible_preserving_alternatives = feasible_preserving_alternatives,
+            .preserving_alternatives_assessed = preserving_alternatives_assessed,
             .chosen_restorable_evictions      = cost.restorable_evictions,
             .assessed_targets_without_goal    = assessed_targets_without_goal,
             .initial_predicted_total_ns       = cost.total_ns,
@@ -1562,7 +1653,46 @@ private:
     // `assess_target` because BOTH paths (the seeded candidate and the search) mark feasibility there, so
     // one site covers both; see the diagnostics field of the same name.
     std::uint64_t feasible_preserving_alternatives_ = 0;
+    // THE DENOMINATOR THE PAIR LACKED. `feasible_preserving_alternatives` is gated on `goal`, so it reads
+    // 0 in TWO different situations: a preserving target was assessed and found goal-less, or NO preserving
+    // target was ever assessed at all. Those are different findings and only the second is #6's shape --
+    // the planner destroyed a restorable checkpoint while a demote was available -- so a counter that
+    // cannot separate them cannot exonerate the case either. This one is UNGATED: it counts every
+    // assessed target whose cost evicts no restorable checkpoint, whatever its goal status.
+    //
+    // Read the two together: `assessed == 0` means no preserving option was ever in front of the planner
+    // (the #6 shape); `assessed > 0 && feasible == 0` means preserving options existed and none was
+    // adoptable, which is a defensible outcome rather than a defect.
+    std::uint64_t preserving_alternatives_assessed_ = 0;
+    // WHERE THE ~4,000 GOAL PROBES OF AN ORDINARY PLANNING RUN COME FROM. The planner calls the goal probe
+    // from FIVE sites (below), all through one wrapper whose signature is identical at each, so the wrapper
+    // cannot tell them apart -- the tally has to be taken at the call sites. 2026-10-01, measured: 67% of
+    // plans end on `time_budget` with ~4,630 probes and 82% end on SOME budget, including plans with ONE
+    // candidate, so the question is which site repeats. Reset per run with its siblings.
+    std::array<std::uint64_t, 5> goal_probes_by_site_{};
+    static constexpr std::array<const char*, 5> kGoalProbeSiteNames{
+        "identity_target", "assessment_a", "assessment_b", "guidance_cost", "guidance_rank"};
+    // UNTESTED ON HOST, AND THAT IS THE HONEST STATE -- do not read the green suite as coverage. Measured
+    // 2026-10-01 against a build that had this counter, three mutants were run:
+    //   * the call-site TRANSPOSITION that actually shipped (arguments shifted by one) -- dies, but by the
+    //     ARENA test's control arm, not by anything specific to this counter;
+    //   * moving this increment inside `if (goal)` -- SURVIVES;
+    //   * deleting this increment outright -- SURVIVES.
+    // The deletion surviving is the informative one: `feasible_preserving_alternatives` is 0 in EVERY
+    // materialization the host fixtures produce (10 of 10 measured in the split fixture), so an
+    // `assessed >= feasible` assertion is `0 >= 0` wherever it can be placed -- the assertion was written,
+    // measured vacuous, and REMOVED rather than left looking like a guard. `feasible > 0` needs pressure AND
+    // an adopted preserving plan, and the only scenario that reaches that (`guided deep retention`) is the
+    // pre-existing baseline failure. So this counter's discriminating power -- a preserving target assessed
+    // and found GOAL-LESS, which is the case it exists for -- has no host coverage at all.
+    // Check it on live traffic: a record with `preserving_alternatives_assessed > feasible_preserving_alternatives`
+    // is the first evidence the distinction is real. If no such record ever appears, this counter adds
+    // nothing its sibling does not already say, and the #6 rule in CLAUDE.md should say so.
     std::uint64_t assessed_targets_without_goal_    = 0;
+    // The split that makes the line above interpretable: `infeasible` never had a goal probe (so its refusal
+    // is capacity), `unadoptable` was feasible and the probe refused it (so its refusal is the goal gate).
+    std::uint64_t assessed_targets_without_goal_infeasible_   = 0;
+    std::uint64_t assessed_targets_without_goal_unadoptable_  = 0;
     BoundedTargetLedger target_ledger_;
     std::vector<CombinedImpact> impact_scratch_;
     ContextPortfolioValue portfolio_value_;

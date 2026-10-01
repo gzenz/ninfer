@@ -68,28 +68,45 @@ HostMemoryReading read_host_memory() noexcept {
     return parse_meminfo(buffer);
 }
 
-bool HostMemoryBudget::decide(const HostMemoryReading& reading, std::size_t bytes) const noexcept {
-    if (bytes == 0U) { return false; }
-    if (!reading.valid) { return false; }  // fail closed: see the header
+GrowthVeto HostMemoryBudget::veto_for(const HostMemoryReading& reading,
+                                      std::size_t bytes) const noexcept {
+    if (bytes == 0U) { return GrowthVeto::NothingWanted; }
+    if (!reading.valid) { return GrowthVeto::InvalidReading; }  // fail closed: see the header
     // The reserve is the safety property: pinned memory may grow into what is available, never into the
     // RAM that the weights' host side, the media cache and the OS need to keep this machine alive.
-    if (reading.mem_available < config_.reserve_bytes) { return false; }
-    if (bytes > reading.mem_available - config_.reserve_bytes) { return false; }
+    if (reading.mem_available < config_.reserve_bytes) { return GrowthVeto::Reserve; }
+    if (bytes > reading.mem_available - config_.reserve_bytes) { return GrowthVeto::Reserve; }
     if (config_.max_bytes != 0U) {
-        if (pinned_bytes_ >= config_.max_bytes) { return false; }
-        if (bytes > config_.max_bytes - pinned_bytes_) { return false; }
+        if (pinned_bytes_ >= config_.max_bytes) { return GrowthVeto::MaxBytes; }
+        if (bytes > config_.max_bytes - pinned_bytes_) { return GrowthVeto::MaxBytes; }
     }
     if (config_.shmem_cap_bytes != 0U) {
-        if (reading.shmem > config_.shmem_cap_bytes) { return false; }
-        if (bytes > config_.shmem_cap_bytes - reading.shmem) { return false; }
+        if (reading.shmem > config_.shmem_cap_bytes) { return GrowthVeto::ShmemCap; }
+        if (bytes > config_.shmem_cap_bytes - reading.shmem) { return GrowthVeto::ShmemCap; }
     }
-    return true;
+    return GrowthVeto::None;
+}
+
+bool HostMemoryBudget::decide(const HostMemoryReading& reading, std::size_t bytes) const noexcept {
+    return veto_for(reading, bytes) == GrowthVeto::None;
 }
 
 bool HostMemoryBudget::allow(std::size_t bytes) noexcept {
-    reading_ = read_host_memory();
-    const bool ok = decide(reading_, bytes);
-    if (ok) { ++approvals_; } else { ++refusals_; }
+    return allow_with(read_host_memory(), bytes);
+}
+
+bool HostMemoryBudget::allow_with(const HostMemoryReading& reading, std::size_t bytes) noexcept {
+    reading_ = reading;
+    const GrowthVeto veto = veto_for(reading_, bytes);
+    const bool ok         = veto == GrowthVeto::None;
+    if (ok) {
+        ++approvals_;
+    } else {
+        ++refusals_;
+        last_veto_               = veto;
+        last_wanted_bytes_       = bytes;
+        last_veto_mem_available_ = reading_.mem_available;
+    }
     return ok;
 }
 

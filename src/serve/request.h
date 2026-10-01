@@ -260,6 +260,11 @@ struct GenerationRequest {
     std::string chat_template_kwargs_json;
     ninfer::PromptContinuationMode continuation = ninfer::PromptContinuationMode::NewAssistantTurn;
     bool allow_engine_automatic_shared_prefixes = true;
+    // HOW MANY EXPLICIT `cache_control` BREAKPOINTS THE CLIENT SENT, counted by the protocol parser with the
+    // same code that enforces the cap. Recorded so the request log can carry it: explicit markers become
+    // shared-prefix candidates, so without this the 2026-10-01 regression -- where the two candidates were
+    // this input and the engine -- had no per-request denominator to separate them by.
+    std::size_t explicit_cache_marker_count = 0;
     SamplingParams sampling;
 
     [[nodiscard]] bool uses_tools() const noexcept {

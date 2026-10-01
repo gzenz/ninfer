@@ -979,10 +979,14 @@ int exercise_shared_replacement_and_full_capacity_reuse(const char* artifact) {
 
 int exercise_anthropic_prefix_regression(const char* artifact) {
     ninfer::Engine engine(anthropic_prefix_regression_engine_options(artifact));
+    // COMPARED AGAINST THE FLOOR, NOT THE MARKER CAP. It read `kMaximumExplicitPromptCacheMarkers`
+    // because those two were the same number until 2026-10-01, when the cap was raised for the client A/B
+    // and the floor was decoupled -- after which this assertion failed on CORRECT code (concurrency 1 gives
+    // max(1, floor), not the cap). Both sides now name `kDefaultSharedPrefixFloor`.
     if (!engine.options().context_cache.max_shared_prefixes ||
-        *engine.options().context_cache.max_shared_prefixes !=
-            ninfer::kMaximumExplicitPromptCacheMarkers) {
-        std::cerr << "single-concurrency Engine did not expose four default shared prefixes\n";
+        *engine.options().context_cache.max_shared_prefixes != ninfer::kDefaultSharedPrefixFloor) {
+        std::cerr << "single-concurrency Engine did not expose the default shared-prefix floor ("
+                  << ninfer::kDefaultSharedPrefixFloor << ")\n";
         return 1;
     }
 

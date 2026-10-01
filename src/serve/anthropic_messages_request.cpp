@@ -970,8 +970,14 @@ void apply_anthropic_prompt_cache_policy(const Json& body, GenerationRequest& re
             explicit_boundaries.push_back(&turn.cache_boundary_after);
         }
     }
+    // RECORDED BEFORE THE CAP IS ENFORCED, so the log carries what the client SENT even for a request that
+    // is about to be rejected for sending too many.
+    request.explicit_cache_marker_count = explicit_boundaries.size();
     if (explicit_boundaries.size() > kMaximumExplicitPromptCacheMarkers) {
-        bad_request("at most four block-level cache_control breakpoints are supported per request",
+        // DERIVED FROM THE CONSTANT, not spelled out: the text said "four" while the cap was 4, and a
+        // hardcoded word is exactly what would keep saying four after the cap moved (it did, 2026-10-01).
+        bad_request("at most " + std::to_string(kMaximumExplicitPromptCacheMarkers) +
+                        " block-level cache_control breakpoints are supported per request",
                     "cache_control", "too_many_cache_breakpoints");
     }
 
@@ -1005,8 +1011,9 @@ void apply_anthropic_prompt_cache_policy(const Json& body, GenerationRequest& re
         return;
     }
     if (explicit_boundaries.size() == kMaximumExplicitPromptCacheMarkers) {
-        bad_request("request-level cache_control needs a fifth distinct cache write after four "
-                    "block-level breakpoints",
+        bad_request("request-level cache_control needs one more distinct cache write than the " +
+                        std::to_string(kMaximumExplicitPromptCacheMarkers) +
+                        " block-level breakpoints already used",
                     "cache_control", "too_many_cache_breakpoints");
     }
     *automatic_target =

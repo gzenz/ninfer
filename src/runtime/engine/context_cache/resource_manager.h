@@ -62,6 +62,28 @@ struct CheckpointObservation {
     RetentionObservation observation;
 };
 
+// Byte/pages/ns moved by context transfers, split by direction.  The observation loop that
+// produces these runs program-level -- `observe_transfers(result)` has no request in scope --
+// so this is a PROCESS-monotonic total and is the only form in which the transfers can be
+// collected where they happen.  The engine snapshots it when a materialization starts and
+// takes the delta at adoption, which is the scope in which ONE request's transfers are
+// separable (the engine's context transaction is a single variant, so at most one
+// materialization is in flight at a time).
+//
+// Why it exists: the request log's proc residual is ordered by PATH, not by host phase.  A
+// request that resumes a checkpoint pays its HostToDevice restore BEFORE its prefill starts,
+// so that time lands in `proc` under no host-phase counter (req#50: 6.07 s proc against a
+// 0.59 s reported prefill).  Emitting the restore/demote split beside the phase totals is
+// what lets such a record be decomposed instead of guessed at.
+struct ContextTransferTotals {
+    std::uint64_t host_to_device_ns    = 0;
+    std::uint64_t device_to_host_ns    = 0;
+    std::uint64_t host_to_device_pages = 0;
+    std::uint64_t device_to_host_pages = 0;
+    std::uint64_t host_to_device_bytes = 0;
+    std::uint64_t device_to_host_bytes = 0;
+};
+
 // ResourceManager owns logical policy only.  Every physical feasibility decision and mutation is
 // represented by an opaque ModelContract::ResourcePlan sealed against Program::resource_revision().
 template <class ModelContract>
@@ -1336,6 +1358,13 @@ public:
         }
     }
 
+    // Monotonic process-wide transfer totals, split by direction.  Callers take a baseline
+    // and subtract; see ContextTransferTotals for why the split is by direction and not by
+    // resource class.
+    [[nodiscard]] ContextTransferTotals transfer_totals() const noexcept {
+        return transfer_totals_;
+    }
+
     void populate_runtime_stats(Program& program, RuntimeStats& out) const noexcept {
         out.state_moves                        = context_stats_.state_moves;
         out.state_forks                        = context_stats_.state_forks;
@@ -1463,12 +1492,15 @@ public:
         out.pressure_publication_cell_losses    = program.publication_cell_losses();
         out.pressure_publication_cell_probes    = program.publication_cell_probes();
         out.pressure_publication_cell_at_risk_runs = program.publication_cell_at_risk_runs();
+        out.pressure_goal_blocked_cell_only        = program.publication_goal_blocked_cell_only();
+        out.pressure_goal_blocked_other            = program.publication_goal_blocked_other();
         out.pressure_publication_cell_veto_goals   = program.publication_cell_veto_goals();
         out.pressure_publication_cell_veto_other   = program.publication_cell_veto_other();
         out.pressure_publication_cell_veto_reuse   = program.publication_cell_veto_reuse();
         out.pressure_checkpoints_dropped       = context_stats_.pressure_checkpoints_dropped;
         out.pressure_searches                  = context_stats_.pressure_searches;
         out.pressure_search_budget_exhaustions = context_stats_.pressure_search_budget_exhaustions;
+        out.pressure_target_arena_truncations  = context_stats_.pressure_target_arena_truncations;
         out.pressure_maximal_fallback_selections =
             context_stats_.pressure_maximal_fallback_selections;
         out.historical_fork_hits            = context_stats_.historical_fork_hits;
@@ -2622,10 +2654,26 @@ private:
         // The probe denominator is added BEFORE the early return, so a planning run that produced no plan still
         // contributes its probes. Conditioning it on success made "probed but never planned" look identical to
         // "stopped probing" -- the one thing a denominator exists to distinguish.
+        // Declared OUTSIDE the block below because the loss prints further down quote it; a second sum for
+        // them would be a second place for the number to drift.
+        std::uint64_t probes_total = 0;
         {
-            std::uint64_t probes_total = 0;
-            for (const PublicationCellProbe& tally : probe_tally) { probes_total += tally.probes; }
+            std::uint64_t blocked_cell  = 0;
+            std::uint64_t blocked_other = 0;
+            for (const PublicationCellProbe& tally : probe_tally) {
+                probes_total += tally.probes;
+                blocked_cell += tally.cell_only;
+                blocked_other += tally.other;
+            }
             program.add_publication_cell_probes(probes_total);
+            // THE GOAL-FAILURE SPLIT BELONGS HERE, IN THE SAME UNCONDITIONAL BLOCK AND FOR THE SAME REASON
+            // AS THE PROBES DENOMINATOR: a planning run that produced NO plan still failed its goals, and
+            // those are exactly the runs whose reasons matter. The first version of this call sat after the
+            // `!planned` early return below, so it fired only when a plan had been produced -- and read 0 on
+            // real traffic while `assessed_targets_without_goal` was 1266/request and the probe denominator
+            // was 295,251. **The instrument measured nothing and the zero looked like an answer**, which is
+            // the failure mode this file's own comment above describes. Keep the two sided by side.
+            program.add_publication_goal_blocked(blocked_cell, blocked_other);
         }
         const auto selected_candidate =
             planned ? std::find_if(candidate_inputs.begin(), candidate_inputs.end(),
@@ -2658,8 +2706,8 @@ private:
             };
             const PublicationCellLoss loss =
                 publication_cell_loss(probe_tally, candidates.size(), winner_index, winner_reuse, reuse_of);
-            std::uint64_t probes_total = 0;
-            for (const PublicationCellProbe& tally : probe_tally) { probes_total += tally.probes; }
+            // (The unconditional goal-failure split is tallied above, beside the probes denominator -- see
+            // the block at the early return for why it must not live down here.)
             // THE AT-RISK LINE IS LOG-ONLY AND DELIBERATELY NOT AN ALERT (see the awk). Its purpose is to
             // settle whether a catalog-caused loss is REACHABLE at this configuration: `evictable_owners` is
             // the count of private owner records the planner had -- i.e. owners it could have taken a cell
@@ -2848,6 +2896,9 @@ private:
                                                     // comment on this field claimed it could be read that way.
                                                     .frontier    = split.restorable,
                                                     .probe_index = split.probe_index,
+                                                    // THIS entry's own divergence, carried here for
+                                                    // the reason `source` and `frontier` are.
+                                                    .divergence  = split.divergence,
 });
             };
             for (std::uint32_t slot = 0; slot < catalog_count_; ++slot) {
@@ -2873,6 +2924,19 @@ private:
             choice.diagnostics_.split_best_source      = best.source;
             choice.diagnostics_.split_best_frontier    = best.frontier;
             choice.diagnostics_.split_probe_index      = best.probe_index;
+            choice.diagnostics_.split_message_index    = best.divergence.message_index;
+            choice.diagnostics_.split_message_offset   = best.divergence.message_offset;
+            choice.diagnostics_.split_message_role     = best.divergence.role;
+            // COVERAGE, STATED SO IT IS NOT ASSUMED. This assignment and the two above it are pinned by
+            // `test_prefix_split_diagnostics_follow_catalog` -- EXCEPT this one: that probe's divergence
+            // lands INSIDE a message, so `past_last_message` is the default and a mutant deleting this
+            // line survives the manager suite. A probe at the last frontier was attempted and abandoned:
+            // every frontier array that puts the divergence at the end (a two-entry {0,5}, or a
+            // shorter last entry) made that fixture report NO CHOICE at all, so the case could not be
+            // reached there. What IS pinned is the value's journey onward -- `test_request_log.cpp`
+            // asserts the key with a non-default `true` -- and the mapping itself is pinned exhaustively
+            // in `test_materialization_budget.cpp`. The gap is exactly one line, here, and it is known.
+            choice.diagnostics_.split_past_last_message = best.divergence.past_last_message;
             choice.diagnostics_.session_cell_frontier = session_cell_frontier;
             choice.diagnostics_.session_cell_offered  = session_cell_offered;
             choice.diagnostics_.session_cell_skip     = candidate_counters.session_cell_skip;
@@ -3135,6 +3199,9 @@ private:
         }
         if (diagnostics.budget_exhausted) {
             saturating_increment(context_stats_.pressure_search_budget_exhaustions);
+        }
+        if (diagnostics.target_arena_truncated) {
+            saturating_increment(context_stats_.pressure_target_arena_truncations);
         }
         if (diagnostics.selected_maximal_fallback) {
             saturating_increment(context_stats_.pressure_maximal_fallback_selections);
@@ -4079,6 +4146,18 @@ private:
         const double seconds = static_cast<double>(observation.elapsed_ns) * 1.0e-9;
         context_stats_.actual_context_transfer_seconds += seconds;
         const std::uint64_t bytes = observation.units;
+        // Per-request attribution: monotonic, read as a delta.  Both resource classes
+        // (State and KV) count -- a restore moves the state image AND the KV it covers,
+        // and the request paid for both.
+        if (observation.direction == ContextTransferDirection::HostToDevice) {
+            transfer_totals_.host_to_device_ns += observation.elapsed_ns;
+            transfer_totals_.host_to_device_pages += observation.page_count;
+            transfer_totals_.host_to_device_bytes += bytes;
+        } else if (observation.direction == ContextTransferDirection::DeviceToHost) {
+            transfer_totals_.device_to_host_ns += observation.elapsed_ns;
+            transfer_totals_.device_to_host_pages += observation.page_count;
+            transfer_totals_.device_to_host_bytes += bytes;
+        }
         switch (observation.resource) {
         case ContextResourceClass::State:
             switch (observation.direction) {
@@ -4185,6 +4264,7 @@ private:
     Planner planner_;
     CapturePlanner capture_planner_;
     RuntimeStats context_stats_;
+    ContextTransferTotals transfer_totals_;
     std::uint64_t next_continuation_id_  = 1;
     std::uint64_t next_shared_prefix_id_ = 1;
     std::uint64_t retention_epoch_       = 0;

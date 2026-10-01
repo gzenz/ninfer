@@ -1,4 +1,22 @@
 #include "runtime/engine/context_cache/materialization_budget.h"
+#include "runtime/engine/context_cache/materialization_planner.h"
+#include "models/qwen3_5/program/planning/pressure_target_arena.h"
+
+// THE COUPLING THE DESIGN DEPENDS ON, COMPILE-CHECKED. The pressure planner stops a search at its own
+// `kTargetBudget`; the model's target arena is sized as `candidates + 1 + kSearchTargetBudget + reserve`
+// and holds the search to `kSearchTargetBudget`. The reserve is only unreachable while
+// `kTargetBudget <= kSearchTargetBudget` -- if someone raises the planner's budget past the arena's, a
+// search that respects its budget could reach into the room the terminal calls need, and the failure
+// returns. It is asserted HERE, in a test TU, because no production TU can see both: the runtime planner
+// does not include a model header, and routing one in to satisfy a static_assert would invert the
+// layering that keeps `ResourceManager` model-agnostic. Careful about WHEN it fires: this is a TEST
+// target, and `BUILD_TESTING` defaults to OFF (`CMakeLists.txt`), while the prescribed deploy build is
+// `--target ninfer-serve` -- so a build that only relinks the server will NOT compile this guard. It
+// fires for anyone building the test targets, which is everyone who changes this code.
+static_assert(ninfer::runtime::kPlannerTargetBudget <=
+                  ninfer::models::qwen3_5::detail::planning_detail::kSearchTargetBudget,
+              "the planner's target budget must not exceed the arena's search budget, or the search can "
+              "spend the room reserved for the calls that cannot degrade");
 
 #include <iostream>
 #include <stdexcept>
@@ -209,6 +227,78 @@ int main() {
                          "token as the cause\n";
             return 1;
         }
+    }
+    // MESSAGE-BOUNDARY ATTRIBUTION. `split_probe_index` localises a divergence to a token, and a token
+    // index is unreadable on its own -- nothing a reader can consult retains the prompt's per-message
+    // layout -- so this is what turns "23,401" into "8 tokens into a user turn". Every case below is a
+    // hand-worked position; the POINT of the block is that the mapping takes the LAST frontier at or below
+    // the divergence (a first-wins loop passes an unmutated eye and reports message 0 for every prompt with
+    // a system preamble).
+    {
+        using ninfer::ChatRole;
+        const std::array<std::optional<std::uint32_t>, 4> frontiers{0U, 100U, 250U, 300U};
+        const std::array<ChatRole, 3> roles{ChatRole::System, ChatRole::User, ChatRole::Assistant};
+
+        // 150 is inside message 1, 50 tokens past its own frontier.
+        const DivergencePosition inside = attribute_divergence(frontiers, roles, 150);
+        require(inside.message_index == 1, "the divergence must fall in the last message it reached");
+        require(inside.message_offset == 50, "the offset is measured from that message's own frontier");
+        require(inside.role == static_cast<std::uint8_t>(ChatRole::User),
+                "the role must be the one of the message the divergence falls in");
+        require(!inside.past_last_message, "message 1 is a message");
+
+        // The last frontier starts no message: it is the end of the prompt, so there is no role.
+        const DivergencePosition at_end = attribute_divergence(frontiers, roles, 300);
+        require(at_end.message_index == 3 && at_end.message_offset == 0,
+                "a divergence at the end boundary is reported at that index, offset 0");
+        require(at_end.past_last_message, "the end boundary is not a message");
+        require(at_end.role == kNoMessageRole, "the end boundary starts no message, so it has no role");
+
+        // Zero-length match: no frontier was reached at all, and the offset is from the prompt's start.
+        const DivergencePosition none = attribute_divergence(frontiers, roles, 0);
+        require(none.message_index == 0 && none.message_offset == 0 && !none.past_last_message,
+                "a zero-length match is attributed to the prompt's first message");
+        require(none.role == static_cast<std::uint8_t>(ChatRole::System),
+                "the first message's role must still be reported");
+
+        // THE MUTATION-SENSITIVE CASE: 260 has passed TWO frontiers, and a first-wins loop reports index 0.
+        const DivergencePosition deepest = attribute_divergence(frontiers, roles, 260);
+        require(deepest.message_index == 2,
+                "MUTATION-SENSITIVE: the mapping must take the LAST frontier at or below the divergence; a "
+                "first-wins loop reports message 0 for every prompt that has a system preamble");
+        require(deepest.message_offset == 10, "the offset is from the frontier that was taken");
+
+        // A hole in the boundaries (a leading instruction folded into the preamble) is skipped, not treated
+        // as position 0 -- and the frontier before the hole is what the offset is measured from.
+        const std::array<std::optional<std::uint32_t>, 4> holed{0U, std::nullopt, 250U, 300U};
+        const DivergencePosition past_hole = attribute_divergence(holed, roles, 200);
+        require(past_hole.message_index == 0 && past_hole.message_offset == 200,
+                "a missing boundary is skipped: the last frontier actually reached is the one that counts");
+
+        // No boundaries at all: the offset falls back to distance from the prompt's start, and no role is
+        // claimed -- an index of 0 here must not be read as "the divergence is in a system turn".
+        const DivergencePosition bare =
+            attribute_divergence(std::span<const std::optional<std::uint32_t>>{}, roles, 42);
+        require(bare.message_index == 0 && bare.message_offset == 42 && bare.role == kNoMessageRole,
+                "with no frontiers the offset is from the prompt's start and no role is invented");
+    }
+    // The divergence is carried from the DEEPEST entry, like `probe_index` and for the same reason: a
+    // shallower entry's divergence is a different divergence. The deepest sample is FIRST here, so a
+    // last-wins implementation takes the shallow one and fails.
+    {
+        using ninfer::ChatRole;
+        const std::array<ChatRole, 2> roles{ChatRole::System, ChatRole::User};
+        const std::array<std::optional<std::uint32_t>, 3> frontiers{0U, 400U, 500U};
+        ninfer::runtime::PrefixSplitSample deep{.tokens = 900};
+        deep.divergence = attribute_divergence(frontiers, roles, 430);
+        ninfer::runtime::PrefixSplitSample shallow{.tokens = 300};
+        shallow.divergence = attribute_divergence(frontiers, roles, 20);
+        const std::array samples{deep, shallow};
+        const ninfer::runtime::PrefixSplitBest best = ninfer::runtime::best_prefix_split(samples);
+        require(best.divergence.message_index == 1 && best.divergence.message_offset == 30,
+                "the divergence must come from the DEEPEST entry, not the last one scanned");
+        require(best.divergence.role == static_cast<std::uint8_t>(ChatRole::User),
+                "the deepest entry's role must travel with its own position");
     }
     std::cout << "prefix-split aggregation ok\n";
 }

@@ -122,6 +122,9 @@ struct RenderedChat {
     // value means the template has no independent boundary there (for example, before a leading
     // instruction message folded into the system preamble).
     std::vector<std::optional<std::size_t>> message_boundaries;
+    // The role of the message starting at `message_boundaries[n]`, one entry per INPUT message --
+    // deliberately NOT padded to messages + 1, because the final boundary starts no message.
+    std::vector<ChatRole> message_roles;
     // One rendered byte boundary per requested cache marker.
     std::vector<std::optional<std::size_t>> cache_boundaries;
 };

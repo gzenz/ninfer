@@ -124,6 +124,112 @@ void test_reads_this_machine() {
 
 }  // namespace
 
+// WHY a growth was refused, and the reading it was refused FROM. Both were added on 2026-10-01 and both
+// needed this test: the reason was previously derivable only by reading the source against the running argv,
+// and the exported reading was the LATEST one (refreshed by every `allow()`, approvals included) rather than
+// the refusal's -- so a reader asking "was the machine short, or was the policy strict?" was shown a reading
+// from a later, unrelated attempt.
+void test_veto_reasons_are_distinct() {
+    const ninfer::HostMemoryReading roomy =
+        ninfer::parse_meminfo(well_formed(16U * 1024U * 1024U, 0U, 16U * 1024U * 1024U));
+    check(roomy.valid, "reading for the veto-reason cases");
+    {
+        ninfer::HostMemoryBudget budget(
+            ninfer::HostMemoryBudgetConfig{.reserve_bytes = 4U * kGib, .max_bytes = 0U});
+        check(budget.veto_for(roomy, 1U * kGib) == ninfer::GrowthVeto::None, "roomy -> None");
+        check(budget.veto_for(roomy, 0U) == ninfer::GrowthVeto::NothingWanted, "zero bytes -> NothingWanted");
+        ninfer::HostMemoryReading invalid;
+        check(budget.veto_for(invalid, 1U * kGib) == ninfer::GrowthVeto::InvalidReading,
+              "unreadable -> InvalidReading (the fail-closed path, indistinguishable from 'full' in a bool)");
+    }
+    {
+        // 1 GiB available against a 1 GiB reserve: the reserve is the reason, not the ceiling.
+        const auto tight = ninfer::parse_meminfo(well_formed(1U * 1024U * 1024U, 0U, 16U * 1024U * 1024U));
+        ninfer::HostMemoryBudget budget(
+            ninfer::HostMemoryBudgetConfig{.reserve_bytes = 4U * kGib, .max_bytes = 0U});
+        check(budget.veto_for(tight, 1U * kGib) == ninfer::GrowthVeto::Reserve, "scarce -> Reserve");
+    }
+    {
+        ninfer::HostMemoryBudget budget(
+            ninfer::HostMemoryBudgetConfig{.reserve_bytes = 0U, .max_bytes = 2U * kGib});
+        budget.set_pinned_bytes(2U * kGib);
+        check(budget.veto_for(roomy, 1U * kGib) == ninfer::GrowthVeto::MaxBytes,
+              "at the configured ceiling -> MaxBytes, a CONFIG fact rather than a machine one");
+    }
+}
+
+// REFUSE, THEN APPROVE, AND THE SNAPSHOT MUST NOT FOLLOW THE APPROVAL. This test exists because its
+// first version could not fail: it wrote `check(!budget.allow(...) || true)`, which is a tautology, and on
+// any healthy machine both calls APPROVE -- so the snapshot stayed 0 and `0 == 0` passed whatever the code
+// did. A commit review proved it by mutation: reinstating the bug (refreshing the snapshot on every
+// `allow()`, approvals included) left it green 5 runs of 5. `allow_with()` exists so a refusal can be
+// CONSTRUCTED; this is the only guard on the refusal snapshot, so it has to be able to fail.
+void test_refusal_snapshots_its_own_reading() {
+    constexpr std::size_t kReserve = 4U * kGib;
+    ninfer::HostMemoryBudget budget(ninfer::HostMemoryBudgetConfig{.reserve_bytes = kReserve});
+    // Reading X: too little available for the request -> the Reserve veto fires.
+    const auto scarce = ninfer::parse_meminfo(well_formed(5U * 1024U * 1024U, 0U, 16U * 1024U * 1024U));
+    const std::size_t want = 2U * kGib;
+    check(!budget.allow_with(scarce, want), "the scarce reading refuses");
+    check(budget.last_veto() == ninfer::GrowthVeto::Reserve, "and names the reason");
+    check(budget.last_veto_mem_available() == scarce.mem_available,
+          "the snapshot is the REFUSAL's reading");
+    check(budget.last_wanted_bytes() == want, "and the refused request's size");
+    check(budget.refusals() == 1U && budget.approvals() == 0U, "counted once, refused");
+
+    // Reading Y: plenty available -> approved. The snapshot must NOT move.
+    const auto roomy = ninfer::parse_meminfo(well_formed(40U * 1024U * 1024U, 0U, 16U * 1024U * 1024U));
+    check(budget.allow_with(roomy, want), "the roomy reading approves");
+    check(budget.approvals() == 1U, "counted once, approved");
+    check(budget.last_veto_mem_available() == scarce.mem_available,
+          "AN APPROVAL DOES NOT OVERWRITE THE REFUSAL'S READING -- this is the assertion the bug broke");
+    check(budget.last_veto() == ninfer::GrowthVeto::Reserve,
+          "nor does it overwrite the reason");
+    check(budget.last_wanted_bytes() == want, "nor the refused size");
+}
+
+// THE SECOND BRANCHES OF EACH VETO. The first version pinned only the first check of each reason, so a
+// mutation moving the SECOND check to the wrong reason survived -- and the second branch is the
+// production-shaped one (available above the reserve, but the chunk does not fit).
+void test_veto_second_branches() {
+    constexpr std::size_t kReserve = 4U * kGib;
+    {
+        // Reserve, SECOND branch: 5 GiB available > 4 GiB reserve, but a 2 GiB chunk does not fit.
+        const auto r = ninfer::parse_meminfo(well_formed(5U * 1024U * 1024U, 0U, 16U * 1024U * 1024U));
+        ninfer::HostMemoryBudget budget(ninfer::HostMemoryBudgetConfig{.reserve_bytes = kReserve});
+        check(budget.veto_for(r, 2U * kGib) == ninfer::GrowthVeto::Reserve,
+              "Reserve via the second check (above the reserve, chunk too big)");
+    }
+    {
+        // MaxBytes, SECOND branch: under the ceiling, but this chunk would cross it.
+        const auto r = ninfer::parse_meminfo(well_formed(40U * 1024U * 1024U, 0U, 16U * 1024U * 1024U));
+        ninfer::HostMemoryBudget budget(
+            ninfer::HostMemoryBudgetConfig{.reserve_bytes = 0U, .max_bytes = 2U * kGib});
+        budget.set_pinned_bytes(1U * kGib + (512U << 20U));  // 1.5 GiB of a 2 GiB ceiling
+        check(budget.veto_for(r, 1U * kGib) == ninfer::GrowthVeto::MaxBytes,
+              "MaxBytes via the second check (under the ceiling, chunk would cross it)");
+    }
+    {
+        // ShmemCap, first branch: already over the cap.
+        const auto r = ninfer::parse_meminfo(well_formed(40U * 1024U * 1024U,
+                                                         20U * 1024U * 1024U, 16U * 1024U * 1024U));
+        ninfer::HostMemoryBudget budget(ninfer::HostMemoryBudgetConfig{
+            .reserve_bytes = 0U, .max_bytes = 0U, .shmem_cap_bytes = 8U * kGib});
+        check(budget.veto_for(r, 1U * kGib) == ninfer::GrowthVeto::ShmemCap,
+              "ShmemCap is reachable and named (it is 0 in production, so only a test can fire it)");
+        // THE SECOND ShmemCap BRANCH TOO: under the cap, but this chunk would cross it. It was the one
+        // mutation that survived pass 2's tests (B5b), because `test_shmem_cap` had only exercised the
+        // first branch through the bool `decide()`. Not load-bearing in production (the config hard-codes
+        // `shmem_cap_bytes = 0`), but a surviving mutant is a surviving mutant.
+        const auto under = ninfer::parse_meminfo(well_formed(40U * 1024U * 1024U,
+                                                             7U * 1024U * 1024U, 16U * 1024U * 1024U));
+        ninfer::HostMemoryBudget budget2(ninfer::HostMemoryBudgetConfig{
+            .reserve_bytes = 0U, .max_bytes = 0U, .shmem_cap_bytes = 8U * kGib});
+        check(budget2.veto_for(under, 2U * kGib) == ninfer::GrowthVeto::ShmemCap,
+              "ShmemCap via the second check (under the cap, chunk would cross it)");
+    }
+}
+
 int main() {
     test_parse_well_formed();
     test_parse_malformed_is_invalid();
@@ -133,6 +239,9 @@ int main() {
     test_shmem_cap();
     test_counters_and_max_pinnable();
     test_reads_this_machine();
+    test_veto_reasons_are_distinct();
+    test_refusal_snapshots_its_own_reading();
+    test_veto_second_branches();
 
     if (failures != 0) { std::printf("%d FAILURE(S)\n", failures); return 1; }
     std::printf("all host-memory-budget checks passed\n");

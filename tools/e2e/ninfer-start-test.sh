@@ -2,11 +2,16 @@
 # ninfer-start-test.sh — test server for this tree (~/ninfer, v3), light by default.
 #
 # Profiles:
-#   CTX=32k (default): 32k ctx / 64k KV / c=3 / 12 GiB host KV. Fast, safe on this
-#       host; the cache-eviction and demote/restore paths are exercised by sizing.
+#   CTX=32k (default): 32k ctx / 64k KV / c=3 / 20,480 MiB host KV. Fast, safe on
+#       this host; the cache-eviction and demote/restore paths are exercised by sizing.
 #   CTX=prod4:         prod SLOT SHAPE (c=4, device-state-slots=4, host-state-slots=16)
-#       with a LIGHT host KV (12 GiB) — the concurrency shape that collapsed prod,
+#       with a LIGHT host KV (20,480 MiB) — the concurrency shape that collapsed prod,
 #       without prod's 30 GiB pinned footprint.
+#
+# THE HOST-KV NUMBERS ABOVE WERE 12 GiB UNTIL 2026-10-01. Since `--host-kv-mib` became the ceiling for
+# KV *and* state together (2026-09-28), 12,288 MiB could not hold a 64-slot state pool plus a KV span,
+# and the server refused to start (`Host KV arena could not pin its initial span`). Read the branches
+# below rather than this header if the two ever disagree.
 #   CTX=200k:          prod parity (262k ctx, c=2, 30 GiB host KV). HEAVY: takes ages
 #       and OOM-crashes WSL (host pinned shmem). Requires ALLOW_HEAVY=1.
 #
@@ -35,9 +40,13 @@ elif [ "$CTX" = "prod4" ]; then
   DEVICE_STATE_SLOTS="${DEVICE_STATE_SLOTS:-4}"
   HOST_STATE_SLOTS="${HOST_STATE_SLOTS:-16}"
 else
-  HOST_KV_MIB="${HOST_KV_MIB:-12288}"
+  # ONE BUDGET: `--host-kv-mib` is the ceiling for KV *and* state (2026-09-28). 128 state slots is ~23.4 GiB
+  # at ~0.187 GiB each, which was twice the old 12,288 MiB ceiling and made the test server fail to pin
+  # its KV span -- `Host KV arena could not pin its initial span`, with the state pool already past the cap. The
+  # profile now leaves the ceiling room to act as the pressure knob.
+  HOST_KV_MIB="${HOST_KV_MIB:-20480}"
   DEVICE_STATE_SLOTS="${DEVICE_STATE_SLOTS:-5}"
-  HOST_STATE_SLOTS="${HOST_STATE_SLOTS:-128}"
+  HOST_STATE_SLOTS="${HOST_STATE_SLOTS:-64}"
 fi
 
 sudo mv /lib/x86_64-linux-gnu/libnvidia-ptxjitcompiler.so.1 /lib/x86_64-linux-gnu/libnvidia-ptxjitcompiler.so.1.disabled 2>/dev/null || true
@@ -121,7 +130,23 @@ unset _mat_name _mat_value
 # -- which is the check that stops a swap whose `systemctl stop` silently failed from running its
 # whole suite against prod (/health alone cannot tell them apart). Verified: the recorded pid equals
 # the pid `ss -ltnp` reports for the port.
-nohup bash -c '"$BIN" "$1" \
+# THE BRANCH ANCHOR IS ON for the test server (2026-09-28), because it is the SHIPPED configuration and it
+# had no coverage at all: it is a server-level flag, so no phase could enable it, and the change that took the
+# pinned-prefix share from 25% to 7% was never exercised by this suite. `phase_reuse_paths` asserts it is
+# taken.
+#
+# ANCHOR-OFF ARM. The engine reads PRESENCE, not value (`engine_core.h:1487` tests
+# `std::getenv("NINFER_BRANCH_ANCHOR") != nullptr`), so `NINFER_BRANCH_ANCHOR=0` still enables the anchor --
+# which is why the documented arm was inert. Two further traps this replaces: `env` with an EMPTY prefix
+# does not REMOVE an inherited variable (QA's own environ carries `NINFER_BRANCH_ANCHOR=1`), so the off arm
+# needs `env -u`; and a presence test would treat `E2E_ANCHOR_OFF=0` as "off". The comparison is therefore
+# against the VALUE, and the child's environment is written to the log so the arm is recorded rather than
+# inferred.
+ANCHOR_ENV=(env "NINFER_BRANCH_ANCHOR=${NINFER_BRANCH_ANCHOR:-1}")
+if [ "${E2E_ANCHOR_OFF:-0}" = "1" ]; then
+  ANCHOR_ENV=(env -u NINFER_BRANCH_ANCHOR)
+fi
+nohup "${ANCHOR_ENV[@]}" bash -c '"$BIN" "$1" \
   --host 0.0.0.0 --port "${PORT:-8080}" \
   --default-max-tokens 131072 --pending-timeout-ms 900000 \
   --kv-dtype nvfp4 '"$SPEC_FLAGS"' \
@@ -132,6 +157,7 @@ nohup bash -c '"$BIN" "$1" \
   '"$CTX_FLAGS"' '"$CT_FLAGS_EXTRA"' &
   SRV=$!
   echo "$SRV" > '"$HOME"'/ninfer-test.pid
+  echo "ANCHOR_CHILD=$(tr '"'"'\0'"'"' '"'"'\n'"'"' < /proc/$SRV/environ | grep -c NINFER_BRANCH_ANCHOR)" >> '"$LOG"'
   wait "$SRV"
   echo "NINFER_EXIT=$?" >> '"$LOG"' 2>&1' _ "$MODEL" \
   > "$LOG" 2>&1 &

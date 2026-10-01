@@ -413,7 +413,9 @@ PreparedContextCache prepare_context_cache(
     std::span<const VisionItem> vision_items, std::optional<std::size_t> engine_tool_marker_index,
     std::optional<std::uint32_t> leading_boundary, std::uint32_t full_prompt_frontier) {
     if (hints.markers.size() > kMaximumExplicitPromptCacheMarkers) {
-        throw std::invalid_argument("PromptInput supports at most four explicit cache markers");
+        throw std::invalid_argument("PromptInput supports at most " +
+                                    std::to_string(kMaximumExplicitPromptCacheMarkers) +
+                                    " explicit cache markers");
     }
     if (cache_boundaries.size() != rendered_markers.size()) {
         throw std::logic_error("rendered cache marker count changed during preparation");
@@ -738,7 +740,9 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     const PromptOptions options   = input.options;
     ContextCacheHints cache_hints = std::move(input.context_cache);
     if (cache_hints.markers.size() > kMaximumExplicitPromptCacheMarkers) {
-        throw std::invalid_argument("PromptInput supports at most four explicit cache markers");
+        throw std::invalid_argument("PromptInput supports at most " +
+                                    std::to_string(kMaximumExplicitPromptCacheMarkers) +
+                                    " explicit cache markers");
     }
     std::vector<ChatRole> message_roles;
     message_roles.reserve(input.messages.size());
@@ -809,8 +813,12 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         result.identity.rewrite_checkpoint = processed.rewrite_checkpoint;
         result.identity.rewrite_execution_frontiers =
             std::move(processed.rewrite_execution_frontiers);
+        result.identity.message_roles = std::move(processed.message_roles);
         message_boundaries = std::move(processed.message_boundaries);
-        cache_boundaries   = std::move(processed.cache_boundaries);
+        // Copied rather than moved: `prepare_context_cache` below still needs the boundaries, and
+        // this vector is one entry per message.
+        result.identity.message_frontiers = message_boundaries;
+        cache_boundaries                  = std::move(processed.cache_boundaries);
     } else {
         const fi::RenderedChat rendered = impl_->chat_template.render(
             messages, render_options(options, rendered_markers), control);
@@ -828,8 +836,10 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         result.identity.rewrite_checkpoint = encoded.rewrite_checkpoint;
         result.identity.rewrite_execution_frontiers =
             std::move(encoded.rewrite_execution_frontiers);
+        result.identity.message_roles = std::move(encoded.message_roles);
         message_boundaries = std::move(encoded.message_boundaries);
-        cache_boundaries   = std::move(encoded.cache_boundaries);
+        result.identity.message_frontiers = message_boundaries; // copied: still needed below
+        cache_boundaries                  = std::move(encoded.cache_boundaries);
         assign_text_positions(result);
     }
     (void)checked_token_count(result.token_ids.size());

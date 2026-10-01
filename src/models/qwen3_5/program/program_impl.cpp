@@ -609,8 +609,28 @@ MemorySummary ProgramImpl::memory_summary() const noexcept {
             out.host_pinned_free_bytes     = pinned_host_pool->free_bytes();
             out.host_pinned_chunks         = static_cast<std::uint32_t>(pinned_host_pool->chunk_count());
             out.host_pinned_grows          = pinned_host_pool->growth_count();
+            out.host_pinned_largest_free_run_bytes =
+                static_cast<std::size_t>(pinned_host_pool->largest_free_run());
+            out.host_pinned_growth_policy_refusals =
+                pinned_host_pool->growth_policy_refusals();
+            out.host_pinned_growth_pin_failures = pinned_host_pool->growth_pin_failures();
+            out.host_pinned_allocation_refusals = pinned_host_pool->allocation_refusals();
+            out.host_pinned_allocation_ram_refusals =
+                pinned_host_pool->allocation_ram_refusals();
+            out.host_pinned_allocation_post_grow_failures =
+                pinned_host_pool->allocation_post_grow_failures();
+            out.host_pinned_allocation_fragmented_misses =
+                pinned_host_pool->allocation_fragmented_misses();
         }
-        if (host_memory_budget) { out.host_pinned_grow_refusals = host_memory_budget->refusals(); }
+        if (host_memory_budget) {
+            out.host_pinned_grow_refusals = host_memory_budget->refusals();
+            out.host_pinned_reserve_bytes = host_memory_budget->config().reserve_bytes;
+            out.host_pinned_last_wanted_bytes = host_memory_budget->last_wanted_bytes();
+            // THE REFUSAL'S OWN READING, not the live one -- see HostMemoryBudget::last_veto_mem_available.
+            out.host_pinned_last_veto_mem_available_bytes =
+                host_memory_budget->last_veto_mem_available();
+            out.host_pinned_last_veto = ninfer::growth_veto_name(host_memory_budget->last_veto());
+        }
         if (host_kv_arena) {
             out.host_kv_grows         = host_kv_arena->growth_count();
             out.host_kv_grow_refusals = host_kv_arena->growth_refusals();

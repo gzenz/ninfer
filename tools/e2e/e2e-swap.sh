@@ -5,8 +5,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # the 32k e2e server 400s on its prompts, so the session is frozen for the
 # whole swap).
 #
-#   bash ~/ninfer-e2e/e2e-swap.sh                 # demote-capable (12 GiB host KV)
-#   E2E_HOST_KV_MIB=512 bash ~/ninfer-e2e/e2e-swap.sh   # eviction-forcing
+#   bash tools/e2e/e2e-swap.sh                 # demote-capable (12 GiB host KV)
+#   E2E_HOST_KV_MIB=512 bash tools/e2e/e2e-swap.sh   # OBSOLETE as written: since 2026-09-28 --host-kv-mib
+#       is the ceiling for ALL host caching (KV + state), so a value below the profile's host-state floor
+#       (~0.187 GiB per slot) cannot start at all -- 512 MiB against 128 slots is arithmetically impossible,
+#       not merely tight. Size this ABOVE the state floor; it is now the pressure knob, because shrinking it
+#       starves both axes at once.
 set -uo pipefail
 LOG=/tmp/ninfer-e2e-swap.log
 # Per-run suite log: a fixed name was overwritten by every swap, so the raw stdout of an earlier run
@@ -79,7 +83,7 @@ PORT="${E2E_PORT:-${PORT:-8085}}"
 PROD_PORT="${PROD_PORT:-8080}"
 listener_pid(){ ss -ltnp 2>/dev/null | sed -n "s/.*:${1:-$PORT} .*pid=\([0-9]*\).*/\1/p" | head -1; }
 
-echo "[$(ts)] swap start (HOST_KV_MIB=${E2E_HOST_KV_MIB:-12288})" | tee -a $LOG
+echo "[$(ts)] swap start (HOST_KV_MIB=${E2E_HOST_KV_MIB:-20480})" | tee -a $LOG
 
 # Restore prod + sentinel. Used by the normal path and by every abort path: a swap that fails before
 # its suite runs used to `exit 1` with prod AND the sentinel down, leaving the outage for a human to
@@ -161,7 +165,7 @@ BIN=$HOME/ninfer/build/apps/ninfer-serve \
 MODEL=$HOME/ninfer-models/swift15/qwen3_8_27b_nvfp4swift15.ninfer \
 CHAT_TEMPLATE=$HOME/froggeric_v225_chat_template.jinja \
 SPEC="${SPEC:-dflash2}" \
-HOST_KV_MIB="${E2E_HOST_KV_MIB:-12288}" \
+HOST_KV_MIB="${E2E_HOST_KV_MIB:-20480}" \
 PORT="$PORT" \
 bash "$SCRIPT_DIR/ninfer-start-test.sh" 9>&- >> $LOG 2>&1
 for i in $(seq 1 90); do

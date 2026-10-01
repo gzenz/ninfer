@@ -104,6 +104,65 @@ template <typename ReuseOf>
 //
 // The two maxima are INDEPENDENT and that is the whole point: the deepest MATCH and the deepest RESTORABLE
 // checkpoint need not come from the same entry, and a reader must not infer one from the other.
+// WHERE A DIVERGENCE FALLS IN THE PROMPT'S OWN MESSAGE HISTORY.
+//
+// `tokens` is the match LENGTH -- the index of the first token the two renders disagreed on -- and
+// `frontiers[n]` is the token at which input message n starts. The divergence is therefore in the
+// last message whose own frontier the match reached, and `message_offset` is how far into that
+// message it got before disagreeing.
+//
+// This is PROMPT-SIDE ONLY: the stored ledger's boundaries are not retained, so it says where the
+// incoming render diverged in its own history, never where the stored one sat.
+inline constexpr std::uint8_t kNoMessageRole = 0xFF;
+
+struct DivergencePosition {
+    std::uint32_t message_index  = 0;
+    std::uint32_t message_offset = 0;  // tokens from that message's frontier to the divergence
+    // The index names the END-of-prompt boundary rather than a message: no message starts there, so
+    // there is no role to report and `message_offset` is measured from the end of the last message.
+    bool          past_last_message = false;
+    // The role of the message the divergence falls in, as a ChatRole value, or kNoMessageRole when
+    // no message starts at that index (the end boundary, or a divergence before the first frontier).
+    std::uint8_t  role = kNoMessageRole;
+};
+
+// No entry of `frontiers` at or below the divergence (a zero-length match, or a template with no
+// boundaries at all) leaves index 0 and measures the offset from the START OF THE PROMPT, which is
+// what `message_offset` is then documented as, and no role is resolved FROM THE FALLBACK INDEX.
+// Careful, because the two cases look alike and are not: if `frontiers[0]` is present and 0 -- the
+// ordinary shape, where message 0 starts at token 0 -- then a zero-length match DOES reach it and the
+// role of message 0 is reported. Only when NO frontier is reached at all (an empty span, or every
+// entry nullopt or greater than `tokens`) is the role kNoMessageRole. A divergence is only
+// attributed when it actually diverged; the caller does not pass one that did not.
+//
+// `roles` is one entry per INPUT message, which is one SHORTER than `frontiers` -- the last
+// frontier is the end of the prompt and starts no message, so an index at or past `roles.size()`
+// carries no role. That is a fact about the prompt, not a failure to measure, and it is reported as
+// kNoMessageRole rather than as a role code that would be read as "the divergence is in a system turn".
+[[nodiscard]] inline DivergencePosition
+attribute_divergence(std::span<const std::optional<std::uint32_t>> frontiers,
+                     std::span<const ChatRole> roles, std::uint32_t tokens) noexcept {
+    DivergencePosition where;
+    bool found = false;
+    for (std::size_t index = 0; index < frontiers.size(); ++index) {
+        if (!frontiers[index].has_value() || *frontiers[index] > tokens) { continue; }
+        where.message_index  = static_cast<std::uint32_t>(index);
+        where.message_offset = tokens - *frontiers[index];
+        found                = true;
+    }
+    if (!found) { where.message_offset = tokens; }
+    where.past_last_message =
+        found && static_cast<std::size_t>(where.message_index) + 1U == frontiers.size();
+    // Gated on `found` as well as the bounds: when no frontier was reached the index is a fallback of
+    // 0 and does NOT name message 0, so resolving a role from it would report "the divergence is in a
+    // system turn" for a prompt that simply has no boundaries to attribute it with.
+    if (found && !where.past_last_message &&
+        static_cast<std::size_t>(where.message_index) < roles.size()) {
+        where.role = static_cast<std::uint8_t>(roles[where.message_index]);
+    }
+    return where;
+}
+
 struct PrefixSplitSample {
     std::uint32_t tokens      = 0;  // this entry's token-exact match
     std::uint32_t restorable  = 0;  // this entry's deepest restorable checkpoint at or below its own match
@@ -123,6 +182,11 @@ struct PrefixSplitSample {
     // they answered their question (the replayed turn's structure diverging from the stored ledger) and they
     // logged content, which an instrument should not keep doing once the question is answered.
     std::uint32_t probe_index = 0;
+    // WHERE that divergence falls in the prompt's own message history. Carried per SAMPLE rather
+    // than read from the best one later, for the same reason `source` and `frontier` are: a
+    // shallower entry's divergence is a different divergence, and the deepest match is often
+    // another conversation's ledger, whose window describes why THAT match stopped.
+    DivergencePosition divergence;
 };
 
 struct PrefixSplitBest {
@@ -140,6 +204,7 @@ struct PrefixSplitBest {
     std::uint8_t  source            = 0;  // ...and these: a shallower entry's ledger is not this one's
     std::uint32_t frontier          = 0;
     std::uint32_t probe_index       = 0;  // ...and this too: a shallower entry's divergence is not this one's
+    DivergencePosition divergence;        // ...and this: it attributes THIS entry's divergence
 };
 
 [[nodiscard]] inline PrefixSplitBest best_prefix_split(std::span<const PrefixSplitSample> samples) noexcept {
@@ -155,6 +220,7 @@ struct PrefixSplitBest {
             best.source      = sample.source;
             best.frontier    = sample.frontier;
             best.probe_index = sample.probe_index;
+            best.divergence  = sample.divergence;
         }
         best.restorable = std::max(best.restorable, sample.restorable);
     }

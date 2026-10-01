@@ -292,7 +292,557 @@ account of the sequence. Read them as local history, not as remote refs.
 
 `git log --oneline eb975b80` on this host still resolves every one of them.
 
+### 1g. 2026-10-01 (late) — the client-compatibility pass, and a regression that is probably the harness
+
+**Raised `kMaximumExplicitPromptCacheMarkers` 4 -> 32** (`include/ninfer/types.h`), as a DELIBERATE
+divergence from Anthropic's API limit. The operator's call: the same harness and queries that ran before
+started sending `cache_control` today, and NInfer 400'd every request above four. Nothing upstream enforces
+the limit here, so it is a guard against pathological input, not a compatibility rule. The three message
+texts now DERIVE their number from the constant (they said "four" while the cap was 4, which is exactly what
+would have kept saying four after it moved). One coupling had to be broken: `model_instance.cpp` used the
+same constant as a shared-prefix FLOOR (`max_shared_prefixes = max(concurrency, cap)`), so raising it would
+have raised that default 8x as a side effect; it now names 4 explicitly, preserving behaviour.
+Verified live: 5 markers accepted, 33 rejected with "at most 32".
+
+**Parse-time rejections were invisible, and now are not.** The `ApiException` catch that handles a request
+rejected ON THE WAY IN wrote the error to the client and returned WITHOUT logging -- in all three protocol
+handlers (anthropic, openai_chat, openai_responses), while the generic catch below each of them logged. So a
+client saw a 400 from a server whose journal and request log both looked idle and healthy; it cost a
+hand-reproduced probe to identify. Each now records a `request_rejected` event plus a journal line, with the
+request id taken BEFORE the parse so a rejected request has one. `make_unparsed_request_rejection_log_context`
+carries only identity/protocol/error, because nothing else exists yet -- and the record says so rather than
+looking like a request that had no fields.
+
+**`response failed during response rendering | HTTP 500 | internal error` was a MISLABEL.** Measured: 13
+render-failures in one load, ALL 13 on cancelled requests, all 13 paired with a 499 on the same id -- i.e.
+EVERY HTTP 500 in that load was a client disconnect. The catch after `encoder->finish(outcome)` now checks
+`stream->cancelled` (already set by the completion callback) and reports client-disconnected instead.
+Verified by reproducing the disconnect mid-stream: one INFO 499, no 500.
+
+**`explicit_cache_markers` is now in the request log** -- the denominator the regression below needed and
+that no log carried. Counted by the protocol parser with the same code that enforces the cap, and recorded
+BEFORE the cap check so a rejected request still says how many it sent. ANTHROPIC PATH ONLY: the OpenAI
+translators mix explicit and automatic markers and do not separate them, so that path logs 0 -- read that as
+"not counted", never as "the client sent none". Verified on real traffic: the harness sends 4-5.
+
+**THE QA READINGS FROM THIS WINDOW ARE INVALID, and here is the instance id: `serve-361506-1790865614772801`,
+plus every request-log record carrying `preserving_alternatives_assessed` before the fix below.** The argument
+transposition described next was live on QA for that instance, so its `preserving_alternatives_assessed`,
+`assessed_targets_without_goal` and `target_arena_truncated` are all three wrong -- 25 of 27 records showed
+`preserving_alternatives_assessed < feasible_preserving_alternatives`, which the design says cannot happen,
+and the same 25 reported `target_arena_truncated=true` while the journal had no `pressure search truncated`
+line at all. **Do not apply the CLAUDE.md #6 rule to those records**: it reads the wrong field. `/stats`
+`pressure.target_arena_truncations` (12) against `search_budget_exhaustions` (11) is garbage for the same
+reason.
+
+**A SECOND BROKEN WINDOW, SAME CAUSE, SAME DAY: `serve-491645-1790869560974998` (17:46:28-17:53:47).**
+Instrumenting the planner's five goal-probe sites, the counter for site 4 was inserted MID-EXPRESSION, so it
+parsed as `cost.logical_ready = ++counter;` with the `logical_goal(...)` call discarded -- `logical_ready` was
+true whenever the counter was non-zero, which disables the `unsatisfied_constraints` term in the cost model.
+**Every request in that window was planned by a wrong cost function**, so its plans, reuse choices, eviction
+choices and probe distributions are NOT evidence. The tell is in the probe vectors: that instance reports
+`probes=[0,1,229,1383,4172]` (site 4 dominant) where the repaired build reports `[0,1,268,2842,209]` (site 3
+dominant) on the same traffic -- a 10x difference in one site from a cost-model change alone.
+**The suite cannot catch this class**: re-applying the broken form leaves `ninfer_resource_manager_test` at
+`51 run, 1 failed`, the baseline. The planner's cost model has no host coverage, like the #6 counter. It was
+found by reading the instrumented site.
+
+**THE PROC RESIDUAL, MEASURED BY REUSE PATH (2026-10-01, 12,000+ requests).** `proc` minus the `prefill` the
+record accounts for, median, by path: `private_long_anchor` 1.82s (on 5,609 tokens to prefill, 4,155 tok/s
+effective), `shared_stable_prefix` 1.32s, `private_endpoint` 0.53s, `root` 0.29s (mostly prefill), and
+`private_response_replay` **0.06s** -- the one path that restores nothing. The ordering follows how much each
+path has to RESTORE, but the transfer counters do NOT confirm that: `state_h2d` 41 restores/0.1s and `main_kv`
+7,725 pages/0.4s on that instance, i.e. restores are fast. So the residual is real and unattributed, and
+**the request record has no restore or transfer field at all** -- req#50 (proc 6.07s, prefill 0.59s, 97%
+reuse) cannot be decomposed from its own record by any means currently available. `ContextTransferObservation`
+(`runtime/contract/resources.h:63`) already carries `elapsed_ns` per resource and direction and the
+materialization outcome already moves it; it stops short of the record because `observe_transfers(result)`
+runs inside `adopt_materialization_progress(Program&, ProgramMaterializationResult&&)`, a PROGRAM-level
+adoption with no request in scope.
+
+**WHERE THE RESIDUAL ACTUALLY IS, AND WHY IT RESISTED ATTRIBUTION (2026-10-01, on the 290 records of the
+post-rename e2e run).** Two results, and the second is the reason the first took so long:
+
+* **The median request has NO residual.** `ttft - queue - host_total - prefill` has a median of **-7 ms**
+  across 290 records -- the ordinary request is fully accounted for by queue, host exposure and prefill. The
+  residual is confined to the TAIL: **33 of 290** records carry a median **3.54 s** each, and by construction
+  of the residual those three terms are already excluded as its explanation.
+* **The two windows do not match, and that is the defect in every residual read so far.** The record's
+  `host_exposed_seconds.total` and `device_wait_exposed_seconds` run for the WHOLE request, while `ttft` --
+  and `proc = ttft - queue`, which is what everyone reads -- stops at the first token. Proved on one record:
+  `ttft 6.05`, `total 7.47`, `device_wait 7.03`, `decode.device_wait 0.20` -- the top-level device wait
+  tracks `total`, not `ttft`. **So every subtraction of those fields from `ttft` has been comparing two
+  windows**, and no field in the record was scoped to the first-token window at all. Fixed by
+  `engine_timing.ttft_window` (below).
+* **Three instrument errors were made getting here, each of which produced a confident-looking number**:
+  summing the latency-exposure fields across concurrent requests (invalid by the record's own docs --
+  `device_wait` came out at 111% of proc, which was the arithmetic objecting); comparing the whole-request
+  `device_wait` against the TTFT-window `proc`; and assuming the identity `proc = host_total + device_wait`,
+  which does not hold (median error 562 ms). **The fields' own documentation is the control here, and it said
+  "must not be summed across concurrent requests" in the same file I was reading.**
+* Population caveat, stated so this is not transferred wrongly: this is the e2e TEST profile under deliberate
+  over-subscription. The earlier QA reading pointed at `engine_commit_output` at 5-16 s, which is ~0.01 s
+  here -- **the two populations have different dominant phases**, so this tail composition is not QA's.
+
+**⚠ CORRECTION (2026-10-01, commit review): THE FREEZE WAS ONE PROGRAM CALL LATE, SO READ THE NUMBERS
+BELOW AS AN ESTIMATE AND RE-READ THEM AFTER THE FIX.** The window was frozen in `finish_program_call`, on
+the stated premise that the first-token commit happens INSIDE the program call. The code says otherwise:
+`program_call.finish()` inside `commit_pending` (and the forced-token path's own) runs BEFORE
+`record_committed_output` -- which sets `first_token`. **Cite functions, not line numbers:** the first version's citations were wrong in every copy within the hour, because the edits that added them moved the lines they named, and two copies cited two different (both wrong) sets. So the
+freeze could not fire in the round that produced the token; it fired at the NEXT program call of any kind
+that had the request exposed, absorbing that round's remaining commit phase and possibly a whole
+`advance_prefill` of an unrelated lane. **And I first wrote that the closure check below CANNOT detect this -- that was wrong, and the correction is
+the useful part.** The expression reduces to `ttft - queue - host - device_wait` by algebra, so it verifies
+arithmetic rather than placement -- BUT it is SIGNED, and a late freeze shows up as a NEGATIVE value. The
+second review computed it over the stored runs: on the old placement, four e2e instances put **78-92 of 290
+records below -10 ms (medians -7.6 to -8.5 ms)**, while the QA-load instances show **0** below -10 ms. **I
+had reported `|difference|`, and taking the absolute value erased exactly the sign that detects the
+misplacement.** Two limits: it catches a LATE freeze and not an early one, and the fixed placement errs
+EARLY (the round's commit host time before the token is inside `ttft` but not `ttft_host`, so it lands in
+`unaccounted` -- one-sided, inflating only, size unmeasured). **Fixed by freezing where
+`first_token` is set**, which is after the round's device wait is accumulated and covers both call sites by
+construction (and closes a case the old placement could not: a request whose FIRST commit is terminal was
+removed before any later program call, so it was never frozen and reported `null`, which the log documents
+as "produced no token"). The conclusions below are not retracted -- the identity and the ordering by path
+were both real -- but their magnitudes were carried by a window that included extra time, so they need
+re-reading on the fixed build before being quoted again.
+**THE TAIL IS NOW ATTRIBUTED, AND IT IS DEVICE WAIT (2026-10-01, run on `554b5c6a5a86a6c1` with
+`ttft_window`).** `engine_timing.ttft_window` is present on **290/290** records and `unaccounted_seconds` is
+null on **0** of them, so the window is frozen for every request that produced a token. The residual then
+collapses onto one term:
+
+    unaccounted_seconds  ==  ttft_window.device_wait_seconds  -  prefill_seconds
+    |difference|  median 10.13 ms   p90 392 ms   max 433 ms   (over 290 records)
+
+**So the "unattributed" seconds were never unattributed -- they are device wait, and the number the record
+calls `prefill` does not contain them.** The two differ by 3-7x: median ttft-scoped device wait **0.503 s**
+(p90 4.01, max 19.45) against median recorded prefill **0.348 s** (p90 2.84). Concretely, on the slowest
+record: `ttft 26.09`, `prefill 2.85`, `device_wait 19.45`, `queue 1.42`, `host 5.22` -- a request whose
+recorded prefill is under 3 s spent **19.45 s blocked on the device inside the first-token window**. By path
+the medians scale with how much prefill the path has to do: `private_long_anchor` 2.958 s device wait /
+2.404 s prefill, `root` 2.753 / 1.989, `private_endpoint` 0.360 / 0.307, `private_turn_closure` 0.319 / 0.321.
+
+**What this does and does not say.** It says the delay is the request waiting for the DEVICE -- under a
+compact batch a lane's round contains other lanes' work, so this is contention and scheduling, not host work,
+not restore volume, and not planning. It does NOT say the engine is at fault, and it does not transfer to QA:
+this run is deliberately over-subscribed (4-10 concurrent sessions), while the earlier QA reading put
+`engine_commit_output` -- HOST exposure -- at 5-16 s, which is ~0.01 s here. **The next reading is the same
+one applied to QA's agentic load**, which the instrument now makes possible; that is what decides whether
+QA's seconds are this contention term or a host-side one.
+Residual caveat: 93 of 290 residuals are negative, i.e. `prefill` and `host_exposed` overlap (the prefill's
+own host portion is counted in both) -- the ~10 ms identity above is what makes the residual usable anyway,
+but it is not an exact conservation law.
+
+**IS THE UPSTREAM SYNC DEFAULT THE CAUSE? NO -- AND THE MEASUREMENT AGREES WITH THE COMMIT THAT MADE IT
+(2026-10-01).** The `origin/master` merge `3d6eb705` brought in `bace20dc` (`perf(core): default to spin with
+configurable cuda synchronization`, 2026-09-24), which REPLACED a hard-coded
+`cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync)` with `NINFER_CUDA_SYNC`, defaulting to
+`cudaDeviceScheduleSpin` and throwing on failure instead of warning. The comment the commit removed is the one
+that predicted the concern: *"cudaDeviceScheduleAuto spin-waits in every synchronize when the host has more
+cores than GPUs, keeping this thread at 100% of a core for as long as the GPU is busy."* **`NINFER_CUDA_SYNC`
+is set NOWHERE** -- not `~/.config/ninfer.conf`, not `~/ninfer-ensure.sh`, not
+`/etc/systemd/system/ninfer.service`, not `tools/e2e/ninfer-start-test.sh` -- and the journal says
+`CUDA sync spin` on every QA instance. So the concern is live, and it was worth testing.
+
+Tested as an A/B on the IDENTICAL binary and tree, one environment variable, the e2e profile, n=290 each, with
+each arm validated from its OWN startup line (`CUDA sync blocking` / `CUDA sync spin`, the latter with
+`NINFER_CUDA_SYNC` confirmed absent from `/proc/<pid>/environ`):
+
+| arm | device_wait med / p90 / max | prefill med | residual med | ttft med | res>1s | host med | submit med | queue med |
+|---|---|---|---|---|---|---|---|---|
+| spin #1 (18:48) | 0.503 / 4.010 / 19.450 | 0.348 | 0.116 | -- | 42 | -- | -- | -- |
+| **blocking** (19:06) | **0.654 / 4.462 / 21.631** | 0.377 | 0.171 | 2.875 | 51 | 0.234 | 0.212 | 1.100 |
+| spin #2 (19:09) | 0.449 / 3.873 / 19.045 | 0.346 | 0.086 | 2.288 | 33 | 0.167 | 0.135 | 1.128 |
+
+**Blocking is WORSE than both spin runs on every term, and the two spin runs agree with each other better than
+either agrees with blocking** (spin medians 0.503 and 0.449; blocking 0.654, with 63% of spin records below the
+blocking median and 556.6 s of device wait against 428.6 s for the same 290 requests). The workload control
+holds: `queue` medians are 1.100 vs 1.128 and `prefill` 0.377 vs 0.346, i.e. the two arms did comparable work.
+**So turning the default off does not recover the time -- it makes it worse, exactly as `bace20dc`'s own docs
+say** ("use `blocking` to let the waiting thread sleep; the decode performance cost depends on the host"): a
+sleeping waiter adds wake latency that the host thread then observes as device wait. **The upstream default is
+not the regression, and `NINFER_CUDA_SYNC` should be left unset.** The ~1 core of CPU the spin schedule burns
+is therefore a price already being paid deliberately, not a fault.
+**Limits, stated: one blocking run** -- the arm-to-arm gap (~0.15 s) is larger than the spin-to-spin gap
+(~0.05 s), which is why the ordering is credible, but a second blocking run would make it decisive. And this is
+the e2e profile under deliberate over-subscription; **the QA reading is below, and it does not reproduce this.**
+
+**THE QA READING: THE DELAY IS QUEUE, AND THE DEVICE-WAIT TAIL DOES NOT TRANSFER (2026-10-01 19:19-19:26, the
+operator's 8-agent load on `554b5c6a5a86a6c1`, n=80 `request_done`, 65 carrying a frozen first-token window).**
+
+| term | median | p90 | max |
+|---|---|---|---|
+| **ttft** | **37.105 s** | 55.952 | 68.553 |
+| **queue** | **34.617 s** | 52.230 | 66.007 |
+| host exposure (ttft-scoped) | 1.172 s | 7.706 | 17.993 |
+| -- `engine_commit_output` | 0.758 s | 6.618 | 10.069 |
+| -- `engine_boundary` | 0.176 s | 2.047 | 7.002 |
+| -- `program_submit` | 0.150 s | 0.559 | 1.070 |
+| prefill | 0.579 s | 3.515 | 7.734 |
+| device_wait (ttft) | 0.698 s | 3.680 | 12.601 |
+| unaccounted (OLD formula, void) | ~~0.068 s~~ | ~~1.041~~ | ~~7.750~~ |
+
+**93% of ttft is FIFO queue wait** -- 34.6 s of a 37.1 s first token. On the e2e the dominant term was device
+wait (2.75 s median on `root`); on QA it is **0.70 s**, a 4x smaller share of a 12x larger ttft. So the two
+populations really do differ, and the difference is not subtle: **the operator's load is over-subscribed by
+design, and the resulting queue is the load's shape, not an engine defect.** `proc = ttft - queue` is therefore
+~2.5 s median here and is **fully accounted for** -- host 1.17 + prefill 0.58 + device 0.70 + 0.068 ~= 2.5 --
+so **the sum closes -- BUT THAT PARAGRAPH IS NOW VOID AS STATED.** It was built on the OLD
+`unaccounted_seconds`, whose formula double-counted the host term (it subtracted `prefill`, which already
+contains the host time, as well as the host term itself); the sum `host + prefill + device + unaccounted` is
+therefore tautological *plus* a double-counted term, and it adds medians. **The corrected residual is
+`ttft - queue - host - device_wait`, and on this window it does NOT close to zero:** on the e2e instance `serve-564402` (n=290) 65 records exceed 50 ms (range 61-428 ms, 47 of them clustered
+at the ~400 ms planner search budget) -- **that figure is the e2e window, NOT this QA one: on
+`serve-516108` only 8 of 71 exceed 50 ms and none fall in 345-468.** Name the instance for each figure. See the correction at the `ttft_window` section above; the honest statement is "the median request has no
+LARGE residual, and one ~400 ms term is unattributed in 22% of records". The largest single host term is `engine_commit_output`
+(median 0.758 s, max 10.069 s): the QA-shaped host cost noted earlier is real, but second-order against queue.
+**AND THE "SUPERSEDES / ACCOUNTS FOR IT" SENTENCE BELOW WAS ITSELF BUILT ON THE VOID FIELD, so it is
+withdrawn rather than kept.** Its `8 of 65 records over 1 s` came from the old formula too. The corrected
+figures for THIS window, recomputed with `ttft - queue - host - device_wait` and sliced by
+`server_instance_id` (`serve-516108`, n=71) rather than by line number -- line-number slices are contaminated
+the moment a later load appends to the same file: **median +10.6 ms, p90 741 ms, max 1653 ms, 0 records below -10 ms** -- and, stated because the text
+calls the residual non-negative when the placement is right, **8 of those 71 are below zero (min -9.1 ms)**.
+That instance predates the freeze fix, so those 8 are the OLD placement's late freeze showing through
+(PLAUSIBLE: which build each instance ran is not recorded). The p90 tail is REAL and ~0.74 s. What `proc`
+does and does not contain is unchanged: `proc` is not `ttft`, and it excludes the queue.
+
+**A LIVE WEDGE, AND ITS CAPTURE DESCRIBES THE RECOVERY RATHER THAN THE STALL (2026-10-01 20:26:46, during
+the same operator load, instance `serve-526325`).** Real, in order:
+`20:10:51` last engine progress (throughput, `running 0`) -> **~15.5 minutes with NOTHING**, during which the
+sentinel saw `r=1 p=1` -- work in flight, no progress -> `20:26:28` `req#163 started` -> `20:26:29` throughput
+`running 1 (prefill 1)` -> **`20:26:45` `req#163 done`, TTFT 3.2 s, total 17.4 s** -> `20:26:46` the sentinel
+**captures and restarts**.
+**THE CAPTURE IS INVALID FOR CHARACTERISING THE WEDGE, and this is the finding.** The sentinel detects a stall
+by looking BACKWARDS (927 s) and captures NOW; the engine had resumed and finished a request **0.6 s before**
+the capture ran. So the 46 threads it recorded -- **42 `httplib::ThreadPool::worker`, `HostWorkerPool::Impl::
+worker_loop`, 2 `EngineCore::worker_loop`, ALL in state `S` on `futex_do_wait`/`poll`/`inet_csk_accept`, and
+NOT ONE RUNNING OR SPINNING** -- are a healthy idle server that had just completed work. **I had the
+"all sleeping, no spinner, therefore a missed wakeup rather than a lock convoy" conclusion written and
+withdrew it**: the dump measures the moment after recovery. The 2026-09-26 wedge (21 of 25 on `futex_do_wait`
+with ONE thread spinning in `sched_yield`) is not comparable for the same reason it cannot be compared here --
+different moment, and here the moment is known to be wrong.
+**What the event DOES establish:** (a) a real ~15.5-minute no-progress window with work in flight, which is
+the wedge signature; (b) **the wedged engine DID run its own shutdown** -- `Stopping` 20:26:47 ->
+`fail-all cleanup` + `post-recovery residual (fail-all)` `main_kv_pages=0 ... host_kv_bytes=0` at 20:26:50 ->
+`Stopped` 20:26:53, i.e. ~6 s against `TimeoutStopSec=300`, with `continuations-live=9` and a **clean,
+all-zero residual**. **So this wedge did not hold the lock its own shutdown needed**, contrary to the standing
+assumption that "a wedged engine cannot run its own shutdown path"; that assumption is not universal and must
+not be stated as one. (c) The engine recovered on its own before the restart -- the restart is not what
+cleared it.
+**Two instrument/doc defects it exposed, both corrected in CLAUDE.md the same hour:** the capture lands in
+**`/ninfer-watch/`** (the unit runs with `PWD=/`, so the script's `$HOME/ninfer-watch` resolves to the root
+path), while the rule pointed readers at `~/ninfer-watch/`, which is EMPTY -- I looked where the rule said and
+briefly concluded the capture had not been written at all; and the capture-moment problem above, which needs
+the journal checked at the capture timestamp before any state is characterised.
+
+**#6 IS LIVE AND TOTAL ON QA, NOT OCCASIONAL.** Cumulative `/stats` over the window:
+`private_eviction_checks = 13`, **`private_evictions_demotable = 13`**, `private_owners_evicted = 13`,
+**`evictions_with_victim_room = 12`** -- every eviction was demotable and 12 of 13 had victim room. The journal
+confirms the mechanism at execution on all eight it printed (`checked=1..8`), each with
+`demote_possible=1 demote_refusal=none` and `host_state_slots` never above 36/40 with `host_kv` at 2.5 GB of
+8.05 GB; three of the eight read `demote_refusal=already-on-host`. `session_erasures_eviction = 13` ties the
+same 13 to the session-cell hole, which is the erase the #59 analysis identified. **The 8-line cap hides
+nothing here -- the counter says 13 -- but it would have: `demotable_total=8` at the last printed line is the
+value AT that line, and the next print is the 512th.**
+
+**Robustness and the counters that behaved.** Absence checks over the whole window (1,061 journal lines, all
+**zero**): `WORKER OOM`, `WORKER CRASH`, `WORKER RECOVER`, `post-recovery residual` (0 lines at all, so no
+non-zero one), `WEDGE`, `non-strict release REFUSED`, `admission stalled`, `admission rejected`, `bad_alloc`,
+`cudaError`, `Segmentation`, `core dumped`, `subtraction underflow`, `recycled-checkpoint`,
+`StateImage INCOMPLETE`, and **0 HTTP 500s**. `/stats` after the stop: `publication_cell_probes = 303,564`
+against **`publication_cell_losses = 0`** -- the catalog is probing heavily and costing no plan, which is the
+probe/loss split working as designed -- and `target_arena_truncations = 0`, i.e. the arena bound did not fire on
+QA's load in either measured window. QA restored and verified after: `health 200`, wedge sentinel active.
+
+**CORRECTED IN PLACE (2026-10-01, later): the record now has that field, and "no means currently available"
+above was true when written.** `ContextTransferTotals` (process-monotonic H2D/D2H ns + pages + bytes,
+accumulated in `ResourceManager::observe_transfer`, which is the only place the transfers are visible) is
+snapshotted into `MaterializingRequest` BEFORE `reserve_materialization` -- the reserve is itself
+transfer-producing -- and its delta is attributed to the request at adoption, then emitted as
+`request_done.engine_timing.transfers{restore_seconds, restore_pages, demote_seconds, demote_pages}`. The
+program-level scope is why a baseline-and-delta is the shape rather than a per-request parameter: at most one
+materialization is in flight (the context transaction is a single variant), and
+`progress_context_transaction -> adopt_materialization_progress -> observe_transfers` all complete before the
+terminal reaches the engine, which is what makes the delta belong to exactly one request. `restore_pages` is
+KV pages ONLY -- the State transfer site passes `page_count=0` by construction -- so a state-only restore is
+non-zero `restore_seconds` against `restore_pages == 0`; it is not a denominator.
+**VALIDATED 2026-10-01 on the e2e test server** (290 `request_done` records, config `host-kv=5.0 GiB`,
+`host_state_slots=16`): the key is present in **290/290** records (no silent skip), **228/290** are non-zero,
+and both directions appear independently -- 99 with KV restore pages, 13 state-only demotes, and **28 with
+`restore_pages == 0 && restore_seconds > 0`**, which is the state-only restore the comment predicts and had
+never been observed. The discriminating control is by reuse path, and it is clean:
+
+| reuse path | n | restore > 0 | median restore | median restore pages |
+|---|---|---|---|---|
+| `root` (nothing reused) | 75 | **0** | 0.000 ms | 0 |
+| `private_endpoint` | 147 | 77 | 0.988 ms | 24 |
+| `private_turn_closure` | 38 | 36 | 3.671 ms | 0 |
+| `private_long_anchor` | 29 | 13 | 0.000 ms | 0 |
+| `shared_stable_prefix` | 1 | 1 | 3.498 ms | 0 |
+
+**A request that reused nothing restores nothing, in 75 of 75 cases** -- that is the negative control that
+makes the attribution to the RIGHT request, and it is what a global counter could not have shown.
+**THE SUBSTANTIVE NEGATIVE: restores are milliseconds, not seconds.** The largest median is 3.7 ms
+(`private_turn_closure`), so on this profile the restore does NOT explain the seconds-scale proc residual --
+consistent with the earlier instance reading (`state_h2d` 41 restores/0.1s, `main_kv` 7,725 pages/0.4s), but
+now measured per request against a counter with a working control rather than inferred. **Scope limit: this is
+the e2e TEST profile** (16 host state slots, 5 GiB host KV); QA's profile has 112 host state slots, so the
+magnitude may not transfer -- the ORDERING by path does, and that is the shape the residual was supposed to
+have.
+
+**RE-RUN ON THE CORRECTED BINARY (18:28-18:37) AND THE CONTROL AGREED AGAIN**, which is the "same
+configuration twice" requirement met on a negative: 290/290 records carry the key; `root` (64 records, nothing
+reused) has **0** with a non-zero restore and median 0.000 ms. Magnitudes are larger this run --
+`private_turn_closure` median 9.183 ms / 188 pages, `shared_stable_prefix` 25.215 ms, `private_endpoint`
+2.618 ms / 51 pages -- and `private_long_anchor` shows 24/24 restores that round to 0.000 ms at 3 decimals
+with median 0 pages, i.e. the state-only case again. **The substantive negative is now stronger, not weaker:
+the largest median in either run is 25 ms, three orders below req#50's 6.07 s of proc.** `restore_seconds` is
+NOT the explanation for the residual on this profile.
+
+**#30 FIXED (2026-10-01): the stop-reason name conflated the search budget with the arena bound.**
+`materialization_planner.h` set `MaterializationStopReason::ExpansionCapacity` on an `expand_target`-false
+stop, but that lambda returns false for exactly two reasons -- `optional_targets >= kTargetBudget`, or an
+expansion whose canonical count would exceed `kTargetBudget - optional_targets` -- and both are the TARGET
+BUDGET. It cannot return false on the arena: `commit_expansion` is bounded by `target_arena_limit`, reports
+that as `children.complete == false`, and the lambda handles it and still returns true. It now records
+`TargetBudget`, matching the enum's other two `ExpansionCapacity` sites, which are both paired with
+`target_arena_truncated = true`. Naming only -- `budget_exhausted` was and remains true on that path, and no
+branch reads the name. The e2e's `phase_planner_latency` counts both names into `budget_stops`, so its number
+is unchanged by the rename.
+
+**AND IT IS THE SECOND-MOST-COMMON STOP, which is why the name mattered.** In the pre-rename e2e run
+(290 records) the stop distribution is `time_budget 207, expansion_capacity 49, insufficient_expected_gain 18,
+target_budget 7, queue_exhausted 5, no_pressure 4`. **The 49 `expansion_capacity` records all carry
+`budget_exhausted = true` and `target_arena_truncated = false`** -- and that triple is UNREACHABLE from the
+post-rename code: both remaining `ExpansionCapacity` sites set the flag, and the only site that sets
+`budget_exhausted` without the flag is the one that was renamed. So those 49 ARE the renamed site: **17% of
+requests stopped on a search-budget stop that the record called a capacity ceiling**, and `budget_exhausted`
+is what told the truth. That is the conflation, measured, on real traffic.
+
+**CONFIRMED ON A SECOND RUN, ON THE CORRECTED BINARY (`1c65566ca12b579d`, 2026-10-01 18:28-18:37, 290
+records).** The stop distribution becomes `time_budget 175, target_budget 92, insufficient_expected_gain 13,
+no_pressure 5, queue_exhausted 5` -- **`expansion_capacity` is gone entirely**, and every one of the 92
+`target_budget` records carries `budget_exhausted = true`. That is the rename doing exactly what it was for:
+the old name called those stops a capacity ceiling while `budget_exhausted` said the search had spent its
+budget, and they cannot both be true.
+**One gap the second run exposes: `target_arena_truncated = true` appears in ZERO records in either run.** So
+the flag's positive path -- the two genuine arena sites -- has still never been observed on live or e2e
+traffic, and the arena ceiling's own name is carried by a flag with no positive evidence. The 49-vs-92 counts
+are NOT a like-for-like comparison: `time_budget` also moved (207 -> 175) and the e2e is a different workload
+each run, so the only defensible statement is qualitative -- the misnamed stops now report their true reason.
+
+**A NEW DEPLOY-TRAP INSTANCE, AND THE CHECK THE TREE'S OWN RULE PRESCRIBES CANNOT SEE IT.** The run above was
+made on a binary that did NOT contain the rename, while `sha256sum /proc/<pid>/exe == sha256sum
+build/apps/ninfer-serve` AND `find src include apps -newer build/apps/ninfer-serve` (prints nothing) BOTH
+passed. The header had been edited at 18:17:22 **while the build was already running** (started 18:14:32, and
+by then its dependents were compiled), so the link at 18:18:03 produced a binary NEWER than the header that
+nevertheless lacked the edit -- and `find -newer` is an mtime comparison, so it sees the opposite. Proved by
+forcing the recompile: `touch` on the header then relink changed the binary `d7fdea731da98b6b` ->
+`1c65566ca12b579d`. **The rule "running == last link" therefore needs a third clause: a header edited
+mid-build is invisible to both checks.** The only reliable form is to rebuild with the source FROZEN (no
+edits during a build), or to grep the running exe for a string the change introduces -- which a naming-only
+change cannot provide. The 49/290 reading above was taken on that binary and is unaffected (it is exactly the
+pre-rename shape); the transfer instrument was in it too (the log proves it fired).
+
+**AN INTERMITTENT SESSION-CELL HOLE, CAUGHT LIVE (req#59, 2026-10-01).** Conversation `5f90eca331ce973b` made
+13 requests on `serve-493233`; eleven reused 56k-60k with a cell present, and **one (req#59) had
+`session_cell_offered=False frontier=0`** -- so it matched a FOREIGN private ledger, diverged 5,171 tokens into
+message 1 (a user turn, from the new attribution), and re-prefilled 37k tokens for ~8.3s of the ~10s proc. Two
+later requests from the same conversation (101, 110) are cell-less too and reuse NOTHING. Measured on the
+instance: **53 session erasures (23 eviction + 30 consume) against 7 of 64 occupied index cells**, and
+`Consume` is the erasure that fires when a request RESUMES from its own cell. The first reading of this
+blamed the *missing republication*, and **that reading is now REFUTED (analysed 2026-10-01; the paragraph
+below is corrected in place rather than annotated).**
+
+**The republication is not missing -- it is guaranteed on every completed consume, and the hole comes from the
+SECOND erase: eviction.** Read from the tree: `publish_session` (`resource_manager.h:4078`) has exactly one
+call site (`:1290`, in the terminal `finish()`) and cannot be refused, because its only refusal is an entry
+with a HIGHER `publication_order` against a globally monotone counter (`engine_core.h:200`). Consuming
+requires a private candidate, which requires the same three conditions (`allow_prefix_reuse`,
+`prompt.identity.reusable`, `cache_enabled`) that force `publish_continuation = true` (`request_plan.cpp:259`)
+-- so `finish()` cannot take the `Released` early-return (`resource_manager.h:1258`). The consume erase
+(`:3707`) and the eviction erase (`:3423`) are the only two deleters, and **for req#59 the timing excludes the
+consume window**: #54 consumed at 17:58:33 and published its continuation in the same `finish()`; #59 planned
+at 17:58:52, 19 s later, by which time the cell existed again. What #59 saw was therefore not "republish
+deferred" but "entry gone": its `best_private_frontier=53199` against the continuation #54 had just published
+at ~59,185, and only the eviction erase drops the catalog entry *and* the index entry (a rollback would have
+left `skip=2`, not `skip=0`).
+
+**The "0 evictions in the window" that supported the old reading was the absence-is-not-zero trap.** The
+eviction print is rate-limited to the first 8 per process (`materialization.cpp` `demotable_eviction_checks_ <=
+8 || % 512 == 0`): `/stats` shows `private_eviction_checks = 53` and `private_owners_evicted = 53` on this
+instance, and the journal carries exactly **8** `private victim evicted` lines, all within nine seconds of
+startup. 45 of 53 evictions are silent, so an eviction at 17:58:33-17:58:52 is fully consistent with the
+journal. **Never read an 8-line eviction window as a zero.**
+
+Two things this leaves standing, both separate from #59: a genuine **deferred-republication window** between
+the consume (`:3707`) and the consumer's `finish()` (`:1290`), during which a same-key planner reads the cell
+as absent -- the shape the code's own gated `NINFER_SIBLING_RETAIN` (`:595-608`) addresses; and a **cancellation
+hole**, where `resources_.abort` (`engine_core.h:1018`) and `release_cancelled_lane` (`:4000`) skip
+`publish_session` and leave a permanent cell-less conversation. Not exercised in the #54->#59 window. Coverage
+gap, CONFIRMED: `session_cell_offered` is asserted at exactly one place (`tests/test_resource_manager.cpp:3043`)
+and only as `true` -- the suite never looks a cell up *after* a consume+finish, so "consume -> republish -> next
+lookup" is untested in either direction.
+
+**THE #6 COUNTER WAS BROKEN WHEN FIRST DEPLOYED (2026-10-01): `make_diagnostics` took its arguments in the
+wrong order.** The new parameter was added to the SIGNATURE beside its sibling but appended at the END of the
+call site, so four arguments shifted by one -- `preserving_alternatives_assessed` received the goal-less
+count, `assessed_targets_without_goal` received 0/1, and `target_arena_truncated` received
+`assessed != 0` through an implicit uint64->bool conversion inside a `noexcept` function. It compiled and it
+deployed. It was caught by the tree's OWN arena test, whose control arm asserts `!target_arena_truncated`:
+`51 run, 2 failed` on the tree as deployed, `51 run, 1 failed` (the baseline) after reordering. A
+`brutal-honesty-review` pass found it; the fix is the reordered call site plus the invariant
+`preserving_alternatives_assessed >= feasible_preserving_alternatives`, enforced on every materialization the
+split fixture makes.
+
+**THE PROC REGRESSION: observed, localized, NOT attributed -- and probably the harness.** `proc = ttft -
+queue` (as monitor.py computes it) measures the engine's own work per request. Same prompt sizes (~40-48k):
+2026-09-28 gave medians 1.11/1.68/1.23/1.95s, the 2026-10-01 load 2.94s (p90 7.27, max 20.27). The time is
+NOT prefill: the slowest requests record 0.2-6.4s of prefill while `engine_commit_output` exposure is 5-16s.
+Two candidates, and the operator's own observation distinguishes them: THE OLD CLAUDE CODE, re-run on the
+same tree, gives medians back near 1s with the slow requests being the COLD ones (reuse=0) -- consistent
+with the new client's request shape rather than with this tree. Not yet conclusive: that arm was still
+partially rejected (see below) and its sample was small.
+
+**`defer_loading=true` is the OLD client's other incompatibility** -- an Anthropic feature (a tool is not
+loaded until the model searches for it) that NInfer refuses at `anthropic_messages_request.cpp:830`,
+alongside Anthropic-provided tools, `strict=true` and `allowed_callers`. DECISION PENDING, and it is a
+semantic one unlike the marker cap: accept-and-include changes what the MODEL SEES (every deferred schema
+lands in the prompt, which the client deferred precisely to avoid), accept-and-drop matches "deferred, not
+loaded" but hides tools the workload may call. Roughly a third of the old-client load is rejected on this.
+
+**`phase_reuse_paths` corrected for the third time, and now correct on real data.** The second version
+failed the anchor for a bogus reason (it demanded the anchor beat the best NON-anchor reuse, which
+`private_endpoint` -- the conversation's own continuation -- naturally exceeds). The yardstick is the
+PINNED CEILING. On the 2026-10-01 load: **58 of 58 anchor records above the 23,353 pin**, median 39,376 --
+the anchor IS lifting the ceiling, which the earlier "inconclusive" verdict could not say because that
+workload's prompts were too short.
+
+**Two corrections to my own reading, both caught by checking rather than reasoning:** the dashboard copy that
+is RUNNING is `tools/monitor/monitor.py` (it reads the current `engine_timing.queue_wait_seconds`; the
+`~/ninfer-monitor/` copy is a stale leftover that reads a path abandoned in 2026-09-21, and my notes pointed
+me at it), and my first proc-outlier table mixed rows from an instance five hours old.
+
 ### 2. Open, in priority order
+
+0. **NEW, 2026-09-28 — THE E2E CANNOT PASS PHASE 1 ON ANY TREE, and it is NOT the message-boundary change.**
+   Phase 1 (pressure, 4 sessions x 8 rounds) aborts on an HTTP 500 within ~28 s of the test server coming
+   up. The engine line is
+   `[engine] WORKER RECOVER: pressure target arena is full [target-count]: targets=4102/4102 (maximum=4102)` —
+   the pressure planner enumerated its ENTIRE optional target arena (`maximum = candidates + 1 +
+   kOptionalTargetCapacity`, i.e. the fixed 4096), threw `std::length_error`
+   (`pressure_planner.cpp:325-352`), and the request died as `HTTP 500 | internal error` followed by a worker
+   recovery. The planner reaching its expansion capacity is not new — the last full run's `phase_planner_latency`
+   already reported `106 searches enumerated to the target budget` — but reaching 4096 *targets* is a magnitude
+   further, and it takes the request down rather than the search.
+   **Attributed by a control, not by reasoning:** the same swap was run three times — twice on the tree with
+   the message-boundary change (`targets=4102/4102`, phase 1 round 5) and once on the tree with that change
+   STASHED and `ninfer-serve` rebuilt from the pre-change sources (`targets=4101/4101`, phase 1 round 3,
+   `ERROR B: HTTPError 500`). All three abort; the round differs, so it is not even a fixed point of the
+   workload. The pre-change arm is therefore the answer to "did the message-boundary change cause this" — it
+   did not. Logs (local, untracked by policy): `/tmp/msgattr-run2-serve.log` (with change) and the control's
+   `~/ninfer-serve.log`. The stack could not be run past phase 1 until this was fixed, so every e2e verdict in
+   this file predates it.
+
+   **FIXED (2026-09-28), THEN CORRECTED AND RE-FIXED (2026-10-01) -- read this version, not the one that
+   stood here before.** Four sites called `intern_target`; one (`construction_target`) already treated the
+   bound as a search stop, the other three threw. Now a non-`terminal` call returns `nullopt` (the search
+   stops) and a `terminal` call -- the incumbent root-maximal and the seal fallback, which must hand back a
+   handle -- is kept clear by a reserve the search cannot spend. **THREE THINGS WRITTEN HERE WERE WRONG:**
+   the reserve was described as "2, one per site" and derived from the call sites (it is `candidates + 2`,
+   kept because it is at least as large as any observed demand -- **oversizing, not derivation**); the story
+   that the first fix failed because "the sites are reached per candidate so it needed three" (withdrawn --
+   post-search terminal demand is at most one node); and the claim that the near-full print is a high-water
+   mark (it is rate-limited to 8 events then every 512th, so it shows the max of the FIRST EIGHT EVENTS).
+   The actual hole was `commit_expansion`, which bounded itself by the WHOLE arena rather than the search
+   limit and so could spend the reserve; it is now bounded by `target_arena_limit(c, false)`, and the
+   `kPlannerTargetBudget <= kSearchTargetBudget` coupling it depended on is a `static_assert` in
+   `tests/test_materialization_budget.cpp` (no production TU sees both constants -- the runtime planner
+   cannot include a model header without inverting the layering that keeps `ResourceManager` model-agnostic).
+   The rule is in `pressure_target_arena.h` so a host-only test drives it; both mutants (no reserve = the old
+   behaviour; unguarded choice arena) are caught by `ninfer_pressure_target_arena_test`. Its own counter,
+   `pressure_target_arena_truncations`, is separate from `search_budget_exhaustions` because "the search spent
+   its own budget" is the designed stop and "no room for another target" is a capacity ceiling, and it also
+   prints `[engine] pressure search truncated [<which>]: ...` rate-limited (first 8, then every 512th) -- a
+   counter alone cannot be told from a counter that is not running.
+   **THE FIRST VERSION OF THIS FIX WAS WRONG, AND THE SECOND RUN SAID SO.** That run ran all 14 phases
+   (`/tmp/ninfer-e2e-run-1790625420.log`) with the counter at ZERO and the arena's full line absent -- near-full
+   fired 8 times, so the bound was approached, not hit, and the pass proved nothing. The next run aborted in
+   phase 1 with `targets=4099/4099 (limit=4099) choice_arena=11963/12414 incoming_choices=2 owners=3
+   candidates=2 terminal=1 reserve=2` -- the new message carrying the diagnosis: **4097 search targets + 2
+   terminal calls = the true maximum.** **WITHDRAWN 2026-10-01: that is NOT the mechanism.** Post-search
+   terminal demand is at most ONE node (the seal fallback), and the node that overflowed came from
+   `commit_expansion`, which bounded itself by the WHOLE arena rather than the search limit and so spent the
+   reserve -- that is now fixed (`target_arena_limit(c, false)`). The reserve is therefore kept as an
+   OVERSIZE (`candidates + 2`), not as a count derived from the call sites, and `pressure_target_arena.h`
+   says so.
+   **The defect underneath was the sizing.** `kTargetBudget` and `kOptionalTargetCapacity` are BOTH 4096, so the
+   arena was `candidates + 1 + 4096` -- EXACTLY the search's budget plus one spare. A search that spent its
+   budget filled the arena completely, leaving the calls that must hand back a handle with that single spare.
+   Now: the arena is `candidates + 1 + kSearchTargetBudget + terminal_target_reserve(candidates)`, i.e.
+   STRICTLY bigger than what a budget-respecting search can spend; the reserve is derived from the candidate
+   count (`candidates + kTerminalTargetSlack`); and one function computes the sizing for every site (three
+   places computed it independently, which is how a capacity can end up smaller than the reserve). A mutant
+   restoring the equality -- the live failure -- is caught by `ninfer_pressure_target_arena_test`.
+   **FIRST FULLY GREEN RUN, WITH A REAL TALLY (2026-09-28): `PASS: 43 PASS, 13 WARN, 0 FAIL`, `e2e rc=0`,
+   all 14 phases** (`/tmp/ninfer-e2e-run-1790627997.log`). Everything this session changed is verified on the
+   real path in one run: `[thinking-sig] PASS: preserve_true` (the corrected expectation, now counted),
+   `[reasoning-effort] PASS` for all five efforts (previously printed and discarded), `[planner-latency] PASS`
+   (86 budget stops, p95 400.0 ms), and -- for the first time, because the crash was at its call site --
+   **`[reuse-paths] PASS: reuse reached 30104, above the 23353 ceiling, and the anchor was taken`. WITHDRAWN
+   2026-10-01 -- THAT PASS IS AN ARTEFACT AND THE CLAIM IT SUPPORTED IS FALSE.** The phase built its max hit
+   over ALL records and its path set over ALL records separately, and never asked whether the record ABOVE
+   the ceiling came through the anchor. The join, run by hand over `~/ninfer-requests.jsonl` for the same
+   instance (`serve-1553637-1790628008699424`, 290 done records): `above 23353: 36 records, ALL
+   private_endpoint`; `private_long_anchor: 17 records, max hit 19815`; `max over non-anchor: 30104`.
+   **The anchor never got past 19,815** -- the 30,104 is an ordinary endpoint continuation of a long
+   conversation, which passes any ceiling trivially on this workload. So this run does NOT show the anchor
+   fix lifting the 23,353 ceiling, and the corrected phase FAILS on this workload, which is the honest
+   reading. The other firsts in this run stand (`preserve_true`, the five effort verdicts, planner-latency).
+   The WARNs are the familiar non-deterministic path-unexercised set
+   plus the `checkpoints dropped > owners evicted` accounting note.
+   **THE SUITE ITSELF WAS CRASHING AT THE END OF EVERY RUN (2026-09-28), AND ITS rc=1 WAS THAT CRASH.**
+   `main()` calls `phase_reuse_paths(args)` at line 791, and the definition had been APPENDED at the END of
+   the file -- after `if __name__ == "__main__": sys.exit(main())` -- so every run died with
+   `NameError: name 'phase_reuse_paths' is not defined` BEFORE `print_summary`, and the `1` it returned was
+   Python's traceback exit code, read as "tests failed". Consequences to carry: no run today produced a
+   `FINAL VERDICTS` tally at all (the individual verdict lines printed before the crash are real; the
+   summaries I quoted from today are not), and the `reuse-paths` phase had never executed BEFORE that run -- the crash was at
+   its call site. Moved above the entry point; the next run is the first that will exercise it. Same class as
+   the two silent testers above: an instrument that could not report what it was built to report.
+   **CONFIRMED BY MEASUREMENT, 2026-09-28 — and not by "it passed this time".** The abort is
+   NONDETERMINISTIC: the same `reserve=2` binary completed one run and aborted the next, so a passing run is
+   not evidence on its own. What decides it is the near-full print, which fires at 7/8 of either bound and
+   therefore reports a HIGH-WATER MARK. **BOTH OF THOSE ARE WRONG, CORRECTED 2026-10-01.** The print is
+   rate-limited to the first 8 events then every 512th, so a run prints up to eight lines and goes silent --
+   the maximum it shows is the maximum OF THE FIRST EIGHT EVENTS, not of the run -- and it fires spuriously
+   on an EMPTY arena (`0 * 8 >= 0 * 7`), which was five of the eight lines in one measured log. It also
+   quotes `4099/4109`, a line that does not exist in the log. The lines that do exist are
+   `4102/4109`, `4099/4103`, `4101/4107`; with `maximum = 2c + 4099` those are c=5, 2, 4, and the OLD
+   maximum was `c + 4097` -- i.e. 4102, 4099, 4101, which GROWS WITH c and is not a fixed 4099. The valid
+   inference is narrower and still holds: each line is an insert at exactly the old maximum, and only a
+   terminal intern (or an expansion commit) can insert there, so a non-search insert happened and survived.
+   The first explanation of WHY the original fix failed -- "the call sites are reached per candidate, so it
+   needed three" -- is also withdrawn: post-search terminal demand is at most one node, and the evidence
+   points instead at `commit_expansion`, which bounded itself by the WHOLE arena rather than the search
+   limit and so could spend the reserve. That hole is now closed in the code.
+   Under the old sizing a request could not get past 4099 without throwing, which is exactly what run B shows
+   (`targets=4099/4099`, then a third terminal call found nothing). So the fix is not "the bound was avoided
+   this time": the capacity was the binding constraint, and raising it above the search's budget is what
+   removes the failure. `pressure_target_arena_truncations` reading zero is the CORRECT reading here — a
+   budget-respecting search can no longer reach the capacity, which is the design.
+   **Three runs, all 14 phases, and the arena line appears in NONE of them -- the arena fix held in those
+   runs. NOTE THE VINTAGE: all three predate the 2026-10-01 engine edits (`commit_expansion`'s bound, the
+   construction stop's counter), so they evidence the FIRST version of the fix, not the current tree. No e2e
+   has yet run on the current tree; the soak is the next gate.** The third (`/tmp/ninfer-e2e-run-1790626902.log`) is a FAILING run, but for a DIFFERENT reason, and it
+   is worth recording because it is the first e2e evidence for an already-tracked item:
+   `[engine] WORKER RECOVER: Qwen3.5 resource subtraction underflow [device.main_kv_pages: have 33, removing
+   251]` (phase 13, 3 x HTTP 500), which fails `[state-saturation]` and, in the same run,
+   `[demotion] FAIL: pages demoted to host but never restored`. That is #13 / task #2 above, not the arena --
+   `grep 'target arena' ~/ninfer-serve.log` is empty for the run. So the e2e reaches the underflow
+   reproducibly, which is the provocation that item has been missing. `phase_planner_latency` PASSES (`budget_stops=58`, n=290, p95 400.0 ms, and the stops
+   still show `expansion_capacity` from `expand_target`'s own budget, which is NOT the arena -- see the naming
+   trap above).
 
 1. **#9 — the leak, a LATENT FRAGILITY with a named mechanism and an UNEXPLAINED incident.** Not "the
    wedge's actual cause": the mechanism is reproduced under injection (a pinned-but-unrecorded page
@@ -932,6 +1482,29 @@ account of the sequence. Read them as local history, not as remote refs.
      frozen=63 ... mismatches=0/1`) and that **the consumer declines the shared prefix**:
      `shared_stable_prefix_selections` stays 0, so no second owner of the prefix is ever created -- and
      with one owner there is no co-owner to evict, which is the whole precondition.
+   **FIRST REAL OCCURRENCE, AND THE AXIS IS NAMED (2026-09-28, e2e phase 13).** The instrument that was
+   deployed for exactly this did its job:
+   `[engine] WORKER RECOVER: Qwen3_5 resource subtraction underflow [device.main_kv_pages: have 33,
+   removing 251]`, followed by three `HTTP 500 | internal error`, `[state-saturation] FAIL: 1 worker
+   recoveries`, and in the same run `[demotion] FAIL: pages demoted to host but never restored`. The log
+   is `~/ninfer-serve.log.prev` (run D of 2026-09-28, `targets=...`/arena absent -- this is NOT the arena
+   bug). Context: six concurrent `openai-chat` admissions, 11 messages with tools -- the phase built to
+   saturate the state pool.
+   **What it does and does not settle.** It settles the axis (`device.main_kv_pages`, declared 33, actual
+   251) and confirms the check fires under real concurrency, on the phase that creates co-owners. It does
+   NOT distinguish the two candidate sources of the exclusivity flip: the transaction's OWN pressure
+   release (the ordering at `:2374` before `:2385`, above) or another lane's. One line at the recovery is
+   consistent with the co-owner story -- `non-strict release REFUSED (state-write,
+   blocker=checkpoint-references (still owned))` -- but consistent is not attributed.
+   **A DIRECTION ARGUMENT, newly checked (2026-09-28): `final_removed` is READ IN EXACTLY ONE PLACE, and
+   it is this check.** `grep -rn final_removed src/` gives the two writers (`request_plan.cpp:1275`,
+   `:1423`), the accumulator (`pressure.cpp:2337`), the capture reader (`capture.cpp:262`, `:480`), and
+   `materialization.cpp:635` -- the assertion itself. Nothing spends it as capacity. So `:635` is not
+   protecting an accounting balance; it is policing a DECLARATION against reality, and it fires only when
+   reality freed MORE than the plan promised -- the direction that costs nothing. A shortfall (reality
+   freeing LESS than declared) is the direction that would matter and is NOT asserted anywhere. That does
+   not make the plan's hypothesis wrong -- the flip is still real and still worth fixing -- but it does
+   set the price: a benign over-delivery currently costs a worker recovery plus an HTTP 500.
    **ANSWERED, AND THE SCENARIO NOW REACHES PRESSURE -- WITHOUT FIRING THE UNDERFLOW (2026-09-26).**
    The consumer-side question is settled: the shared prefix at frontier 63 IS considered
    (`[plan] n=5 reuse=5 reuse_base=63`) and a private candidate with a far longer base wins -- and, per
@@ -1075,6 +1648,33 @@ task needs no re-derivation:
   it bites at five times the budget too, and raising the budget buys assessment depth without removing
   the bound. That is the measurement the W5 residual asked for, at the one budget where it could be made
   cheaply; an agentic workload at 400 ms remains the unrun arm.
+  **INDEPENDENTLY REPRODUCED 2026-10-01 (e2e, `NINFER_SEARCH_MS=2000`, arm validated from
+  `/proc/<pid>/environ` AND from the log's own `search_granted_ns` median = 2.000 s): `stop_reason` =
+  `target_budget` **275 of 290**, `time_budget` **0**, search elapsed median 572 ms / max 928 ms. The clock
+  is not the bound; the arena is -- the same verdict, a second time, on a different day and a different
+  instrument.** The run also produced the sharpened variance figure this record needed: across **three arms on
+  the same workload shape**, records containing any restorable eviction were **54** (400 ms), **107** (400 ms,
+  blocking) and **79** (2000 ms) -- **two IDENTICAL 400 ms arms differ by 2x**, so the workload's run-to-run
+  variation exceeds any arm effect and **cross-arm eviction comparison on this e2e is invalid in both
+  directions**. Only within-run relationships and per-record readings hold here.
+  **`[demotion] FAIL: pages demoted to host but never restored` -- AND MY FIRST ATTRIBUTION OF IT WAS WRONG.**
+  **THE EXACT COUNTS, from the run logs (`/tmp/ninfer-e2e-run-17908*.log`): it occurred on 1 of 6
+  default-400 ms runs (22:08) and on 1 of 1 `NINFER_SEARCH_MS=2000` runs (19:36), and in none of the five
+  default runs at 18:19, 18:29, 18:49, 18:59 and 19:09.** (An earlier version of this entry said "three 400 ms
+  runs before it"; there were five.)
+  **n IS TOO SMALL TO ATTRIBUTE IT, and there is a confound the counts do not resolve: the only two FAILs are
+  the two MOST RECENT runs, after five clean ones.** A regression landing between 19:17 and 19:36 would
+  produce the same pattern as intermittency, and the e2e run logs record no binary hash, so which build each
+  run used cannot be recovered. So: not override-specific (retracted, not refined), not shown to be
+  build-related either, and **not excludable** -- 22:08 is the only default run on `b1752589`, so "the freeze
+  change regressed demotion" is not ruled out. The change looks read-only (a counter copy plus
+  `transfer_totals()` reads), but that is PLAUSIBLE, not tested. It belongs to the demote-never-restored
+  accounting item (#13 / task #2).
+  **AND A CORRECTION AGAINST MYSELF: this had already been run, and I re-ran it.** The entry above is dated
+  2026-09-27 and ends "Recorded so the next reader does not re-run this to learn the same two numbers." I
+  framed the 2 s experiment to the operator as "never run" and spent ten minutes re-deriving it. The unrun
+  experiment that line refers to is the ORDERING A/B, not `NINFER_SEARCH_MS`. Read the whole item before
+  proposing its experiment.
   traffic. **So this item is now: mechanism present, one scenario showing no starvation, the load case
   untested** -- which is a QA-or-heavy-suite question rather than a port.
 
@@ -1879,6 +2479,240 @@ it is an engine regression, which `git stash` settles in one run.
    preserve fail adoption. `logical_goal` gates on `publication_slot` being valid, and the incumbent is only
    adopted when `goal && cost.less(...)` -- so the question is which of those rejects a demote whose physical
    path is provably open. That is the next read, and it is a bounded one.
+   **⚠ REFUTED THE SAME EVENING, BY THE INSTRUMENT THIS READ PRODUCED -- READ THIS PARAGRAPH FIRST.**
+   The mechanism below (a structural bias toward eviction, because only an `Evicted` victim always supplies a
+   publication cell) is a true statement about `logical_goal_probe`. **It is NOT what refuses the preserving
+   plans, and the reading I based that on was a conflation I made, not the code's.** The split reads
+   `goal_blocked_cell_only = 0` and `goal_blocked_other = 0` against **`publication_cell_probes = 417,152`**
+   on live QA -- so **every goal probe that was ever MADE succeeded**, and the publication cell is not
+   implicated at all.
+   **PROVENANCE OF THE 417,152 READING, because a review noted it was cited without one and the load-bearing
+   run is a different, better-attested one.** The 417,152 figure was read from `/stats` at ~20:32 on the
+   instance started 20:26:53 (`cae5ab2dfdf382d2`); it is a CUMULATIVE process counter and the window's own
+   per-record data was not captured alongside it, so treat it as a spot reading. **The reading this
+   conclusion actually rests on is the 21:18-21:23 window on `44be3fc0081b46f3`, which has the per-record
+   instrument pair: 84 records, `assessed_targets_without_goal_unadoptable` summed to 0 while
+   `infeasible` summed to the whole total.** Two instruments agreeing on one measured window is the claim;
+   the 417,152 spot reading is corroboration, not the evidence. The reason is one line: `materialization_planner.h:486-491` calls `logical_goal` **only
+   when `assessment.physical_status == Feasible`**, while `:496` increments `assessed_targets_without_goal_`
+   for **any** target with no goal -- infeasible ones included, which never had a probe to fail. So
+   `assessed_targets_without_goal` conflates **"physically infeasible"** with **"feasible but no cell"**, and
+   my "~4000 of ~4080 targets lacked a goal, therefore the gate is the cell" read the first as the second.
+   **The refusal is upstream of the goal: those targets were never feasible to begin with**, which points at
+   CAPACITY, not at the catalog. There is also **no counter for physical infeasibility anywhere in `/stats`**,
+   so the population that actually dominates cannot be measured today -- that is the next instrument, and it
+   is a physical-status split on `assessed_targets_without_goal`, not another look at the cell.
+   **THE SPLIT IS BUILT AND DEPLOYED (2026-10-01, `a8619ccbb955dee4`):**
+   `assessed_targets_without_goal_infeasible` (physical_status != Feasible -- NO PROBE WAS MADE, so the
+   refusal is capacity) and `assessed_targets_without_goal_unadoptable` (Feasible, probe made, the gate
+   returned nullopt -- the refusal is the catalog), emitted beside the total in the request log, assigned
+   directly on the struct rather than as another positional argument. `infeasible + unadoptable` is exactly
+   **THE HOST-PINNED "CAPACITY" QUESTION, ANSWERED AS FAR AS THE OLD INSTRUMENTS ALLOWED, AND THE GAPS
+   CLOSED (2026-10-01 late).** Asked whether the evictions are RAM exhaustion or fragmentation, the answer is
+   **neither**, and the reasoning had to be DERIVED from source-plus-argv because no counter recorded it:
+   * The running argv sets only `--host-state-slots` and `--host-kv-mib`. **No `--host-ram-reserve-mib`, no
+     `--host-pinned-max-mib`, no `--host-chunk-mib`** -- so `max_bytes = 0` and `shmem_cap_bytes = 0` skip
+     their branches entirely and `HostMemoryBudget::decide` reduces to ONE test: refuse when
+     `chunk(1 GiB) > MemAvailable - reserve(8 GiB)`, i.e. **below ~9 GiB available**.
+   * **So fragmentation cannot be the mechanism**: the growth decision never looks at the pool's internal
+     free space. A fragmented pool WITH ram still grows.
+   * And it is not absolute RAM shortage: MemTotal 56.6 GB, MemAvailable **22.6 GB**, swap 16 GB untouched
+     (`VmSwap 0`), against a process pinning 30.0 GB of shmem at 32.2 GB RSS. It is a RESERVE POLICY on the
+     HOST tier. **The device is the tighter resource: 3,004 MiB free of 32,607.**
+   * **CORRECTED IN PLACE -- I first wrote "30 GB pinned plus 22 GB of weights out of 56.5 GB", WHICH IS
+     WRONG: the weights are DEVICE memory, not host.** `weights_bytes` / `available_after_weights_bytes` come
+     from `current_free_device_bytes()` (`model_instance.cpp:204`), and the host side proves it
+     independently: process `VmRSS` tracks `Shmem` (14.13 GB against 12.15 GB on a fresh instance), so there
+     is NO host-side weight residency. The host tier holds pinned memory and little else; the device holds
+     the weights (~20.8 GiB) + KV payload (4.5 GiB) + runtime/sequence reservations. **This also weakens the
+     8 GiB constant's own cited justification**, since one of its three named components -- "weight
+     staging" -- is a LOAD-TIME TRANSIENT (the weights end up on the device), not a standing need; the media
+     cache is ~1 GiB by config (`--media-cache-mib 512 --media-live-mib 512`). What remains is "the OS" plus
+     reclaim slack, which on WSL2 is a real function because pinned memory is unswappable while
+     `MemAvailable` counts reclaimable page cache -- but it is not what the comment says it is.
+   * `pre_grow_host_state_pool` returns `NotFull`/`Disabled` WITHOUT counting, so `attempts = grew + refused`
+     = 1299 = 127 + **1172** are genuine "full AND refused", not benign no-ops.
+   **WHY 8 GiB, AND IT IS NOT DERIVED FROM THIS HOST.** `include/ninfer/types.h:45-48` says so in the
+   constant's own comment: *"8 GiB held back from pinned memory, as a FIRST CUT -- the number that justifies
+   it is `~/ninfer-e2e/ab-runner.sh`'s gate, which treats MemAvailable >= 38 GiB as 'memory released' on this
+   53 GB host, implying ~15 GiB is needed for weight staging, the media cache and the OS."* Three things
+   follow, and all three are uncomfortable: (a) it is a FIRST CUT, never tuned -- no `--host-ram-reserve-mib`
+   is set anywhere; (b) its citation is a **stale path** (that directory was retired 2026-09-28; the gate now
+   lives at `tools/e2e/ab-runner.sh:118`, `[ "$a" -ge 38 ]`, verified present); (c) **by its own borrowed
+   derivation 8 GiB is on the SMALL side** -- that gate implies ~15 GiB of non-pinned need on a 53 GiB host,
+   and this host is 53.9 GiB. So the wall is a safety margin against a documented fatal failure mode
+   (pinned memory cannot be swapped; this VM's OOM is the documented mode), sized by a first cut borrowed
+   from another tool rather than measured here.
+   **THE GAPS ARE NOW CLOSED** -- `host_pinned_largest_free_run_bytes` (the pool has computed
+   `largest_free_run()` since the elastic change and its own comment says fragmentation "is visible here and
+   nowhere else"; it was simply never exported), `host_pinned_growth_policy_refusals` vs
+   `host_pinned_growth_pin_failures` (policy-said-no vs `cudaMallocHost`-failed -- they shared ONE counter
+   and mean opposite things), `host_pinned_last_veto` (`none|nothing_wanted|invalid_reading|reserve|
+   max_bytes|shmem_cap`) with `host_pinned_last_wanted_bytes` and `host_pinned_last_veto_mem_available_bytes` (SNAPSHOTTED at the
+   refusal, not read live -- the live one came from a later `allow()`, which is the reading a reader is
+   trying to interpret), and
+   `host_pinned_reserve_bytes`. `GrowthVeto` is returned by `veto_for()` and `decide()` is now that plus
+   `== None`, so there is one decision site and two spellings of it. Both host-only suites green
+   (`host_memory_budget`, `pinned_host_pool`). **Read them on the next load**: `last_veto = reserve` with a
+   low `last_mem_available_bytes` is a RAM gate; with a HIGH one it is a fail-closed reading; `max_bytes`
+   would mean a configured ceiling.
+   **RESERVE LOWERED TO 4 GiB AND TESTED (2026-10-01 21:18-21:23) -- A NULL, AND THE WINDOW COULD NOT HAVE
+   SHOWN ANYTHING ELSE.** `--host-ram-reserve-mib 4096` set in BOTH `~/.config/ninfer.conf:3` and
+   `~/ninfer-ensure.sh:53` (the `swift` profile is the default and REWRITES the conf, so one alone gets
+   reverted; `quasar` left alone). Live value confirmed `4294967296`. Result: `host_pinned_grow_refusals = 0`,
+   `growth_policy_refusals = 0`, `growth_pin_failures = 0`, `last_veto = none`, `grows = 28`. **That is NOT
+   evidence the reserve was the gate, and must not be read as one**: a 5 s sampler over the whole window shows
+   `MemAvailable` never fell below **21.69 GiB** (`Shmem` peaking 28.62 GiB), while the gate refuses only
+   below `reserve + 1 GiB` -- ~5 GiB now, ~9 GiB before. **At 21.7 GiB both values allow growth, so this
+   window cannot distinguish them.** The 1,172 refusals on the earlier instance therefore happened when
+   availability was genuinely below 9 GiB, and the reserve change stays unobservable until a load drives
+   availability into that band.
+   **THE FREE-LIST POLICY FIX, IMPLEMENTED AND MEASURED (2026-10-01 late).** `try_allocate` now takes the
+   SMALLEST extent that fits WITHIN each chunk instead of the first one it meets. First-fit splits from the
+   FRONT of whatever extent it reaches first, so a small request eats into the largest run -- which is one
+   mechanism behind the `free 1798 MiB / largest run 90 MiB` state above. **DELIBERATELY PER-CHUNK, NOT
+   GLOBAL:** chunks must still be consumed in ASCENDING order, because that is what keeps the newest chunk
+   empty longest and makes `shrink_idle` (which frees only a FULLY free chunk) useful rather than a coin
+   flip -- see the invariant in `pinned_host_pool.h`. A global best-fit would scatter allocations into older
+   chunks with room and strand the newest one partly filled, trading a real capability for a local packing
+   win, and the existing chunk-order test would NOT have caught it.
+   **Measured on the operator's 8-agent load, one run each, at comparable occupancy:**
+
+   | | first-fit | best-fit |
+   |---|---|---|
+   | occupancy | ~93% | 91% |
+   | free | 2175 MiB | 2006 MiB |
+   | **largest free run** | 290 MiB | **837 MiB** |
+   | **contiguous share of free** | **13%** | **42%** |
+   | `allocation_fragmented_misses` | 25 | **12** |
+   | chunks pinned (`grows`) | 29 | 16 |
+
+   `grows` falling 29 -> 16 is the confirming shape rather than a second headline: more is served from
+   existing free space instead of by pinning another chunk, which is what better packing should produce.
+   Growth refusals and RAM refusals both 0, `last_veto = none`.
+   **LIMITS, so this is not over-read: one run each, and the windows were NOT duration-matched** (the
+   first-fit 25 accumulated over a longer period that included pre-soak traffic). The direction is solid and
+   the magnitude is approximate -- consistent with the 2x cross-arm variance this workload showed earlier,
+   which is why "52% better" is NOT quoted as a result.
+   **AND IT IS NOT A FIX: 12 misses remain**, so there is still free space the pool cannot place. That
+   residual is the case CHUNK HOMOGENEITY addresses -- the pool is shared by two consumers with different
+   shapes (fixed ~187 MiB state images, variable KV page runs) and mixed shapes in one free list is the root
+   cause; best-fit mitigates the symptom, size-classing removes it. **Not implemented; this measurement is
+   what justifies it rather than assuming it.**
+   **FRAGMENTATION IS REAL, MEASURED, AND MY "NEITHER" WAS HALF WRONG (same window).** `free_bytes`
+   **1798 MiB** against `largest_free_run` **90 MiB** (21 chunks, capacity 27.50 GiB) while a state image
+   needs **~187 MiB**: the pool holds far more than enough BYTES and no single place to put one. The earlier
+   reasoning was right about the GROWTH path -- that decision is a pure `MemAvailable` comparison and never
+   sees the free list -- and WRONG to conclude fragmentation is therefore not a mechanism, because there is a
+   second path: `try_allocate` serving from EXISTING free space, which the free list does govern.
+   **`allocate()` has two distinct failures sharing one counter, and NO COUNTER ANYWHERE showed the
+   fragmentation:** `allocation_refusals_` counted both "no room and growth refused" (RAM/policy) and
+   "IT GREW A FRESH CHUNK AND STILL COULD NOT PLACE IT" -- the second of which the commit review showed is
+   UNREACHABLE -- while the reachable fragmentation path (the FIRST placement failing with free bytes
+   sufficient) was counted nowhere at all. Now split
+   (`allocation_ram_refusals` / `allocation_post_grow_failures`) and exported with the total.
+   **CORRECTED THE SAME EVENING BY THE COMMIT REVIEW: the counter I first called the fragmentation proof
+   (`place_failures`, the post-grow failure) CANNOT FIRE.** `grow()` pins a fresh extent of at least the
+   requested size, so the post-grow retry always fits; the counter asserting "fragmentation is real" was dead
+   while the real path -- the FIRST placement failing while free BYTES were sufficient -- was counted
+   nowhere. Now `allocation_fragmented_misses` counts that reachable path and IS the signature;
+   `allocation_post_grow_failures` is kept only as a growth-contract check (if it ever fires, the pool could
+   not use a chunk it had just pinned, which is a different and worse fault). **Asserted by
+   `test_fragmentation_is_visible`, which already drove the exact path, and MUTATION-CHECKED: deleting the
+   increment fails it.**
+
+   the total. **READ 2026-10-01 20:52-20:56 (the operator's load, 69 records) -- AND IT CONFIRMS THE
+   REFUTATION OUTRIGHT:**
+
+   | | summed over the window |
+   |---|---|
+   | `assessed_targets_without_goal_infeasible` | **73,388** |
+   | `assessed_targets_without_goal_unadoptable` | **0** |
+   | `assessed_targets_without_goal` (total) | 73,388 (the split sums exactly) |
+
+   **EVERY target that lacked a goal lacked it because it was PHYSICALLY INFEASIBLE. The goal gate refused
+   nothing -- not one target, in this window or (at 641,861 probes) in the previous one.** So the refusal is
+   CAPACITY, and it is now established by two independent instruments that agree: the goal-probe reason split
+   (`cell_only = 0`, `other = 0`) and this physical-status split (`unadoptable = 0`). **The publication-cell
+   mechanism is real code and is NOT what #6 has been hitting**; the code read above is refuted on the record
+   and should not be re-proposed without a reading that shows `unadoptable > 0` somewhere.
+   Window context, stated so the numbers are not over-read: this one was LIGHTER than the 19:19 and 20:32
+   windows -- `chosen_restorable_evictions` summed to **0** across all 69 records and `/stats` shows
+   `owners_evicted_total = 0` (re-read after the publication interval, since a zero read immediately after an
+   event is a timing artefact), so **there was no #6 case in it and the pair check is vacuous here**, not
+   negative. `feasible_preserving_alternatives` summed to 34,578 (median 217) against
+   `preserving_alternatives_assessed` 87,817 -- so preserving alternatives ARE feasible on QA's traffic; what
+   is not observable is an adopted destroying plan chosen against one.
+   (Kept below because the mechanism is real and the dead guard is real, but do not read it as the cause.)
+   **AND `/stats` IS A SNAPSHOT, SO A COUNTER CAN READ 0 SECONDS AFTER THE EVENT.** Read at 20:32:40, ten
+   seconds after the journal printed seven evictions, EVERY eviction counter still read 0 while
+   `publication_cell_probes` read 398,267 -- and reread at 20:32:52 the same counters read
+   `owners_evicted_total = 34` (29 private + 5 shared). The 5 s publication interval plus the event sites had
+   simply not run yet. CLAUDE.md records this for the catalog fields; it is true of all of them, and a zero
+   read in the seconds after an event is a timing artefact, not a missing increment.
+   **THE READ IS DONE (2026-10-01), AND IT FINDS THE GATE -- BUT NOT, YET, ITS CAUSE.**
+   `feasible_preserving_alternatives` is gated on `goal` (`materialization_planner.h:497-508`), and admission is
+   `goal && cost.less(...)` (`:509`), so a target with no goal can never become the incumbent. The measurement
+   that makes this the whole story: on the 2 s arm **`assessed_targets_without_goal` was ~4000 of ~4080
+   targets** -- essentially every target lacked a goal -- while `feasible` stayed 0 with thousands assessed.
+   **WHERE A GOAL COMES FROM, and the asymmetry that is the mechanism candidate.** `logical_goal_probe`
+   (`resource_manager.h:2509-2607`) must produce a `publication_slot`, and it has exactly THREE sources:
+   (A) `candidate.private_source->slot` when the source mode is `ConsumeToActive` -- consuming its own private
+   source; (B) the first `CatalogState::Vacant` entry in the catalog; (C) **the slot of an owner whose
+   disposition is `Evicted`** (`:2575-2578`). **Only an eviction ALWAYS supplies a cell.** A plan whose victims
+   are all `Retained` -- i.e. demoted rather than destroyed, which is exactly the plan the operator's ruling
+   prefers -- obtains a cell only from (A) or from a vacant cell (B). So under catalog occupancy the plans that
+   can always publish are the ones that destroy, and a fully-preserving plan is adoptable only when a vacant
+   cell happens to exist. That is a structural bias toward eviction, it is not a budget problem (which is why
+   raising the search budget changed nothing -- independently reproduced 2026-10-01 at 2 s), and it would
+   explain why the ordering fix is inert: **the ordering can only rank plans that HAVE a goal, and the
+   preserving plans may have none to rank.**
+   **THE INSTRUMENT COULD NOT SAY WHY, AND THAT WAS THE REAL GAP.** The `cell_only` / `other` reason split is
+   already computed per candidate (`logical_goal` wrapper, `resource_manager.h:2612-2631`), but it is only
+   TALLIED when `at_risk != 0` -- the reuse-loss predicate, which asks "would this candidate have reused
+   MORE". On QA: `publication_cell_probes = 303,564`, `losses = 0`, `at_risk_runs = 0`, every `veto_*` = 0,
+   while ~4000 targets had no goal. **So the record said almost every target lacked a goal and could not say
+   what took it** -- absence read as zero, the recurring failure mode.
+   Two consequences recorded: (i) `publication_cell_losses`' test is "would have reused MORE", which is
+   structurally blind to #6, whose case is destroying LESS at EQUAL reuse -- so the cell could cost #6
+   everything and `losses` would still read 0; (ii) the goal-failure tally is now unconditional
+   (`goal_blocked_cell_only` / `goal_blocked_other` in `/stats`, `RuntimeStats` + `Program` + `ProgramImpl`,
+   fed from the same `probe_tally`), which is the instrument that can actually answer "is the cell what
+   refuses the preserving plans". **What remains is to READ that split on a pressure run** -- the code read
+   identifies the mechanism class and does not establish it; the ungated counters are the measurement, and
+   they have not been read yet.
+   Also found while reading, and recorded as a dead guard rather than a defect: the check at
+   `resource_manager.h:2547` (`disposition != Retained && != Evicted -> no goal`) is **unreachable** --
+   `VictimDisposition` (`runtime/contract/resources.h:209-212`) has only those two values.
+   **THE FIRST VERSION OF THAT INSTRUMENT MEASURED NOTHING, AND THE ZERO LOOKED LIKE AN ANSWER (2026-10-01,
+   caught in the first window it ran in).** The new split was placed AFTER the `!planned` early return in the
+   same function, while the probes denominator above it is deliberately placed BEFORE it -- and the comment
+   three lines above says why: *"a planning run that produced no plan still contributes its probes... the one
+   thing a denominator exists to distinguish."* So the split fired only when a plan had been produced, and read
+   `goal_blocked_cell_only = 0`, `goal_blocked_other = 0` against **`publication_cell_probes = 295,251`** on
+   live QA traffic. The tell was arithmetic, not intuition: the wrapper tallies `probes`, `goals`, `cell_only`
+   and `other` with `probes = goals + cell_only + other`, so 0/0 against 295,251 would mean EVERY probe
+   succeeded -- while the planner's own `assessed_targets_without_goal` read **1266 per request** and
+   `goal_probes_by_site` summed **320,680**. **I reproduced the exact placement mistake the adjacent comment
+   exists to prevent.** Fixed by moving it into the same unconditional block as the probes denominator, with
+   the reason and the measurement written beside it. **DEPLOYED, by the wedge below rather than by a planned
+   restart:** the sentinel restarted QA at 20:26:53 onto `cae5ab2dfdf382d2`, verified running == built with
+   the fix present in the running exe. **Still not READ on a pressure window** -- the load had stopped, so
+   `publication_cell_probes = 7` and the split reads 0/0 for want of traffic, not for want of the fix.
+   **A CORRECTION TO MY OWN READING OF THAT WINDOW, made before it reached the record as a result.** I first
+   read `feasible_preserving_alternatives` median **267** on QA against 0 on the e2e and flagged it as possibly
+   #6 live. That median is over ALL records, including the many that evicted nothing; restricted to the
+   population that matters, the window had exactly **one** record with restorable evictions and it is the
+   DEFENSIBLE branch (`assessed > 0`, `feasible == 0`), with **zero** records where both are positive. So #6
+   is not demonstrated in this window either. **Compare like populations: a population-wide median against an
+   eviction-restricted figure is the pooled-population error this file keeps logging.**
+   **AND THE PER-REQUEST ATTRIBUTION OF EVICTIONS IS STILL AN UNDERCOUNT.** That window's `/stats` reads
+   `owners_evicted_total = 26` (21 private + 5 shared), `private_evictions_demotable = 21/21`,
+   `evictions_with_victim_room = 19`, while the request log attributes them to **one** record --
+   `chosen_restorable_evictions` is the incumbent PLAN's count, not the committed set, and the pressure
+   transition commits victims the plan's own number does not enumerate. The journal is no help either: the
+   print stopped at `checked=8` while /stats counted 21, so **13 of that window's 21 private evictions were
+   never printed** -- the documented cap, reading as a quiet system.
    **(Superseded, kept to show what it replaced:)** -- the two instrument two DIFFERENT planners' views, and `#6`'s own history is full of cases where one
    said "available" and the other said "none". The pair reading for this request is the next check.
    **THE 2s EXPERIMENT ANSWERED IT, BY SHOWING THE BUDGET IS NOT THE BINDING CONSTRAINT (2026-09-27 13:32-13:37,
@@ -2048,7 +2882,7 @@ noise.** Recorded here as a criterion, because that is what it is:
 
 | criterion | measured | verdict |
 |---|---|---|
-| `demotable` evictions fall | they still occur, and the decisive pair shows no adoptable preserving plan in every case (adoptable>0 WITH chosen>0 = 0 across 49+133 records) | met in the sense that the remaining evictions are not ordering-caused; the pressure itself is unchanged |
+| `demotable` evictions fall | they still occur, and the pair shows no adoptable preserving plan in every case (adoptable>0 WITH chosen>0 = 0 across 49+133 records) | met in the sense that the remaining evictions are not ordering-caused; the pressure itself is unchanged |
 | `private_owners_demoted*` rise | **demoted 38 vs evicted 5** over the same window | **met**: 88% demotions |
 | **reuse fraction improves** | **FAILING**: the reused prefix is pinned at ~23,353 while sessions grow (75% at 31k tokens -> 36% at 65k), costing 6-11 s of re-prefill per turn | **FAILING, and it has been failing for hours** |
 
@@ -4672,7 +5506,7 @@ current sources and is configuration-comparable. Dispositions:
 
 | # | finding | disposition |
 |---|---|---|
-| 1 | the swap fix is in `tools/e2e/e2e-swap.sh` but the operator runs `~/ninfer-e2e/e2e-swap.sh`, a **different, stale** file (no flock, no `restore_prod`, abort exits with QA down; stale `cmp-e2e.py` too) | **fixed**: the repo copies are installed over `~/ninfer-e2e/` (swap, cmp-e2e, ninfer-start-test, canary-e2e, toolcall-e2e, ninfer-e2e.py), md5-verified identical. The claim in the commit body is now about the command the operator runs |
+| 1 | **RESOLVED 2026-09-28**: the two copies were byte-identical when checked, and the repo's `tools/e2e/` was found to be the MAINTAINED side -- it carried the 2026-09-26 fixes (`e7c07e60`, `aea1b9ce`) and a `STATS_PORT` guard the outside copy never had, while `CLAUDE.md` pointed at the outside one. The outside tree is retired, `CLAUDE.md` now names `~/ninfer/tools/e2e/e2e-swap.sh`, and the 20 probe scripts that lived only there are vendored in. |
 | 2 | no signal trap: a killed/timed-out swap still leaves QA + sentinel down | **fixed**: `trap 'restore_prod || true' EXIT INT TERM HUP` right after the lock; `restore_prod` is idempotent so the normal path's call wins |
 | 3 | the swap never verifies QA stopped or that the test server owns :8080 — `/health` cannot tell them apart, so a silently-failed `systemctl stop` runs the whole suite against QA | **fixed**: pre-start check that nothing listens on the port, post-start check that the listener pid equals the recorded test pid; `ninfer-start-test.sh` now records the **server's** pid (it recorded the wrapper's). Validated: the launcher pattern's recorded pid equals the process pid and differs from the wrapper's; `listener_pid` returns QA's 286588 against a stale recorded 286292 |
 | 4 | `capture.cpp` kept the same error string for a second, unfixed branch — so "that line no longer appears" cannot distinguish fixed from untriggered | **fixed**: distinct message ("capture offer is stale"), with the reason in the comment |

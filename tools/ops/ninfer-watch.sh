@@ -33,6 +33,11 @@ UNIT="${UNIT:-ninfer.service}"
 SENTINEL_UNIT="${SENTINEL_UNIT:-ninfer-wedge-sentinel.service}"
 HEALTH_URL="${HEALTH_URL:-http://127.0.0.1:8080/health}"
 POLL_S="${POLL_S:-30}"
+# DEFINED HERE, ABOVE ITS FIRST USE. It is echoed in the startup banner (and read by the request-log leg), and
+# it used to be assigned 17 lines LOWER -- with `set -u` that made the banner die mid-echo with
+# `REQUEST_LOG: unbound variable`, so the watcher wrote a truncated banner and still looked alive. A monitor
+# whose own startup line is incomplete is the "instrument that cannot fire" failure this file exists to avoid.
+REQUEST_LOG="${REQUEST_LOG:-$HOME/ninfer-requests.jsonl}"
 LOGDIR="${LOGDIR:-$HOME/ninfer-watch}"
 LOG="${LOG:-$LOGDIR/watch-$(date +%Y%m%d-%H%M%S).log}"
 mkdir -p "$LOGDIR"
@@ -69,7 +74,6 @@ JOURNAL_CMD="${JOURNAL_CMD:-journalctl -u $UNIT -u $SENTINEL_UNIT -f -q -n 0 --o
 # The request log is a SECOND instrument, not a duplicate of the journal: the journal says what the engine
 # did (evictions, recoveries), this says what a client got (reuse, prefill time). Both thresholds are a
 # first cut and are settable, so they can be tuned from the log rather than recompiled.
-REQUEST_LOG="${REQUEST_LOG:-$HOME/ninfer-requests.jsonl}"
 # 0.6, SET FROM THE LOG (2026-09-26), not chosen: over 4,439 non-root reuse requests with
 # prompt >= 20k the hit fraction is bimodal -- 0.1-0.5 (1,016 requests, the shared-prefix-only cluster)
 # and 0.9-1.0 (3,292, healthy) -- with only 69 requests in the 0.4-0.8 valley. The threshold belongs in

@@ -378,14 +378,23 @@ class ThinkingSignatureTester:
                 except Exception as e:
                     ok = False
                     error = repr(e)[:100]
-            # Expected: succeed for false/none, fail for true
-            expected_ok = pt_val is not True
+            # ALL THREE MUST BE ACCEPTED, INCLUDING preserve_thinking=true. This check used to expect a
+            # REJECTION for `true` (`expected_ok = pt_val is not True`) and so printed
+            # `preserve_true: FAIL (accepted=True, expected=False)` on every run -- but that expectation
+            # was never the engine's behaviour: `anthropic_messages_request.cpp:318` says the wire
+            # signature is INTENTIONALLY dropped ("NInfer has no encrypted reasoning state to restore.
+            # The wire signature is therefore intentionally outside the lowered request; only visible
+            # Thinking reaches the model"). The engine does not model the signature, so it cannot and
+            # should not reject a bogus one; a rejection here would mean it began validating an opaque
+            # blob it does not model. A permanently-failing line is also the worst kind of check: it
+            # trains a reader to skip FAIL lines.
+            expected_ok = True
             if ok == expected_ok:
                 self.results.append({"test": label, "ok": True})
-                print(f"  {label}: OK (accepted={ok}, expected={expected_ok})")
+                print(f"  {label}: OK (accepted={ok}; the wire signature is deliberately ignored)")
             else:
                 self.results.append({"test": label, "ok": False, "error": f"accepted={ok} expected={expected_ok}: {error}"})
-                print(f"  {label}: FAIL (accepted={ok}, expected={expected_ok}: {error})")
+                print(f"  {label}: FAIL (rejected={not ok}, expected acceptance: {error})")
         return self.results
 
 
@@ -546,6 +555,25 @@ _ARGS = None
 NO_CACHE_PHASES = ("checkpoint-advance", "tool-calling", "responses-tools",
                    "reasoning-effort", "concurrent", "thinking-sig", "demotion",
                    "state-saturation", "queued-relief")
+
+
+def tester_verdicts(phase_name, results):
+    """A tester's own per-case results AS VERDICTS.
+
+    They used to be printed and thrown away: `evaluate` has no branch for these phases, and nothing
+    reads `Tester.results`, while `print_summary` counts `all_verdicts` only -- so a failing case could
+    not reach the summary OR the exit code. `preserve_true` printed
+    `FAIL (accepted=True, expected=False)` on every run while the summary reported `1 FAIL` for the
+    phase. A check that cannot fail the suite is not a check.
+    """
+    out = []
+    for r in results or []:
+        label = r.get("test") or r.get("effort") or "case"
+        if r.get("ok"):
+            out.append((phase_name, f"PASS: {label}"))
+        else:
+            out.append((phase_name, f"FAIL: {label} — {r.get('error') or 'no detail'}"))
+    return out
 
 
 def evaluate(phase_name, sessions, stats0, stats1, log, expect_trash=False,
@@ -758,6 +786,11 @@ def main():
     planner_verdicts = phase_planner_latency(args)
     all_verdicts.extend(planner_verdicts)
     for pn, v in planner_verdicts:
+        print(f"  [{pn}] {v}")
+
+    reuse_verdicts = phase_reuse_paths(args)
+    all_verdicts.extend(reuse_verdicts)
+    for pn, v in reuse_verdicts:
         print(f"  [{pn}] {v}")
     return print_summary(all_verdicts)
 
@@ -1051,11 +1084,12 @@ def phase_8(args):
     log_off = count_log_lines(args.serve_log)
     stats0 = get_stats(args)
     tester = ReasoningEffortTester(args)
-    tester.test()
+    effort_results = tester.test()
     stats1 = get_stats(args)
     log8 = parse_serve_log(args.serve_log, log_off)
     for v in evaluate("reasoning-effort", [tester], stats0, stats1, log8):
         all_verdicts.append(("reasoning-effort", v))
+    all_verdicts.extend(tester_verdicts("reasoning-effort", effort_results))
     return all_verdicts
 
 
@@ -1105,11 +1139,12 @@ def phase_10(args):
     log_off = count_log_lines(args.serve_log)
     stats0 = get_stats(args)
     sig_tester = ThinkingSignatureTester(args)
-    sig_tester.test()
+    sig_results = sig_tester.test()
     stats1 = get_stats(args)
     log10 = parse_serve_log(args.serve_log, log_off)
     for v in evaluate("thinking-sig", [sig_tester], stats0, stats1, log10):
         all_verdicts.append(("thinking-sig", v))
+    all_verdicts.extend(tester_verdicts("thinking-sig", sig_results))
     return all_verdicts
 
 
@@ -1406,8 +1441,18 @@ def phase_planner_latency(args):
     (stop_reason expansion_capacity/target_budget, ~3.2s per search) whenever
     the evict-all seed incumbent was hard to beat. The fix seeds with a
     feasible cover (guided closure / greedy eviction cover), stops expanding
-    covered targets, prunes infeasible branches, and caps the search at
-    30ms (time_budget). Assert the search no longer enumerates and stays fast.
+    covered targets, prunes infeasible branches, and caps the search in TIME.
+
+    REFACTORED 2026-09-28. It used to assert `budget_stops == 0` -- that no search ever stops for a budget
+    reason -- which fails on the very behaviour the fix introduced, because a capped search is supposed to
+    stop at its cap. Three things were wrong at once and all three are fixed here:
+      * the assertion (any budget stop = FAIL) contradicted the fix it protects;
+      * it counted `expansion_capacity`/`target_budget` while IGNORING `time_budget`, which is the cap its
+        own docstring credits -- so it read a partial stop distribution as a verdict;
+      * its thresholds (30ms in the text, 50ms in the code) predate the current cap: the full run of
+        2026-09-28 measured `p95_search=400.0ms`, so BOTH would have failed a healthy planner.
+    What the original defect looked like is what this bars: a search that enumerated to the budget at ~3.2s.
+    The gate is that latency, and the stop distribution is reported WITH its denominator as information.
     """
     all_verdicts = []
     start = getattr(args, "_request_log_start", 0)
@@ -1443,15 +1488,154 @@ def phase_planner_latency(args):
         stops[s] = stops.get(s, 0) + 1
     detail = (f"n={len(rows)} p95_search={p95 / 1e6:.1f}ms max_search={search_ns[-1] / 1e6:.1f}ms "
               f"budget_stops={budget_stops} stops={stops}")
-    if budget_stops > 0:
+    # THE GATE IS DERIVED FROM THE CAP THE ENGINE ACTUALLY ENFORCES, not from a round number. The cap is
+    # `limit_ns = 400'000'000` in `materialization_planner.h` (`MaterializationSearchBudget`), enforced by
+    # `PlanningAllowance::boundary`; the gate allows one step over it, so a cap that has been raised,
+    # removed or broken shows up at ~1.25x rather than hiding under an arbitrary 1s ceiling (1s let a
+    # broken cap run 2.5x over unseen, which is what this replaces). A 3.2s enumeration -- the pre-fix
+    # behaviour -- still fails it by a wide margin.
+    SEARCH_CAP_NS = 400 * 1_000 * 1_000          # materialization_planner.h: limit_ns
+    ENUMERATION_REGRESSION_NS = SEARCH_CAP_NS + SEARCH_CAP_NS // 4
+    if search_ns[-1] > ENUMERATION_REGRESSION_NS:
         all_verdicts.append(("planner-latency",
-                             f"FAIL: {budget_stops} searches enumerated to the target budget "
-                             f"(expansion_capacity/target_budget) — convergence regression. {detail}"))
-    elif p95 > 50 * 1000 * 1000:
-        all_verdicts.append(("planner-latency",
-                             f"FAIL: p95 search {p95 / 1e6:.1f}ms exceeds the 50ms budget. {detail}"))
+                             f"FAIL: a search took {search_ns[-1] / 1e6:.0f}ms, past the "
+                             f"{ENUMERATION_REGRESSION_NS / 1e6:.0f}ms gate (cap "
+                             f"{SEARCH_CAP_NS / 1e6:.0f}ms + one step) — either the cap is broken or the "
+                             f"enumerated-to-the-target-budget behaviour is back. {detail}"))
     else:
-        all_verdicts.append(("planner-latency", f"PASS: planner converged — {detail}"))
+        all_verdicts.append(("planner-latency",
+                             f"PASS: no search exceeded the {ENUMERATION_REGRESSION_NS / 1e6:.0f}ms gate "
+                             f"(cap {SEARCH_CAP_NS / 1e6:.0f}ms, n={len(rows)}); {budget_stops} stopped for "
+                             f"a budget reason, which is the cap working — {detail}"))
+    return all_verdicts
+
+
+def phase_reuse_paths(args):
+    """The reuse ceiling the 2026-09-28 work was about, asserted from the request log.
+
+    WHY THIS EXISTS. The branch anchor (`NINFER_BRANCH_ANCHOR`) captures a checkpoint at the depth a request
+    actually matched to, taking the conversation's reuse ceiling from a pinned 23,353 tokens to 33k-45k. It
+    had NO coverage here: no phase enabled it, nothing read the request log's reuse fields.
+
+    THE ASSERTION IS A JOIN, PER RECORD -- and the first version got that wrong twice over.
+
+    1. It took `max(hits)` over ALL records and `paths` as the union over ALL records, then asked whether
+       the max was above the ceiling AND the union contained the anchor. Those are different records: on the
+       2026-09-28 run the 36 requests above 23,353 were ALL `private_endpoint`, and the 17
+       `private_long_anchor` records topped out at 19,815. The phase printed PASS and the record claimed the
+       anchor fix was measured, when the anchor had never crossed the ceiling.
+    2. Even joined, the constant is the wrong yardstick. 23,353 is QA's Claude Code system-prompt pin, and
+       this workload's own `shared_stable_prefix` hits are ~9.9k/12.0k/15.2k. So the gate can neither pass
+       on a workload whose prompts never reach the pin NOR fail on one whose shared prefix is longer than it.
+
+    The yardstick is the PINNED CEILING -- not, as a previous version of this docstring said, the best
+    non-anchor reuse: that version FAILED whenever the anchor did not beat `private_endpoint`, which is the
+    conversation's own continuation and naturally reuses more. When NO anchor record's prompt could have
+    reached the pin, the verdict is WARN-INCONCLUSIVE rather than a FAIL that describes the workload. `anchor_trivial` is printed because 14 of 17 anchors reusing
+    <=14 tokens is a signal that `anchor_records` alone hides.
+    """
+    all_verdicts = []
+    # WHICH ARM THIS IS, read from the serve log rather than inferred: `ninfer-start-test.sh` writes
+    # `ANCHOR_CHILD=<n>` (counted from the child's own environ) at startup. Without it an anchor-OFF run
+    # reports "no request took `private_long_anchor` ... the anchor is enabled in the test config", which
+    # is exactly backwards for that arm.
+    anchor_expected = None
+    try:
+        with open(args.serve_log, "r", errors="replace") as f:
+            for line in f:
+                if line.startswith("ANCHOR_CHILD="):
+                    anchor_expected = line.strip().split("=", 1)[1].strip() != "0"
+    except OSError:
+        anchor_expected = None
+    start = getattr(args, "_request_log_start", 0)
+    rows = []
+    try:
+        with open(args.request_log, "r", errors="replace") as f:
+            for i, line in enumerate(f):
+                if i < start:
+                    continue
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except Exception:
+                    continue
+                r = d.get("result") or {}
+                hit, path = r.get("prefix_cache_hit_tokens"), r.get("prefix_reuse_path")
+                if hit is not None:
+                    rows.append((int(hit), path or "unknown", int(r.get("prompt_tokens") or 0)))
+    except OSError:
+        all_verdicts.append(("reuse-paths", "WARN: request log unreadable — ceiling check skipped"))
+        return all_verdicts
+    if not rows:
+        all_verdicts.append(("reuse-paths", "WARN: no reuse readings in window — ceiling check skipped"))
+        return all_verdicts
+
+    PINNED_CEILING = 23_353
+    anchor   = [(hit, prompt) for hit, path, prompt in rows if path == "private_long_anchor"]
+    nonanchor_best = max((hit for hit, path, _ in rows if path != "private_long_anchor"), default=0)
+    # THE SAME JOIN, TWICE OVER: the best anchor hit and the prompt it came FROM must be the same record.
+    # Taking `max(hit)` and `max(prompt)` independently is exactly the error this phase was rewritten to
+    # remove, and it reappeared here on the first pass -- caught by replaying the phase over the real log,
+    # which reported "an anchor request had a prompt past the pin" from two different requests.
+    best_anchor, best_anchor_prompt = max(anchor, key=lambda row: row[0]) if anchor else (None, 0)
+    # TWO DIFFERENT PROMPTS, and the first version used one for both questions. `best_anchor_prompt` belongs
+    # to the record with the best HIT -- it answers "did the anchor that worked have a prompt long enough to
+    # cross the pin?". The inconclusive gate asks a different question -- "could ANY anchor request have
+    # crossed it?" -- and must take the LONGEST anchor prompt, or a record with a long prompt and a trivial
+    # reuse slips past. Measured: instance serve-1553637-… has an anchor record with prompt 24,499 that
+    # reused 14 tokens, above the 23,353 pin, and the phase still reported "longest 22957".
+    longest_anchor_prompt = max((prompt for _, prompt in anchor), default=0)
+    trivial_anchors = sum(1 for hit, _ in anchor if hit <= 14)
+    detail = (f"n={len(rows)} anchor_records={len(anchor)} anchor_best={best_anchor} "
+              f"anchor_best_prompt={best_anchor_prompt} anchor_longest_prompt={longest_anchor_prompt} "
+              f"anchor_trivial(<=14tok)={trivial_anchors} "
+              f"(reference only — other paths legitimately reuse more) best_nonanchor_hit="
+              f"{nonanchor_best} best_nonanchor_prompt="
+              f"{max((prompt for _, path, prompt in rows if path != 'private_long_anchor'), default=0)}")
+
+    if not anchor:
+        if anchor_expected is False:
+            all_verdicts.append(("reuse-paths",
+                                 f"WARN: anchor-OFF arm (ANCHOR_CHILD=0) and no request took "
+                                 f"`private_long_anchor` — that is the control working, not a failure. "
+                                 f"{detail}"))
+        elif anchor_expected is None:
+            all_verdicts.append(("reuse-paths",
+                                 f"WARN: no `ANCHOR_CHILD=` marker in the serve log, so which arm this was "
+                                 f"is unknown and the anchor's absence cannot be read. {detail}"))
+        else:
+            all_verdicts.append(("reuse-paths",
+                                 f"FAIL: no request took `private_long_anchor` at all — the anchor is ON in "
+                                 f"this arm (ANCHOR_CHILD=1) and is not being taken, which is the regression "
+                                 f"this case exists for. {detail}"))
+    elif longest_anchor_prompt <= PINNED_CEILING:
+        # The workload cannot answer the question: no anchor record's prompt was long enough for the pin to
+        # be reachable, so "did the anchor lift the ceiling?" has no evidence either way here. A FAIL would
+        # describe the workload, not the anchor.
+        all_verdicts.append(("reuse-paths",
+                             f"WARN: inconclusive — the anchor was taken {len(anchor)} times but no anchor "
+                             f"request had a prompt longer than the {PINNED_CEILING} pin (longest "
+                             f"{longest_anchor_prompt}), so this workload cannot show the anchor lifting it. "
+                             f"{detail}"))
+    # THE YARDSTICK IS THE PIN, NOT THE OTHER PATHS. An earlier version of this branch FAILED whenever the
+    # anchor's best did not exceed the best non-anchor reuse -- which is wrong, and it fired on the load
+    # that PROVED the anchor works (2026-10-01: 58 of 58 anchor records above the pin, median 39,376, and
+    # still a FAIL because `private_endpoint` is the conversation's own continuation and reuses slightly
+    # more). Each reuse path has a different job; the anchor's is to beat the SHARED-PREFIX ceiling, which
+    # is what it is measured against. The non-anchor maximum is printed beside it as a reference.
+    elif best_anchor <= PINNED_CEILING:
+        all_verdicts.append(("reuse-paths",
+                             f"FAIL: an anchor request had a prompt past the {PINNED_CEILING} pin "
+                             f"({longest_anchor_prompt}) and the BEST anchor reuse was only {best_anchor} — "
+                             f"the anchor is taken and is not lifting the ceiling. (The prompt quoted is the "
+                             f"LONGEST anchor prompt, which is what makes the question answerable; the best "
+                             f"hit came from a {best_anchor_prompt}-token request.) {detail}"))
+    else:
+        all_verdicts.append(("reuse-paths",
+                             f"PASS: an anchor request reused {best_anchor}, past the {PINNED_CEILING} "
+                             f"shared-prefix pin — {detail}"))
     return all_verdicts
 
 
@@ -1469,4 +1653,3 @@ def print_summary(all_verdicts):
 
 if __name__ == "__main__":
     sys.exit(main())
-

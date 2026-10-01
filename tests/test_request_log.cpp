@@ -389,6 +389,15 @@ int main() {
                   .prefill_units                        = 4,
                   .decode_rounds                        = 2,
                   .control_units                        = 1,
+                  // THE FIRST-TOKEN WINDOW, with `ttft_device_wait_seconds` DELIBERATELY DIFFERENT from
+                  // `prefill_seconds` (0.2 against 0.2345678901234). `unaccounted_seconds` must subtract
+                  // the DEVICE WAIT; an earlier version subtracted `prefill_seconds`, which is program WALL
+                  // time that already contains the submit/post host time the host term also contains, so it
+                  // double-counted the host term and went negative on real traffic. NOTHING tested that, so
+                  // reverting the subtrahend passed every suite -- which is why these differ here.
+                  .ttft_host_exposed_seconds            = 0.011,
+                  .ttft_device_wait_seconds             = 0.2,
+                  .ttft_window_frozen                   = true,
     };
     outcome.metrics.speculative_backend               = ninfer::SpeculativeBackend::Mtp;
     outcome.metrics.speculative_draft_window          = 3;
@@ -473,6 +482,17 @@ int main() {
     outcome.metrics.materialization.split_best_tokens     = 23353;
     outcome.metrics.materialization.split_best_restorable = 23353;
     outcome.metrics.materialization.split_entries         = 9;
+    // THE DIVERGENCE'S POSITION IN THE PROMPT'S OWN HISTORY, on the same principle: `split_probe_index`
+    // localises the stop to a TOKEN, and nothing a reader can consult retains the prompt's per-message
+    // layout, so a record that drops these three cannot say which turn the two renders disagreed on --
+    // it can only name a number. `split_message_role` is a ChatRole value (2 = User here), and 255 is
+    // the "no message starts at that index" sentinel, so a defaulted field must not be read as a role.
+    outcome.metrics.materialization.split_probe_index     = 23401;
+    outcome.metrics.materialization.split_message_index   = 3;
+    outcome.metrics.materialization.split_message_offset  = 8;
+    outcome.metrics.materialization.split_message_role    = 2;
+    // TRUE, not the default: with `false` here a mutant that always emits `false` survives the check.
+    outcome.metrics.materialization.split_past_last_message = true;
     {
         const Json done_split = Json::parse(format_request_done_json("serve-test", 3000, context, outcome));
         failures += check(done_split.at("materialization").at("split_best_tokens") == 23353 &&
@@ -480,6 +500,12 @@ int main() {
                               done_split.at("materialization").at("split_entries") == 9,
                           "the split is missing from the record, so a shallow match cannot be told from a "
                           "deep one whose restorable frontier was lost");
+        failures += check(done_split.at("materialization").at("split_message_index") == 3 &&
+                              done_split.at("materialization").at("split_message_offset") == 8 &&
+                              done_split.at("materialization").at("split_message_role") == 2 &&
+                              done_split.at("materialization").at("split_past_last_message") == true,
+                          "the divergence's message position is missing from the record, so a divergence "
+                          "can only be read as a token index -- which nothing in the record explains");
     }
     failures += check(done.at("materialization").at("initial_predicted_total_ns") == 500000 &&
                           done.at("materialization").at("first_improvement_ns") == 2000 &&
@@ -557,6 +583,46 @@ int main() {
             done.at("engine_timing").at("decode").at("rounds") == 2 &&
             done.at("engine_timing").at("units").at("prefill") == 4,
         "request Engine timing exposure is incomplete");
+
+    // THE RESIDUAL, pinned against BOTH candidate subtrahends. This case exists because the fix for the
+    // formula had NO test: putting `prefill_seconds` back as the subtrahend passed every host suite and the
+    // e2e, so the only guard was an offline recomputation of one slice. With the two figures differing
+    // above, each assertion below fails if the wrong one is subtracted.
+    {
+        const Json& window = done.at("engine_timing").at("ttft_window");
+        const double ttft   = outcome.metrics.ttft_seconds;
+        const double queue  = outcome.metrics.engine_timing.queue_wait_seconds;
+        const double host   = outcome.metrics.engine_timing.ttft_host_exposed_seconds;
+        const double device = outcome.metrics.engine_timing.ttft_device_wait_seconds;
+        const double prefill = outcome.metrics.prefill_seconds;
+        const double expected = ttft - queue - host - device;
+        failures += check(std::abs(window.at("unaccounted_seconds").get<double>() - expected) < 1.0e-15,
+                          "unaccounted_seconds does not subtract the ttft-window DEVICE WAIT");
+        failures += check(std::abs(expected - (ttft - queue - host - prefill)) > 1.0e-3,
+                          "the two subtrahends are not distinguishable in this fixture, so the case above "
+                          "would not catch a revert to prefill_seconds");
+        failures += check(window.at("prefill_seconds").get<double>() == prefill,
+                          "the window still reports prefill_seconds beside the residual");
+    }
+
+    // THE NULL BRANCH, and it is the instrument's OWN discriminator: `null` means "the window was never
+    // frozen", i.e. the request produced NO TOKEN, which is a different statement from "a residual of
+    // zero". Production reaches it -- 13 of 105 request_done records on the running instance are null, all
+    // cancelled zero-token requests -- and the docs promise it. Without this case, replacing the
+    // `ttft_window_frozen ? ... : nullopt` with `true ? ...` compiles and passes every suite, and those 13
+    // records would read about -58 s instead of null, silently destroying the "0 below -10 ms" reading the
+    // residual is used for.
+    {
+        GenerationOutcome unfrozen = outcome;
+        unfrozen.metrics.engine_timing.ttft_window_frozen = false;
+        const Json raw = Json::parse(format_request_done_json("serve-test", 3000, context, unfrozen));
+        const Json& window = raw.at("engine_timing").at("ttft_window");
+        failures += check(window.at("unaccounted_seconds").is_null(),
+                          "an unfrozen window reports unaccounted_seconds as NULL, not as a number");
+        failures += check(!done.at("engine_timing").at("ttft_window")
+                               .at("unaccounted_seconds").is_null(),
+                          "and the frozen case is still numeric (the control for the assertion above)");
+    }
 
     const OperationalRecord pretty_done = render_request_done(context, outcome);
     failures += check(
@@ -658,6 +724,9 @@ int main() {
     throughput.current.pressure_spill_pages             = 4;
     throughput.current.pressure_private_owners_degraded = 1;
     throughput.current.pressure_checkpoints_dropped     = 1;
+    // A NON-ZERO value, so the delta below is a reading and not 0 == 0: a key that is present with the
+    // default in both arms would let a mutant emit the wrong field and still pass.
+    throughput.current.pressure_target_arena_truncations = 5;
     throughput.current.pressure_searches                = 1;
     throughput.current.host_work                        = {
                                .engine_boundary_ns            = 1000000,
@@ -716,6 +785,14 @@ int main() {
                           throughput_json.at("scheduler").at("capture_pending") == 1 &&
                           throughput_json.at("scheduler").at("terminal_pending") == 1,
                       "context scheduler gauges missing");
+    // THE ARENA CEILING'S OWN KEY, in the throughput record. It was added to the emitter and NOT asserted,
+    // so a mutant removing it survived -- and the key is what lets a saturation be read from the periodic
+    // record rather than only from /stats, which is the whole reason it was added beside its sibling.
+    // The pressure counters live under `context_cache` in this record, not at the top level.
+    failures += check(throughput_json.at("context_cache").at("pressure").contains("target_arena_truncations") &&
+                          throughput_json.at("context_cache").at("pressure").at("target_arena_truncations") == 5,
+                      "the arena-truncation counter is missing from the throughput record, so a capacity "
+                      "ceiling cannot be read from it");
     failures += check(
         std::abs(throughput_json.at("host_work").at("elapsed_seconds").at("total").get<double>() -
                  0.015) < 1.0e-15 &&

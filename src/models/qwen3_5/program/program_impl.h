@@ -17,6 +17,9 @@
 #include "models/qwen3_5/program/storage/kv_store.h"
 #include "models/qwen3_5/program/storage/state_store.h"
 #include "models/qwen3_5/program/prefix_identity.h"
+// For `runtime::DivergencePosition`, which a split carries beside its probe index. Header-only and
+// std/types-only itself, so this adds no dependency of substance.
+#include "runtime/engine/context_cache/materialization_budget.h"
 #include "models/qwen3_5/program/kv_row_binding.h"
 #include "models/qwen3_5/program/shared_slot_release.h"
 #include "models/qwen3_5/program/planning/resource_projection.h"
@@ -558,6 +561,12 @@ public:
         // match stopped short of BOTH lengths, and without this the stop cannot be localised to an index.
         std::uint32_t stored         = 0;
         std::uint32_t probe_index = 0;  // where the match stopped; 0 unless it diverged
+        // WHICH TURN OF THE PROMPT'S OWN HISTORY the divergence falls in, and how far into it the
+        // match got. `probe_index` localises the stop to a token; on its own that is unreadable,
+        // because the prompt's token layout is not retained anywhere a reader can consult. Set only
+        // when the match diverged (the only case where attribution means anything) and PROMPT-SIDE
+        // ONLY -- the stored ledger's boundaries are not retained.
+        runtime::DivergencePosition divergence;
     };
     // Takes the prompt DATA, not just its tokens: the identity chain is a stricter test than the token
     // comparison (`prefix_matches` = same tokens AND same render), and `identity_ok` is the field that
@@ -692,6 +701,21 @@ public:
     }
     [[nodiscard]] std::uint64_t publication_cell_veto_reuse() const noexcept {
         return publication_cell_veto_reuse_;
+    }
+    // GOAL PROBE FAILURES BY REASON, UNCONDITIONALLY. The three `veto_*` totals above are gated on
+    // `at_risk != 0` (a candidate that failed on the cell AND would have out-reused the winner), so on a run
+    // where no candidate out-reuses the winner they all read 0 while thousands of goals were still refused --
+    // which is exactly the state measured on 2026-10-01 and exactly why "why do targets have no goal?" was
+    // unanswerable. Called once per planning run, from the same per-candidate tally the loss predicate reads.
+    void add_publication_goal_blocked(std::uint64_t cell_only, std::uint64_t other) noexcept {
+        publication_goal_blocked_cell_only_ += cell_only;
+        publication_goal_blocked_other_ += other;
+    }
+    [[nodiscard]] std::uint64_t publication_goal_blocked_cell_only() const noexcept {
+        return publication_goal_blocked_cell_only_;
+    }
+    [[nodiscard]] std::uint64_t publication_goal_blocked_other() const noexcept {
+        return publication_goal_blocked_other_;
     }
     void add_publication_cell_probes(std::uint64_t count) noexcept { publication_cell_probes_ += count; }
     [[nodiscard]] detail::PhysicalResources admission_capacity() const noexcept;
@@ -1089,6 +1113,8 @@ private:
     std::uint64_t publication_cell_veto_goals_           = 0;
     std::uint64_t publication_cell_veto_other_           = 0;
     std::uint64_t publication_cell_veto_reuse_           = 0;
+    std::uint64_t publication_goal_blocked_cell_only_    = 0;
+    std::uint64_t publication_goal_blocked_other_        = 0;
     // W1-B (plan form): the durable {owner, state content epoch} pairing. Counted in every build with
     // its denominator; deliberately not enforced until a mismatch has actually been observed -- a throw
     // on this path kills the worker (the wedge, 2026-09-25), and an unobserved condition is not a licence
@@ -1601,7 +1627,7 @@ struct PressurePlanningSessionImpl {
     identity_target(runtime::PlanningCandidateId candidate) const;
     [[nodiscard]] qwen3_5::PressureTargetHandle
     root_maximal_target(runtime::PlanningCandidateId root_candidate);
-    [[nodiscard]] qwen3_5::PressureTargetHandle
+    [[nodiscard]] std::optional<qwen3_5::PressureTargetHandle>
     maximal_target(runtime::PlanningCandidateId candidate);
     [[nodiscard]] qwen3_5::PressureConstructionCursor
     begin_construction(qwen3_5::PressureTargetHandle target, bool restore = false);
@@ -1648,9 +1674,14 @@ struct PressurePlanningSessionImpl {
     [[nodiscard]] const TargetNode*
     find_target(std::uint32_t candidate_index,
                 std::span<const std::uint16_t> choices) const noexcept;
-    [[nodiscard]] std::uint32_t intern_target(std::uint32_t candidate_index,
-                                              std::span<const std::uint16_t> choices,
-                                              bool root_maximal = false);
+    // THE ARENA BOUND IS A SEARCH BOUND. A non-`terminal` call returns `nullopt` when the target
+    // arena cannot take one more node (the room the terminal calls need is reserved out of its
+    // reach); `terminal` marks the calls that must hand back a handle, and is unreachable in
+    // practice -- see `terminal_target_reserve` in `pressure_target_arena.h` for what that reserve is
+    // and how it is sized (by oversizing, not by derivation).
+    [[nodiscard]] std::optional<std::uint32_t>
+    intern_target(std::uint32_t candidate_index, std::span<const std::uint16_t> choices,
+                  bool root_maximal = false, bool terminal = false);
     void index_target(std::uint32_t target_index);
     void populate_options(std::uint32_t candidate_index);
     [[nodiscard]] std::vector<PressureDecision>

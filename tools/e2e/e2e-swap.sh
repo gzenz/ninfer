@@ -83,6 +83,23 @@ PORT="${E2E_PORT:-${PORT:-8085}}"
 PROD_PORT="${PROD_PORT:-8080}"
 listener_pid(){ ss -ltnp 2>/dev/null | sed -n "s/.*:${1:-$PORT} .*pid=\([0-9]*\).*/\1/p" | head -1; }
 
+# STOP THE TEST SERVER BY PORT, NEVER BY PATH. This used to be `pkill -f "build/apps/ninfer-serve"`,
+# which matches the CALLER's own command line -- so a caller whose command contained that path (e.g. a
+# freshness check `find ... -newer build/apps/ninfer-serve`) killed its own shell mid-swap, twice on
+# 2026-10-03 and twice on 2026-09-25. **Bracketing the pattern does NOT fix it**: pkill takes an ERE, so
+# `ninfer-serv[e]` still matches the caller's literal string. Only dropping the path match does.
+kill_listener(){
+  local port="${1:-$PORT}" pid
+  pid="$(listener_pid "$port")"
+  [ -z "$pid" ] && return 0
+  kill -TERM "$pid" 2>/dev/null || true
+  for _ in $(seq 1 10); do
+    [ -z "$(listener_pid "$port")" ] && return 0
+    sleep 1
+  done
+  kill -KILL "$pid" 2>/dev/null || true
+}
+
 echo "[$(ts)] swap start (HOST_KV_MIB=${E2E_HOST_KV_MIB:-20480})" | tee -a $LOG
 
 # Restore prod + sentinel. Used by the normal path and by every abort path: a swap that fails before
@@ -99,7 +116,7 @@ restore_prod(){
     return 0
   fi
   RESTORING=1
-  pkill -f "build/apps/ninfer-serve" 2>/dev/null; sleep 3
+  kill_listener "$PORT"; sleep 3
   sudo -n systemctl start ninfer.service
   MAIN=""; LISTENER=""
   for i in $(seq 1 90); do
@@ -140,7 +157,7 @@ restore_prod(){
 sudo -n systemctl stop ninfer-wedge-sentinel.service 2>/dev/null || true
 sudo -n systemctl stop ninfer.service
 sleep 3
-pkill -f "build/apps/ninfer-serve" 2>/dev/null; sleep 2
+kill_listener "$PORT"; sleep 2
 
 # Verify prod really is gone before starting the test server. This script is `set -uo pipefail` (no
 # -e), so a failed `systemctl stop` would otherwise be invisible: the test server cannot bind :8080,

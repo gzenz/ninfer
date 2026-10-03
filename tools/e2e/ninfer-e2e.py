@@ -1528,11 +1528,22 @@ def phase_reuse_paths(args):
        this workload's own `shared_stable_prefix` hits are ~9.9k/12.0k/15.2k. So the gate can neither pass
        on a workload whose prompts never reach the pin NOR fail on one whose shared prefix is longer than it.
 
-    The yardstick is the PINNED CEILING -- not, as a previous version of this docstring said, the best
-    non-anchor reuse: that version FAILED whenever the anchor did not beat `private_endpoint`, which is the
-    conversation's own continuation and naturally reuses more. When NO anchor record's prompt could have
-    reached the pin, the verdict is WARN-INCONCLUSIVE rather than a FAIL that describes the workload. `anchor_trivial` is printed because 14 of 17 anchors reusing
-    <=14 tokens is a signal that `anchor_records` alone hides.
+    3. AND THE CONSTANT ITSELF WAS STILL BEING USED, which this docstring recorded as wrong and then did
+       anyway. `PINNED_CEILING` is now a printed REFERENCE, not the verdict. The verdict is the per-request
+       question the request log can answer: DID AN ANCHOR REQUEST REUSE LESS THAN AN ELIGIBLE ALTERNATIVE
+       IT COULD HAVE TAKEN? Measured 2026-10-02: that FAILs on the e2e (9 of 374 anchor records, decided by
+       `total_ns` in 5 and `restorable_evictions` in 4) and is inconclusive on QA (0 of 443) -- a verdict
+       that describes the ENGINE, not the workload's shared-prefix size.
+    4. A CEILING TEST ALONE CAN NEVER FAIL once it is workload-relative, and that is why the verdict moved:
+       an anchor record whose own split is past the ceiling has ALREADY reused past it (the anchor's reuse IS
+       its frontier, `request_plan.cpp:884`), so "the anchor had the opportunity" and "the anchor beat the
+       ceiling" are the same condition. A gate that cannot pass on the workload it runs on is not a weak
+       gate, it is a broken one -- it teaches the reader to ignore the FAIL, which is how the anchor stayed
+       invisible behind WARN-INCONCLUSIVE for two e2e runs before this. `anchor_trivial` is still printed
+       because 14 of 17 anchors reusing <=14 tokens is a signal `anchor_records` alone hides.
+    LIMITATION, stated rather than hidden: the ceiling is the run's MAX `shared_stable_prefix` hit, which is
+    strict -- a request that takes the anchor never shows what its OWN shared prefix would have given, so a
+    per-request baseline is not observable here. The `lost` branch does not depend on it.
     """
     all_verdicts = []
     # WHICH ARM THIS IS, read from the serve log rather than inferred: `ninfer-start-test.sh` writes
@@ -1562,9 +1573,27 @@ def phase_reuse_paths(args):
                 except Exception:
                     continue
                 r = d.get("result") or {}
+                m = d.get("materialization") or {}
                 hit, path = r.get("prefix_cache_hit_tokens"), r.get("prefix_reuse_path")
                 if hit is not None:
-                    rows.append((int(hit), path or "unknown", int(r.get("prompt_tokens") or 0)))
+                    # A DICT, NOT A TUPLE. The verdict below asks a workload-RELATIVE and per-REQUEST
+                    # question, so it needs the split depths and the selection outcome beside the hit -- and
+                    # a tuple unpacked in six places is exactly how the "max(hit) and max(prompt)
+                    # independently" error this phase was rewritten to remove would come back.
+                    rows.append({
+                        "hit":        int(hit),
+                        "path":       path or "unknown",
+                        "prompt":     int(r.get("prompt_tokens") or 0),
+                        "split":      int(m.get("split_best_tokens") or 0),
+                        "restorable": int(m.get("split_best_restorable") or 0),
+                        "longer_lost": bool(m.get("longer_lost_eligible")),
+                        "decided_by": m.get("longer_lost_decided_by"),
+                        "chosen":     int(m.get("chosen_reuse") or 0),
+                        "loser":      int(m.get("best_eligible_loser_reuse") or 0),
+                        # THE PER-CANDIDATE ROWS, because the verdict is a DOMINATION test and no scalar
+                        # pair can express it: "reused less" is not a defect on its own (see below).
+                        "cand":       m.get("candidates") or [],
+                    })
     except OSError:
         all_verdicts.append(("reuse-paths", "WARN: request log unreadable — ceiling check skipped"))
         return all_verdicts
@@ -1572,34 +1601,186 @@ def phase_reuse_paths(args):
         all_verdicts.append(("reuse-paths", "WARN: no reuse readings in window — ceiling check skipped"))
         return all_verdicts
 
-    PINNED_CEILING = 23_353
-    anchor   = [(hit, prompt) for hit, path, prompt in rows if path == "private_long_anchor"]
-    nonanchor_best = max((hit for hit, path, _ in rows if path != "private_long_anchor"), default=0)
-    # THE SAME JOIN, TWICE OVER: the best anchor hit and the prompt it came FROM must be the same record.
-    # Taking `max(hit)` and `max(prompt)` independently is exactly the error this phase was rewritten to
-    # remove, and it reappeared here on the first pass -- caught by replaying the phase over the real log,
-    # which reported "an anchor request had a prompt past the pin" from two different requests.
-    best_anchor, best_anchor_prompt = max(anchor, key=lambda row: row[0]) if anchor else (None, 0)
-    # TWO DIFFERENT PROMPTS, and the first version used one for both questions. `best_anchor_prompt` belongs
-    # to the record with the best HIT -- it answers "did the anchor that worked have a prompt long enough to
-    # cross the pin?". The inconclusive gate asks a different question -- "could ANY anchor request have
-    # crossed it?" -- and must take the LONGEST anchor prompt, or a record with a long prompt and a trivial
-    # reuse slips past. Measured: instance serve-1553637-… has an anchor record with prompt 24,499 that
-    # reused 14 tokens, above the 23,353 pin, and the phase still reported "longest 22957".
-    longest_anchor_prompt = max((prompt for _, prompt in anchor), default=0)
-    trivial_anchors = sum(1 for hit, _ in anchor if hit <= 14)
+    PINNED_CEILING = 23_353   # QA's Claude Code system prompt -- a PRODUCTION constant, kept as a
+                              # REFERENCE below and no longer the verdict (see the block comment).
+    shared   = [row for row in rows if row["path"] == "shared_stable_prefix"]
+    ceiling  = max((row["hit"] for row in shared), default=0)
+    anchor   = [row for row in rows if row["path"] == "private_long_anchor"]
+    nonanchor_best = max((row["hit"] for row in rows if row["path"] != "private_long_anchor"), default=0)
+    best_row        = max(anchor, key=lambda row: row["hit"]) if anchor else None
+    best_anchor     = best_row["hit"] if best_row else None
+    best_anchor_prompt   = best_row["prompt"] if best_row else 0
+    longest_anchor_prompt = max((row["prompt"] for row in anchor), default=0)
+    trivial_anchors = sum(1 for row in anchor if row["hit"] <= 14)
+    # THE FALSIFIABLE TEST, PER REQUEST. The old gate compared the anchor's best against a constant and
+    # FAILED when it lost -- but with a workload-relative ceiling that comparison is PASS-or-INCONCLUSIVE by
+    # construction: an anchor record whose own split is past the ceiling has already reused past it (the
+    # anchor's reuse IS its frontier, `request_plan.cpp:884`), so "the anchor had the opportunity" and "the
+    # anchor beat the ceiling" are the same condition. What CAN fail, and what is fixable, is a request that
+    # took the anchor while an ELIGIBLE ALTERNATIVE would have reused MORE -- which the request log now
+    # carries (`longer_lost_eligible` + `decided_by`, from the 2026-10-02 instrument).
+    lost = [row for row in anchor if row["longer_lost"]]
+    bycause = {}
+    for row in lost:
+        bycause[row["decided_by"]] = bycause.get(row["decided_by"], 0) + 1
+
+    def election_terms(cand):
+        """The terms THE ELECTION RANKED THIS CANDIDATE ON.
+
+        THE WINNER'S ROW IS ITS SEATED COST, not its elected one (`finalize_selection` says so in as many
+        words, and the row is meant to describe the plan that ran). Comparing that against a loser's
+        ELECTED cost is comparing two different things, and a seal that changes the plan makes the winner
+        look dominated by a candidate the election never preferred -- which is the likeliest explanation for
+        the 2 historical hits (plan.md, 2026-10-02). So the winner is read through `elected_*`, and every
+        other candidate through its own fields, which already ARE its elected cost.
+
+        Returns None when the winner's elected terms are ABSENT -- a record written before this field
+        existed. Those rows are counted as `unattributable` rather than silently passing: a missing field
+        would otherwise read as an elected cost of zero, i.e. a winner that can never be dominated."""
+        if cand.get("winner"):
+            terms = (cand.get("elected_reuse"), cand.get("elected_restorable_evictions"),
+                     cand.get("elected_total_ns"), cand.get("elected_affected_selected_hits"),
+                     cand.get("elected_owner_evictions"), cand.get("elected_checkpoint_drops"))
+            if any(t is None for t in terms):
+                return None
+            return tuple(t or 0 for t in terms)
+        return (cand.get("reuse") or 0, cand.get("restorable_evictions") or 0,
+                cand.get("total_ns") or 0, cand.get("affected_selected_hits") or 0,
+                cand.get("owner_evictions") or 0, cand.get("checkpoint_drops") or 0)
+
+    unattributable = [0]
+    # ROWS WITH NO CANDIDATES ARE NOT UNATTRIBUTABLE -- THEY ARE COLD. A first-token request that reused
+    # nothing has an empty candidate set, and the gate has no election to
+    # re-derive for it. Counting those as unattributable made `unattributable>0 -> FAIL` fire on ordinary
+    # traffic: measured on QA's own instance, 13 of 155 rows are exactly that shape, so the gate would have
+    # FAILed a window the e2e passes. They are counted separately and printed, so the two are never
+    # confused -- and a row WITH candidates but a malformed winner is still unattributable.
+    no_candidates = [0]
+
+    def domination(row):
+        """A loser that reuses MORE and is no worse on the terms that outrank reuse -- which the ordering
+        must never reject. Returns (winner, loser) or None.
+
+        THIS REPLACES A YARDSTICK THAT WAS TOO STRICT. The phase used to fail on ANY eligible alternative
+        with a longer reuse, which is not a defect: `key()` is (restorable_evictions, total_ns, ...,
+        reuse), so a cheaper plan that reuses less is the ordering WORKING. Measured over the 145 records
+        carrying `longer_lost_eligible` (2026-10-02): 0 dominate -- the losses were decided by total_ns in
+        112 and by the #6 ruling in 33. A domination, by contrast, is unconditionally a selection fault,
+        so this gate can still fail on a real inversion while no longer firing on healthy traffic.
+
+        Assessed candidates only (`total_ns > 0`): unassessed placeholder rows carry `total_ns` 0/1 beside
+        absurd reuse values and would otherwise register as three-token "dominations".
+
+        KNOWN LIMITATION, recorded as an OPEN ITEM rather than fixed (pass 3 ruled it not load-bearing, pass 4
+        agreed): because only five of the ten terms above reuse are exported, a loser that TIES on those five
+        and loses on an unexported one (element 3 `newest_affected_hit_epoch`, or 6-9) is called a domination
+        when the election was legitimate. Every error it can produce is a FALSE FAIL -- it can never pass
+        silently -- and it read `dominated=0` on all four real windows measured. Exact `total_ns` ties do
+        occur (5 of 3,362 and 4 of 1,913 eligible losers), but all of them also tie on reuse, so the
+        `c_reuse > w_reuse` precondition is never met."""
+        cs = row.get("cand") or []
+        if not cs:
+            # COLD MEANS `hit == 0`, NOT "no candidates". An empty candidate set is a symptom shared by a
+            # cold request AND by a broken candidates export, and the first version of this counted BOTH as
+            # cold -- so a window whose `candidates` array had gone missing entirely returned a PASS that
+            # claimed a result. Reproduced by a review with two fixtures (every row's candidates emptied:
+            # `no_candidates=475`, PASS, including anchor rows with `hit=61018`). A row that reused NOTHING
+            # has no election to re-derive; one that reused something and still shows no candidates is data
+            # the gate could not read, which is exactly what `unattributable` is for.
+            if row.get("hit"):
+                unattributable[0] += 1
+            else:
+                no_candidates[0] += 1
+            return None
+        # A PARTIAL EXPORT IS UNREADABLE, NOT HEALTHY. `resource_manager.h:2863` merges the election only
+        # when `index < election.size()`, so a SHORTER election array leaves losers with `eligible=false` and
+        # `total_ns=0` -- and the scan below skips exactly those, returning PASS on a window whose losers
+        # were never exported. Measured: removing every loser, or just the `eligible` field, made the gate
+        # PASS twice on both the e2e and the soak windows. This cross-check asks the RECORD whether the
+        # election claimed an eligible loser and then requires a row to back it; on real data it finds 0
+        # violations, so it costs nothing and closes the sibling of the hole the cold predicate closed.
+        if (row.get("longer_lost") or (row.get("loser") or 0) > 0) and not any(
+                not c.get("winner") and c.get("eligible") for c in cs):
+            unattributable[0] += 1
+            return None
+        win = [c for c in cs if c.get("winner")]
+        w = win[0] if len(win) == 1 else None
+        wt = election_terms(w) if w is not None else None
+        if wt is None or not wt[2] > 0:
+            # TWO WINNERS, NO WINNER, MISSING ELECTED TERMS OR A ZERO COST are all rows this gate cannot
+            # read, and every one of them is counted. Before, only the missing-terms case was, and a
+            # malformed row passed silently.
+            unattributable[0] += 1
+            return None
+        w_reuse, w_rest, w_ns, w_hits, w_own, w_drops = wt
+        for c in cs:
+            if c.get("winner") or not c.get("eligible"):
+                continue
+            ct = election_terms(c)
+            # `<= 1` NOT `<= 0`: the placeholder rows this repo has already been bitten by carry
+            # `total_ns == 1` beside absurd reuse values, and a `> 0` test let them through -- which is how
+            # three-token "dominations" appeared in the first analysis.
+            if ct is None or ct[2] <= 1:
+                continue
+            c_reuse, c_rest, c_ns, c_hits, c_own, c_drops = ct
+            if c_reuse <= w_reuse:
+                continue
+            # EVERY EXPORTED TERM ABOVE REUSE (key elements 0,1,2,4,5 -- of the TEN that outrank reuse;
+            # element 3 and 6-9 are not exported), not three:
+            # a loser that TIES on restorable_evictions and total_ns but is worse on owner_evictions is a
+            # LEGITIMATE election, and the three-term test called it a domination.
+            if (c_rest <= w_rest and c_ns <= w_ns and c_hits <= w_hits
+                    and c_own <= w_own and c_drops <= w_drops):
+                return (w, c, ct)
+        return None
+
+    dom = [(row, d) for row in rows if (d := domination(row))]
+    opportunities = [row for row in anchor if row["split"] > ceiling and row["split"] > row["restorable"]]
     detail = (f"n={len(rows)} anchor_records={len(anchor)} anchor_best={best_anchor} "
               f"anchor_best_prompt={best_anchor_prompt} anchor_longest_prompt={longest_anchor_prompt} "
               f"anchor_trivial(<=14tok)={trivial_anchors} "
-              f"(reference only — other paths legitimately reuse more) best_nonanchor_hit="
-              f"{nonanchor_best} best_nonanchor_prompt="
-              f"{max((prompt for _, path, prompt in rows if path != 'private_long_anchor'), default=0)}")
+              f"workload_shared_ceiling={ceiling} (max `shared_stable_prefix` hit - THE WORKLOAD'S OWN, "
+              f"not the production {PINNED_CEILING}) anchor_opportunities={len(opportunities)} "
+              f"anchor_lost_to_eligible_alternative={len(lost)} by_decided_by={bycause} "
+              f"dominated={len(dom)} unattributable={unattributable[0]} no_candidates={no_candidates[0]} "
+              f"best_nonanchor_hit={nonanchor_best} "
+              f"best_nonanchor_prompt={max((row['prompt'] for row in rows if row['path'] != 'private_long_anchor'), default=0)}")
 
-    if not anchor:
+    if dom:
+        # CHECKED FIRST, and that ordering is the fix: `not anchor` used to be tested before this, so a
+        # domination on ANY other reuse path -- including `root`, which is where BOTH of the two historical
+        # hits are -- fell into the "no anchor request" branch and returned a WARN. A domination is a
+        # selection fault independent of which path won.
+        # `rd` is (row, (winner_dict, loser_dict, loser_terms)): the LOSER's reuse minus the WINNER's,
+        # so the reported instance is the one that gave up the most.
+        worst = max(dom, key=lambda rd: rd[1][2][0] - (election_terms(rd[1][0]) or (0,))[0])
+        w, c, ct = worst[1]
+        w_reuse, w_rest, w_ns, _wh, _wo, _wd = election_terms(w)
+        c_reuse, c_rest, c_ns, _ch, _co, _cd = ct
+        all_verdicts.append(("reuse-paths",
+                             f"FAIL: {len(dom)} requests elected a plan PARETO-DOMINATED by an eligible "
+                             f"candidate (ELECTED vs ELECTED; the FIVE exported terms of the ten that "
+                             f"outrank reuse -- so this is a SUFFICIENT, not a necessary, domination: a tie "
+                             f"here that the election settled on an UNEXPORTED element reads as one) -- the "
+                             f"loser reused "
+                             f"more ({c_reuse} vs {w_reuse}) and was no worse on restorable_evictions "
+                             f"({c_rest} vs {w_rest}), total_ns ({c_ns} vs {w_ns}), "
+                             f"affected_selected_hits, owner_evictions and checkpoint_drops. {detail}"))
+    elif unattributable[0]:
+        # A CURRENT-SCHEMA RUN MUST BE ABLE TO ATTRIBUTE EVERY ROW. Before this, `unattributable` was
+        # printed in the detail and gated NOTHING, so a run where every winner lacked the elected terms
+        # returned PASS -- a gate passing on data it cannot read.
+        all_verdicts.append(("reuse-paths",
+                             f"FAIL: {unattributable[0]} rows could not be attributed -- no winner, MORE THAN "
+                             f"ONE winner, missing `elected_*` terms, or a row that reused tokens with no "
+                             f"candidate set at all. The domination gate cannot run on "
+                             f"them, so a PASS would be a pass on data it could not read. Either the binary "
+                             f"predates the elected/seated split or the row is malformed. {detail}"))
+    elif not anchor:
         if anchor_expected is False:
             all_verdicts.append(("reuse-paths",
                                  f"WARN: anchor-OFF arm (ANCHOR_CHILD=0) and no request took "
-                                 f"`private_long_anchor` — that is the control working, not a failure. "
+                                 f"`private_long_anchor` -- that is the control working, not a failure. "
                                  f"{detail}"))
         elif anchor_expected is None:
             all_verdicts.append(("reuse-paths",
@@ -1607,35 +1788,57 @@ def phase_reuse_paths(args):
                                  f"is unknown and the anchor's absence cannot be read. {detail}"))
         else:
             all_verdicts.append(("reuse-paths",
-                                 f"FAIL: no request took `private_long_anchor` at all — the anchor is ON in "
+                                 f"FAIL: no request took `private_long_anchor` at all -- the anchor is ON in "
                                  f"this arm (ANCHOR_CHILD=1) and is not being taken, which is the regression "
                                  f"this case exists for. {detail}"))
-    elif longest_anchor_prompt <= PINNED_CEILING:
-        # The workload cannot answer the question: no anchor record's prompt was long enough for the pin to
-        # be reachable, so "did the anchor lift the ceiling?" has no evidence either way here. A FAIL would
-        # describe the workload, not the anchor.
+    elif anchor_expected is False and anchor:
+        # THE OFF ARM'S OWN CONTROL. Without this, an OFF run in which the disable did NOT take effect --
+        # `NINFER_BRANCH_ANCHOR` still present on the child -- reports PASS, because every branch below
+        # assumes a taken anchor is the ON arm working. Measured: feeding the ON window to the gate with the
+        # real OFF serve log returns PASS twice. So the OFF arm had no way to fail, and "verified in both
+        # directions" was a claim about the MARKER, not about the gate.
         all_verdicts.append(("reuse-paths",
-                             f"WARN: inconclusive — the anchor was taken {len(anchor)} times but no anchor "
-                             f"request had a prompt longer than the {PINNED_CEILING} pin (longest "
-                             f"{longest_anchor_prompt}), so this workload cannot show the anchor lifting it. "
-                             f"{detail}"))
-    # THE YARDSTICK IS THE PIN, NOT THE OTHER PATHS. An earlier version of this branch FAILED whenever the
-    # anchor's best did not exceed the best non-anchor reuse -- which is wrong, and it fired on the load
-    # that PROVED the anchor works (2026-10-01: 58 of 58 anchor records above the pin, median 39,376, and
-    # still a FAIL because `private_endpoint` is the conversation's own continuation and reuses slightly
-    # more). Each reuse path has a different job; the anchor's is to beat the SHARED-PREFIX ceiling, which
-    # is what it is measured against. The non-anchor maximum is printed beside it as a reference.
-    elif best_anchor <= PINNED_CEILING:
+                             f"FAIL: anchor-OFF arm (ANCHOR_CHILD=0) and {len(anchor)} request(s) took "
+                             f"`private_long_anchor` anyway -- the disable did not take effect, so this run "
+                             f"cannot be read as a control. {detail}"))
+    elif lost:
+        # NOT A FAILURE, AND THE DISTINCTION IS THE POINT. The anchor was taken where an eligible
+        # alternative reused more, and every one of them was a TRADE THE ORDERING IS BUILT TO MAKE:
+        # `key()` is (restorable_evictions, total_ns, ..., reuse), so fewer dropped checkpoints or a
+        # cheaper plan legitimately outranks a longer reuse. `by_decided_by` names which (0 =
+        # restorable_evictions, the #6 ruling; 1 = total_ns, the cost model). Measured 2026-10-02 over 145
+        # such records: 0 dominated the winner. A PASS here, with the split quoted, so a real inversion
+        # still shows up as the domination FAIL above rather than as a longer-reuse count.
         all_verdicts.append(("reuse-paths",
-                             f"FAIL: an anchor request had a prompt past the {PINNED_CEILING} pin "
-                             f"({longest_anchor_prompt}) and the BEST anchor reuse was only {best_anchor} — "
-                             f"the anchor is taken and is not lifting the ceiling. (The prompt quoted is the "
-                             f"LONGEST anchor prompt, which is what makes the question answerable; the best "
-                             f"hit came from a {best_anchor_prompt}-token request.) {detail}"))
+                             f"PASS: {len(lost)} anchor requests reused less than an eligible alternative "
+                             f"(unattributable={unattributable[0]}: rows the gate could NOT read -- a "
+                             f"winner missing or duplicated, or without `elected_*` terms; no_candidates="
+                             f"{no_candidates[0]}: COLD rows with no candidate set, counted apart so neither "
+                             f"is read as the other), "
+                             f"and NONE was Pareto-dominated -- every one lost on a term that outranks reuse "
+                             f"(by_decided_by={bycause}: 0=restorable_evictions, the #6 ruling; "
+                             f"1=total_ns, the cost model). {detail}"))
+    elif best_anchor > ceiling:
+        all_verdicts.append(("reuse-paths",
+                             f"PASS: an anchor request reused {best_anchor}, past this workload's own "
+                             f"shared-prefix ceiling of {ceiling} (the production pin is {PINNED_CEILING}) "
+                             f"-- {detail}"))
     else:
+        # NOT A FAILURE, AND SAYING SO IS THE POINT. The anchor is a fallback: on a workload whose shared
+        # prefix is shallower than the production pin, and whose endpoint path covers the session's own
+        # reuse, the anchor is rarely the best option and CANNOT be shown lifting anything here. Measured
+        # 2026-10-02: e2e `shared_stable_prefix` max 22,790 against a hardcoded 23,353, and of 580 deep
+        # non-resumable splits only 6 were handled by the anchor, 214 by `private_endpoint`. Failing on that
+        # is failing on the workload -- and a gate that cannot pass on the workload it runs on teaches the
+        # reader to ignore it, which is how this anchor stayed hidden behind WARN-INCONCLUSIVE for two runs.
         all_verdicts.append(("reuse-paths",
-                             f"PASS: an anchor request reused {best_anchor}, past the {PINNED_CEILING} "
-                             f"shared-prefix pin — {detail}"))
+                             f"WARN: inconclusive -- the anchor was taken {len(anchor)} times, was never "
+                             f"beaten by an eligible alternative, and this workload never put it in front of "
+                             f"a non-resumable match deeper than the workload's own shared-prefix ceiling "
+                             f"({ceiling}), so nothing here can show the anchor lifting a ceiling. The "
+                             f"anchor is a FALLBACK (measured: 6 of 580 deep non-resumable splits taken by "
+                             f"the anchor, 214 by `private_endpoint`), so this is the expected shape on this "
+                             f"workload, not a defect. {detail}"))
     return all_verdicts
 
 

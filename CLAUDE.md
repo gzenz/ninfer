@@ -1,430 +1,210 @@
 # NInfer — ops rules
 
-QA = the local server on this WSL2 host (`ninfer.service`, Qwen3.8-27B on the
-v3 engine). It serves the user's local Claude Code sessions and the Bash
-classifier — which session runs through it is not fixed: read
-`env ANTHROPIC_BASE_URL` rather than assuming. A deploy/restart interrupts
-whatever QA is serving, including this session while its base URL points at
-`127.0.0.1:8080`.
+QA = the local server on this WSL2 host (`ninfer.service`, Qwen3.8-27B on the v3 engine). It serves the
+user's local Claude Code sessions and the Bash classifier — which session runs through it is not fixed:
+read `env ANTHROPIC_BASE_URL` rather than assuming. A deploy/restart interrupts whatever QA is serving,
+including this session while its base URL points at `127.0.0.1:8080`.
 
-Current state lives in `plan.md` at the repo root -- read its **Current state**
-section (actionable: what is fixed and its evidence, what is not, the next
-instruments with their validation, the open-claims list), which is kept current;
-the dated narrative follows it in the same file, and the still-live items of the
-old upstream-adoption plan are carried at its end. **Correction history belongs
-there, not in this file** -- these are the rules.
+**Rules only.** Why each rule exists: `docs/ops-rules-why.md`. Current investigation state and counter
+semantics: `plan.md` → **Current state** (actionable: what is fixed and its evidence, what is not, the next
+instruments with their validation, the open-claims list). Each `tools/ops` script's header records the
+failure it prevents.
 
-Since 2026-09-25 `plan.md` is the **single record**: `results/HANDOFF.md` was
-merged into it and deleted, and `~/.claude/plans/ticklish-sniffing-wadler.md` is
-a superseded duplicate kept only for the session that produced it.
+## Instruments — run these; do not re-derive them by hand
+
+| when | run | it answers |
+|---|---|---|
+| after resolving a merge or rebase | `bash tools/ops/merge-loss-check.sh <base> <ours-pre> <theirs>` | **did the resolution drop local work?** Token-free line-multiset diff; run it TWICE and require agreement. |
+| before believing a deploy | `bash tools/ops/verify-deploy.sh ['new string']` | running == built, built == tree, and (with a string) that the change is IN the running exe. It says which of the three it could not check. |
+| after a killed swap, or any time QA+monitor look wrong | `bash tools/ops/recover-after-killed-swap.sh` | the orphaned test server, QA, and **the sentinel** — the one that is silent when missing. |
+| when arming a monitor | `bash tools/ops/watcher-token-reachability.sh` | **can every alert token still fire?** A token that matches nothing reads exactly like a quiet system. |
+| after touching a startup path or a config flag | `bash tools/e2e/startup-smoke.sh` (GPU window) | do YaRN and `--vision-cpu` still START. No other gate covers them; e2e, ctest and the soak all passed over a tree where they were broken. |
+| before citing a test binary | `bash tools/ops/check-test-binaries.sh` | is that executable built from the source you think? |
+| to pin a hook in a fresh clone | `git config core.hooksPath tools/hooks` | `.git/hooks` is IGNORED when `core.hooksPath` is set, so symlinking there does nothing. |
+| before quoting a number from the request log | `bash tools/ops/reqs.sh instances` / `QA` | that file is a MIXED population; a figure is QA-only only if it was filtered. |
+| **on every commit** | `tools/ops/pre-commit.sh`, run by git via `core.hooksPath=tools/hooks` | **The gate.** Runs the full host suite, the quarantined target and the e2e in a QA-down window, and blocks on a failure, a SKIP, a timeout, an oversized `CLAUDE.md`, or staged `.log` files. Bypass only with `--no-verify`, and say why in the message. |
+
+**Two instruments have stated blind spots; do not over-trust them.** The token check catches only losses
+where a string is deleted outright; the startup smoke proves a configuration *starts*, not that its flag is
+*applied*.
+
+**`pkill -f`/`pgrep -f`: do not use them to kill.** Find the pid and `kill <pid>`
+(`ps -eo pid,args | grep <thing>`), or kill by PORT. Bracketing (`ninfe[r]`) defeats only the pattern
+matching *itself*, never a literal copy elsewhere on the same command line — so it fails exactly when the
+command also mentions the path, which is the form that keeps biting. The worst form is editing a script
+whose path is on the same command line. `e2e-swap.sh` and `ninfer-start-test.sh` kill by port.
 
 ## Monitoring
+
 - Keep a monitor armed during a soak/QA. It expires at 30 min — re-arm on expiry and after any stop.
-- **Arm `tools/ops/ninfer-watch.sh`.** It is the monitor: it carries state (a regex cannot express the
-  rules below), polls `/health` and reports transitions, and splits one pass over the journal into an
-  alert stream and a full-fidelity log at `~/ninfer-watch/latest.log`. **Its alert set is
-  `tools/ops/ninfer-watch.awk`, and that file is the only specification of it** — do not maintain a second
-  copy here, because one already drifted: the pattern that used to be written in this file was missing
-  `WORKER OOM` and `private victim evicted: demotable=1`, so following it armed a monitor blind to both.
-- Fallback only if the script cannot be used at all — `grep -E` on
-  `journalctl -u ninfer.service -f -q -n 0 --output=short-iso` (`-n 0`: `-f` otherwise replays its last 10
-  lines, so every re-arm re-reports the previous run's tail):
-  `CUDA error|cudaError|bad_alloc|terminate called|Assertion|Segmentation|core dumped|Killed [0-9]|WORKER OOM|WORKER RECOVER|WORKER CRASH|host-arena|single_alloc|admission stalled|admission rejected|subtraction underflow|post-recovery residual|non-strict release REFUSED|recycled-checkpoint|checkpoint StateImage INCOMPLETE|private victim evicted: demotable=1`
-- What the tokens mean, and the two rules a flat pattern cannot carry:
-  * **`post-recovery residual` — a residual line is evidence when it is NON-ZERO, whatever its prefix.**
-    The amount is the signal and the line carries its own discriminator, `(recover)` or `(fail-all)`; an
-    all-zero one is restart noise. `fail_all_locked` runs on the **shutdown** path too
-    (`engine_core.h:2170-2196`), so every clean stop logs one for an empty engine — which is how 19 zero
-    lines were once read as "19 recoveries, residual zero" when every one was a stop. Arming on a preceding
-    `WORKER RECOVER`/`WORKER CRASH` instead is *also* wrong: it drops a non-zero residual after
-    `WORKER OOM`, which is the wedge signature (`WORKER OOM: … - recovering`, then the same recovery, then
-    the residual).
-  * **`private victim evicted: demotable=1` is an alert although it is not an error** — it is #6's evidence
-    (an eviction taken while the host tier had room), and a crash-only pattern drops it.
-  * `admission stalled` / `admission rejected` are the two admission-path outcomes `5fe12cf3` introduced (a
-    head blocked with an empty active set: reported during its 5 s grace window, then rejected with
-    `Overloaded`). Without them the condition is invisible, which is why the wedge looked like a silent
-    outage. `subtraction underflow` names the diagnosis instead of relying on the `WORKER RECOVER` prefix;
-    `WORKER CRASH` is the fatal path, distinct from `WORKER RECOVER`; `non-strict release REFUSED` is a
-    release that did not free its address or state image (the leak's shape); `recycled-checkpoint` is the
-    abort branch over a reused checkpoint (#11a).
-  * `checkpoint StateImage INCOMPLETE` is #11(b)'s alerting line: pricing found a state image that is not a
-    restorable checkpoint (invalid, not immutable, no settled replica, or zero epoch). Its companion
-    `checkpoint StateImage priced: incomplete=0 (… denominator=…)` prints on a separate schedule so that
-    "priced, none incomplete" can be told from "never priced" — **if the denominator line is absent from a
-    long journal, pricing is not running; do not read its silence as a healthy zero.** The same logic
-    applies to every counter here: absence is not zero.
-- **A token that cannot fire reads exactly like a quiet system.** Before adding or removing one, check it
-  with `grep -rl '<token>' src/`. Most are strings the engine prints and must match a source file; a few are
-  journal-level signatures that match none and still fire — `Killed [0-9]` (the kernel's OOM killer),
-  `terminate called`, `Assertion`, `Segmentation`, `core dumped` (the C++ runtime, libc, the kernel).
-  `CUDA error|cudaError` DOES appear in `src/` and is not in that class. Four tokens that matched nothing
-  (`WEDGE`, `planner-no-plan`, `relief-shared`, `host-state-pool`) were carried here for weeks.
+- **Arm `tools/ops/ninfer-watch.sh`** (the monitor: it carries state, polls `/health`, reports transitions,
+  and splits one pass over the journal into an alert stream and a full-fidelity log at
+  `~/ninfer-watch/latest.log`). **Its alert set is TWO files, and this line named only the first until
+  2026-10-03 — which is how an alert class goes invisible.** `tools/ops/ninfer-watch.awk` covers the JOURNAL
+  (tested by `tools/ops/ninfer-watch-test.sh`); **`tools/ops/ninfer-watch-requests.jq` covers the REQUEST LOG**
+  (`LOW PREFIX USE` / `SLOW REUSE`, thresholds `WATCH_REUSE_MIN_FRACTION=0.6`, `WATCH_REUSE_MAX_PREFILL_S=2.0`).
+  The omission was found the only way it could be: a `LOW PREFIX USE` alert fired that the awk does not
+  contain. **`watcher-token-reachability.sh` reads only the awk**, so the request-log class has no reachability
+  check — a threshold that can no longer trip is silent there too. There is deliberately NO hand-written
+  fallback pattern. If `ninfer-watch.sh` cannot run, fix the script.
+- **A `post-recovery residual` is evidence iff NON-ZERO, whatever its prefix** (`(recover)` or `(fail-all)`);
+  an all-zero one is restart noise. `fail_all_locked` runs on the **shutdown** path too
+  (`src/runtime/engine/engine_core.h`, `fail_all_locked`), so a clean stop logs one for an empty engine.
 - **The watcher follows TWO units: `ninfer.service` and `ninfer-wedge-sentinel.service`.** The wedge is
-  announced by the SENTINEL (`WEDGE (A/B): engine idle with work pending Ns -- restarting ninfer`), so
-  watching one unit means the event that explains a dead QA is invisible -- observed 2026-09-26: a live
-  wedge at ~19:51:54, the sentinel's restart at 19:54:37, and the monitor reporting only a bare
-  `health 200 -> 000` with no cause. **`WEDGE` is therefore a live token**, and the note below that it
-  "matches nothing in `src/`" is true and beside the point: it is a sentinel output, not an engine string,
-  so the `grep src/` validation rule does not cover a token emitted by a helper script. That rule is what
-  removed it, and tonight is what that cost.
-- **A wedge is now CAPTURED before it is restarted.** `tools/monitor/wedge-sentinel.sh` writes
-  `wedge-<ts>.waits` (per-thread `state=`/`wchan=`, which needs no symbols) and `.bt` (best-effort backtrace)
-  immediately before its `systemctl restart`. **THE DIRECTORY IS NOW EXPLICIT: `~/ninfer-watch/`.** It was
-  not, until 2026-10-01: the script used `$HOME/ninfer-watch` and the sentinel is a SYSTEM unit where **`HOME`
-  is unset** (the unit sets no `User=` and no `Environment=`), so it expanded to the root-level
-  `/ninfer-watch` — while this file told the reader to look in `~/ninfer-watch/`, which held no `wedge-*` file
-  at all, and the natural conclusion ("the capture was not written") is wrong. **Fixed at the cause rather
-  than by documenting "check both":** a drop-in
-  `/etc/systemd/system/ninfer-wedge-sentinel.service.d/zz-capture-dir.conf` sets
-  `WEDGE_CAPTURE_DIR=/home/zenz/ninfer-watch`, which the script already honoured. Verified active. Note the
-  mechanism was `HOME`, NOT `PWD` — this file said `PWD=/` first, which is wrong about the cause even though
-  it pointed at the right symptom; a reader checking `PWD` would find nothing to fix. If the path is ever
-  wrong again, `systemctl show -p Environment ninfer-wedge-sentinel.service` is the one-line answer.
-- **AND THE CAPTURE IS ONLY VALID IF THE ENGINE IS STILL STALLED WHEN IT IS TAKEN.** The sentinel detects a
-  stall by looking BACKWARDS (927 s of no progress on 2026-10-01) and captures NOW, so an engine that resumed
-  in between is captured in its healthy idle state. Observed: the engine finished a request at 20:26:45.398
-  and the capture ran at 20:26:46 — 0.6 s later — so the 46 threads it recorded (42 `httplib::ThreadPool`
-  workers + `HostWorkerPool` + 2 `EngineCore::worker_loop`, ALL sleeping on futex/condvar, none running)
-  describe an idle server that had just completed work, NOT the stall. Reading that as the wedge's signature
-  would have produced a confident and false conclusion ("all sleeping, therefore a missed wakeup rather than a
-  lock convoy"). **Check the journal at the capture timestamp before characterising the state — if progress
-  resumed before the capture, the dump describes the recovery, not the wedge.** A wedged engine cannot run its own
-  shutdown path -- the shutdown needs the lock the wedge holds -- so this is the only moment the evidence
-  exists, and on 2026-09-26 the restart destroyed it. Read those two files FIRST when a wedge is reported.
-  The backtrace resolves only the innermost frame on a release build; the wait distribution is what
-  characterised the 2026-09-26 wedge (21 of 25 threads on `futex_do_wait`, five on one condvar, with ONE
-  thread spinning in `sched_yield`).
-  **For a resolvable backtrace, run QA from the diagnostic build:** `build-diag` is configured
-  `RelWithDebInfo` and already contains `build-diag/apps/ninfer-serve`, so the next wedge captured while that
-  binary is running will name the caller of the spin -- which the release build cannot (its frames below the
-  innermost were `??`, and that caller is the frame that identifies the lock).
-- **A `health 200 -> 000` transition under heavy load is NOT an outage until you check two things.** Observed
-  2026-09-27 with QA serving an agentic workload: the watcher reported `200 -> 000` while the unit was
-  ACTIVE on the SAME pid and start time, and the journal showed it working throughout (throughput lines,
-  checkpoint pricing, evictions). Under that load `/stats` took 60+ s -- the handler takes the engine's
-  execution mutex -- and `/health` itself can miss a probe's timeout behind a prefill, though it answers in
-  0.0003 s when free. **So `000` means "did not answer in time", and the check is:** the unit's
-  `MainPID` and `ExecMainStartTimestamp` unchanged, and the journal still printing progress. **This is not
-  the wedge signature**: a wedge gives `/health` **503** with `/stats` still answering, which is the
-  opposite shape. The sentinel is not fooled either -- it restarts on idle-with-work-pending or stalled
-  progress, has a 90 s grace, and its own notes say a healthy busy server "never arms".
-- One monitor at a time (duplicates double-notify). After stopping one, kill any orphaned `journalctl` —
-  by **`pkill -f 'journalctl -u ninfe[r]'`**, bracketed, because an unbracketed `-f` pattern matches the
-  calling shell's own command line (see the traps below).
-- **A MONITOR THAT EXPIRES IS NOT A MONITOR THAT STOPPED — VERIFY, THEN ARM.** The 30-minute expiry REPORTS
-  itself but does **not** reap the process, so "re-arm on expiry" (below) accumulates watchers: observed
-  2026-10-01, three live watchers (three `journalctl` tailers, pids 537863/543379/544481) from re-arming on
-  two expiries whose processes survived. The count that matters is the TAILER count, one per watcher:
-  `pgrep -cf 'journalctl -u ninfe[r]'` must read 1. Do not count `ninfer-watch.sh` matches — every watcher's
-  own children carry that string, so the same three watchers reported as 21 processes. **The safe order is
-  `TaskStop` the expired task → `pgrep -cf 'journalctl -u ninfe[r]'` reads 0 → arm → it reads 1.**
-  `TaskStop` does reap; expiry does not.
+  announced by the SENTINEL (`WEDGE … restarting ninfer`); watching one unit hides the event that explains a
+  dead QA. `WEDGE` is a sentinel output, not an engine string, so it is exempt from the `grep src/` reachability
+  check.
+- **A `health 200 -> 000` transition is NOT an outage until you check two things:** the unit's `MainPID` and
+  `ExecMainStartTimestamp` unchanged, and the journal still printing progress. `000` means the probe did not
+  answer in time (the `/stats` handler takes the engine's execution mutex). A wedge is the **opposite shape**:
+  `/health` **503** with `/stats` still answering. (The watcher reads `MainPID` only at startup.)
+- **A wedge is CAPTURED before it is restarted.** Read `~/ninfer-watch/wedge-<ts>.{waits,bt}` FIRST when a
+  wedge is reported. **Before characterising the capture, check the journal at its timestamp** — the sentinel
+  detects a stall by looking BACKWARDS and captures NOW, so an engine that resumed in between is captured in
+  its healthy idle state, and the dump describes the recovery, not the wedge. If the path is ever wrong,
+  `systemctl show -p Environment ninfer-wedge-sentinel.service` is the one-line answer. For a resolvable
+  backtrace, **rebuild `build-diag` from HEAD first** and run QA from that binary (release frames below the
+  innermost are `??`); a stale `build-diag/apps/ninfer-serve` deploys a week-old binary.
+- One monitor at a time (duplicates double-notify). **A monitor that expires is not one that stopped:**
+  `TaskStop` the expired task, then arm. **Count TAILERS, not matches: `ps -eo args | grep -cE
+  '[j]ournalctl .*-f '` — a `pgrep -cf` on the name counts COMMAND-LINE TEXT, so every watcher child AND
+  anything else whose line merely mentions journalctl inflates it** (observed 2026-10-03: it read 2 with
+  exactly one tailer, because a background wrapper's own eval'd line contained the string). It must read
+  exactly 1. (No script enforces this; it is a manual check.) Kill an orphaned `journalctl` by pid, never
+  `pkill -f`.
 
 ## Working
-- All development, commits, builds, and tests happen on this host (Strix,
-  WSL2) — the Mac workflow is retired (2026-09-19). Never plan "do X on the
-  Mac, pull here" steps.
-- Soak data (net/census/evictions) accrues only while driving the server with
-  requests. Never offer "wait / let it accumulate" as an option — proceed, and
-  keep working.
+
+- All development, commits, builds, and tests happen on this host (Strix, WSL2).
+- **Soak data (net/census/evictions) accrues only while driving the server with requests.** Never offer
+  "wait / let it accumulate" — proceed, and keep working.
+- The Bash classifier routes through NInfer in both modes, so a stop still blocks command classification
+  while it lasts; it may block swap/restart during prefills. Don't hammer retries — the user runs it with
+  `! <cmd>`.
 
 ### Dev time vs QA time — `NINFERDEV`
 
-**The operator declares which mode the host is in by creating the file `/tmp/NINFERDEV`.** Check it with
-`test -e /tmp/NINFERDEV` — present means dev time, absent means QA time. Do not infer the mode from the
-hour, from `ANTHROPIC_BASE_URL`, or from how busy the journal looks.
+**The operator declares the mode by creating the file `/tmp/NINFERDEV`.** Check it with
+`test -e /tmp/NINFERDEV` — present means dev time, absent means QA time. Do not infer the mode from the hour,
+from `ANTHROPIC_BASE_URL`, or from how busy the journal looks. (It is a file and not an env var because an
+`export` in the operator's shell does not reach tool calls.) The modes differ in what stopping QA *costs*,
+not in the safety rules, which hold always.
 
-**Why a file and not an environment variable:** an `export` typed into the operator's session shell does
-not reach the agent's tool calls — each Bash invocation gets a fresh shell initialised from the profile, so
-`env NINFERDEV` comes back empty while the operator's own shell has it set. A file is visible to every
-invocation. (`~/.claude/settings.json`'s `env` block *does* propagate — that is where `ANTHROPIC_BASE_URL`
-comes from — so an env var set there would also work; the file is the lighter switch.) The two modes differ
-in what stopping QA *costs* and in what the session should do with its time — they do NOT differ in the
-safety rules, which hold always (see below).
+- **Present — dev time.** QA is not serving the operator; a GPU window or an e2e swap costs essentially
+  nothing. **Run the experiment. Never defer a run to "save QA time", and never offer batching as a reason to
+  postpone one** — batch only when a run's own validity requires it.
+- **Absent — QA time.** QA serves the operator's sessions; the default is **read, don't stop**: journal,
+  `/stats`, the request log, the monitor. Drive it rather than idling. If a stop is genuinely needed, say so
+  before doing it and treat it as an event.
 
-- **`/tmp/NINFERDEV` exists — dev time.** QA is not serving the operator: nothing local depends on it, so a GPU
-  window or an e2e swap costs essentially nothing beyond the Bash classifier's round-trip for the
-  duration of the stop. **Run the experiment. Do not defer a run to "save QA time", and never offer
-  batching as a reason to postpone one** — batch only when a run's own validity requires it (a shared
-  build tree, a single freeze covering several suites). This is the mode where the open experiments are
-  the work; a session here that only reads and edits is wasting the cheapest resource it has.
-- **`/tmp/NINFERDEV` absent — QA time.** QA is serving the operator's sessions. Stopping it interrupts them
-  and breaks soak continuity, so the default action is **read, don't stop**: journal, `/stats`, the
-  request log, the monitor. Collect insights — and note that soak data (net/census/evictions) accrues
-  only while the server is driven with requests, so drive it rather than idling. If a stop is genuinely
-  needed, say so before doing it and treat it as an event, not routine.
-
-**Unchanged in both modes** (a mode switch is not a licence) — these exist because each one has already
-cost an outage:
+**Unchanged in both modes** (a mode switch is not a licence):
 - the e2e test server must never bind `:8080`; it defaults to `E2E_PORT=8085`;
-- the swap is ONE blocking foreground command, never split, never detached;
-- `pkill -f` / `pgrep -f` patterns match the **calling shell's own command line**, including text that is
-  only a regex. `pkill -f 'journalctl -u ninfer'` killed its own shell (exit 144, no output — which reads
-  like a failed kill, not a self-kill); the same trap killed this session three times via the string
-  `build/apps/ninfer-serve` in an e2e-swap command line. Bracket one character (`ninfe[r]`) or put the
-  pattern in a script — **and note that bracketing only helps if the unbracketed text appears nowhere else
-  on that command line**: a call that both ran `journalctl -u ninfer` and bracketed-pgrep'd for it still
-  matched its own shell;
+- the swap is **ONE command, never split**, run **uncapped and in the background**
+  (`E2E_TIMEOUT=0 bash tools/e2e/e2e-swap.sh`);
 - after any window or swap, QA is restored and *verified* — `/health` 200, wedge sentinel active;
 - the sentinel is stopped FIRST and re-armed LAST around a window;
 - one journal monitor at a time.
 
-The Bash classifier routes through NInfer in both modes, so a stop still blocks command classification
-while it lasts. In dev time that is the entire cost; in QA time it is the smallest part of it.
-
 ## Reviewing
-- **Reviews run in parallel with e2e, one pass per milestone — never a chain of
-  passes with no e2e between them.** Ten consecutive review passes once ran
-  while the last five had no e2e test; the passes were finding real defects in
-  the *documentation* while the actual bugs sat untouched. A review is worth its
-  cost only when the tree changed in a way e2e cannot judge (claims, staging,
-  instrumentation safety) — otherwise run the thing.
+
+- **Reviews run in parallel with e2e, one pass per milestone — never a chain of passes with no e2e between
+  them.** A review is worth its cost only when the tree changed in a way e2e cannot judge (claims, staging,
+  instrumentation safety); otherwise run the thing.
 - **How a review is run.** Spawn the global `brutal-honesty-review` agent
-  (`~/.claude/agents/brutal-honesty-review.md`, backed by the skill of the same
-  name, read-only tools) — its own context is the point, so it must read the
-  artifacts rather than a summary of them. Never self-review, and never a
-  general-purpose agent. The brief must contain:
-  1. **What changed since the last pass**, by path, with the specific claims to
-     attack — not "review this".
-  2. **The prohibition**: never run `tools/e2e/e2e-swap.sh`, never stop or start
-     `ninfer.service` or the wedge sentinel — `:8080` serves the user's live
-     session. It may read anything, including the running process's logs.
-  3. **The verdict to return**, phrased as one question (e.g. "is this fit to
-     split and push?"), plus any judgement call you want decided rather than
-     invented (whether a documentation omission counts, whether a control is
-     valid).
-  4. **Instruction to validate any instrument it reasons from** — run the same
-     configuration twice, require agreement — because most false conclusions in
-     this repo came from an instrument measuring nothing.
-  Report shape we rely on: mode and calibration; findings each labelled
-  CONFIRMED (it ran something) or PLAUSIBLE, each with `file:line` or a command
-  and its output; what is genuinely good, verified rather than courteous; and
-  what it did not check. Relay its verdict to the user; do not paraphrase a
-  finding into something weaker.
-- **Definitive results come from e2e tests and the full implementation**, not
-  from review prose, not from reading artifacts, and not from your own analysis
-  of logs. A claim is a result only when a run produced it; state the run.
-- **Every finding gets triaged**: an actionable code defect is fixed; a
-  claim/comment or documentation defect is corrected *in place*, where a reader
-  meets it — a note in a triage section does not unstate a wrong claim. Grep the
-  whole tree for other copies first: a stale claim usually has duplicates, and
-  the one a reviewer quotes is rarely the only one.
-- **Validate the instrument before believing its output.** Run the same
-  configuration twice and require the two runs to agree; if they do not, the
-  probe measures something other than what you think. Most false conclusions in
-  this repo came from an instrument that measured nothing (a silent skip, a
-  probe that never executed, a hash that cannot distinguish one ULP from
-  divergence, a wrong dtype, a comparison keyed by an allocation detail) while
-  looking like a clean result. Print skips and denominators, and check counts
-  over the whole log, never the first screenful.
-- **A negative is a result too**, and often the useful one: record what was
-  closed and by which control, so the same surface is not re-audited.
+  (`~/.claude/agents/brutal-honesty-review.md`, read-only tools) — its own context is the point, so it must
+  read the artifacts, not a summary. Never self-review, and never a general-purpose agent. The brief must
+  contain: (1) **what changed since the last pass**, by path, with the specific claims to attack; (2) **the
+  prohibition** — never run `tools/e2e/e2e-swap.sh`, never stop/start `ninfer.service` or the wedge sentinel
+  (`:8080` serves the user's live session); (3) **the verdict to return**, phrased as one question, plus any
+  judgement call you want decided rather than invented; (4) **instruction to validate any instrument it
+  reasons from** — run the same configuration twice, require agreement. Report shape: findings labelled
+  CONFIRMED (it ran something) or PLAUSIBLE, each with `file:line` or a command and its output, plus what it
+  did not check. Relay its verdict to the user; do not paraphrase a finding into something weaker.
+- **Definitive results come from e2e tests and the full implementation**, not from review prose, not from
+  reading artifacts, and not from your own analysis of logs. A claim is a result only when a run produced it;
+  state the run.
+- **Every finding gets triaged.** An actionable code defect is fixed; a claim/comment or documentation defect
+  is corrected *in place*, where a reader meets it. Grep the whole tree for other copies first — a stale claim
+  usually has duplicates, and the one a reviewer quotes is rarely the only one.
+- **Validate the instrument before believing its output.** Run the same configuration twice and require the
+  two runs to agree; if they do not, the probe measures something other than what you think. Print skips and
+  denominators, and check counts over the whole log, never the first screenful.
+- **A negative is a result too**, and often the useful one: record what was closed and by which control.
 
 ## Deploys
-- E2E swap = ONE command, **never split** — the swap stops QA for its duration, so splitting it leaves
-  QA down between the halves. It is **not** a foreground-only command: `E2E_TIMEOUT=420` is a cap that
-  fitted the caller's 10-minute tool limit by accident, and the full suite now exceeds it (a 420 s run
-  returns `rc=124` with partial results). Run it **uncapped and in the background** —
-  `E2E_TIMEOUT=0 bash ~/ninfer/tools/e2e/e2e-swap.sh` — and let the completion notification bring you
-  back, which is what the script's own help text prescribes.
-- **Where this session's own model traffic goes is not fixed — check it, don't assume:**
-  `env ANTHROPIC_BASE_URL`. It is OpenRouter at the time of writing, and the operator moves it back to
-  local NInfer when they judge the server stable enough, so the tooling must be correct in
-  both states rather than tuned to one.
-- **The e2e server must NOT bind :8080, in either state.** :8080 is QA, and QA serves
-  real traffic whatever this session is doing: the classifier, and any live local session
-  (this one included whenever `ANTHROPIC_BASE_URL` points at 127.0.0.1:8080). A test
-  server there answers requests the suite never issued — tainting every cache and timing
-  number with an unknown workload, and 400ing them on the test profile's smaller context.
-  If this session *is* local, a swap also takes the session down for its duration.
-  The swap defaults its test server to `E2E_PORT=8085` (`PROD_PORT=8080` stays QA's) and
-  forwards `--port` to the suite; `~/.config/ninfer.conf` pins QA to 8080, so anything on
-  8085 is the test server by construction. Two checks enforce it: nothing may listen on
-  either port before the test server starts, and after it starts the listener's pid must
-  equal the pid recorded by `ninfer-start-test.sh`. Never pass `--port 8080` to a suite by
-  hand — a run that talks to QA is not a run.
-- **The reverse mix-up costs the same.** Load driven at QA (:8080, e.g.
-  `tools/load/prod-load.py`, deliberately not in `tools/e2e/` and asserting nothing) shares
-  the server with that real traffic, and the request log cannot separate the two — same
-  protocol, same growing-context shape, no client id. Readings taken that way are valid for
-  concurrency questions (does a foreign marker appear under N lanes?) and invalid for
-  reuse, queue and counter numbers, which belong on the isolated port.
-- The Bash classifier routes through NInfer; it may block swap/restart during
-  prefills or thrash. Don't hammer retries — the user runs it with `! <cmd>`.
-- Build: `cmake --build build -j --target ninfer-serve`. After restarting QA on a build, verify by the
-  **running exe's hash**, not the build directory's: `sha256sum /proc/$(systemctl show -p MainPID --value
-  ninfer.service)/exe` must equal `sha256sum build/apps/ninfer-serve`. A build-directory hash changes on
-  every relink and proves nothing on its own.
-  **That check proves "running == last link", never "last link == HEAD", and the difference has already cost
-  a deploy:** while iterating on one target (`ninfer_qwen3_5_prefix_real_test`) and never rebuilding
-  `ninfer-serve`, the two hashes agreed because both were the OLD build, and QA served a version of the
-  change that lacked its guard and its instrument for ~10 minutes. **So pair it with a build-freshness
-  check:** `cmake --build build -j --target ninfer-serve` first, then either
-  `find src include apps -newer build/apps/ninfer-serve` (must print nothing) or grep the RUNNING exe for a
-  string the change introduces — `grep -ac '<new log line>' /proc/$(systemctl show -p MainPID --value
-  ninfer.service)/exe` must be ≥ 1, with an old string absent as the control. Without one of those, a change
-  that prints nothing cannot be observed on QA no matter how long you watch.
-  **A source edited WHILE a build is running is invisible to BOTH checks.** The build compiles that file's
-  dependents before the edit and links after it, so the binary ends up **newer than the source** and lacks the
-  change — and `find -newer` is an mtime comparison, so it reports clean. Measured 2026-10-01: the header was
-  edited 3 minutes into a 4-minute build, and `d7fdea731da98b6b` passed the hash check *and* the freshness
-  check while not containing its change; forcing the recompile gave `1c65566ca12b579d`. **So freeze the source
-  while a build runs — no edits between launching it and linking — and if you did edit, force the rebuild
-  (`touch` the file, rebuild, and require the binary hash to CHANGE).** For a naming-only or otherwise
-  string-less change the grep control cannot exist, so the freeze is the only guard.
-- **Stopping QA is not a "kill it if busy" operation.** The unit runs with `TimeoutStopSec=300` (raised
-  from 30 on 2026-09-26, `/etc/systemd/system/ninfer.service`; nothing else writes it, and
-  `~/ninfer-ensure.sh` does not, so an edit there is authoritative). A stop-timeout SIGKILL destroys the
-  engine's OWN shutdown path — `fail-all cleanup` and `post-recovery residual`, the only lines that report
-  whether a shutdown left occupancy unowned — and 30 s is not a budget a server can meet while unpinning
-  30 GiB of host KV and tearing down CUDA on WSL2: measured 39 s from `Stopping` to SIGKILL, so the shutdown
-  never ran and every stop silently lost that evidence. **A stop that still times out at 300 s is a HANG to
-  diagnose, not a budget to shrink back.**
-- **A wedged engine is NOT fixed by `~/ninfer-ensure.sh`.** That script is idempotent and
-  reports "already running with desired config" whenever the unit is *active* — and a wedge
-  is internal to the engine, not a unit failure (observed 2026-09-25: unit active,
-  `/health` and `/v1/messages` both 503, scheduler completely empty, `/stats` still
-  answering). Recovery is `sudo systemctl restart ninfer.service`; then confirm `/health`
-  is 200 and the wedge sentinel is active again.
+
+- E2E swap = **ONE command, never split**, run **uncapped and in the background**:
+  `E2E_TIMEOUT=0 bash ~/ninfer/tools/e2e/e2e-swap.sh`; the completion notification brings the session back.
+- **The e2e server must NOT bind `:8080`, in either state.** `:8080` is QA and serves real traffic whatever
+  this session is doing; a test server there answers requests the suite never issued. The swap defaults its
+  test server to `E2E_PORT=8085` (`PROD_PORT=8080` stays QA's). Two checks enforce it: nothing may listen on
+  either port before the test server starts, and after it starts the listener's pid must equal the pid
+  recorded by `ninfer-start-test.sh`. Never pass `--port 8080` to a suite by hand.
+- **The reverse mix-up costs the same.** Load driven at QA (`:8080`, e.g. `tools/load/prod-load.py`) shares
+  the server with real traffic, and the request log cannot separate the two. Such readings are valid for
+  concurrency questions and invalid for reuse, queue and counter numbers, which belong on the isolated port.
+- Build: `cmake --build build -j --target ninfer-serve`. **After any QA restart on a build:**
+  `bash tools/ops/verify-deploy.sh '<string the change adds>'`.
+- **Freeze the source from build launch to link.** A source edited while a build runs yields a binary NEWER
+  than the source that lacks the change, and both the hash check and `find -newer` pass. If you edited during
+  the build, `touch` the file, rebuild, and require the binary hash to CHANGE. (For a string-less change
+  nothing catches this — the freeze is the only guard.)
+- **`TimeoutStopSec=300` is deliberate** (`/etc/systemd/system/ninfer.service`). A stop-timeout SIGKILL
+  destroys the engine's own shutdown path (`fail-all cleanup`, `post-recovery residual`), the only lines that
+  report whether a shutdown left occupancy unowned. A stop that still times out at 300 s is a HANG to diagnose,
+  never a budget to shrink.
+- **A wedged engine is NOT fixed by `~/ninfer-ensure.sh`** (idempotent; reports "already running" whenever the
+  unit is *active*, and a wedge is internal — unit active, `/health` and `/v1/messages` 503, `/stats` still
+  answering). Recovery is `sudo systemctl restart ninfer.service`; then confirm `/health` is 200 and the
+  wedge sentinel is active.
 
 ## Observability
-- Journal: `journalctl -u ninfer.service --since "..." --no-pager`.
-- Stats: **`curl -s http://127.0.0.1:8081/stats`** → host-KV census (per-tier
-  {entries,bytes}: dead/live/idle/active), host-KV unit bytes, `pressure.*`,
-  `scheduler.*`. **The stats endpoint is `:8081`; `:8080/stats` serves nothing at all**
-  (`http=000 bytes=0`) — querying the wrong port there once made a working counter look dead.
-- `/stats` is where a counter that the journal has stopped printing can still be read. Four for #6:
-  `pressure_private_evictions_demotable` and its denominator `pressure_private_eviction_checks`, plus
-  `pressure_evictions_with_victim_room` (evictions of a RESTORABLE victim whose own slots would have fitted
-  -- narrower than `demotable`) and, in the REQUEST LOG's `materialization` block, THREE fields read together
-  (it was called "the decisive pair" until 2026-10-01, and that was wrong -- see below):
-  `feasible_preserving_alternatives` against `chosen_restorable_evictions`, plus
-  **`preserving_alternatives_assessed`, their denominator and the one that makes the other two readable**.
-  Needed because the eviction print is rate-limited to the first 8 and then every 512th, so its silence
-  after the 8th means "not printed", not "not recurring".
 
-  **WHAT THE PAIR DOES AND DOES NOT SETTLE — corrected 2026-10-01, after three loads were read as "not #6"
-  on a test that could not see the case.** Both > 0 in one request DOES mean a plan that preserved a
-  restorable checkpoint was assessed feasible and a destroying one was taken anyway. But
-  `feasible_preserving_alternatives` is GATED ON A LOGICAL GOAL (`materialization_planner.h`, the increment
-  sits inside `if (goal)`), so **a 0 does NOT mean no preserving option existed**: it reads 0 both when a
-  preserving target was assessed and found goal-less AND when none was ever assessed at all. Only the second
-  is #6's shape -- a restorable checkpoint destroyed while a demote was available -- and the victim-level
-  `demote_possible=1 demote_refusal=none` on an eviction line speaks to that independently, computed at
-  execution, whether or not the planner ever proposed a demote. So:
-    * `preserving_alternatives_assessed == 0` -> the planner never had a preserving option in front of it.
-      With evictions taken, THAT is the #6 condition.
-    * `assessed > 0 && feasible == 0` -> preserving options existed and none was adoptable: a defensible
-      outcome, not a defect.
-  The ungated counter is the fix for the gap; it is the one that can exonerate, and it is why the pair is no
-  longer called decisive on its own.
-- **The private catalog had NEITHER half of a capacity/occupancy pair** — host state slots, host KV and the
-  pinned pool each report both plus a growth-refusal counter, which is why `--max-private-continuations`
-  exhaustion used to be invisible. **It is not the only one**: the shared-prefix pool has neither half and
-  `device-state-slots` has occupancy without a capacity; both are recorded in `plan.md` §4. It now reads
-  `memory.private_catalog_capacity_cells` / `memory.private_catalog_occupied_cells` (as of the last stats
-  publication -- the 5 s interval plus ~20 event sites, not of the request) against
-  `pressure.publication_cell_losses`.
-- **`occupied == capacity` is NOT evidence that the catalog is binding, and must not be read as one.** Every
-  active lane holds a `ReservedForActive` cell (its own future publication cell — NOT the capture descriptor,
-  which is a Program address-space slot), so occupancy is at least the lane count by construction, and under
-  eviction-to-publish a full catalog is the ordinary steady state. The reading that means something is
-  `publication_cell_losses`: PLANNING RUNS where a candidate whose every goal probe failed on the cell -- and on
-  nothing else -- would have reused strictly more than the plan that won. Its journal line is
-  `[engine] catalog cell blocked reuse: occupied=%u/%u candidates=%u best_blocked_reuse=%u chosen_reuse=%u
-  probes=%llu losses=%llu`, rate-limited to the first 8 then every 512th.
-- **A PROBE COUNT IS A DENOMINATOR AND MUST NEVER ALERT OR BE QUOTED AS THE EVENT.** `pressure.publication_cell_probes`
-  is raw goal-probe calls: the planner probes a cell-free option from five sites (`materialization_planner.h`
-  `:163/:297/:471/:550/:590`) on its way to an ordinary eviction, so it runs ~1,900 per planning run on a measured case (45,533 over 24) — and the withdrawn counter's OWN cell-free count was 108,544 in
-  one 24-request run, and 97 lines in a run where four requests reused 99.9%. The first version of this
-  instrument reported that number as the loss count and put it in the alert set, which made it fire on healthy
-  traffic and unable to falsify a capacity raise. Keep the two apart: `losses` is the outcome, `probes` exists
-  only so `losses == 0` can be told from a planner that stopped probing.
-- **The eviction line is**
-  `[engine] private victim evicted: demotable=%d restorable=%d session=%016llx cont=%u frontier=%u
-  endpoint=%d rewrite=%d anchors=%zu victim_host_slots=%u victim_dev_slots=%u host_state_slots=%u/%llu
-  host_kv=%zu/%llu victim_room=%d checked=%llu demotable_total=%llu`
-  (`materialization.cpp`). **This spec had drifted**: it was written before `restorable=`, `session=`,
-  `victim_*_slots=` and `victim_room=` existed, so a reader parsing it would silently mis-read every field
-  after `demotable`. Corrected 2026-09-27 against the format string itself. `victim_room` is the ROOM
-  QUESTION ASKED PER VICTIM for state slots (usage + this victim's own slots <= capacity) -- `demotable` is
-  a pool-level `<` test that reports room the victim's footprint may not fit, which is why the two are
-  printed side by side. `demotable` is a **capacity** test at the decision — `host_state_slots` and
-  `host_kv_bytes` both under capacity — and NOT a statement that the victim could have been demoted (that
-  needs a complete, immutable, settled StateImage) nor that the planner chose eviction for value reasons.
-  The per-tier `{dead,live,idle,active}` census is in `/stats`, not in the journal.
-- **Evidence logs are gitignored on purpose (`*.log`, `.gitignore:45`) and are NOT tracked.** Never
-  `git add -f` one. What is committed is the MANIFEST beside them: binary sha256, artifact, `git-head`, and
-  -- for runs made by `tools/e2e/prefix-real-evidence.sh` -- each log's own sha256 and rc. A claim cites
-  `results/<run>/manifest` in the repo and the log locally; a log that was never written down is not
-  evidence.
+- Journal: `journalctl -u ninfer.service --since "..." --no-pager`.
+- **`/stats` is on `:8081`, never `:8080`** (`curl -s http://127.0.0.1:8081/stats`; `:8080/stats` serves
+  nothing at all). The host-KV census, `pressure.*`, `scheduler.*` and the #6 counters live there; the
+  eviction-line format string lives in `src/models/qwen3_5/program/transactions/materialization.cpp` — read it
+  there, it has drifted once.
+- **Absence is not zero:** a rate-limited line's silence is not non-recurrence — read the counter in `/stats`.
+  **A probe count is a denominator; never alert on it or quote it as the event** (`probes` exists only so
+  `losses == 0` can be told from a planner that stopped probing).
+- **Evidence logs are gitignored on purpose (`*.log`) and are NOT tracked.** Never `git add -f` one. What is
+  committed is the MANIFEST beside them: binary sha256, artifact, `git-head`, and each log's own sha256 and
+  rc. A claim cites `results/<run>/manifest` in the repo and the log locally.
 
 ## Commits
-- User-directed. Conventional Commit subjects (`fix(scope):`, `feat(scope):`,
-  `chore(scope):`, `docs(scope):`) + descriptive body, no attribution line.
-- **Before committing an ENGINE change: the 8-agent soak.** The e2e suite runs the server on its own
-  isolated port with its own profile; it does not exercise QA's real configuration under more parallelism
-  than QA is sized for. So the last gate is a manual load the OPERATOR runs, with a monitor armed for the
-  whole window:
-  1. **Ask the operator to run it** — their 8-agent agentic load, driven at QA. **It is a MANUAL step
-     and the operator runs it; the agent never runs it and must not invent a command for it.** It is not
-     `tools/load/prod-load.py`: that tool drives N seeded sessions with no agentic shape, and the load
-     this rule means is the agentic one already in the record (`plan.md`, "What the load showed", 8
-     parallel agents, deliberately over-subscribing: 190 requests / 17 conversations). Ask the operator
-     to start it and to say when it is stopped. Readings from it are valid for CONCURRENCY questions and
-     invalid for reuse, queue and counter numbers — see the load-at-`:8080` rule in **Deploys**.
-  2. **DEPLOY THE FROZEN TREE FIRST, AND PROVE IT IS WHAT IS RUNNING.** A soak that loads QA while QA runs an
-     older binary soaks the old build and says nothing about the change — measured 2026-10-01: QA's
-     `/proc/<pid>/exe` was a DELETED inode hashing `855d8143…` while `build/apps/ninfer-serve` was
-     `9a133aea…`. So: rebuild `ninfer-serve`, restart QA on it, then the two checks from **Deploys** —
-     `sha256sum /proc/$(systemctl show -p MainPID --value ninfer.service)/exe` equals
-     `sha256sum build/apps/ninfer-serve`, AND `find src include apps -newer build/apps/ninfer-serve` prints
-     nothing (or grep the running exe for a string the change introduces). A soak on an unverified binary is
-     not a gate, it is five minutes of load.
-  3. **Arm `tools/ops/ninfer-watch.sh` for ~5 minutes**, one monitor at a time, and re-arm on expiry. The
-     operator stops the load; the agent reports what the journal and `/stats` showed.
-  4. **What must be absent, not merely unnoticed:** a `WORKER OOM`/`WORKER CRASH`/`WORKER RECOVER`, a
-     NON-ZERO `post-recovery residual` (any prefix — see the Monitoring rules), a wedge (the sentinel's
-     `WEDGE` line and its `systemctl restart`), an HTTP 500 burst, and a `health` transition that is not
-     explained by the two-condition check in **Monitoring**. A quiet journal is not the same as a checked
-     one: say which lines you looked for and what the counts were.
-  5. Scope: any change to `src/`, `include/` or the serve path — i.e. anything that can alter engine
-     behaviour. A docs/`tools`-only change does not need it; if in doubt, run it, because the cost is
-     5 minutes against the cost of a regression reaching QA unnoticed.
-  6. **A green e2e is not a substitute.** The e2e is the acceptance test for the CHANGE; the soak is the
-     regression gate for the SERVER. Tonight's three instrument defects (two testers whose results were
-     discarded, a phase defined after the entry point) were all found in the e2e, not the engine — which is
-     the argument for having a gate that does not depend on that suite's reporting being correct.
-- Run brutal-honesty-review agent on commit.
-  1. Triage findings: **load-bearing** vs documentation. Fix both, but only one of them gates another pass.
-     * **LOAD-BEARING** — it can change behaviour or the validity of a measurement: memory unsafety, wrong
-       state, a control or instrument that cannot fail on a path production uses, a test whose failure is
-       what would catch that. A finding about the *test* is load-bearing exactly when production reaches the
-       code it covers (`grep` the call sites: an uncovered helper with no caller is not).
-     * **NOT LOAD-BEARING** — every claim, comment, doc, PR-body or commit-message wording issue, *including
-       a false one*: a stale copy, a denominator that does not hold, a sentence citing a run that says
-       something else. These are cheap to fix and expensive to leave (a message is immutable once pushed),
-       so fix them in place where a reader meets them — but they do not by themselves buy another pass.
+
+- User-directed. Conventional Commit subjects (`fix(scope):`, `feat(scope):`, `chore(scope):`,
+  `docs(scope):`) + descriptive body, no attribution line.
+- **Before committing an ENGINE change: the 8-agent soak** (a change to `src/`, `include/` or the serve path;
+  a docs/`tools`-only change does not need it). The e2e does not exercise QA's real configuration under more
+  parallelism than QA is sized for, so the last gate is a manual load **the OPERATOR runs** (the agent never
+  runs it and must not invent a command). Ask the operator to start it and to say when it is stopped.
+  1. **Deploy the frozen tree first, and prove it is running:** rebuild, restart QA, then
+     `verify-deploy.sh` (see Deploys).
+  2. **Arm `tools/ops/ninfer-watch.sh` for ~5 minutes**, one monitor at a time, re-arm on expiry.
+  3. **What must be absent, not merely unnoticed:** a `WORKER OOM`/`WORKER CRASH`/`WORKER RECOVER`, a NON-ZERO
+     `post-recovery residual` (any prefix), a wedge (the sentinel's `WEDGE` line and its restart), an HTTP 500
+     burst, and an unexplained `health` transition. Say which lines you looked for and what the counts were
+     (a manual check — no script prints this checklist).
+  4. **A green e2e is not a substitute.** The e2e is the acceptance test for the CHANGE; the soak is the
+     regression gate for the SERVER.
+- **Run the `brutal-honesty-review` agent on commit.**
+  1. Triage every finding: **LOAD-BEARING** (can change behaviour or the validity of a measurement: memory
+     unsafety, wrong state, a control or instrument that cannot fail on a path production uses, a test whose
+     failure is what would catch that) vs **NOT** (every claim/comment/doc/PR-body/commit-message wording
+     issue, *including a false one*). Fix both in place; only a load-bearing finding gates another pass.
   2. **Convergence = a fresh pass with ZERO LOAD-BEARING findings.** A pass whose findings are all
-     documentation IS converged: fix them in place, note them in one line, and push. Do not chain a pass to
-     re-audit prose — ten consecutive prose passes once ran here while the last five had no e2e test, and
-     they found real defects in the *documentation* while the bugs sat untouched. Only a load-bearing finding
-     sends the tree back for another pass. Never self-attest "looks clean" from a manual skim — the pass is
-     what decides, and the fix list you hand the next pass must itself be verified, because a wrong finding
-     costs a whole cycle.
+     documentation IS converged: fix them in place, note them in one line, and push. Never self-attest "looks
+     clean" from a manual skim — the pass decides, and a wrong finding costs a whole cycle.
   3. Repeat until converged, then push.
-- **A commit message cannot be corrected after a push, so a hash or a run path it cites must resolve for
-  every reader.** Cite ids that exist on the remote, never a pre-rewrite id; put the mapping in `plan.md`
-  if history was rewritten.
-- **A PULL REQUEST ALWAYS TARGETS THE OPERATOR'S OWN FORK (`gzenz/ninfer`), NEVER UPSTREAM
-  (`Neroued/ninfer`).** Stated by the operator 2026-10-01. The two PRs that went upstream (#64
-  `pr/host-kv-cache`, #65 `fix/tool-arg-schema-type`) were both CLOSED unmerged, and every PR that has
-  landed here went to the fork: #12 (`engine/cache-reuse-and-host-budget` -> `gzenz:master`, merged
-  2026-09-28) is the pattern. So:
-  * push the branch to the `fork` remote (`git push -u fork <branch>`), not `origin`;
-  * open with `gh pr create --repo gzenz/ninfer --base master --head <branch>`;
-  * the squash convention is unchanged — the fork's master is behind, so ANY PR from this tree carries the
-    whole delta, and the operator's choice is to send it as ONE commit (see `plan.md` §1f, where 149 commits
-    were collapsed for PR #12). Say in the PR body which part of that delta is upstream's own commits
-    rather than local work, or a reviewer reads absorbed history as a local change.
+- **A commit message cannot be corrected after a push**, so a hash or run path it cites must resolve for every
+  reader. Cite ids that exist on the remote; put any rewritten-history mapping in `plan.md`.
+- **A PULL REQUEST ALWAYS TARGETS THE OPERATOR'S OWN FORK (`gzenz/ninfer`), NEVER UPSTREAM (`Neroued/ninfer`).**
+  Push the branch to the `fork` remote (`git push -u fork <branch>`), not `origin`. Open with
+  `gh pr create --repo gzenz/ninfer --base master --head <branch>`. Send the whole delta as ONE commit and
+  record that squash in `plan.md` (a property of the branch, not of the description).
+- **A PR DESCRIPTION SAYS WHAT THE CHANGE DELIVERS, NOT HOW THE BRANCH WAS ASSEMBLED.** Include what changes,
+  why, and the evidence (measurements with their conditions, the tests, the soak result). Exclude the squash
+  itself, how many commits came from upstream, and how many review passes ran. Provenance that changes what a
+  reviewer is looking at is handled by the branch and the mapping in `plan.md`, not by prose.

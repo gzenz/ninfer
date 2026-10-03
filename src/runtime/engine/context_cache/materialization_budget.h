@@ -297,6 +297,66 @@ struct FoldedCost {
     }
 };
 
+// WHICH ELEMENT OF `key()` DECIDED ONE COST OVER ANOTHER: the index of the first element at which the two
+// differ, or `kNoDifferingKeyElement` when they are key-equal.
+//
+// COMPUTED OVER `key()` ITSELF, never over a hand-carried list of terms. The first version of this walked
+// six terms chosen by name and jumped from element 5 straight to element 10, so a pair differing on
+// `newest_affected_hit_epoch` (3), `copy_operations` (6), `transferred_bytes` (7), `remaining_text_prefill`
+// (8) or `remaining_vision_prefill` (9) was reported as **element 10** -- which its own legend called
+// "reuse itself decided, the real defect". That is a counter asserting the defect it exists to stop
+// asserting, and a review reproduced it. The `index_sequence` walk below cannot drift from `key()` and
+// covers EVERY element, including the two ordinal tie-breakers -- so "the winner was picked by ENUMERATION
+// ORDER" (an arbitrary tie-break, the real bug) is now distinguishable from "an unlooked-at term decided".
+//
+// THE INVARIANT THIS MAKES CHECKABLE, and it is the one to test the instrument with: a key that TIES on
+// elements 0..9 prefers MORE reuse, so **a loser with more `reused_prompt_tokens` than the winner cannot
+// have lost on element 10**. Therefore (`longer_lost_eligible` && `decided_by == 10`) is IMPOSSIBLE, and
+// seeing it means the two costs are not the ones the election compared -- an instrument fault, not a finding.
+// **IT NAMES `longer_lost_eligible`, NOT `longer_lost`** (corrected 2026-10-02): the ROW-based `longer_lost`
+// counts INELIGIBLE candidates, so it can be true for a reason that has nothing to do with this invariant,
+// and a legitimate `decided_by == 10` can sit beside it. All four copies of the claim now say the same.
+inline constexpr std::uint8_t kNoDifferingKeyElement = 255U;
+// 254 = THE "WINNER" DOES NOT BEAT THE LOSER ON `key()`. `first_differing_key_element` is symmetric, so
+// given an inverted pair it will happily name an element -- and that element is one where the LOSER was
+// better, presented as the winner's reason. That is not hypothetical: the seal fallback replaces the
+// sealed plan with root-maximal, whose key can be worse than a loser's, and the election never ranked that
+// pair. Attributing against the wrong cost therefore produced `decided_by` values that read as findings
+// (a review measured 974 of 977 such pairs yielding the supposedly-impossible `decided_by == 10`).
+// This sentinel makes the inverted comparison LOUD instead of plausible, so wherever the attribution is
+// computed from the wrong cost the record says so rather than inventing a cause.
+inline constexpr std::uint8_t kNotAnElectedWinner = 254U;
+
+[[nodiscard]] inline std::uint8_t first_differing_key_element(const FoldedCost& a,
+                                                              const FoldedCost& b) noexcept {
+    const auto ka = a.key();
+    const auto kb = b.key();
+    std::uint8_t result = kNoDifferingKeyElement;
+    bool found          = false;
+    const auto probe = [&]<std::size_t I>() {
+        if (!found && std::get<I>(ka) != std::get<I>(kb)) {
+            result = static_cast<std::uint8_t>(I);
+            found  = true;
+        }
+    };
+    // The pack must be DEDUCED from the argument -- a lambda whose only template parameters are the pack
+    // cannot be called with a `std::index_sequence` value.
+    [&]<std::size_t... Index>(std::index_sequence<Index...>) {
+        (probe.template operator()<Index>(), ...);
+    }(std::make_index_sequence<std::tuple_size_v<decltype(ka)>>{});
+    return result;
+}
+
+// THE ATTRIBUTION, WITH THE DIRECTION CHECKED -- the entry point to use, rather than
+// `first_differing_key_element` directly. It answers "which element decided the WINNER over this loser", and
+// returns `kNotAnElectedWinner` when the winner does not in fact beat the loser, because then no element can
+// honestly be named. Use it wherever a winner is compared against a candidate: `first_differing_key_element`
+// alone is symmetric and will name an element where the LOSER was better.
+[[nodiscard]] inline std::uint8_t election_deciding_element(const FoldedCost& winner,
+                                                            const FoldedCost& loser) noexcept {
+    return winner.less(loser) ? first_differing_key_element(winner, loser) : kNotAnElectedWinner;
+}
+
 
 
 template <class Clock = std::chrono::steady_clock>

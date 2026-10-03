@@ -46,6 +46,11 @@ PressurePlanningSessionImpl::PressurePlanningSessionImpl(
     // BEFORE any candidate is priced: if the host state pool is full, grow it by one slot so the demote
     // options the search is about to assess can be affordable at all. See ensure_host_state_headroom.
     program->ensure_host_state_headroom();
+    // AND the KV axis, which had no equivalent until now. The state pre-grow is measured firing and still
+    // could not convert the one eviction that workload produced: that one was bound by host KV BYTES
+    // (`host_kv` at 99.3%) while a state slot was free -- the inverse of the shape the state pre-grow
+    // addresses, and the exact case this adds.
+    program->ensure_host_kv_headroom();
 
     candidates.assign(physical_candidates.begin(), physical_candidates.end());
     candidate_ids.assign(admission_candidate_ids.begin(), admission_candidate_ids.end());
@@ -618,6 +623,18 @@ std::vector<PressureDecision> PressurePlanningSessionImpl::pressure_successors(
     }
     const PressureDecision& eviction =
         victim_options.decisions[victim_options.eviction_choice - 1U];
+    // **THE HALF OF THE PRESERVATION PROBE THAT EXONERATES, counted where the successors already exist.**
+    // `inspect_*_successors` returns the owner's NON-EVICTING options; the eviction is appended AFTER, so an
+    // EMPTY `successors` here means this owner had no non-evicting option at all -- the eviction was the only
+    // move and destroying its checkpoint was UNAVOIDABLE. Measured 2026-10-02 (a fresh analysis pass): the
+    // sealed evicting plans all had their search TRUNCATED (935 of 1044 on `time_budget`, 82 on
+    // `target_budget`, 0 on the "further gain did not justify more work" reasons), which points at the search
+    // -- but the planners' GENERATORS ignore preservation while only ADOPTION ranks it
+    // (`FoldedCost::key`), so the alternative is that no preserving option existed to adopt. This counter
+    // separates those two, and it is the denominator-free half: if owners routinely HAVE a non-evicting
+    // option, the search is the defect; if they routinely do not, the evictions are correct and the whole
+    // line of work has been chasing a planner that is behaving properly.
+    program->note_pressure_successor_outcome(successors.empty());
     if (std::find(successors.begin(), successors.end(), eviction) == successors.end()) {
         successors.push_back(eviction);
     }

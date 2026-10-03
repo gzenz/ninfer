@@ -1,0 +1,430 @@
+2026-10-02T12:06:00+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=555520)
+2026-10-02T12:06:00+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=556032)
+2026-10-02T12:06:00+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=556544)
+2026-10-02T12:06:00+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=557056)
+2026-10-02T12:06:00+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=557568)
+2026-10-02T12:06:00+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=558080)
+2026-10-02T12:06:00+02:00 Strix bash[28425]: 2026-10-02 12:06:00.791  INFO  throughput | 16.0s | prefill 15.0 tok/s (240 tok) | decode 21.9 tok/s (351 tok) | running 2 (decode-ready 2) | waiting 9 | batch 1.86 | host 65.5% (10.5s)
+2026-10-02T12:06:00+02:00 Strix bash[28425]: [kv-binding] LANE-RELEASE lane=2 checks=0 diverged=0 unverifiable=0 foreign=56/1088
+2026-10-02T12:06:00+02:00 Strix bash[28425]: 2026-10-02 12:06:00.880  INFO  req#128 done | openai-chat | output limit | prompt 817 | output 128 | cache 0 (0.0%) | TTFT 671 ms | total 6.0s | queue 458 ms | prefill 6.46k tok/s | decode 208.8 tok/s | dflash2 accepted 101/174 (58.0%)
+2026-10-02T12:06:00+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=558592)
+2026-10-02T12:06:00+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=559104)
+2026-10-02T12:06:01+02:00 Strix bash[28425]: [kv-binding] LANE-RELEASE lane=1 checks=0 diverged=0 unverifiable=0 foreign=56/1088
+2026-10-02T12:06:01+02:00 Strix bash[28425]: 2026-10-02 12:06:01.379  INFO  req#124 done | anthropic | tool calls 1 | prompt 42,352 | output 158 | cache 41,291 (97.5%, long anchor) | TTFT 25.6s | total 26.4s | queue 21.1s | prefill 2.27k tok/s | decode 203.7 tok/s | dflash2 accepted 122/252 (48.4%)
+2026-10-02T12:06:01+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=559616)
+2026-10-02T12:06:01+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=560128)
+2026-10-02T12:06:01+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=560640)
+2026-10-02T12:06:01+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=561152)
+2026-10-02T12:06:01+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=561664)
+2026-10-02T12:06:01+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=562176)
+2026-10-02T12:06:02+02:00 Strix bash[28425]: 2026-10-02 12:06:02.661  INFO  req#130 started | anthropic stream | 20 messages | max output 64,000 | thinking template default | tools 27
+2026-10-02T12:06:03+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=562688)
+2026-10-02T12:06:03+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=563200)
+2026-10-02T12:06:04+02:00 Strix bash[28425]: 2026-10-02 12:06:04.085  INFO  req#131 started | anthropic stream | 29 messages | max output 64,000 | thinking template default | tools 27
+2026-10-02T12:06:05+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=563712)
+2026-10-02T12:06:05+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=564224)
+2026-10-02T12:06:05+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=564736)
+2026-10-02T12:06:05+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=565248)
+2026-10-02T12:06:05+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=565760)
+2026-10-02T12:06:05+02:00 Strix bash[28425]: 2026-10-02 12:06:05.850  INFO  throughput | 5.1s | prefill 406.8 tok/s (2,058 tok) | decode 391.4 tok/s (1,980 tok) | running 2 (decode-ready 2) | waiting 10 | batch 2.05 | host 175.1% (8.9s)
+2026-10-02T12:06:07+02:00 Strix bash[28425]: 2026-10-02 12:06:07.309  INFO  req#132 started | anthropic stream | 30 messages | max output 64,000 | thinking template default | tools 27
+2026-10-02T12:06:07+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=566272)
+2026-10-02T12:06:07+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=566784)
+2026-10-02T12:06:07+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=567296)
+2026-10-02T12:06:07+02:00 Strix bash[28425]: [kv-binding] LANE-RELEASE lane=1 checks=0 diverged=0 unverifiable=0 foreign=56/1092
+2026-10-02T12:06:07+02:00 Strix bash[28425]: 2026-10-02 12:06:07.684  INFO  req#125 done | anthropic | tool calls 2 | prompt 44,596 | output 352 | cache 44,416 (99.6%, private endpoint) | TTFT 29.8s | total 31.9s | queue 26.0s | prefill 1.17k tok/s | decode 170.3 tok/s | dflash2 accepted 257/672 (38.2%)
+2026-10-02T12:06:07+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=567808)
+2026-10-02T12:06:08+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=568320)
+2026-10-02T12:06:08+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=568832)
+2026-10-02T12:06:08+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=569344)
+2026-10-02T12:06:08+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=569856)
+2026-10-02T12:06:08+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=570368)
+2026-10-02T12:06:08+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=570880)
+2026-10-02T12:06:08+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=571392)
+2026-10-02T12:06:08+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=571904)
+2026-10-02T12:06:08+02:00 Strix bash[28425]: 2026-10-02 12:06:08.370  INFO  req#133 started | anthropic stream | 33 messages | max output 64,000 | thinking template default | tools 27
+2026-10-02T12:06:08+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=572416)
+2026-10-02T12:06:08+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=572928)
+2026-10-02T12:06:08+02:00 Strix bash[28425]: [kv-binding] LANE-RELEASE lane=1 checks=0 diverged=0 unverifiable=0 foreign=56/1094
+2026-10-02T12:06:08+02:00 Strix bash[28425]: 2026-10-02 12:06:08.787  INFO  req#126 done | anthropic | stop token | prompt 38,553 | output 60 | cache 38,392 (99.6%, response replay) | TTFT 25.3s | total 25.8s | queue 25.1s | prefill 1.69k tok/s | decode 123.0 tok/s | dflash2 accepted 37/161 (23.0%)
+2026-10-02T12:06:08+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=573440)
+2026-10-02T12:06:08+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=573952)
+2026-10-02T12:06:09+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=574464)
+2026-10-02T12:06:09+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=574976)
+2026-10-02T12:06:09+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=575488)
+2026-10-02T12:06:09+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=576000)
+2026-10-02T12:06:09+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=576512)
+2026-10-02T12:06:09+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=577024)
+2026-10-02T12:06:09+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=577536)
+2026-10-02T12:06:09+02:00 Strix bash[28425]: [kv-binding] LANE-RELEASE lane=1 checks=0 diverged=0 unverifiable=0 foreign=56/1096
+2026-10-02T12:06:09+02:00 Strix bash[28425]: 2026-10-02 12:06:09.107  INFO  req#127 done | anthropic | stop token | prompt 44,753 | output 51 | cache 44,591 (99.6%, response replay) | TTFT 25.7s | total 26.1s | queue 25.4s | prefill 1.37k tok/s | decode 131.6 tok/s | dflash2 accepted 32/126 (25.4%)
+2026-10-02T12:06:09+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=578048)
+2026-10-02T12:06:09+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=578560)
+2026-10-02T12:06:09+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=579072)
+2026-10-02T12:06:09+02:00 Strix bash[28425]: 2026-10-02 12:06:09.566  INFO  req#134 started | anthropic stream | 39 messages | max output 64,000 | thinking template default | tools 27
+2026-10-02T12:06:09+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=579584)
+2026-10-02T12:06:09+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=580096)
+2026-10-02T12:06:09+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=580608)
+2026-10-02T12:06:09+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=581120)
+2026-10-02T12:06:09+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=581632)
+2026-10-02T12:06:10+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=582144)
+2026-10-02T12:06:10+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=582656)
+2026-10-02T12:06:12+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=583168)
+2026-10-02T12:06:12+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=583680)
+2026-10-02T12:06:12+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=584192)
+2026-10-02T12:06:14+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=584704)
+2026-10-02T12:06:14+02:00 Strix bash[28425]: [engine] shared candidate CONSTRUCTED: frontier=62719 prompt=64915 best_private_frontier=63818 live_private=20 longer_private_exists=1 choice=9216
+2026-10-02T12:06:14+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=585216)
+2026-10-02T12:06:14+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=585728)
+2026-10-02T12:06:14+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=586240)
+2026-10-02T12:06:16+02:00 Strix bash[28425]: [kv-binding] LANE-RELEASE lane=1 checks=0 diverged=0 unverifiable=0 foreign=56/1101
+2026-10-02T12:06:16+02:00 Strix bash[28425]: 2026-10-02 12:06:16.422  INFO  req#130 done | anthropic | tool calls 1 | prompt 39,438 | output 457 | cache 38,180 (96.8%, long anchor) | TTFT 12.3s | total 14.5s | queue 7.7s | prefill 2.60k tok/s | decode 210.4 tok/s | dflash2 accepted 355/721 (49.2%)
+2026-10-02T12:06:16+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=586752)
+2026-10-02T12:06:16+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=587264)
+2026-10-02T12:06:16+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=587776)
+2026-10-02T12:06:16+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=588288)
+2026-10-02T12:06:16+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=588800)
+2026-10-02T12:06:16+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=589312)
+2026-10-02T12:06:16+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=589824)
+2026-10-02T12:06:18+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=590336)
+2026-10-02T12:06:18+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=590848)
+2026-10-02T12:06:18+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=591360)
+2026-10-02T12:06:20+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=591872)
+2026-10-02T12:06:20+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=592384)
+2026-10-02T12:06:20+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=592896)
+2026-10-02T12:06:20+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=593408)
+2026-10-02T12:06:20+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=593920)
+2026-10-02T12:06:21+02:00 Strix bash[28425]: [kv-binding] LANE-RELEASE lane=1 checks=0 diverged=0 unverifiable=0 foreign=56/1105
+2026-10-02T12:06:21+02:00 Strix bash[28425]: 2026-10-02 12:06:21.110  INFO  req#131 done | anthropic | tool calls 1 | prompt 42,628 | output 94 | cache 42,509 (99.7%, private endpoint) | TTFT 17.4s | total 17.8s | queue 13.5s | prefill 814.1 tok/s | decode 226.2 tok/s | dflash2 accepted 77/126 (61.1%)
+2026-10-02T12:06:21+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=594432)
+2026-10-02T12:06:21+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=594944)
+2026-10-02T12:06:21+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=595456)
+2026-10-02T12:06:21+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=595968)
+2026-10-02T12:06:21+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=596480)
+2026-10-02T12:06:21+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=596992)
+2026-10-02T12:06:21+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=597504)
+2026-10-02T12:06:21+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=598016)
+2026-10-02T12:06:21+02:00 Strix bash[28425]: 2026-10-02 12:06:21.798  INFO  req#135 started | anthropic stream | 31 messages | max output 64,000 | thinking template default | tools 27
+2026-10-02T12:06:21+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=598528)
+2026-10-02T12:06:21+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=599040)
+2026-10-02T12:06:21+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=599552)
+2026-10-02T12:06:22+02:00 Strix bash[28425]: [kv-binding] LANE-RELEASE lane=1 checks=0 diverged=0 unverifiable=0 foreign=56/1107
+2026-10-02T12:06:22+02:00 Strix bash[28425]: 2026-10-02 12:06:22.118  INFO  req#132 done | anthropic | stop token | prompt 42,787 | output 59 | cache 42,623 (99.6%, response replay) | TTFT 15.2s | total 15.6s | queue 15.0s | prefill 1.37k tok/s | decode 153.5 tok/s | dflash2 accepted 41/126 (32.5%)
+2026-10-02T12:06:22+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=600064)
+2026-10-02T12:06:22+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=600576)
+2026-10-02T12:06:22+02:00 Strix bash[28425]: [engine] reuse-select: winner=shared reuse=22931 | best_loser=private reuse=44417 longer_lost=1 candidates=8 selects=127
+2026-10-02T12:06:22+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=601088)
+2026-10-02T12:06:22+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=601600)
+2026-10-02T12:06:22+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=602112)
+2026-10-02T12:06:22+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=602624)
+2026-10-02T12:06:22+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=603136)
+2026-10-02T12:06:22+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=603648)
+2026-10-02T12:06:22+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=604160)
+2026-10-02T12:06:23+02:00 Strix bash[28425]: 2026-10-02 12:06:23.157  INFO  req#136 started | anthropic stream | 22 messages | max output 64,000 | thinking template default | tools 27
+2026-10-02T12:06:23+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=604672)
+2026-10-02T12:06:23+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=605184)
+2026-10-02T12:06:23+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=605696)
+2026-10-02T12:06:23+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=606208)
+2026-10-02T12:06:23+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=606720)
+2026-10-02T12:06:23+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=607232)
+2026-10-02T12:06:23+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=607744)
+2026-10-02T12:06:23+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=608256)
+2026-10-02T12:06:23+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=608768)
+2026-10-02T12:06:23+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=609280)
+2026-10-02T12:06:23+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=609792)
+2026-10-02T12:06:23+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=610304)
+2026-10-02T12:06:24+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=610816)
+2026-10-02T12:06:24+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=611328)
+2026-10-02T12:06:24+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=611840)
+2026-10-02T12:06:24+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=612352)
+2026-10-02T12:06:24+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=612864)
+2026-10-02T12:06:24+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=613376)
+2026-10-02T12:06:24+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=613888)
+2026-10-02T12:06:24+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=614400)
+2026-10-02T12:06:24+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=614912)
+2026-10-02T12:06:25+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=615424)
+2026-10-02T12:06:25+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=615936)
+2026-10-02T12:06:25+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=616448)
+2026-10-02T12:06:25+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=616960)
+2026-10-02T12:06:25+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=617472)
+2026-10-02T12:06:25+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=617984)
+2026-10-02T12:06:26+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=618496)
+2026-10-02T12:06:26+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=619008)
+2026-10-02T12:06:26+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=619520)
+2026-10-02T12:06:26+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=620032)
+2026-10-02T12:06:26+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=620544)
+2026-10-02T12:06:26+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=621056)
+2026-10-02T12:06:26+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=621568)
+2026-10-02T12:06:26+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=622080)
+2026-10-02T12:06:27+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=622592)
+2026-10-02T12:06:27+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=623104)
+2026-10-02T12:06:27+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=623616)
+2026-10-02T12:06:27+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=624128)
+2026-10-02T12:06:27+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=624640)
+2026-10-02T12:06:27+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=625152)
+2026-10-02T12:06:27+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=625664)
+2026-10-02T12:06:27+02:00 Strix bash[28425]: [engine] shared candidate CONSTRUCTED: frontier=42511 prompt=43201 best_private_frontier=42845 live_private=21 longer_private_exists=1 choice=9728
+2026-10-02T12:06:27+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=626176)
+2026-10-02T12:06:27+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=626688)
+2026-10-02T12:06:27+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=627200)
+2026-10-02T12:06:28+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=627712)
+2026-10-02T12:06:28+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=628224)
+2026-10-02T12:06:28+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=628736)
+2026-10-02T12:06:28+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=629248)
+2026-10-02T12:06:28+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=629760)
+2026-10-02T12:06:30+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=630272)
+2026-10-02T12:06:30+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=630784)
+2026-10-02T12:06:30+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=631296)
+2026-10-02T12:06:32+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=631808)
+2026-10-02T12:06:32+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=632320)
+2026-10-02T12:06:32+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=632832)
+2026-10-02T12:06:32+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=633344)
+2026-10-02T12:06:32+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=633856)
+2026-10-02T12:06:34+02:00 Strix bash[28425]: [kv-binding] LANE-RELEASE lane=1 checks=0 diverged=0 unverifiable=0 foreign=56/1132
+2026-10-02T12:06:34+02:00 Strix bash[28425]: 2026-10-02 12:06:34.990  INFO  req#134 done | anthropic | tool calls 1 | prompt 45,184 | output 362 | cache 22,931 (50.8%, shared prefix) | TTFT 23.4s | total 25.5s | queue 13.1s | prefill 4.13k tok/s | decode 173.5 tok/s | dflash2 accepted 266/679 (39.2%)
+2026-10-02T12:06:34+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=634368)
+2026-10-02T12:06:34+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=634880)
+2026-10-02T12:06:35+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=635392)
+2026-10-02T12:06:35+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=635904)
+2026-10-02T12:06:35+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=636416)
+2026-10-02T12:06:35+02:00 Strix bash[28425]: 2026-10-02 12:06:35.691  INFO  req#137 started | anthropic stream | 41 messages | max output 64,000 | thinking template default | tools 27
+2026-10-02T12:06:37+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=636928)
+2026-10-02T12:06:37+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=637440)
+2026-10-02T12:06:37+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=637952)
+2026-10-02T12:06:39+02:00 Strix bash[28425]: 2026-10-02 12:06:39.071  INFO  req#138 started | anthropic stream | 23 messages | max output 64,000 | thinking template default | tools 27
+2026-10-02T12:06:39+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=638464)
+2026-10-02T12:06:39+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=638976)
+2026-10-02T12:06:39+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=639488)
+2026-10-02T12:06:39+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=640000)
+2026-10-02T12:06:39+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=640512)
+2026-10-02T12:06:40+02:00 Strix bash[28425]: 2026-10-02 12:06:40.217  INFO  req#139 started | anthropic stream | 42 messages | max output 64,000 | thinking template default | tools 27
+2026-10-02T12:06:40+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=641024)
+2026-10-02T12:06:40+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=641536)
+2026-10-02T12:06:40+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=642048)
+2026-10-02T12:06:40+02:00 Strix bash[28425]: [kv-binding] LANE-RELEASE lane=0 checks=0 diverged=0 unverifiable=0 foreign=56/1135
+2026-10-02T12:06:40+02:00 Strix bash[28425]: 2026-10-02 12:06:40.717  INFO  req#101 done | anthropic | tool calls 1 | prompt 70,306 | output 3,773 | cache 22,931 (32.6%, shared prefix) | TTFT 1m 19.9s | total 2m 52.0s | queue 1m 5.0s | prefill 4.27k tok/s | decode 135.0 tok/s | dflash2 accepted 2,475/9,093 (27.2%)
+2026-10-02T12:06:40+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=642560)
+2026-10-02T12:06:40+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=643072)
+2026-10-02T12:06:40+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=643584)
+2026-10-02T12:06:40+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=644096)
+2026-10-02T12:06:40+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=644608)
+2026-10-02T12:06:40+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=645120)
+2026-10-02T12:06:40+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=645632)
+2026-10-02T12:06:40+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=646144)
+2026-10-02T12:06:40+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=646656)
+2026-10-02T12:06:40+02:00 Strix bash[28425]: 2026-10-02 12:06:40.728  INFO  req#140 started | anthropic stream | 29 messages | max output 64,000 | thinking template default | tools 27
+2026-10-02T12:06:40+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=647168)
+2026-10-02T12:06:40+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=647680)
+2026-10-02T12:06:40+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=648192)
+2026-10-02T12:06:41+02:00 Strix bash[28425]: [kv-binding] LANE-RELEASE lane=0 checks=0 diverged=0 unverifiable=0 foreign=56/1137
+2026-10-02T12:06:41+02:00 Strix bash[28425]: [kv-binding] LANE-RELEASE lane=1 checks=0 diverged=0 unverifiable=0 foreign=56/1137
+2026-10-02T12:06:41+02:00 Strix bash[28425]: 2026-10-02 12:06:41.254  INFO  req#103 done | anthropic | stop token | prompt 70,461 | output 96 | cache 70,301 (99.8%, response replay) | TTFT 2m 37.4s | total 2m 38.0s | queue 2m 37.2s | prefill 1.26k tok/s | decode 161.3 tok/s | dflash2 accepted 68/196 (34.7%)
+2026-10-02T12:06:41+02:00 Strix bash[28425]: 2026-10-02 12:06:41.254  INFO  req#135 done | anthropic | tool calls 2 | prompt 43,201 | output 292 | cache 42,510 (98.4%, long anchor) | TTFT 18.2s | total 20.2s | queue 13.7s | prefill 1.89k tok/s | decode 210.1 tok/s | dflash2 accepted 229/448 (51.1%)
+2026-10-02T12:06:41+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=648704)
+2026-10-02T12:06:41+02:00 Strix bash[28425]: 2026-10-02 12:06:41.661  INFO  throughput | 37.2s | prefill 38.6 tok/s (1,436 tok) | decode 22.0 tok/s (819 tok) | running 2 (prefill 1, decode-ready 1) | waiting 10 | batch 1.92 | host 4.2% (1.6s)
+2026-10-02T12:06:41+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=649216)
+2026-10-02T12:06:42+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=649728)
+2026-10-02T12:06:42+02:00 Strix bash[28425]: [kv-binding] LANE-RELEASE lane=0 checks=0 diverged=0 unverifiable=0 foreign=56/1137
+2026-10-02T12:06:42+02:00 Strix bash[28425]: [kv-binding] LANE-RELEASE lane=1 checks=0 diverged=0 unverifiable=0 foreign=56/1137
+2026-10-02T12:06:42+02:00 Strix bash[28425]: [kv-binding] LANE-RELEASE lane=1 checks=0 diverged=0 unverifiable=0 foreign=56/1137
+2026-10-02T12:06:42+02:00 Strix bash[28425]: [kv-binding] LANE-RELEASE lane=1 checks=0 diverged=0 unverifiable=0 foreign=56/1137
+2026-10-02T12:06:42+02:00 Strix bash[28425]: [kv-binding] LANE-RELEASE lane=1 checks=0 diverged=0 unverifiable=0 foreign=56/1137
+2026-10-02T12:06:42+02:00 Strix bash[28425]: [kv-binding] LANE-RELEASE lane=1 checks=0 diverged=0 unverifiable=0 foreign=56/1137
+2026-10-02T12:06:42+02:00 Strix bash[28425]: [kv-binding] LANE-RELEASE lane=1 checks=0 diverged=0 unverifiable=0 foreign=56/1137
+2026-10-02T12:06:42+02:00 Strix bash[28425]: [kv-binding] LANE-RELEASE lane=1 checks=0 diverged=0 unverifiable=0 foreign=56/1137
+2026-10-02T12:06:42+02:00 Strix bash[28425]: [kv-binding] LANE-RELEASE lane=0 checks=0 diverged=0 unverifiable=0 foreign=56/1137
+2026-10-02T12:06:42+02:00 Strix bash[28425]: [kv-binding] LANE-RELEASE lane=1 checks=0 diverged=0 unverifiable=0 foreign=56/1137
+2026-10-02T12:06:42+02:00 Strix bash[28425]: [kv-binding] LANE-RELEASE lane=1 checks=0 diverged=0 unverifiable=0 foreign=56/1137
+2026-10-02T12:06:42+02:00 Strix bash[28425]: [kv-binding] LANE-RELEASE lane=1 checks=0 diverged=0 unverifiable=0 foreign=56/1137
+2026-10-02T12:06:42+02:00 Strix bash[28425]: [kv-binding] LANE-RELEASE lane=1 checks=0 diverged=0 unverifiable=0 foreign=56/1137
+2026-10-02T12:06:42+02:00 Strix bash[28425]: [kv-binding] LANE-RELEASE lane=1 checks=0 diverged=0 unverifiable=0 foreign=56/1137
+2026-10-02T12:06:42+02:00 Strix bash[28425]: [kv-binding] LANE-RELEASE lane=0 checks=0 diverged=0 unverifiable=0 foreign=56/1137
+2026-10-02T12:06:42+02:00 Strix bash[28425]: [kv-binding] LANE-RELEASE lane=2 checks=0 diverged=0 unverifiable=0 foreign=56/1137
+2026-10-02T12:06:42+02:00 Strix bash[28425]: [kv-binding] LANE-RELEASE lane=1 checks=0 diverged=0 unverifiable=0 foreign=56/1137
+2026-10-02T12:06:42+02:00 Strix bash[28425]: [kv-binding] LANE-RELEASE lane=1 checks=0 diverged=0 unverifiable=0 foreign=56/1137
+2026-10-02T12:06:42+02:00 Strix bash[28425]: [kv-binding] LANE-RELEASE lane=1 checks=0 diverged=0 unverifiable=0 foreign=56/1137
+2026-10-02T12:06:42+02:00 Strix bash[28425]: [kv-binding] LANE-RELEASE lane=0 checks=0 diverged=0 unverifiable=0 foreign=56/1137
+2026-10-02T12:06:42+02:00 Strix bash[28425]: [kv-binding] LANE-RELEASE lane=1 checks=0 diverged=0 unverifiable=0 foreign=56/1137
+2026-10-02T12:06:42+02:00 Strix bash[28425]: [engine] WORKER RECOVER: Qwen3.5 resource subtraction underflow [device.main_kv_pages: have 1057, removing 1059]
+2026-10-02T12:06:42+02:00 Strix bash[28425]: [kv-binding] LANE-RELEASE lane=0 checks=0 diverged=0 unverifiable=0 foreign=59/1140
+2026-10-02T12:06:42+02:00 Strix bash[28425]: [engine] non-strict release REFUSED (state-write, blocker=checkpoint-references (still owned)): the caller dropped its handle and the store did not free the image. count=1
+2026-10-02T12:06:42+02:00 Strix bash[28425]: [kv-binding] LANE-RELEASE lane=1 checks=0 diverged=0 unverifiable=0 foreign=59/1140
+2026-10-02T12:06:42+02:00 Strix bash[28425]: [engine] fail-all cleanup: shared catalogued=0 released-refused=0 skipped=0 (reserved-capture=0 reserved-replacement=0) continuations-live=0
+2026-10-02T12:06:42+02:00 Strix bash[28425]: [engine] post-recovery residual (recover): main_kv_pages=1060 backend_kv_pages=0 device_state_slots=1 host_state_slots=0 host_kv_bytes=1244528640
+2026-10-02T12:06:42+02:00 Strix bash[28425]: [census] text address=31 active=0 occupied=1 row=0 reserved_pages=0 page_count=1060 device_resident=1060 host_resident=1055 frontier=67835
+2026-10-02T12:06:42+02:00 Strix bash[28425]: 2026-10-02 12:06:42.172  ERROR req#136 failed during generation | anthropic | HTTP 500 | internal error
+2026-10-02T12:06:42+02:00 Strix bash[28425]: 2026-10-02 12:06:42.172  ERROR req#116 failed during generation | anthropic | HTTP 500 | internal error
+2026-10-02T12:06:42+02:00 Strix bash[28425]: 2026-10-02 12:06:42.300  INFO  req#141 started | anthropic non-stream | 22 messages | max output 64,000 | thinking template default | tools 27
+2026-10-02T12:06:42+02:00 Strix bash[28425]: 2026-10-02 12:06:42.316  INFO  req#142 started | anthropic non-stream | 22 messages | max output 64,000 | thinking template default | tools 27
+2026-10-02T12:06:47+02:00 Strix bash[28425]: [engine] shared candidate CONSTRUCTED: frontier=22700 prompt=67634 best_private_frontier=0 live_private=0 longer_private_exists=0 choice=10240
+2026-10-02T12:06:49+02:00 Strix bash[28425]: 2026-10-02 12:06:49.726  INFO  throughput | 8.1s | prefill 6.78k tok/s (54,658 tok) | decode 282.9 tok/s (2,282 tok) | running 1 (prefill 1) | waiting 10 | batch 1.87 | host 257.3% (20.8s)
+2026-10-02T12:06:49+02:00 Strix bash[28425]: 2026-10-02 12:06:49.888  INFO  req#143 started | anthropic stream | 34 messages | max output 64,000 | thinking template default | tools 27
+2026-10-02T12:06:52+02:00 Strix bash[28425]: 2026-10-02 12:06:52.589  INFO  req#144 started | anthropic stream | 35 messages | max output 64,000 | thinking template default | tools 27
+2026-10-02T12:06:53+02:00 Strix bash[28425]: [engine] shared candidate CONSTRUCTED: frontier=22700 prompt=65072 best_private_frontier=0 live_private=0 longer_private_exists=0 choice=10752
+2026-10-02T12:06:55+02:00 Strix bash[28425]: 2026-10-02 12:06:55.423  INFO  throughput | 5.7s | prefill 3.95k tok/s (22,528 tok) | running 1 (prefill 1) | waiting 11 | host 8.0% (454 ms)
+2026-10-02T12:07:00+02:00 Strix bash[28425]: 2026-10-02 12:07:00.320  INFO  throughput | 4.9s | prefill 3.31k tok/s (16,190 tok) | decode 29.4 tok/s (144 tok) | running 1 (decode-ready 1) | waiting 12 | batch 1.00 | host 3.7% (181 ms)
+2026-10-02T12:07:03+02:00 Strix bash[28425]: [kv-binding] LANE-RELEASE lane=0 checks=0 diverged=0 unverifiable=0 foreign=59/1212
+2026-10-02T12:07:03+02:00 Strix bash[28425]: 2026-10-02 12:07:03.494  INFO  req#117 done | anthropic | tool calls 2 | prompt 69,841 | output 1,554 | cache 0 (0.0%) | TTFT 1m 47.1s | total 1m 54.6s | queue 1m 33.2s | prefill 5.06k tok/s | decode 208.7 tok/s | dflash2 accepted 1,162/2,751 (42.2%)
+2026-10-02T12:07:03+02:00 Strix bash[28425]: 2026-10-02 12:07:03.552  INFO  throughput | 3.2s | decode 313.1 tok/s (1,012 tok) | running 1 (decode-ready 1) | waiting 12 | batch 1.00 | host 0.8% (25.8 ms)
+2026-10-02T12:07:04+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=650240)
+2026-10-02T12:07:05+02:00 Strix bash[28425]: [engine] shared candidate CONSTRUCTED: frontier=22700 prompt=69682 best_private_frontier=0 live_private=1 longer_private_exists=0 choice=11264
+2026-10-02T12:07:05+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=650752)
+2026-10-02T12:07:06+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=651264)
+2026-10-02T12:07:08+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=651776)
+2026-10-02T12:07:09+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=652288)
+2026-10-02T12:07:10+02:00 Strix bash[28425]: [engine] shared candidate CONSTRUCTED: frontier=22931 prompt=43852 best_private_frontier=0 live_private=1 longer_private_exists=0 choice=11776
+2026-10-02T12:07:11+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=652800)
+2026-10-02T12:07:12+02:00 Strix bash[28425]: 2026-10-02 12:07:12.452  INFO  req#145 started | anthropic stream | 30 messages | max output 64,000 | thinking template default | tools 27
+2026-10-02T12:07:12+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=653312)
+2026-10-02T12:07:12+02:00 Strix bash[28425]: 2026-10-02 12:07:12.367  INFO  throughput | 9.5s | prefill 1.61k tok/s (15,360 tok) | decode 41.6 tok/s (397 tok) | running 1 (prefill 1) | waiting 11 | batch 1.00 | host 2.1% (203 ms)
+2026-10-02T12:07:15+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=653824)
+2026-10-02T12:07:22+02:00 Strix bash[28425]: [kv-binding] LANE-RELEASE lane=0 checks=0 diverged=0 unverifiable=0 foreign=59/1258
+2026-10-02T12:07:22+02:00 Strix bash[28425]: 2026-10-02 12:07:22.731  INFO  req#118 done | anthropic | tool calls 2 | prompt 67,634 | output 1,318 | cache 22,931 (33.9%, shared prefix) | TTFT 2m 6.7s | total 2m 13.3s | queue 1m 53.3s | prefill 4.24k tok/s | decode 200.9 tok/s | dflash2 accepted 970/2,443 (39.7%)
+2026-10-02T12:07:22+02:00 Strix bash[28425]: 2026-10-02 12:07:22.749  INFO  throughput | 10.4s | prefill 2.83k tok/s (29,343 tok) | decode 26.6 tok/s (276 tok) | running 1 (decode-ready 1) | waiting 12 | batch 1.00 | host 31.4% (3.3s)
+2026-10-02T12:07:22+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=654336)
+2026-10-02T12:07:23+02:00 Strix bash[28425]: [kv-binding] LANE-RELEASE lane=0 checks=0 diverged=0 unverifiable=0 foreign=59/1260
+2026-10-02T12:07:23+02:00 Strix bash[28425]: 2026-10-02 12:07:23.031  INFO  req#120 done | anthropic | stop token | prompt 67,795 | output 25 | cache 67,629 (99.8%, response replay) | TTFT 2m 5.5s | total 2m 5.7s | queue 2m 5.3s | prefill 1.31k tok/s | decode 160.9 tok/s | dflash2 accepted 16/56 (28.6%)
+2026-10-02T12:07:23+02:00 Strix bash[28425]: 2026-10-02 12:07:23.572  INFO  req#146 started | anthropic stream | 38 messages | max output 64,000 | thinking template default | tools 27
+2026-10-02T12:07:23+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=654848)
+2026-10-02T12:07:24+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=655360)
+2026-10-02T12:07:24+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=655872)
+2026-10-02T12:07:25+02:00 Strix bash[28425]: [engine] shared candidate CONSTRUCTED: frontier=22931 prompt=70868 best_private_frontier=67819 live_private=2 longer_private_exists=1 choice=12288
+2026-10-02T12:07:25+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=656384)
+2026-10-02T12:07:26+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=656896)
+2026-10-02T12:07:27+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=657408)
+2026-10-02T12:07:27+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=657920)
+2026-10-02T12:07:28+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=658432)
+2026-10-02T12:07:29+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=658944)
+2026-10-02T12:07:30+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=659456)
+2026-10-02T12:07:30+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=659968)
+2026-10-02T12:07:31+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=660480)
+2026-10-02T12:07:33+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=660992)
+2026-10-02T12:07:33+02:00 Strix bash[28425]: 2026-10-02 12:07:33.167  INFO  throughput | 10.4s | prefill 1.98k tok/s (20,646 tok) | decode 102.2 tok/s (1,065 tok) | running 1 (prefill 1) | waiting 11 | batch 1.00 | host 9.8% (1.0s)
+2026-10-02T12:07:33+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=661504)
+2026-10-02T12:07:34+02:00 Strix bash[28425]: [kv-binding] LANE-RELEASE lane=0 checks=0 diverged=0 unverifiable=0 foreign=59/1304
+2026-10-02T12:07:34+02:00 Strix bash[28425]: 2026-10-02 12:07:34.938  INFO  req#129 done | anthropic | tool calls 2 | prompt 64,915 | output 209 | cache 22,931 (35.3%, shared prefix) | TTFT 1m 39.2s | total 1m 40.1s | queue 1m 28.6s | prefill 4.12k tok/s | decode 221.4 tok/s | dflash2 accepted 159/350 (45.4%)
+2026-10-02T12:07:35+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=662016)
+2026-10-02T12:07:35+02:00 Strix bash[28425]: [engine] shared candidate CONSTRUCTED: frontier=22931 prompt=69682 best_private_frontier=67819 live_private=3 longer_private_exists=1 choice=12800
+2026-10-02T12:07:35+02:00 Strix bash[28425]: [kv-binding] LANE-RELEASE lane=0 checks=0 diverged=0 unverifiable=0 foreign=59/1306
+2026-10-02T12:07:35+02:00 Strix bash[28425]: 2026-10-02 12:07:35.540  INFO  req#133 done | anthropic | stop token | prompt 65,072 | output 19 | cache 64,910 (99.8%, response replay) | TTFT 1m 29.2s | total 1m 29.4s | queue 1m 29.1s | prefill 1.33k tok/s | decode 161.6 tok/s | dflash2 accepted 12/42 (28.6%)
+2026-10-02T12:07:35+02:00 Strix bash[28425]: 2026-10-02 12:07:35.693  INFO  req#147 started | anthropic stream | 35 messages | max output 64,000 | thinking template default | tools 27
+2026-10-02T12:07:35+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=662528)
+2026-10-02T12:07:36+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=663040)
+2026-10-02T12:07:36+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=663552)
+2026-10-02T12:07:37+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=664064)
+2026-10-02T12:07:37+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=664576)
+2026-10-02T12:07:38+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=665088)
+2026-10-02T12:07:38+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=665600)
+2026-10-02T12:07:39+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=666112)
+2026-10-02T12:07:40+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=666624)
+2026-10-02T12:07:40+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=667136)
+2026-10-02T12:07:41+02:00 Strix bash[28425]: 2026-10-02 12:07:41.453  INFO  throughput | 8.3s | prefill 3.97k tok/s (32,930 tok) | decode 27.3 tok/s (226 tok) | running 1 (prefill 1) | waiting 10 | batch 1.00 | host 17.0% (1.4s)
+2026-10-02T12:07:41+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=667648)
+2026-10-02T12:07:42+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=668160)
+2026-10-02T12:07:43+02:00 Strix bash[28425]: [kv-binding] LANE-RELEASE lane=0 checks=0 diverged=0 unverifiable=0 foreign=59/1333
+2026-10-02T12:07:43+02:00 Strix bash[28425]: 2026-10-02 12:07:43.550  INFO  req#137 done | anthropic | tool calls 1 | prompt 47,046 | output 329 | cache 22,931 (48.7%, shared prefix) | TTFT 1m 8.6s | total 1m 10.0s | queue 1m 1.7s | prefill 4.14k tok/s | decode 222.0 tok/s | dflash2 accepted 248/567 (43.7%)
+2026-10-02T12:07:43+02:00 Strix bash[28425]: 2026-10-02 12:07:43.961  INFO  throughput | 3.2s | prefill 3.98k tok/s (12,851 tok) | decode 25.7 tok/s (83 tok) | running 1 (decode-ready 1) | waiting 10 | batch 1.00 | host 40.1% (1.3s)
+2026-10-02T12:07:43+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=668672)
+2026-10-02T12:07:44+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=669184)
+2026-10-02T12:07:44+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=669696)
+2026-10-02T12:07:44+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=670208)
+2026-10-02T12:07:45+02:00 Strix bash[28425]: [engine] shared candidate CONSTRUCTED: frontier=22931 prompt=75237 best_private_frontier=71394 live_private=4 longer_private_exists=1 choice=13312
+2026-10-02T12:07:45+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=670720)
+2026-10-02T12:07:45+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=671232)
+2026-10-02T12:07:46+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=671744)
+2026-10-02T12:07:46+02:00 Strix bash[28425]: 2026-10-02 12:07:46.373  INFO  req#148 started | anthropic stream | 43 messages | max output 64,000 | thinking template default | tools 27
+2026-10-02T12:07:46+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=672256)
+2026-10-02T12:07:47+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=672768)
+2026-10-02T12:07:47+02:00 Strix bash[28425]: 2026-10-02 12:07:47.864  INFO  throughput | 3.9s | prefill 3.94k tok/s (15,360 tok) | decode 62.8 tok/s (245 tok) | running 1 (prefill 1) | waiting 10 | batch 1.00 | host 19.3% (753 ms)
+2026-10-02T12:07:47+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=673280)
+2026-10-02T12:07:48+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=673792)
+2026-10-02T12:07:48+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=674304)
+2026-10-02T12:07:48+02:00 Strix bash[28425]: [kv-binding] LANE-RELEASE lane=0 checks=0 diverged=0 unverifiable=0 foreign=59/1353
+2026-10-02T12:07:48+02:00 Strix bash[28425]: 2026-10-02 12:07:48.767  INFO  req#138 done | anthropic | stop token | prompt 40,162 | output 52 | cache 22,931 (57.1%, shared prefix) | TTFT 1m 11.6s | total 1m 11.9s | queue 1m 7.0s | prefill 4.36k tok/s | decode 191.2 tok/s | dflash2 accepted 37/105 (35.2%)
+2026-10-02T12:07:48+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=674816)
+2026-10-02T12:07:49+02:00 Strix bash[28425]: [kv-binding] LANE-RELEASE lane=0 checks=0 diverged=0 unverifiable=0 foreign=59/1355
+2026-10-02T12:07:49+02:00 Strix bash[28425]: 2026-10-02 12:07:49.721  INFO  req#139 done | anthropic | stop token | prompt 47,204 | output 152 | cache 47,041 (99.7%, response replay) | TTFT 1m 10.8s | total 1m 11.7s | queue 1m 10.7s | prefill 1.57k tok/s | decode 184.0 tok/s | dflash2 accepted 107/315 (34.0%)
+2026-10-02T12:07:50+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=675328)
+2026-10-02T12:07:50+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=675840)
+2026-10-02T12:07:50+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=676352)
+2026-10-02T12:07:50+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=676864)
+2026-10-02T12:07:51+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=677376)
+2026-10-02T12:07:51+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=677888)
+2026-10-02T12:07:51+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=678400)
+2026-10-02T12:07:52+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=678912)
+2026-10-02T12:07:52+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=679424)
+2026-10-02T12:07:53+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=679936)
+2026-10-02T12:07:53+02:00 Strix bash[28425]: 2026-10-02 12:07:53.515  INFO  req#149 started | anthropic stream | 39 messages | max output 64,000 | thinking template default | tools 27
+2026-10-02T12:07:53+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=680448)
+2026-10-02T12:07:53+02:00 Strix bash[28425]: [engine] shared candidate CONSTRUCTED: frontier=22931 prompt=70868 best_private_frontier=67819 live_private=5 longer_private_exists=1 choice=13824
+2026-10-02T12:07:53+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=680960)
+2026-10-02T12:07:54+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=681472)
+2026-10-02T12:07:54+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=681984)
+2026-10-02T12:07:54+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=682496)
+2026-10-02T12:07:55+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=683008)
+2026-10-02T12:07:55+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=683520)
+2026-10-02T12:07:56+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=684032)
+2026-10-02T12:07:56+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=684544)
+2026-10-02T12:07:57+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=685056)
+2026-10-02T12:07:57+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=685568)
+2026-10-02T12:07:58+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=686080)
+2026-10-02T12:07:58+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=686592)
+2026-10-02T12:07:59+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=687104)
+2026-10-02T12:07:59+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=687616)
+2026-10-02T12:07:59+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=688128)
+2026-10-02T12:08:00+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=688640)
+2026-10-02T12:08:00+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=689152)
+2026-10-02T12:08:01+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=689664)
+2026-10-02T12:08:01+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=690176)
+2026-10-02T12:08:02+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=690688)
+2026-10-02T12:08:03+02:00 Strix bash[28425]: 2026-10-02 12:08:03.235  INFO  throughput | 15.4s | prefill 875.2 tok/s (13,453 tok) | decode 13.1 tok/s (202 tok) | running 1 (prefill 1) | waiting 8 | batch 1.00 | host 9.1% (1.4s)
+2026-10-02T12:08:04+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=691200)
+2026-10-02T12:08:04+02:00 Strix bash[28425]: [engine] shared candidate CONSTRUCTED: frontier=67629 prompt=70868 best_private_frontier=67819 live_private=6 longer_private_exists=1 choice=14336
+2026-10-02T12:08:04+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=691712)
+2026-10-02T12:08:05+02:00 Strix bash[28425]: [kv-binding] LANE-RELEASE lane=0 checks=0 diverged=0 unverifiable=0 foreign=59/1408
+2026-10-02T12:08:05+02:00 Strix bash[28425]: 2026-10-02 12:08:05.120  INFO  req#140 done | anthropic | tool calls 1 | prompt 75,082 | output 212 | cache 22,931 (30.5%, shared prefix) | TTFT 1m 25.1s | total 1m 25.9s | queue 1m 10.9s | prefill 4.17k tok/s | decode 265.6 tok/s | dflash2 accepted 170/294 (57.8%)
+2026-10-02T12:08:05+02:00 Strix bash[28425]: 2026-10-02 12:08:05.869  INFO  req#150 started | anthropic stream | 31 messages | max output 64,000 | thinking template default | tools 27
+2026-10-02T12:08:05+02:00 Strix bash[28425]: 2026-10-02 12:08:05.888  INFO  req#151 started | anthropic stream | 36 messages | max output 64,000 | thinking template default | tools 27
+2026-10-02T12:08:06+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=692224)
+2026-10-02T12:08:06+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=692736)
+2026-10-02T12:08:06+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=693248)
+2026-10-02T12:08:08+02:00 Strix bash[28425]: [kv-binding] LANE-RELEASE lane=0 checks=0 diverged=0 unverifiable=0 foreign=59/1411
+2026-10-02T12:08:08+02:00 Strix bash[28425]: 2026-10-02 12:08:08.300  INFO  req#141 done | anthropic | tool calls 1 | prompt 40,005 | output 244 | cache 39,895 (99.7%, long anchor) | TTFT 1m 26.1s | total 1m 27.5s | queue 1m 24.7s | prefill 1.07k tok/s | decode 179.8 tok/s | dflash2 accepted 170/525 (32.4%)
+2026-10-02T12:08:08+02:00 Strix bash[28425]: [engine] reuse-select: winner=private reuse=67834 | best_loser=shared reuse=67835 longer_lost=1 candidates=3 selects=142
+2026-10-02T12:08:08+02:00 Strix bash[28425]: 2026-10-02 12:08:08.711  INFO  throughput | 5.5s | prefill 7.46k tok/s (40,842 tok) | decode 80.7 tok/s (442 tok) | running 1 (decode-ready 1) | waiting 10 | batch 1.00 | host 68.4% (3.7s)
+2026-10-02T12:08:09+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=693760)
+2026-10-02T12:08:10+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=694272)
+2026-10-02T12:08:18+02:00 Strix bash[28425]: 2026-10-02 12:08:18.202  INFO  throughput | 10.2s | prefill 181.0 tok/s (1,848 tok) | decode 54.1 tok/s (552 tok) | running 1 (decode-ready 1) | waiting 9 | batch 1.00 | host 19.2% (2.0s)
+2026-10-02T12:08:20+02:00 Strix bash[28425]: 2026-10-02 12:08:20.167  INFO  req#152 started | anthropic stream | 44 messages | max output 64,000 | thinking template default | tools 27
+2026-10-02T12:08:20+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=694784)
+2026-10-02T12:08:20+02:00 Strix bash[28425]: [kv-binding] LANE-RELEASE lane=0 checks=0 diverged=0 unverifiable=0 foreign=59/1414
+2026-10-02T12:08:20+02:00 Strix bash[28425]: 2026-10-02 12:08:20.990  INFO  req#142 done | anthropic | tool calls 2 | prompt 69,682 | output 2,331 | cache 67,834 (97.3%, long anchor) | TTFT 1m 29.9s | total 1m 40.9s | queue 1m 27.9s | prefill 3.54k tok/s | decode 213.8 tok/s | dflash2 accepted 1,775/3,892 (45.6%)
+2026-10-02T12:08:21+02:00 Strix bash[28425]: 2026-10-02 12:08:21.838  INFO  req#153 started | anthropic stream | 25 messages | max output 64,000 | thinking template default | tools 27
+2026-10-02T12:08:22+02:00 Strix bash[28425]: 2026-10-02 12:08:22.305  INFO  req#154 started | anthropic stream | 24 messages | max output 64,000 | thinking template default | tools 27
+2026-10-02T12:08:22+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=695296)
+2026-10-02T12:08:23+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=695808)
+2026-10-02T12:08:23+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=696320)
+2026-10-02T12:08:23+02:00 Strix bash[28425]: 2026-10-02 12:08:23.277  INFO  throughput | 5.1s | prefill 403.5 tok/s (2,048 tok) | decode 352.7 tok/s (1,790 tok) | running 1 (prefill 1) | waiting 11 | batch 1.00 | host 42.3% (2.1s)
+2026-10-02T12:08:23+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=696832)
+2026-10-02T12:08:23+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=697344)
+2026-10-02T12:08:23+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=697856)
+2026-10-02T12:08:23+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=698368)
+2026-10-02T12:08:23+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=698880)
+2026-10-02T12:08:23+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=699392)
+2026-10-02T12:08:24+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=699904)
+2026-10-02T12:08:24+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=700416)
+2026-10-02T12:08:24+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=700928)
+2026-10-02T12:08:24+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=701440)
+2026-10-02T12:08:24+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=701952)
+2026-10-02T12:08:24+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=702464)
+2026-10-02T12:08:24+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=702976)
+2026-10-02T12:08:24+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=703488)
+2026-10-02T12:08:25+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=704000)
+2026-10-02T12:08:25+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=704512)
+2026-10-02T12:08:25+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=705024)
+2026-10-02T12:08:25+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=705536)
+2026-10-02T12:08:25+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=706048)
+2026-10-02T12:08:25+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=706560)
+2026-10-02T12:08:25+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=707072)
+2026-10-02T12:08:28+02:00 Strix bash[28425]: 2026-10-02 12:08:28.214  INFO  throughput | 4.9s | prefill 4.15k tok/s (20,480 tok) | running 1 (prefill 1) | waiting 11 | host 8.9% (439 ms)
+2026-10-02T12:08:28+02:00 Strix bash[28425]: [engine] checkpoint StateImage priced: incomplete=0 (numerator=0, denominator=707584)

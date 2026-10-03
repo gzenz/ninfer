@@ -474,6 +474,9 @@ void Program::resource_census() const noexcept { impl_->resource_census(); }
 std::uint64_t Program::shared_replacements() const noexcept { return impl_->shared_replacements(); }
 std::uint64_t Program::demotable_evictions() const noexcept { return impl_->demotable_evictions(); }
 
+std::uint64_t Program::evictions_demote_possible() const noexcept {
+    return impl_->evictions_demote_possible();
+}
 std::uint64_t Program::evictions_with_victim_room() const noexcept {
     return impl_->evictions_with_victim_room();
 }
@@ -513,6 +516,28 @@ std::uint64_t Program::publication_goal_blocked_cell_only() const noexcept {
 }
 std::uint64_t Program::publication_goal_blocked_other() const noexcept {
     return impl_->publication_goal_blocked_other();
+}
+std::uint64_t Program::options_refused_no_kv() const noexcept { return impl_->options_refused_no_kv(); }
+void Program::note_pressure_successor_outcome(bool nonevicting_available) noexcept {
+    impl_->note_pressure_successor_outcome(nonevicting_available);
+}
+std::uint64_t Program::pressure_successor_calls() const noexcept {
+    return impl_->pressure_successor_calls();
+}
+std::uint64_t Program::pressure_successors_with_option() const noexcept {
+    return impl_->pressure_successors_with_option();
+}
+std::uint64_t Program::demote_option_refused_no_state_deficit() const noexcept {
+    return impl_->demote_option_refused_no_state_deficit();
+}
+std::uint64_t Program::demote_option_refused_precondition() const noexcept {
+    return impl_->demote_option_refused_precondition();
+}
+std::uint64_t Program::options_refused_active_lanes() const noexcept {
+    return impl_->options_refused_active_lanes();
+}
+std::uint64_t Program::options_refused_evicting_current() const noexcept {
+    return impl_->options_refused_evicting_current();
 }
 void Program::add_publication_cell_probes(std::uint64_t count) noexcept {
     impl_->add_publication_cell_probes(count);

@@ -949,11 +949,117 @@ struct MaterializationDiagnostics {
         bool          winner     = false;
         bool          private_source = false;
         bool          shared_source  = false;
+        // WAS IT ELECTION-ELIGIBLE, and what did the election rank it on? `reuse` alone cannot answer the
+        // question this row exists for, because `FoldedCost::key()` ranks TEN terms ABOVE
+        // `reused_prompt_tokens` (see `materialization_budget.h`): a candidate with more reuse losing is the
+        // ORDINARY case whenever any of them differs, so `longer_lost` as a bare boolean asserts a defect the
+        // ordering may have applied on purpose. These are that ordering's leading terms, so a loss can be
+        // attributed to the element that decided it instead of to reuse.
+        // `eligible` = the planner reached a PHYSICALLY FEASIBLE assessment for it and the goal builder
+        // produced a goal (the same condition `becomes_incumbent` uses); an ineligible candidate was never
+        // compared at all, and counting it as a loser is what made this flag unreadable.
+        bool          eligible               = false;
+        std::uint32_t restorable_evictions   = 0;  // key element 0 -- the operator's #6 ruling
+        std::uint64_t total_ns               = 0;  // key element 1
+        std::uint64_t affected_selected_hits = 0;  // key element 2
+        std::uint32_t owner_evictions        = 0;  // key element 4
+        std::uint32_t checkpoint_drops       = 0;  // key element 5
+        // See `ElectionTerm`: the winner's row is its SEATED cost, so a re-derivation of the election must
+        // read these instead. `elected_*` are meaningful only where `seated_differs` is true (elsewhere the
+        // row's own fields already ARE the elected ones).
+        bool          seated_differs                = false;
+        std::uint32_t elected_reuse                 = 0;
+        std::uint32_t elected_restorable_evictions  = 0;
+        std::uint64_t elected_total_ns              = 0;
+        // Elements 2 and 4 as well, so a re-derivation can compare ALL the terms above reuse rather than
+        // the three of them the first version exported -- comparing three let a loser that TIES on 0 and 1
+        // and is worse on element 4 read as a domination, which is a legitimate election.
+        std::uint64_t elected_affected_selected_hits= 0;
+        std::uint32_t elected_owner_evictions       = 0;
+        std::uint32_t elected_checkpoint_drops      = 0;
     };
     std::vector<MaterializationCandidate> candidates;
+    // WHICH TERM OF THE ORDERING DECIDED THE WINNER OVER THE BEST LOSER. An index into `FoldedCost::key()`
+    // (0 = `restorable_evictions` ... 10 = `reused_prompt_tokens`, 11 = `current_session_binding`,
+    // 12 = `candidate_ordinal`, 13 = `target_ordinal`), or 255 when there was no eligible loser
+    // to compare against (the honest value for "no longer candidate existed", which a bare
+    // `longer_lost=false` cannot distinguish from "one existed and was ineligible").
+    // Its purpose: `longer_lost` fires on ANY of the ten terms ranked above reuse, so the interesting
+    // question is never "did a longer candidate lose" but "WHY". Element 0 means the #6 preservation
+    // ruling decided (by design); the ORDINAL elements (12/13) mean the winner was picked by ENUMERATION
+    // ORDER on a full tie, which is arbitrary and is the shape that would be a real bug.
+    //
+    // **DO NOT READ 10 AS "reuse itself decided, the real defect".** An earlier legend said exactly that,
+    // and it is impossible to observe: element 10 is `max - reused_prompt_tokens`, so a cost with MORE
+    // reuse has a SMALLER key and wins on element 10. A loser holding more reuse therefore lost on one of
+    // elements 0..9 and `first_differing_key_element` cannot return 10 for that pair. **10 can only appear
+    // beside a loser with LESS reuse** -- in which case there is no "longer candidate lost" to explain.
+    // So (`longer_lost_eligible` && `decided_by == 10`) means the two costs are not the ones the election compared:
+    // an instrument fault, and the test asserts the invariant so it cannot be read as a finding.
+    // **AND `decided_by` IS COMPUTED EVEN WHEN `longer_lost_eligible` IS FALSE**, where it describes the winner's
+    // margin over the best eligible loser rather than the loss of a longer candidate -- read it only
+    // together with the two reuse fields, never alone.
+    // 254 (`kNotAnElectedWinner`) means the recorded winner does NOT beat the loser on `key()`, so no
+    // element can be named -- an instrument fault (a cost the election never ranked), not a finding.
+    // 255 means NO ELIGIBLE LOSER EXISTED AT ALL, and nothing else -- an eligible loser that reuses nothing
+    // still produces an attribution, so this is stronger than the first version, where 255 also covered
+    // "eligible losers existed, none reusing anything".
+    std::uint8_t longer_lost_decided_by = 255;
+    // The same comparison restricted to ELIGIBLE candidates -- the one that can be called a defect.
+    // **TWO DIFFERENT FOLDS, AND THIS IS THE PAIR THAT DIFFERS FROM `longer_lost`.** `longer_lost` /
+    // `best_loser_reuse` / `chosen_reuse` are computed in `resource_manager` from `row.reuse`, which is the
+    // plan's `summary().reusable_prompt_tokens`; THIS pair comes from the planner's election costs, whose
+    // reuse is `machine_work.reused_prompt_tokens` (`fold_identity` / `fold_assessment`). The two agree on
+    // live records so far, but they are not the same quantity by construction, so do not treat a
+    // disagreement between `best_loser_reuse` and `best_eligible_loser_reuse` as an error in either one.
+    std::uint32_t best_eligible_loser_reuse = 0;
+    bool          longer_lost_eligible      = false;
+    // PER-CANDIDATE ELECTION TERMS, index-aligned with `candidates` above. Filled by the PLANNER, which is
+    // the only place the election's own costs exist (the planner folds a cost per candidate as it assesses
+    // it); `resource_manager` merges these into the rows. Kept as a separate transport rather than folded
+    // into the row so the row can stay a serialization type.
+    struct ElectionTerm {
+        bool          eligible               = false;  // feasible assessment AND a goal: eligible to win
+        std::uint32_t restorable_evictions   = 0;
+        std::uint64_t total_ns               = 0;
+        std::uint64_t affected_selected_hits = 0;
+        std::uint32_t owner_evictions        = 0;
+        std::uint32_t checkpoint_drops       = 0;
+
+        // THE WINNER'S COST AS THE ELECTION RANKED IT, BESIDE THE ONE THAT RAN. Every field above is
+        // `elected_cost` for a LOSER and `seated_cost` for the WINNER -- deliberately, so the winner's row
+        // describes the plan that actually ran. That is right for reading the outcome and WRONG for
+        // re-deriving the election: a seal that changes the plan makes the winner's row worse than the plan
+        // the election chose, so a re-derivation can "find" a candidate that dominates a winner the
+        // election never preferred. `seated_differs` says the two disagree; the four values are the
+        // elected ones and are the ONLY terms a re-derivation may compare. Meaningful on the winner's term.
+        bool          seated_differs                = false;
+        std::uint32_t elected_reuse                 = 0;
+        std::uint32_t elected_restorable_evictions  = 0;
+        std::uint64_t elected_total_ns              = 0;
+        // Elements 2 and 4 as well, so a re-derivation can compare ALL the terms above reuse rather than
+        // the three of them the first version exported -- comparing three let a loser that TIES on 0 and 1
+        // and is worse on element 4 read as a domination, which is a legitimate election.
+        std::uint64_t elected_affected_selected_hits= 0;
+        std::uint32_t elected_owner_evictions       = 0;
+        std::uint32_t elected_checkpoint_drops      = 0;
+    };
+    std::vector<ElectionTerm> election;
+    // (The attribution itself is computed IN THE PLANNER, from the election's own `FoldedCost`s, by
+    // `first_differing_key_element` in `materialization_budget.h`. It used to live here as a hand-carried
+    // list of six terms over the ROW fields, and a review showed that version reported "element 10" for
+    // pairs decided by any of the five elements it did not carry -- 10 being the value its legend called
+    // "the real defect". It also read the rows, which on the search path hold the LAST assessment for a
+    // candidate rather than the cost it was elected on. Both faults are removed by computing in the
+    // planner from `FoldedCost`; do not reintroduce a row-based attribution here.)
     // The selection comparison itself, promoted out of the rate-limited journal line: `longer_lost` true
-    // means a candidate reusing strictly MORE than the adopted plan was available and lost, which is the
-    // defect this pair exists to catch.
+    // means a candidate reusing strictly MORE than the adopted plan was present in the candidate set and
+    // lost. CORRECTED 2026-10-02 -- the original text here called that "the defect this pair exists to
+    // catch", and THAT WAS WRONG: `reused_prompt_tokens` is element 10 of `FoldedCost::key()`, so a
+    // higher-reuse candidate losing is the ordinary case whenever any of the ten terms ranked above it
+    // differ, and a live reading showed the flag firing at 3.3% of requests while naming no cause. Read
+    // `longer_lost_eligible` (eligible candidates only) for the defect-shaped comparison, and
+    // `longer_lost_decided_by` for the term that decided it.
     std::uint32_t chosen_reuse     = 0;
     std::uint32_t best_loser_reuse = 0;
     bool          longer_lost      = false;
@@ -1151,17 +1257,36 @@ struct MemorySummary {
     std::size_t   host_pinned_free_bytes     = 0;
     std::uint32_t host_pinned_chunks         = 0;
     std::uint64_t host_pinned_grows          = 0;
+    // INCLUDES SPECULATIVE PRE-GROW REFUSALS -- one of the three that still conflate them; see the warning
+    // at `host_kv_grow_refusals`. Measured 2026-10-03: this read 1282, exactly the soak's
+    // `host_state_pregrow_refusals`, while the SEPARATED `host_pinned_allocation_refusals` stayed 0. Demand
+    // policy refusals can be DERIVED: this - `host_state_pregrow_refusals` - `host_kv_pregrow_refusals`.
     std::uint64_t host_pinned_grow_refusals  = 0;
     // THE LARGEST SINGLE FREE RUN, and the only figure that separates "full" from "fragmented":
     // `host_pinned_free_bytes` can be large while nothing large can be placed. The pool has computed this
     // since the elastic-pool change and its own comment says fragmentation "is visible here and nowhere
     // else" -- it simply was never exported, so the question could not be asked of `/stats`.
     std::size_t host_pinned_largest_free_run_bytes = 0;
+    // GROWTH HEADROOM ONLY -- NOT capacity plus growth. `max_pinnable()` is `MemAvailable - reserve`
+    // (clipped by `max_bytes`/`shmem_cap_bytes` when non-zero), i.e. how much MORE could be pinned, and
+    // `host_kv_arena.cpp` spends it exactly that way (`unsatisfied_bytes <= growth_headroom_bytes`). An
+    // earlier version of this comment said "pinned capacity plus what growth could add", which would be
+    // read as a total; a review caught it.
+    // **AND IT IS AS OF THE LAST READING, NOT NOW:** `reading_` is refreshed only at the KV pre-grow or
+    // inside `allow()`, so `/stats` can show a figure whose age is unrecorded. Read it as a ceiling the
+    // policy will spend, not a live measurement. `PinnedHostPool::growth_headroom_bytes()` reads an INJECTED pure query (0 when
+    // none is installed), deliberately separate from the growth policy: the planner calls it inside a
+    // bounded search that must have no side effects, and wiring it to `allow()` would re-read /proc/meminfo
+    // and move the policy's call counters on every probe. Read 0 as "no query installed OR no headroom" and
+    // pair it with `host_pinned_last_veto` to tell those apart -- the same absence-is-not-zero discipline
+    // the counters beside it exist for.
+    std::size_t host_pinned_growth_headroom_bytes = 0;
     // WHY a growth was refused, and from what reading. `host_pinned_grow_refusals` is a total and the reason
     // had to be DERIVED by reading the source against the running argv (2026-10-01); these make it measured.
     // `growth_policy_refusals` vs `growth_pin_failures` is the distinction that sends a fix to the right
     // place: the policy saying no is a POLICY fact (reserve / ceiling / unreadable meminfo), while
     // `cudaMallocHost` failing is a MACHINE fact. They shared one counter until now.
+    // ALSO INCLUDES SPECULATIVE PRE-GROW REFUSALS -- see `host_pinned_grow_refusals` above.
     std::uint64_t host_pinned_growth_policy_refusals = 0;
     std::uint64_t host_pinned_growth_pin_failures    = 0;
     // ALLOCATION failures, split the same way and for the same reason as the growth ones above -- plus the
@@ -1174,6 +1299,11 @@ struct MemorySummary {
     // fire, and the real path was counted nowhere.
     std::uint64_t host_pinned_allocation_refusals       = 0;
     std::uint64_t host_pinned_allocation_ram_refusals   = 0;
+    // THE PRE-GROW'S OWN REFUSALS, kept out of the two above. A session-start pre-grow pins before any real
+    // allocation asked for the room, so counting its refusal as an allocation failure made those counters
+    // stop meaning "the pool failed to serve a real demand": measured 2026-10-02, ALL 106 refusals and 132
+    // fragmented misses on QA were speculative (`pregrows=0`). Read this beside them, never instead of them.
+    std::uint64_t host_pinned_allocation_speculative_refusals = 0;
     std::uint64_t host_pinned_allocation_post_grow_failures = 0;
     std::uint64_t host_pinned_allocation_fragmented_misses  = 0;
     std::size_t   host_pinned_reserve_bytes          = 0;
@@ -1187,11 +1317,61 @@ struct MemorySummary {
     std::uint64_t host_state_pregrow_attempts = 0;
     std::uint64_t host_state_pregrows         = 0;
     std::uint64_t host_state_pregrow_refusals = 0;
+    // The KV axis's equivalents. `fragmented` is not a failure and NOT a refusal: it counts the pre-grows
+    // that FIRED on fragmentation -- the arena held free BYTES but no single step-sized RUN -- and it is
+    // incremented inside the `Grew` case, beside `pregrows` (`storage/context.cpp:1789`). An earlier version
+    // of this comment said the trigger "declined to grow", which is the EXACT INVERSE and matched the
+    // journal label it was read beside (`fragmented_skipped`, since renamed); a live reading of 2 beside
+    // `pregrows=2` was taken as two refusals until the increment site was checked. It measures how often
+    // growth was triggered by FRAGMENTATION rather than exhaustion -- 1 GiB spans at ~1 s each -- which is
+    // the number that says whether the session-start pre-grow is affordable.
+    std::uint64_t host_kv_pregrow_attempts    = 0;
+    std::uint64_t host_kv_pregrows            = 0;
+    std::uint64_t host_kv_pregrow_refusals    = 0;
+    std::uint64_t host_kv_pregrow_fragmented  = 0;
+    // ASSESSED SEARCH NODES where a blocked KV demote was one growth away (the pure fit said `Growable`).
+    // NOT planning runs, and the difference is not cosmetic: the increment sits in
+    // `ProgramImpl::compose_pressure_candidate` (`planning/pressure.cpp:2338`), which `pressure_planner`
+    // calls once per assessed search NODE (`pressure_planner.cpp:1144`/`:1154`), so a single planning run
+    // can add thousands. This comment said "Planning runs" until a review checked the call sites -- a
+    // denominator error in the direction that makes a zero look like proof and a small number look small.
+    // 0 remains the goal (the narrowing never had a growth-away case in front of it), but it means
+    // "no node ever saw one", which is a weaker statement than "no session ever had one".
+    std::uint64_t host_kv_fit_growable         = 0;
+    // THE VETO'S DENOMINATOR AND ITS OTHER TWO VERDICTS. `blocked_checks` counts nodes that took the
+    // pinned-capacity failure path at all; `pinned`/`growable`/`blocked` are the tri-state's answer. Without
+    // the denominator, a `growable` of 0 cannot be told from the veto never running.
+    std::uint64_t host_kv_blocked_checks       = 0;
+    // HOW MANY BYTES THE BIGGEST VETO WANTED, to go with the count above.
+    //
+    // IT IS A PROCESS-LIFETIME HIGH-WATER MARK, NOT A PER-REQUEST FIGURE -- an earlier version of this
+    // comment said "request-level" and that was wrong: it is only ever raised with `std::max` and is never
+    // reset, so a "+0 delta" between two readings means something only because it was still 0.
+    //
+    // AND A VETOED COMPOSITION DOES NOT RETURN `nullopt` -- that claim was wrong too. `compose_pressure_
+    // candidate` returns TRUE with the field set (`pressure.cpp:2381-2412`); it is `seal_materialization`
+    // that returns `nullopt`, and the planner DOES read the vetoed value per node
+    // (`pressure_planner.cpp:1176`, `:1185`). So a per-candidate figure WAS obtainable at the assessment
+    // site, and the per-row field was removed one night after it shipped -- 0 in all 2,339 rows that
+    // carried it, which read as "the veto refused nothing" when it meant "this value never reached a row".
+    // That removal is defensible for the ROW (the row is built from the original candidate, not the
+    // composed copy) but "cannot be per-candidate" overstated it.
+    std::uint64_t host_kv_blocked_max_bytes    = 0;
+    std::uint64_t host_kv_fit_pinned           = 0;
+    std::uint64_t host_kv_fit_blocked          = 0;
     // KV's own growth, so a host-KV span added on demand is visible and not only inferable from total
     // capacity. With these three -- grew, could not grow, and the existing `maximal_fallback_selections`
     // (evicted everything) -- the three outcomes a full host tier can produce are DISTINGUISHABLE, which
     // they were not: a failed seal and claim contention used to look identical in the fallback counter.
     std::uint64_t host_kv_grows              = 0;
+    // THE GROWTH-SIDE COUNTERS STILL INCLUDE SPECULATIVE PRE-GROW REFUSALS -- this one, the pool's
+    // `growth_policy_refusals()` and `HostMemoryBudget::refusals()`. Only the `allocation_*` family was
+    // separated (`allocation_speculative_refusals`), because only that family is read as "the pool failed to
+    // serve a demand". Measured 2026-10-02: `host_kv_grow_refusals` 106 == `host_kv_pregrow_refusals` 106 ==
+    // `host_pinned_grow_refusals` 106 in one soak, and 2195 == 2195 in the next -- the same equality that
+    // produced a false "2,195 real refusals" reading on the allocation side. **Do not read these as demand
+    // failures**; they are "the tier did not grow", pre-grow included. Threading `speculative` through them
+    // is the open item.
     std::uint64_t host_kv_grow_refusals      = 0;
     std::size_t host_kv_occupied_bytes            = 0;
 };
@@ -1373,6 +1553,11 @@ struct RuntimeStats {
     // reports room this victim's own footprint may not fit -- the three post-fix prod evictions were all
     // `demotable=1` at 17/18 slots with host KV 94% full.
     std::uint64_t pressure_evictions_with_victim_room = 0;
+    // THE #6 POPULATION: `victim_room && demote_possible` -- a demote fully available, the victim's own
+    // slots fitting, and the victim evicted anyway. `demote_refusal` is PRINTED but never counted, and the
+    // print is rate-limited (8 of 57 evictions on 2026-10-02, 7 of them benignly `already-on-host`), so
+    // without this the defect's size could only be sampled.
+    std::uint64_t pressure_evictions_demote_possible  = 0;
     // The OTHER half of #6, and the one that had no signal at all: REQUESTS that lost reuse to the private
     // catalog. A plan takes its publication cell from its own consumed private source, a `Vacant` cell, or a
     // victim it evicts; when every cell is catalogued and no victim is evictable, a candidate that could
@@ -1405,11 +1590,35 @@ struct RuntimeStats {
     std::uint64_t capture_skips_not_feasible_no_pressure = 0;
     std::uint64_t pressure_options                     = 0;
     std::uint64_t pressure_demote_options              = 0;
+    // WHY `inspect_pressure_option` built no demote option, by clause. Only the third is a policy choice;
+    // the total cannot separate them, and a fix aimed at the wrong one would be aimed at nothing.
+    std::uint64_t pressure_options_refused_no_kv             = 0;
+    // Why the STATE-side demote option died at `pressure.cpp:796`. `no_state_deficit` means the deficit
+    // carried no state slots, so the relief wanted is a KV demote -- a different fix from the other six
+    // conditions, which say no demote exists and the eviction is correct.
+    std::uint64_t pressure_demote_option_refused_no_state_deficit = 0;
+    // THE PRESERVATION PROBE: an owner whose successor set was EMPTY had no non-evicting option, so its
+    // checkpoint's destruction was unavoidable. `calls` is the denominator -- without it, "none lacked an
+    // option" and "none was examined" read the same.
+    std::uint64_t pressure_successor_calls         = 0;
+    std::uint64_t pressure_successors_with_option  = 0;
+    std::uint64_t pressure_demote_option_refused_precondition     = 0;
+    std::uint64_t pressure_options_refused_active_lanes      = 0;
+    std::uint64_t pressure_options_refused_evicting_current  = 0;
     std::uint64_t pressure_publication_cell_losses     = 0;
     // The DENOMINATOR. Raw goal-probe calls, one or two orders of magnitude larger than any plausible loss
     // count, kept only so that `losses == 0` can be told from a planner that stopped probing. Never read it
     // as the loss: it is search pressure, not an outcome.
     std::uint64_t pressure_publication_cell_probes     = 0;
+    // THE DEMAND WINDOW'S SET BITS, BY THE EVIDENCE THAT SET THEM -- see
+    // `ResourceManager::tally_demand_evidence`. The portfolio valuation sums a saving per set bit, so if
+    // `considered` dominates, `future_loss_ns` is pricing OFFERS as DEMAND: every request that merely had a
+    // checkpoint in its candidate set registers demand for it, and the planner then preserves the
+    // continuation and refuses reuse to protect demand that may never arrive. Uncapped, because a capped
+    // print would hide the very ratio this exists to measure.
+    std::uint64_t pressure_demand_bits_selected        = 0;
+    std::uint64_t pressure_demand_bits_resident        = 0;
+    std::uint64_t pressure_demand_bits_considered      = 0;
     // The at-risk totals, and they exist because the JOURNAL PRINT IS CAPPED -- 8 then every 512th -- so the
     // printed line count is a SAMPLE and never the count. Reading "8 at-risk runs" off eight lines is the
     // documented trap for the eviction print, and it was made here before these fields existed. `at_risk_runs`

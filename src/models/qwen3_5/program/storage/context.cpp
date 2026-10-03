@@ -1758,6 +1758,55 @@ void ProgramImpl::maintain_host_memory(std::size_t retain_bytes) noexcept {
     }
 }
 
+void ProgramImpl::ensure_host_kv_headroom() noexcept {
+    if (host_kv_arena == nullptr || host_kv_extents == nullptr || pinned_host_pool == nullptr) { return; }
+    // SEE `HostKVExtentStore::HostKVPreGrow`. Mirrors `ensure_host_state_headroom` directly below/beside it:
+    // once per planning session, OUTSIDE the search, because growth pins real memory and reads
+    // /proc/meminfo -- the state axis records that an earlier version ran inside the search and was removed.
+    //
+    // Refresh the budget reading first, so the headroom the search will consult is this session's rather
+    // than the last growth's. `refresh_reading` is the non-counting reader: `allow_with(reading, 0)` would
+    // count a `NothingWanted` refusal and corrupt `refusals()`.
+    host_memory_budget->refresh_reading();
+    // WHY the trigger is about to fire, taken BEFORE the growth changes the arena: free bytes still
+    // available means this is FRAGMENTATION rather than exhaustion, which is the expensive case (the arena
+    // holds space, just not one step-sized run) and the one whose frequency decides whether this trigger is
+    // affordable. Read here, not after, because growth adds a span and would make every firing look like
+    // exhaustion.
+    const bool fragmented = host_kv_arena->free_bytes() != 0U &&
+                            host_kv_arena->largest_free_run_bytes() < host_kv_arena->span_step_bytes();
+    switch (HostKVExtentStore::pre_grow(*host_kv_arena, *host_kv_extents)) {
+    case HostKVExtentStore::HostKVPreGrow::Disabled:
+    case HostKVExtentStore::HostKVPreGrow::NotFull:
+        return;
+    case HostKVExtentStore::HostKVPreGrow::Refused:
+        ++host_kv_pregrow_attempts_;
+        ++host_kv_pregrow_refusals_;
+        return;
+    case HostKVExtentStore::HostKVPreGrow::Grew:
+        ++host_kv_pregrow_attempts_;
+        ++host_kv_pregrows_;
+        if (fragmented) { ++host_kv_pregrow_fragmented_; }
+        if (host_kv_pregrows_ <= 8ULL || host_kv_pregrows_ % 512ULL == 0ULL) {
+            std::fprintf(stderr,
+                         "[engine] host KV arena PRE-GROWN before planning: capacity=%zu occupied=%zu "
+                         // `fragmented_triggered`, NOT `fragmented_skipped`. The counter is incremented
+                         // INSIDE the `Grew` case above, beside `++host_kv_pregrows_`, so it counts grows
+                         // that fired because the arena held free bytes but no single run of one step --
+                         // i.e. grows that DID happen. The old label said the opposite, and a live reading
+                         // of `fragmented_skipped=2` beside `grew=2` was read as two SKIPS until the
+                         // increment site was checked. Names are read at face value under load.
+                         "grew=%llu refused=%llu fragmented_triggered=%llu\n",
+                         host_kv_arena->capacity_bytes(), host_kv_arena->occupied_bytes(),
+                         static_cast<unsigned long long>(host_kv_pregrows_),
+                         static_cast<unsigned long long>(host_kv_pregrow_refusals_),
+                         static_cast<unsigned long long>(host_kv_pregrow_fragmented_));
+            std::fflush(stderr);
+        }
+        return;
+    }
+}
+
 void ProgramImpl::ensure_host_state_headroom() noexcept {
     if (host_state_images == nullptr || pinned_host_pool == nullptr) { return; }
     // §3 item 6: make the host state pool ONE slot bigger BEFORE the planner prices anything, so a demote

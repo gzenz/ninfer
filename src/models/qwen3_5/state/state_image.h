@@ -98,7 +98,7 @@ public:
     // ceiling it once was: `ensure_host_state_headroom` pre-grows the pool by one slot when it is full,
     // before the planner prices anything.
     // Returns how many were created (fewer than asked if the pool refused to grow).
-    [[nodiscard]] std::uint32_t reserve_slots(std::uint32_t count) noexcept;
+    [[nodiscard]] std::uint32_t reserve_slots(std::uint32_t count, bool speculative = false) noexcept;
 
     // Give back the trailing slots that hold nothing, so the shared pool can unpin the memory under them.
     // TRAILING ONLY: a slot index is a handle, so removing one from the middle would renumber live ones.
@@ -138,7 +138,7 @@ private:
     [[nodiscard]] bool valid(HostStateSlotHandle handle) const noexcept;
     [[nodiscard]] std::byte* slot_data(std::uint32_t index) const noexcept;
     // Pin one more slot from the shared pool and append it to the free list.
-    [[nodiscard]] bool grow_slot() noexcept;
+    [[nodiscard]] bool grow_slot(bool speculative = false) noexcept;
 
     StateImageHostLayout layout_;
     PinnedHostPool*     pool_ = nullptr;  // non-owning; the program owns the shared budget

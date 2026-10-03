@@ -301,4 +301,125 @@ int main() {
                 "the deepest entry's role must travel with its own position");
     }
     std::cout << "prefix-split aggregation ok\n";
+
+    // WHICH ELEMENT OF THE SELECTION ORDERING DECIDED, PINNED AGAINST `key()` ITSELF.
+    // The subject is the defect in the READING, not in the planner: `longer_lost` compares
+    // `reused_prompt_tokens` ALONE, which is element 10 of a 14-element key, so it fires whenever any of the
+    // ten terms ranked above it differ -- the ORDINARY case -- and a live reading took that for a defect
+    // rate. The helper names the element instead.
+    //
+    // THE FIRST VERSION OF THIS TEST COULD NOT FAIL ON THAT. Its expected values were a hand-written copy
+    // of the indices, and it had no arm combining an UNCARRIED term with a carried one -- which is exactly
+    // the case in which the old six-term helper returned 10, the value its own legend called "the real
+    // defect". A review found both. So every arm below is checked TWO ways: the exact index (the regression
+    // pin, including the mixed arm that failed before), and the DEFINING PROPERTY walked over `key()`
+    // itself -- the answer must be a true difference, and every element before it must be equal.
+    {
+        const auto property_holds = [&](const FoldedCost& a, const FoldedCost& b) {
+            const auto ka = a.key();
+            const auto kb = b.key();
+            constexpr std::size_t count = std::tuple_size_v<decltype(ka)>;
+            const std::uint8_t got      = ninfer::runtime::first_differing_key_element(a, b);
+            if (ka == kb) {
+                require(got == ninfer::runtime::kNoDifferingKeyElement,
+                        "key-equal costs must read as \"no differing element\"");
+                return;
+            }
+            // THE FIRST DIFFERING ELEMENT, DERIVED FROM `key()` -- not from a literal, so a reorder of
+            // `key()` cannot leave this green.
+            std::size_t first = count;
+            const auto note = [&]<std::size_t I>() {
+                if (first == count && std::get<I>(ka) != std::get<I>(kb)) { first = I; }
+            };
+            [&]<std::size_t... I>(std::index_sequence<I...>) { (note.template operator()<I>(), ...); }
+            (std::make_index_sequence<count>{});
+            require(static_cast<std::size_t>(got) == first,
+                    "the attribution must be the FIRST element at which key() differs");
+        };
+        struct Arm {
+            const char*  what;
+            std::uint8_t expected;  // the index `key()` must name for this pair
+            FoldedCost   a;
+            FoldedCost   b;
+        };
+        const Arm arms[] = {
+            {"restorable_evictions (0)", 0U, FoldedCost{.restorable_evictions = 1U}, FoldedCost{}},
+            {"total_ns (1)", 1U, FoldedCost{.total_ns = 7U}, FoldedCost{}},
+            {"affected_selected_hits (2)", 2U, FoldedCost{.affected_selected_hits = 3U}, FoldedCost{}},
+            {"newest_affected_hit_epoch (3) -- UNCARRIED by the old helper",
+             3U, FoldedCost{.newest_affected_hit_epoch = 5U}, FoldedCost{}},
+            {"owner_evictions (4)", 4U, FoldedCost{.owner_evictions = 2U}, FoldedCost{}},
+            {"checkpoint_drops (5)", 5U, FoldedCost{.checkpoint_drops = 9U}, FoldedCost{}},
+            // THE ARM THAT FAILED BEFORE, and the reason this test exists: an uncarried element (6) decides
+            // while reuse ALSO differs. The old helper returned 10 -- "reuse itself decided, the real
+            // defect" -- for a pair that `copy_operations` decided.
+            {"copy_operations (6) DECIDES with reuse also differing",
+             6U, FoldedCost{.copy_operations = 1U, .reused_prompt_tokens = 4U},
+             FoldedCost{.reused_prompt_tokens = 5U}},
+            {"transferred_bytes (7) with reuse also differing",
+             7U, FoldedCost{.transferred_bytes = 1U, .reused_prompt_tokens = 4U},
+             FoldedCost{.reused_prompt_tokens = 5U}},
+            {"remaining_text_prefill (8) with reuse also differing",
+             8U, FoldedCost{.remaining_text_prefill = 1U, .reused_prompt_tokens = 4U},
+             FoldedCost{.reused_prompt_tokens = 5U}},
+            {"remaining_vision_prefill (9)", 9U, FoldedCost{.remaining_vision_prefill = 1U}, FoldedCost{}},
+            {"reused_prompt_tokens (10) alone",
+             10U, FoldedCost{.reused_prompt_tokens = 4U}, FoldedCost{.reused_prompt_tokens = 5U}},
+            // THE ORDINAL TIE-BREAKERS ARE NOW REACHABLE. The old helper could never return 11, 12 or 13,
+            // so "the winner was picked by ENUMERATION ORDER" -- the arbitrary tie-break that would be the
+            // real bug -- was indistinguishable from "an unlooked-at term decided". It is now its own answer.
+            {"candidate_ordinal (12) -- the ENUMERATION-ORDER tie-break", 12U,
+             FoldedCost{.candidate_ordinal = 3U}, FoldedCost{.candidate_ordinal = 4U}},
+        };
+        for (const Arm& arm : arms) {
+            // The arm must actually differ in `key()`, or it measures nothing.
+            require(arm.a.key() != arm.b.key(), arm.what);
+            require(ninfer::runtime::first_differing_key_element(arm.a, arm.b) == arm.expected, arm.what);
+            require(ninfer::runtime::first_differing_key_element(arm.b, arm.a) == arm.expected, arm.what);
+            property_holds(arm.a, arm.b);
+            // THE INVARIANT THAT MAKES A LIVE READING TRUSTWORTHY: element 10 is `max - reused_prompt_tokens`,
+            // so a cost with MORE reuse has a SMALLER key and wins on element 10. A LOSER holding more reuse
+            // therefore lost on one of elements 0..9, and `decided_by == 10` beside a longer loser is
+            // impossible -- if a live reading shows it, the two costs are not the ones the election compared.
+            // The loser is identified by `less()`, NOT by which operand was written first: the first version
+            // of this assertion assumed `a` was the winner and fired on the reuse-only arm, where `a` is the
+            // one that loses -- a test bug that would have looked like a helper bug.
+            const FoldedCost& winner = arm.a.less(arm.b) ? arm.a : arm.b;
+            const FoldedCost& loser  = arm.a.less(arm.b) ? arm.b : arm.a;
+            if (loser.reused_prompt_tokens > winner.reused_prompt_tokens) {
+                require(ninfer::runtime::first_differing_key_element(winner, loser) != 10U,
+                        "a LOSER with more reuse cannot have lost on the reuse element");
+            }
+        }
+        // THE DIRECTION CHECK, and this is the arm for the fault that made pass 1's fix wrong. The seal
+        // fallback seats a plan whose key can be WORSE than a loser's -- a pair the election never ranked --
+        // and `first_differing_key_element` is symmetric, so on that pair it would name an element where the
+        // LOSER was better and present it as the winner's reason. `election_deciding_element` refuses to
+        // name one. A review measured 974 of 977 such inverted pairs yielding `decided_by == 10`, the value
+        // its own legend called impossible.
+        {
+            const FoldedCost real_winner{.total_ns = 5U, .reused_prompt_tokens = 9U};
+            const FoldedCost real_loser{.total_ns = 7U, .reused_prompt_tokens = 4U};
+            require(ninfer::runtime::election_deciding_element(real_winner, real_loser) == 1U,
+                    "a genuine win is attributed to the element that decided it");
+            // THE INVERSION. The "winner" here has MORE restorable evictions, which element 0 prefers FEWER
+            // of, so it does not beat the loser at all -- the shape a fallback cost produces.
+            const FoldedCost seated_by_fallback{.restorable_evictions = 3U};
+            const FoldedCost loser_ahead{.restorable_evictions = 0U};
+            require(!seated_by_fallback.less(loser_ahead), "fixture: the fallback cost really is worse");
+            require(ninfer::runtime::election_deciding_element(seated_by_fallback, loser_ahead) ==
+                        ninfer::runtime::kNotAnElectedWinner,
+                    "an inverted pair must read 254, NOT an element where the loser was better");
+            // And the raw helper WOULD have named one -- which is why the wrapper exists. 0 here is not a
+            // bug in the helper; it is the helper answering the question it is asked.
+            require(ninfer::runtime::first_differing_key_element(seated_by_fallback, loser_ahead) == 0U,
+                    "fixture: the symmetric helper names element 0 for this pair");
+        }
+        // The equal pair: 255, and deliberately the same value as "differs only on an element this cannot
+        // see" is NOT a case any more -- every element is walked, so 255 now means key-equal and nothing else.
+        require(ninfer::runtime::first_differing_key_element(FoldedCost{}, FoldedCost{}) ==
+                    ninfer::runtime::kNoDifferingKeyElement,
+                "identical costs must read 255");
+        std::cout << "selection-term attribution ok\n";
+    }
 }

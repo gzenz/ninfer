@@ -219,12 +219,17 @@ HostStatePool::HostStatePool(StateImageHostLayout layout, PinnedHostPool& pool)
     // FREE. Not `allocate_growing()`: that one pins AND OCCUPIES, so N calls would leave N slots held.
 }
 
-bool HostStatePool::grow_slot() noexcept {
+bool HostStatePool::grow_slot(bool speculative) noexcept {
     if (pool_ == nullptr) {
         ++growth_refusals_;
         return false;
     }
-    auto allocation = pool_->allocate(layout_.image_bytes);
+    // `speculative` IS PART OF THE CONTRACT, not a convenience: the session-start pre-grow reaches the pool
+    // through here, and a pre-grow refusal counted as a REAL allocation failure makes
+    // `host_pinned_allocation_refusals` stop meaning what it says. Measured 2026-10-02: `host_state_pregrow_
+    // refusals` 2195 and `host_pinned_allocation_refusals` 2195 were the SAME events, which had already
+    // produced one false conclusion ("2,195 real refusals") before the two were compared.
+    auto allocation = pool_->allocate(layout_.image_bytes, speculative);
     if (!allocation) {
         ++growth_refusals_;
         return false;
@@ -257,10 +262,10 @@ std::uint32_t HostStatePool::trim_idle_slots(std::uint32_t keep) noexcept {
     return given_back;
 }
 
-std::uint32_t HostStatePool::reserve_slots(std::uint32_t count) noexcept {
+std::uint32_t HostStatePool::reserve_slots(std::uint32_t count, bool speculative) noexcept {
     std::uint32_t created = 0U;
     for (std::uint32_t i = 0; i < count; ++i) {
-        if (!grow_slot()) { break; }
+        if (!grow_slot(speculative)) { break; }
         ++created;
     }
     return created;
@@ -520,8 +525,10 @@ HostStatePreGrow pre_grow_host_state_pool(HostStatePool& pool) noexcept {
     if (capacity == 0U) { return HostStatePreGrow::Disabled; }
     if (pool.occupied() < capacity) { return HostStatePreGrow::NotFull; }
     // ADDS, so the argument is the number of NEW slots and must be 1. See the unit test.
-    return pool.reserve_slots(HOST_STATE_PREGROW_SLOTS) == 0U ? HostStatePreGrow::Refused
-                                                              : HostStatePreGrow::Grew;
+    // SPECULATIVE: this pins before any real demand asked for the room.
+    return pool.reserve_slots(HOST_STATE_PREGROW_SLOTS, /*speculative=*/true) == 0U
+               ? HostStatePreGrow::Refused
+               : HostStatePreGrow::Grew;
 }
 
 } // namespace ninfer::models::qwen3_5

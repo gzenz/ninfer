@@ -417,6 +417,95 @@ public:
                                                                  allocations);
     }
 
+    // SESSION-START PRE-GROW, the KV analogue of `pre_grow_host_state_pool` (`state_image.h:223`).
+    //
+    // WHY IT IS NEEDED, and the record rather than the theory: the state axis has had this since §3 item 6
+    // and it is measured firing (`17 -> 18` slots, `grew=2 refused=0`). The one eviction that load produced
+    // was NOT a state-slot case -- `host_kv=31971999744/32212254720`, 99.3% of host KV, while the state pool
+    // had a free slot. That is the inverse of the shape the state pre-grow addresses, and `plan.md` says so
+    // plainly: "a workload whose constraint is host KV bytes, which growing STATE SLOTS cannot relieve".
+    // This is the missing half.
+    //
+    // THE TRIGGER IS "CANNOT PLACE ONE STEP", deliberately NOT "has no free bytes at all". The conservative
+    // form looks safer and is useless: the eviction above left ~224 MiB free, which is not zero, so a
+    // free-bytes trigger would have declined and left the demote unaffordable -- the very case this change
+    // exists for. The cost of the wider trigger is why the caller COUNTS it: growth is ~1 s/GiB on the
+    // engine thread (the state axis's own measurement), so this can pin 1 GiB on a session that is merely
+    // fragmented, and `host_kv_pregrow_fragmented` records how often the trigger fired while free bytes
+    // were still available -- the number that decides whether the cost is acceptable.
+    enum class HostKVPreGrow : std::uint8_t {
+        Disabled,  // no arena capacity: the tier is off. Fail closed rather than guess.
+        NotFull,   // the arena can already place one step; nothing pinned.
+        Grew,
+        Refused,   // the pool or the host budget said no. Counted by the caller, so it is not silence.
+    };
+
+    [[nodiscard]] static HostKVPreGrow pre_grow(HostKVArena& arena, HostKVExtentStore& store) noexcept {
+        if (arena.capacity_bytes() == 0U) { return HostKVPreGrow::Disabled; }
+        const std::size_t step = arena.span_step_bytes();
+        if (arena.largest_free_run_bytes() >= step) { return HostKVPreGrow::NotFull; }
+        // SPECULATIVE: this pins before any real allocation asked for the room, so its refusal must not
+        // enter the pool's real-failure counters (see `PinnedHostPool::allocate`).
+        if (!arena.grow_bytes(step, /*speculative=*/true) || !store.ensure_capacity_for(arena)) {
+            return HostKVPreGrow::Refused;
+        }
+        return HostKVPreGrow::Grew;
+    }
+
+    // The THREE-VALUED form, so the planner can tell "affordable from pinned memory" from "affordable only
+    // if the arena grows" -- the distinction `pressure.cpp` names as the defect it exists to fix. Same
+    // simulation as the boolean above (the arena owns the walk); this adds the one thing the arena cannot
+    // know: whether the extent tables could DESCRIBE another span.
+    //
+    // THE DESCRIPTOR GUARD IS PURE, so it is a size comparison rather than a call to `ensure_capacity_for`,
+    // which RESERVES (a mutation) and can itself fail on allocation. The tables are pre-sized at
+    // construction from `host_pinned_max_bytes`, so this should not fire in practice -- but without it the
+    // query could promise a span the store cannot describe, and `prepare` would then return nullopt and the
+    // demote would throw `bad_alloc` instead of admitting it could not be done.
+    [[nodiscard]] HostKVFitResult fit_after_page_releases(
+        std::span<const HostKVPageReplicaRelease> releases,
+        std::span<const HostKVPageReplicaRelease> last_reference_releases,
+        std::span<const HostKVAllocationRequest> allocations,
+        std::size_t growth_headroom_bytes) const {
+        begin_release_marks();
+        suballocation_scratch_.clear();
+        const auto append = [&](const HostKVPageReplicaRelease& release) {
+            if (release.pages == nullptr) { return false; }
+            const HostKVPageReplica replica = release.pages->host_replica(release.page);
+            const Extent& extent            = require(replica.extent);
+            if (!extent.allocation) { return false; }
+            suballocation_scratch_.push_back(HostKVSuballocationRelease{
+                .allocation = extent.allocation->handle(),
+                .begin_page = replica.page_offset,
+                .page_count = 1,
+            });
+            return true;
+        };
+        for (const HostKVPageReplicaRelease& release : releases) {
+            if (release.pages == nullptr || !mark_release(*release.pages, release.page, false) ||
+                !append(release)) {
+                return HostKVFitResult{};
+            }
+        }
+        for (const HostKVPageReplicaRelease& release : last_reference_releases) {
+            if (release.pages == nullptr || !mark_release(*release.pages, release.page, true) ||
+                !append(release)) {
+                return HostKVFitResult{};
+            }
+        }
+        HostKVFitResult result = arena_->fit_after_suballocation_releases(
+            suballocation_scratch_, allocations, growth_headroom_bytes);
+        if (result.fit == HostKVFit::Growable && arena_ != nullptr) {
+            const std::size_t with_one_more_span = arena_->capacity_bytes() + arena_->span_step_bytes();
+            if (arena_->descriptor_hint_for(with_one_more_span) > capacity()) {
+                // The tables could not describe the span that the growth would add. Conservative: this
+                // query does not model table growth, so it must not promise the span.
+                result.fit = HostKVFit::Blocked;
+            }
+        }
+        return result;
+    }
+
     [[nodiscard]] bool release_page_replicas(std::span<const HostKVPageReplicaRelease> releases) {
         if (!can_release_page_replicas(releases)) { return false; }
         release_marked_extents();

@@ -70,7 +70,8 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
                    : std::nullopt),
       dflash_host(is_masked_draft_backend(plan.speculative_backend)
                       ? std::make_optional<PinnedHostBuffer>(sizeof(qwen3_5::DFlashDecodeIngress) +
-                                                             sizeof(qwen3_5::DFlashDecodeEgress))
+                                                             sizeof(qwen3_5::DFlashDecodeEgress) +
+                                                             sizeof(qwen3_5::DFlashPrefillIngress))
                       : std::nullopt),
       context_source_ready_(device_in), context_completion_(device_in),
       context_transfer_timers_{CudaEventTimer(device_in, device_in.transfer_stream),
@@ -150,6 +151,12 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         host_memory_budget->set_pinned_bytes(pinned_host_pool->capacity_bytes());
         return host_memory_budget->allow(bytes);
     });
+    // The PURE companion to the policy above, and deliberately a separate hook: the policy answers
+    // "may I grow by `bytes`?" by re-reading /proc/meminfo and mutating the budget's counters, which the
+    // planner cannot do per assessed node. This answers "how much more may be pinned?" from the cached
+    // reading, and is safe to call inside the search. See `set_growth_headroom_query`.
+    pinned_host_pool->set_growth_headroom_query(
+        [this] { return host_memory_budget->max_pinnable(); });
 
     if (plan.context_cache.host_state_slots != 0) {
         const std::uint64_t host_state_bytes =
@@ -326,12 +333,12 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         dflash_host_egress  = reinterpret_cast<qwen3_5::DFlashDecodeEgress*>(
             static_cast<unsigned char*>(dflash_host->data()) +
             sizeof(qwen3_5::DFlashDecodeIngress));
-        *dflash_host_ingress = {};
-        *dflash_host_egress  = {};
-    }
-    if (io.dflash_prefill) {
-        CUDA_CHECK(cudaMemsetAsync(io.dflash_prefill->produced_count.data, 0,
-                                   io.dflash_prefill->produced_count.bytes(), device.stream));
+        *dflash_host_ingress        = {};
+        *dflash_host_egress         = {};
+        dflash_prefill_host_ingress = reinterpret_cast<qwen3_5::DFlashPrefillIngress*>(
+            static_cast<unsigned char*>(dflash_host->data()) +
+            sizeof(qwen3_5::DFlashDecodeIngress) + sizeof(qwen3_5::DFlashDecodeEgress));
+        *dflash_prefill_host_ingress = {};
     }
     CUDA_CHECK(cudaMemsetAsync(io.rope_delta.data, 0, io.rope_delta.bytes(), device.stream));
     if (io.mtp) {
@@ -479,6 +486,7 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
                 state_slot,
                 state_slot,
                 0,
+                0,
                 nullptr};
             mark_workspace_usage(workspace_plan.text_prefill);
             const execution::PrefillChunkResult result = execution::prefill_text_chunk(
@@ -611,10 +619,22 @@ MemorySummary ProgramImpl::memory_summary() const noexcept {
             out.host_pinned_grows          = pinned_host_pool->growth_count();
             out.host_pinned_largest_free_run_bytes =
                 static_cast<std::size_t>(pinned_host_pool->largest_free_run());
+            // GROWTH HEADROOM ONLY -- `max_pinnable()` is `MemAvailable - reserve`, how much MORE could be
+            // pinned, not a capacity total. (This line said "capacity plus what growth could add"; a review
+            // caught it.) It is the figure the planner consults (`pressure.cpp`'s feasibility site) and
+            // therefore the one that makes a "growable" verdict legible from outside, but it is read from a
+            // CACHED reading last refreshed at a pre-grow or a growth, so its age is unrecorded. Without it the tri-state's `Growable` arm can be exercised and still
+            // read 0 in `/stats`, which cannot be told from the query never being wired -- the same
+            // absence-is-not-zero trap the counters beside it were added to close. 0 also means "no query
+            // installed", which is why `host_pinned_grow_refusals`/`last_veto` are read with it.
+            out.host_pinned_growth_headroom_bytes =
+                static_cast<std::size_t>(pinned_host_pool->growth_headroom_bytes());
             out.host_pinned_growth_policy_refusals =
                 pinned_host_pool->growth_policy_refusals();
             out.host_pinned_growth_pin_failures = pinned_host_pool->growth_pin_failures();
             out.host_pinned_allocation_refusals = pinned_host_pool->allocation_refusals();
+            out.host_pinned_allocation_speculative_refusals =
+                pinned_host_pool->allocation_speculative_refusals();
             out.host_pinned_allocation_ram_refusals =
                 pinned_host_pool->allocation_ram_refusals();
             out.host_pinned_allocation_post_grow_failures =
@@ -639,6 +659,15 @@ MemorySummary ProgramImpl::memory_summary() const noexcept {
         out.host_state_pregrow_attempts = host_state_pregrow_attempts_;
         out.host_state_pregrows         = host_state_pregrows_;
         out.host_state_pregrow_refusals = host_state_pregrow_refusals_;
+        out.host_kv_pregrow_attempts    = host_kv_pregrow_attempts_;
+        out.host_kv_pregrows            = host_kv_pregrows_;
+        out.host_kv_pregrow_refusals    = host_kv_pregrow_refusals_;
+        out.host_kv_pregrow_fragmented  = host_kv_pregrow_fragmented_;
+        out.host_kv_fit_growable        = host_kv_fit_growable_;
+        out.host_kv_blocked_checks      = host_kv_blocked_checks_;
+        out.host_kv_blocked_max_bytes   = host_kv_blocked_max_bytes_;
+        out.host_kv_fit_pinned          = host_kv_fit_pinned_;
+        out.host_kv_fit_blocked         = host_kv_fit_blocked_;
     }
     if (host_kv_arena) {
         out.host_kv_capacity_bytes = host_kv_arena->capacity_bytes();

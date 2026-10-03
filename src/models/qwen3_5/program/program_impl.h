@@ -654,10 +654,40 @@ public:
     [[nodiscard]] std::uint64_t evictions_with_victim_room() const noexcept {
         return evictions_with_victim_room_;
     }
+    [[nodiscard]] std::uint64_t evictions_demote_possible() const noexcept {
+        return evictions_demote_possible_;
+    }
     [[nodiscard]] std::uint64_t demotable_eviction_checks() const noexcept {
         return demotable_eviction_checks_;
     }
     [[nodiscard]] std::uint64_t pressure_options() const noexcept { return pressure_options_; }
+    // THE PRESERVATION PROBE'S EXONERATING HALF. See the site: an owner whose `pressure_successors` came
+    // back EMPTY had no non-evicting option, so destroying its checkpoint was unavoidable. Reported with its
+    // denominator, because "no owner lacked a non-evicting option" and "no owner was examined" are the same
+    // reading otherwise.
+    void note_pressure_successor_outcome(bool nonevicting_available) noexcept {
+        ++pressure_successor_calls_;
+        if (nonevicting_available) { ++pressure_successors_with_option_; }
+    }
+    [[nodiscard]] std::uint64_t pressure_successor_calls() const noexcept {
+        return pressure_successor_calls_;
+    }
+    [[nodiscard]] std::uint64_t pressure_successors_with_option() const noexcept {
+        return pressure_successors_with_option_;
+    }
+    [[nodiscard]] std::uint64_t demote_option_refused_no_state_deficit() const noexcept {
+        return demote_option_refused_no_state_deficit_;
+    }
+    [[nodiscard]] std::uint64_t demote_option_refused_precondition() const noexcept {
+        return demote_option_refused_precondition_;
+    }
+    [[nodiscard]] std::uint64_t options_refused_no_kv() const noexcept { return options_refused_no_kv_; }
+    [[nodiscard]] std::uint64_t options_refused_active_lanes() const noexcept {
+        return options_refused_active_lanes_;
+    }
+    [[nodiscard]] std::uint64_t options_refused_evicting_current() const noexcept {
+        return options_refused_evicting_current_;
+    }
     [[nodiscard]] std::uint64_t demote_options() const noexcept { return demote_options_; }
     // The private catalog's TWO readings, kept apart because they answer different questions. `losses` is
     // the event -- a request where the cell alone made a better-reusing candidate unadoptable -- and is what
@@ -718,6 +748,7 @@ public:
         return publication_goal_blocked_other_;
     }
     void add_publication_cell_probes(std::uint64_t count) noexcept { publication_cell_probes_ += count; }
+
     [[nodiscard]] detail::PhysicalResources admission_capacity() const noexcept;
     [[nodiscard]] bool isolated_request_feasible(const RequestBasePlan& base) const noexcept;
 
@@ -812,8 +843,9 @@ public:
     qwen3_5::MtpDecodeIngress* mtp_host_ingress = nullptr;
     qwen3_5::MtpDecodeEgress* mtp_host_egress   = nullptr;
     std::optional<PinnedHostBuffer> dflash_host;
-    qwen3_5::DFlashDecodeIngress* dflash_host_ingress = nullptr;
-    qwen3_5::DFlashDecodeEgress* dflash_host_egress   = nullptr;
+    qwen3_5::DFlashDecodeIngress* dflash_host_ingress          = nullptr;
+    qwen3_5::DFlashDecodeEgress* dflash_host_egress            = nullptr;
+    qwen3_5::DFlashPrefillIngress* dflash_prefill_host_ingress = nullptr;
 
     std::size_t workspace_logical_peak_bytes = 0;
     std::size_t vision_handoff_peak_bytes    = 0;
@@ -1091,6 +1123,8 @@ private:
     // slots would have fit in the room left -- i.e. the pool-level `demotable` flag was right about room in
     // the way that matters for THIS victim. The KV half stays pool-level; see the site's comment.
     std::uint64_t evictions_with_victim_room_             = 0;
+    // The #6 population: victim_room AND demote_possible. The conjunction, not either half.
+    std::uint64_t evictions_demote_possible_              = 0;
     // Every eviction the check above ran for -- the denominator. Without it a zero numerator cannot be
     // told from a gate that never had a chance to be true.
     std::uint64_t demotable_eviction_checks_             = 0;
@@ -1103,11 +1137,28 @@ private:
     // there is no concurrent increment.
     mutable std::uint64_t pressure_options_              = 0;
     mutable std::uint64_t demote_options_                = 0;
+    // The three refusal clauses of `inspect_pressure_option`, counted apart because they want different
+    // fixes. **CORRECTED 2026-10-02: this line said "83% of restorable-checkpoint evictions never assessed a
+    // preserving alternative", which is FALSE and was read off two instances whose counters were transposed
+    // by the 2026-10-01 argument-order defect. Over 1044 evicting records, NOT ONE has
+    // `preserving_alternatives_assessed == 0` (min 65). Preserving targets ARE assessed; see the site.
+    mutable std::uint64_t options_refused_no_kv_             = 0;
+    // Why the state-side demote option died. `no_state_deficit` is the axis choice; `precondition` is
+    // "no demote existed", where the eviction is correct.
+    mutable std::uint64_t demote_option_refused_no_state_deficit_ = 0;
+    // The preservation probe: how often an owner had a non-evicting successor at all, over how often the
+    // question was asked. `calls - with_option` is the population where the eviction was UNAVOIDABLE.
+    mutable std::uint64_t pressure_successor_calls_       = 0;
+    mutable std::uint64_t pressure_successors_with_option_ = 0;
+    mutable std::uint64_t demote_option_refused_precondition_     = 0;
+    mutable std::uint64_t options_refused_active_lanes_      = 0;
+    mutable std::uint64_t options_refused_evicting_current_  = 0;
     // #6's other half, as a LOSS rather than a probe count: a request whose winning plan reused strictly
     // fewer tokens than a candidate that the publication cell alone had made unadoptable. See the
     // RuntimeStats field for why the probe count beside it must never be presented as this number.
     std::uint64_t publication_cell_losses_               = 0;
     std::uint64_t publication_cell_probes_               = 0;
+
     std::uint64_t publication_cell_at_risk_              = 0;
     std::uint64_t publication_cell_at_risk_runs_         = 0;
     std::uint64_t publication_cell_veto_goals_           = 0;
@@ -1274,12 +1325,42 @@ private:
     // item 6). Called once per planning session -- never per search node, where pinning would be a side
     // effect inside the cost model's loop.
     void ensure_host_state_headroom() noexcept;
+    // The KV analogue, from the same place and for the same reason -- see the note in `host_kv_store.h`.
+    // The state pre-grow is measured firing and could not convert the one eviction this workload produced,
+    // because that one was bound by host KV BYTES rather than state slots.
+    void ensure_host_kv_headroom() noexcept;
     // "the pool was full at planning and we asked it to grow" vs "it grew": two counters because a refusal
     // and a success look identical from outside, and because a growth that never happens must be
     // distinguishable from one that happens constantly.
     std::uint64_t host_state_pregrow_attempts_  = 0;
     std::uint64_t host_state_pregrows_          = 0;
     std::uint64_t host_state_pregrow_refusals_  = 0;
+    // Same three, for the KV axis. `fragmented` is the FOURTH and it is the measurement, not a failure --
+    // and NOT a refusal either: it counts the pre-grows that FIRED on fragmentation (the arena held free
+    // bytes but no single step-sized run), incremented inside the `Grew` case beside `pregrows_`
+    // (`storage/context.cpp:1789`). This comment said the trigger "declines to grow", which is the exact
+    // inverse and matched the journal label it was read beside (`fragmented_skipped`, since renamed to
+    // `fragmented_triggered`). It measures how often growth was triggered by fragmentation rather than
+    // exhaustion -- 1 GiB spans at ~1 s each -- which is what says whether the pre-grow is affordable.
+    std::uint64_t host_kv_pregrow_attempts_      = 0;
+    std::uint64_t host_kv_pregrows_              = 0;
+    std::uint64_t host_kv_pregrow_refusals_      = 0;
+    std::uint64_t host_kv_pregrow_fragmented_    = 0;
+    // ASSESSED SEARCH NODES -- NOT planning runs -- where a KV demote read as blocked from pinned capacity
+    // but the PURE fit query says the reported growth headroom would have covered it. The unit matters
+    // because the increment is inside `compose_pressure_candidate` (`planning/pressure.cpp:2338`), which
+    // `pressure_planner` calls once per assessed search NODE (`:1144`/`:1154`), so one run can add
+    // thousands; this said "PLANNING RUNS" until a review checked the call sites. What it still measures is
+    // the thing the fix's acceptance rests on -- "the pre-grow already made this affordable" (0) versus "a
+    // demote was one growth away and we evicted instead" (non-zero) -- but 0 now means "no NODE saw one",
+    // which is weaker than "no session had one", and must not be quoted as the latter.
+    std::uint64_t host_kv_fit_growable_          = 0;
+    // The DENOMINATOR and the other two verdicts. See the site: `fit_growable == 0` conflated "the failure
+    // path is never reached" with "every failing node was Blocked".
+    std::uint64_t host_kv_blocked_checks_        = 0;
+    std::uint64_t host_kv_blocked_max_bytes_     = 0;
+    std::uint64_t host_kv_fit_pinned_            = 0;
+    std::uint64_t host_kv_fit_blocked_           = 0;
     [[nodiscard]] StateImageHandle
     selected_state(const SequenceState& sequence, ReusePath reuse,
                    std::optional<runtime::CheckpointRef> checkpoint) const;

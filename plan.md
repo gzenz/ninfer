@@ -142,7 +142,7 @@ wedge; when it says `#13`, the accounting underflow.
 | #1 | `#14` | the wedge's admission symptom (throw → stall → now grace + refusal) |
 | #9 | `#14` / `#9` | the wedge's **cause**: recovery leaves unowned occupancy |
 | #10 | `#14` | the wedge's stage two: feasibility vs non-evictable occupancy |
-| #2 | `#13` | the accounting underflow (instrumented, awaiting an occurrence) |
+| #2 | `#13` | the accounting underflow — **OCCURRED 2026-10-02 12:06:42; axis and call site named, §2 item 4** |
 | #3 | `#15` | the D2 sibling defects (both closed) |
 | #7 | `#12` | the Swift-1.5 move |
 | #6 | — | W2/W5 residuals (the demote-for-evict-only counter) |
@@ -291,6 +291,44 @@ the record of what was done and in what order, and rewriting its ids to a single
 account of the sequence. Read them as local history, not as remote refs.
 
 `git log --oneline eb975b80` on this host still resolves every one of them.
+
+### 1h. HISTORY WAS COLLAPSED AGAIN FOR PR #13 (2026-10-01)
+
+Same mechanical reason as §1f, and the same convention: **`gzenz/ninfer` master is behind, so any PR from this
+tree carries the whole delta, and the operator's choice is to send it as ONE commit.**
+
+- **Branch** `engine/host-pool-and-planner-instruments`, squashed vs `fork/master` (`f8761347`), single commit
+  **`87e9f589`**, pushed to `gzenz/ninfer`.
+- **PR #13** -> `gzenz:master`, 485 files, +25,366/-17,054. **MERGED 2026-10-01 as `bba15b95`, THEN REWRITTEN the
+  same evening to `d088828d`** (see the mapping note below). **Against the FORK, not upstream** — the operator's
+  standing instruction, now written into `CLAUDE.md`, because the two upstream PRs (#64, #65) were closed
+  unmerged and every PR that has landed here went to the fork.
+- **The mapping is the identity over a range:** every local id from `f8761347` (exclusive) to `489b6c29` (the
+  tip of `master` when the branch was cut) collapses into `87e9f589`. The branch was rebuilt once, after a
+  `CLAUDE.md` rule was added, so an earlier push of `c0e94c73` is superseded by `87e9f589`.
+- **The squash changes history, not content, and that was CHECKED rather than assumed:**
+  `git diff --name-only 87e9f589 master` prints nothing. The branch's tree is byte-identical to the tree the
+  five review passes and the 8-agent soak were run against.
+- **Composition, because a reviewer would otherwise misread it:** of the 23 absorbed commits, **17 are
+  UPSTREAM's own** (the ops template unification, the KDA paths, the docs completion rules, the CUDA-sync
+  default) — they are in the delta only because the fork's master predates them. Six are local. The PR body
+  says so at the top.
+
+**THE MERGE COMMIT'S MESSAGE WAS REWRITTEN, AND THE MAPPING IS:**
+`87e9f589` (squashed, wordy) -> **`4e124b81`** (same tree, delivery-focused message), and `bba15b95` (the merge)
+-> **`d088828d`**. Both old ids are now UNREACHABLE on the fork; `git log --oneline` on this host still resolves
+them. The tree is unchanged and that was CHECKED, not assumed: `87e9f589^{tree} == bba15b95^{tree} ==
+d088828d^{tree} == ab5cd95b76ca216885b33266ab5b24599080bfa1`, the tree the five review passes and the 8-agent
+soak ran against.
+**Why it was rewritten, because the trigger is a rule now:** the squashed commit's message still opened with the
+squash and the upstream/local composition -- the meta the operator rejected in the PR description (see
+`CLAUDE.md`). Rewriting the PR description with `gh pr edit` had changed only the PR's title and body, NOT the
+commit message: they are separate artifacts, and the commit message is what lands in history. **The exposure was
+checked before force-pushing** (the merge was two minutes old, `git ls-remote` showed nothing else tracking
+`master`) and the force-push was `--force-with-lease`.
+
+**So ids cited in this file below `489b6c29` do not exist on the fork's remote**, and a message citing one
+will not resolve for a reader there. `git log --oneline 489b6c29` on this host still resolves every one.
 
 ### 1g. 2026-10-01 (late) — the client-compatibility pass, and a regression that is probably the harness
 
@@ -722,6 +760,855 @@ workload's prompts were too short.
 is RUNNING is `tools/monitor/monitor.py` (it reads the current `engine_timing.queue_wait_seconds`; the
 `~/ninfer-monitor/` copy is a stale leftover that reads a path abandoned in 2026-09-21, and my notes pointed
 me at it), and my first proc-outlier table mixed rows from an instance five hours old.
+
+## 2026-10-02 — `blocked_host_allocation_bytes` exported, and the destroy channel that no eviction counter counts
+
+**THE EXPORT.** The pinned-capacity feasibility veto has recorded its shortfall per candidate since the
+tri-state change, but the figure could not be read per candidate: it lives on the model-side
+`AdmissionCandidateImpl` (`program_impl.h:215`) while the row is built on the runtime side by
+`finalize_selection`, whose enclosing `candidates` span is not in scope. It now crosses the seam the way
+`election_best_` does -- `AdmissionCandidate::blocked_host_allocation_bytes()` (declared `program.h`,
+defined in `program.cpp` because the impl type is incomplete in the header), read into a
+`record_election_shortfall` call at the same three sites `election_best_` is filled, carried in
+`election_shortfall_`, and emitted on the request log's materialization rows
+(`request_log.cpp:388`). **The WINNER's value is 0 by construction** (it passed the test), so the number is
+only ever meaningful on a candidate the veto refused -- do not read a row's 0 as "nothing was vetoed".
+Two compile faults found on the way, both real and both worth the note: the first replacement still named
+`candidates` (the parameter genuinely is not in scope there), and the planner is a template whose own test
+fake (`FakeAdmissionCandidate`, `tests/test_resource_manager.cpp:328`) must satisfy the seam -- it now does.
+Host suites at baseline: `ninfer_resource_manager_test` `51 run, 1 failed` (the recorded `guided deep
+retention`), `ninfer_materialization_budget_test` ok. **DEPLOYED AND READ LIVE (2026-10-02, dev time):**
+QA rebuilt and restarted, `running == built` (`352ca325c1638caf`), `find src include apps -newer
+build/apps/ninfer-serve` empty, sentinel re-armed and active, health 200; the running exe carries the key
+(`grep -ac` -> 3) and a smoke request's record shows `materialization.candidates[0].
+blocked_host_allocation_bytes = 0` -- the winner's, 0 by construction. The field is PER CANDIDATE ROW
+(`materialization.candidates[i]`), not a top-level key: a check that looks for it at the materialization
+block's top level will report it absent on a working build.
+
+**THE OTHER CHANNEL, AND A CLAIM OF MINE THAT WAS WRONG.** The question was "a destroyed checkpoint that no
+eviction counter sees". **The channel is `sibling_candidates`** (`resource_manager.h:602`): a private source
+whose own endpoint lies BEYOND this request's prompt, so consuming it (`retain=false` -> plan `Replace`)
+destroys an endpoint this request can never reach. It is NOT uncounted -- it has its own counter, exported
+on the same materialization block -- but it is invisible to every eviction counter, which is exactly the
+claim.
+
+**I first reported this as "consumption destroys 6.6x more endpoints than eviction" (13,067 vs 1,990).
+That was wrong twice, and the correction matters more than the number.** (a) `consumed_sources` is the
+ORDINARY turn path -- `retain` is false exactly when the entry IS this request's own session's, so the plan
+is `Replace` and the endpoint is replaced by this request's own new one. Destroyed and immediately
+re-established is not a loss. (b) The two figures came from mismatched populations (a window vs a whole
+log, across a log that spans 843 server starts and at least two materialization schemas). Measured
+apples-to-apples over the **11,406 records that carry the field** (91 server instances; 27 of them have
+zero siblings):
+
+| counter | total | what it is |
+|---|---|---|
+| `sibling_candidates` | **2,766** (1,842 rows, 0.243/req) | endpoint destroyed with no replacement by this request |
+| `chosen_restorable_evictions` | 4,282 | the #6 channel |
+| `consumed_sources` | 22,322 | ordinary turn consume -- endpoint REPLACED, not lost |
+| `retained_sources` | 11,688 | source kept |
+
+So the sibling channel is **0.65x the eviction channel**, not 6.6x of it.
+
+**What the sibling population looks like, and why it does NOT yet read as a large loss.** By
+`prefix_reuse_path`, the 1,842 sibling rows land on `private_response_replay` 642, `private_long_anchor`
+402, `private_endpoint` 321, `root` 245, `shared_stable_prefix` 122, `private_turn_closure` 110 -- i.e.
+sibling rows are on average HIGH-reuse rows. The documented mechanism says the cost lands on the NEXT turn
+(the sibling takes the endpoint and the real continuation falls back to the shared marker), not on the
+sibling row itself, so this distribution neither confirms nor refutes the loss.
+
+**The mechanism's own prediction IS testable on existing data, and it comes out WEAK.** The join key is
+already in the record -- `request.session_key` (`request_log.cpp:225`, emitted by `request_json`, which
+`format_request_done_json` calls) -- so a session's turns can be ordered and each turn's reuse compared to
+its own session's best-so-far. Over the same 11,406 records (777 sessions, 354 with >1 row), counting a
+"sharp regression" as a reuse below 60% of the session's running best once that best reached 2,000 tokens:
+
+| turn preceded by | sharp regressions | turns | rate |
+|---|---|---|---|
+| a sibling-consuming row | 209 | 833 | **25.1%** |
+| a non-sibling row | 626 | 3,232 | **19.4%** |
+
+Relative risk **1.30x**. That is the direction the mechanism predicts and it is NOT nothing -- but it is an
+**observational, confounded** comparison (a sibling row is itself a marker of a busy/concurrent session, and
+a regression has many other causes: evictions, catalog loss, the ceiling pin), and the 60%/best-so-far
+threshold is a heuristic, not a measurement. **It does not establish the loss; it declines to refute it.**
+**The behaviour is OFF by default** (`NINFER_SIBLING_RETAIN` unset, `resource_manager.h:603`), so all 2,766
+are consumes, and the decisive reading remains the A/B that turns it on and drives the same workload under
+the same conditions -- which has not been run. **It also needs a workload that PRODUCES siblings on the
+isolated port** (`tools/load/prod-load.py` drives seeded sessions with no agentic shape, and a load at
+`:8080` shares QA's traffic, so neither can carry a reuse verdict); nothing in the suite is known to
+generate them, so the A/B needs either a new e2e phase or the operator's agentic load with the sink port
+checked first.
+
+## 2026-10-02 (later) — the sibling capture probe: the condition is CAPTURED, the LOSS does not reproduce
+
+**`tools/e2e/sibling-probe.py`** (new) drives the sibling shape through `/v1/messages` and reads the
+request log back per turn. The shape comes from the source comment's own words, "the same prompt plus a
+small delta": a session's key is `derive_session_key` (`request.h:153`) = system text + the FIRST user
+message, so two requests share a session key -- and so count as "the same session" for the `retain` test --
+while their tails differ, and a request whose prompt is the session's own conversation plus a small delta
+gets `retain=false` and replaces an endpoint it does not reach.
+
+**THREE INSTRUMENT DEFECTS, each of which made the probe measure nothing while looking like a result:**
+1. **Ordinal matching.** The first version took the first three `request_done` records as its three turns
+   and reported a clean reading -- on QA, where a foreign record landed first and every row was attributed
+   to the wrong turn. Fixed by matching each turn on its own `prompt_tokens` in a window opened before the
+   post.
+2. **`usage.input_tokens` is not the prompt size.** On a cache hit it is only the UNCACHED REMAINDER:
+   measured, a turn whose record read `prompt_tokens=15472` returned `input_tokens=1,
+   cache_read_input_tokens=15471`. The first run of the fixed version therefore found nothing at all --
+   its own earlier run had warmed the cache. Fixed by reconstructing the total.
+3. **A thinking-only answer renders as no text.** `max_tokens=2500` came back with 2500 thinking tokens and
+   an empty text block, so turn 1's answer was `""`, turn 3's prompt never reached the frontier, and the
+   probe read a healthy reuse for a reason unrelated to the sibling. Fixed with `thinking:{"type":
+   "disabled"}` on turn 1 and the length demand moved from the system prompt into the turn (a system-level
+   "write several hundred words" produced a THREE-token answer, leaving F ten tokens above the sibling's
+   prompt -- a precondition that held by accident).
+
+4. **The ARM ITSELF was broken in the OFF direction, by me.** `ninfer-start-test.sh` builds one `env`
+   command for the branch-anchor and sibling-retain arms, and the first version appended `-u
+   NINFER_SIBLING_RETAIN` AFTER `NINFER_BRANCH_ANCHOR=…`. GNU `env` stops option parsing at the first
+   `NAME=VALUE`, so `-u` became the COMMAND to run: the test server never started and the swap died with
+   `FATAL: e2e server did not come up` after six minutes -- in the OFF arm, the one whose entire job is to
+   be the control. Unserts are now collected separately and emitted FIRST (`env "${UNSETS[@]}"
+   "${SETS[@]}"`), and the composition was proved for both arms WITH the variable inherited as `1`, which
+   is QA's own state. It failed loudly, which is the only reason it cost six minutes rather than a
+   conclusion.
+
+**THE PROBE NOW CHECKS ITS OWN PRECONDITIONS and voids the reading when they fail** -- `t2.prompt < F`
+(the endpoint frontier, estimated as t1 prompt + completion) and `t3.prompt >= F`. Both are reported
+alongside the numbers rather than assumed, because a probe that silently measures nothing is this repo's
+recorded failure mode.
+
+**THE CONTROLLED A/B (2026-10-02, two swaps on the isolated :8085, same shape, same 32k profile, same
+fresh server; only the arm differs -- and the arm is read back from the server's own `/proc/<pid>/environ`
+rather than trusted from the caller's label):**
+
+| arm | server env | sibling turn (t2) | turn 3 reuse | path |
+|---|---|---|---|---|
+| OFF | `NINFER_SIBLING_RETAIN` absent | `consumed=1, retained=0` | `hit=15500` | `private_long_anchor` |
+| ON | `NINFER_SIBLING_RETAIN=1` | `consumed=0, retained=1` | `hit=15500` | `private_long_anchor` |
+
+**The arm works; it recovers NOTHING -- AND "RECOVERS NOTHING" IS NOT A RESULT, which a review caught.**
+The sibling's decision flips exactly as designed. But turn 3's reuse is identical to the token because, as
+the next sentence says, **the endpoint was never on turn 3's route in EITHER arm** (both reused only 15500,
+turn 1's prompt length, not F = 17265/16963). **A probe cannot observe a recovery on a path it never
+exercised**, so "the arm recovers nothing" states a null from a construction that could not have produced a
+non-null. What IS established is narrower: the arm mechanism works, and this shape does not put the
+endpoint on the next turn's route. Whether retaining recovers anything is UNTESTED.
+
+**RESULT (validated, run repeatedly on QA; QA's own traffic is a smoke bed, NOT the measurement):** the
+CAPTURE fires every time -- `sibling_candidates > 0` on the sibling turn, and it is common in real
+traffic (2,766 over 11,406 records). **The LOSS does not reproduce in the sequential shape, and that is a
+negative result with a stated reason:** turn 3 reuses ~99.8% of its prompt (`hit=16945/16971`,
+`17123/17149`) in every construction tried, including the one where the sibling's prompt contains turn 1's
+prompt as a strict prefix. A sibling that REPLACES the tail instead of extending it cannot even reach the
+endpoint's entry -- its prompt falls below turn 1's own prefix, so it resumes a shallower anchor and
+destroys the wrong thing. **The documented case is CONCURRENT** -- the source comment's own numbers are
+that 196 of 218 such requests arrived BEFORE the request they extend finished -- and a sequential probe
+cannot produce that. So the capture is established and the loss is not; the decisive test needs a
+concurrent sibling, which is a change to the probe, not a re-run.
+
+## 2026-10-02 (later still) — the `reuse-paths` FAIL is the ORDERING WORKING, and the population it exposes is 116 `root` rows
+
+**The flagged record, read in full** (20:00:00, `path=private_long_anchor`, prompt 19675, hit 16580,
+`decided_by=1`): the winner reused 16580 and the best eligible alternative 18171, and the winner was
+**cheaper by 1.15 s** (104.49 s vs 105.64 s) with **2 fewer `checkpoint_drops`** (4 vs 6) and equal
+`restorable_evictions` (1). Key element 1 is `total_ns` and element 10 is reuse, so the ordering bought 2
+fewer dropped checkpoints for 1591 tokens -- **which is what the ordering says to do**. `total_ns` is
+104.5 s of which `now` is 1.55 s and **`future_loss` is 102.9 s (98.5%)**.
+
+**THE DECISIVE TEST, AND IT FALSIFIES THE PHASE'S VERDICT.** The phase fails on any eligible alternative
+with more reuse. The correct test for a SELECTION defect is **Pareto domination**: a loser that reuses
+more AND is no worse on `restorable_evictions`, `total_ns` and `checkpoint_drops` -- which the ordering
+must never reject. Over the **145 records carrying `longer_lost_eligible`** (every server instance, all
+paths): **0 dominate.** The three nominal hits are sentinel rows (`total_ns=1`, reuse > 2^32) whose only
+difference is THREE tokens. So no candidate anywhere lost a comparison it should have won; the phase is
+measuring the ordering's own rule, not a defect.
+
+**Why they lost, per record:** `decided_by=1` (`total_ns`) in **112** of 145, `decided_by=0`
+(`restorable_evictions`, i.e. the #6 ruling) in **33**. Tokens sacrificed: median **14**, p90 **16,177**,
+max 50,657 -- and the winner was cheaper by a **median 10.0 s** against the alternative it passed over.
+
+**THE POPULATION THAT MATTERS IS NOT THE ANCHOR.** By reuse path the 145 split
+`root` **116**, `private_long_anchor` 18 (9 by cost, 9 by preservation), `shared_stable_prefix` 8,
+`private_endpoint` 3. **116 requests took `root` -- ZERO reuse -- while an eligible alternative reused a
+median ~16k tokens**, and the model priced that as ~10 s cheaper. That is the operator's original
+complaint ("massive anchor-not-used issues", "throwing away caches although we have cache space") and it
+is three orders of magnitude larger than the anchor row the phase flags.
+
+**The next target is therefore `future_loss_ns`, not the anchor.** It decides 112 of 145 and it is 98.5%
+of the quantity doing the deciding, and it has never been validated -- while the term beside it, `now`, is
+measurably overpredicted (this record: `predicted_now` 1.55 s against an actual `prefill` of 0.598 s,
+2.6x; the plan's standing figure is 2.7x). Whether these 116 `root` rows are the model being right or the
+model throwing caches away is **exactly the open claim about `future_loss`**, and nothing here settles it.
+
+## 2026-10-02 — the `reuse-paths` yardstick is now a DOMINATION TEST, and it fires on 2 records
+
+**THE CHANGE (approved by the operator).** `phase_reuse_paths` no longer fails on "an anchor request reused
+less than an eligible alternative" -- measured, that is the ORDERING WORKING, not a defect (0 of 145
+records dominate; see the section above). It now fails only when the elected plan is **Pareto-dominated**
+by an eligible candidate: the loser reused MORE and was no worse on `restorable_evictions`, `total_ns` and
+`checkpoint_drops`. That is a fault under ANY policy, including the #6 ruling, so the gate can still fail
+on a real inversion while no longer firing on healthy traffic. The old count is kept as a **PASS** line
+with its `decided_by` split (0 = restorable_evictions, 1 = total_ns), so the reading is preserved rather
+than deleted. Rows now carry `cand[]` (the per-candidate evidence) because no scalar pair can express
+domination; unassessed placeholder rows (`total_ns` 0/1 beside absurd reuse) are excluded.
+
+**VALIDATED:** the phase was driven twice over the full request log through a direct import and returned
+**byte-identical verdicts** -- and it FIRES, which is the control that matters.
+
+**IT FIRES ON 2 RECORDS, AND THEY ARE UNATTRIBUTED.**
+- `13:15:44` (`root`, prompt 12018): winner `reuse=0, total_ns=7.85e9, restorable_evictions=1`; a dominator
+  `reuse=3, total_ns=5.05e9, restorable_evictions=0`.
+- `13:16:00` (`root`, prompt 15324): winner `reuse=0, total_ns=17.41e9, restorable_evictions=3,
+  checkpoint_drops=6`; dominators `reuse=577, total_ns=14.06e9, restorable_evictions=1` and
+  `reuse=577, total_ns=6.53e9, restorable_evictions=0`.
+Both have `budget_exhausted=True`, `stop_reason=time_budget`, `search_boundary_limited=True`, and
+`selected_maximal_fallback=False` -- so NOT the seal fallback. **On its face the second is the #6 ruling
+violated outright** (element 0 is `restorable_evictions` and the winner has 3 against a dominator's 0).
+
+**WHY IT IS NOT YET A FINDING.** The election is `becomes_incumbent = goal && cost.less(incumbent.cost)`
+(`materialization_planner.h:570`) and costs only ever DECREASE, so a candidate with a strictly lower `key()`
+cannot be seated over once it has been assessed -- which means the recorded row is **not the cost the
+election compared**, and `election_best_` is filled from the identity fold as well as from `assess_target`
+(the identity fold is "the only cost this candidate has until it is assessed"). Which of those two a given
+row holds is not determinable from the record. **Resolving it needs the planner's own `ASSESS` lines**
+(`NINFER_MAT_DEBUG=1`, which prints `phys/now/fut/total/reused_tok` and `incumbent_now` per assessment) on
+a run that reproduces the shape -- not more log archaeology. Recorded here as an OPEN CLAIM: the gate is
+live and this is what it caught, and the two rows are not yet attributable to the engine or to the
+instrument.
+
+## 2026-10-02 — the MAT_DEBUG run: the shape did not reproduce, and the log cannot attribute
+
+**WHAT WAS RUN.** Two isolated-port runs with `NINFER_MAT_DEBUG=1` and a new focused driver
+(`tools/e2e/matdebug-driver.py`, so a slice of the suite runs without the 14-phase cost and perturbation):
+phase 1 (pressure), then phases 2-3 (mixed, trash). **330k `IDENT`/`ASSESS` lines.** No domination in
+either (0 of 132 records). Phase 3 reported `evicted=0` on the current build where the 13:10 run recorded
+`evicted=7` and `evicted=4` -- consistent with the demote-gate fix, and it is why the shape moved.
+
+**THE GATE'S OBSERVED RATE, WHICH IS THE USEFUL PART -- AND THESE NUMBERS MOVE, WHICH IS WHY A REVIEW
+COULD NOT REPRODUCE THEM.** `~/ninfer-requests.jsonl` is append-only and LIVE, so every count over it is a
+count at a MOMENT, and the figures below were taken at ~22:00 while the reviewer read a longer file. The
+predicate was also unstated. Restated with both: **predicate = a `request_done` record having any candidate
+row with `restorable_evictions > 0`**; at 22:00 that was **1,440 records, 2 dominated (0.14%)**, both from
+the 13:10 run (a superseded binary); **0 of 314** since 17:00; re-measured at 23:15 the same predicate gives
+**1,497 and 371** with the same 2 dominations. The rate is what is stable; the denominators are not. And a positive check that came out of the cross-tab: **every candidate row carrying a
+nonzero `total_ns` has `goals > 0` -- 2,174 of 2,174.** **I claimed that refuted the identity-fold
+hypothesis; IT DOES NOT (review, 2026-10-02).** `goals` counts successful goal probes from EVERY site
+including the identity site (`resource_manager.h:2688`), and an entry exists only when a goal succeeded --
+so an identity fold CAN carry a cost, and 191 cost-bearing rows sit in `no_pressure` records where no
+pressure assessment happened. The identity-fold hypothesis is **not refuted**; it is also not established.
+**The 2,174 was taken over the LAST 400 records only and the window was not stated**, which is why the
+reviewer's whole-log count did not match it (15,003 by its predicate; 15,680 re-measured at 23:15 over the
+whole live log). The cross-tab is over `done[-400:]` and the claim holds within that window.
+
+**WHY THE LOG CANNOT SETTLE IT, stated so nobody repeats the attempt.** The `[mat-debug]` lines carry **no
+request id**, and the e2e **reuses prompt sizes** (its sessions repeat turn sizes), so a block keyed by
+prompt size contains SEVERAL passes -- verified: one such block held three `IDENT` values repeating
+(`702192877, 697397012, 800628987`). Any "the recorded total appears among that request's assessments"
+therefore proves nothing. Attribution needs the debug lines to carry the request id, which is an
+instrument change, not an analysis.
+
+**A LEADING EXPLANATION I PROPOSED, AND WHICH A REVIEW PASS FALSIFIED.** I argued the seated/elected
+asymmetry in `finalize_selection` explained both hits. **It cannot.** `incumbent.cost` changes only in the
+`!sealed` fallback, which sets `root_maximal` -- the same thing that feeds `selected_maximal_fallback` --
+and **both hits have `selected_maximal_fallback=False`**, so seated EQUALS elected on them. My sentence
+"`selected_maximal_fallback=False` does not exclude a seal-time re-plan" is false. `seated_differs` is
+therefore a narrower copy of the fallback flag, and its 0 across a soak where all 153 records have
+`fallback=False` carries NO information. **The 2 hits are again unexplained** -- not attributed to the
+engine, not exonerated, and no longer with an instrument explanation either.
+
+## 2026-10-02 — the gate now compares ELECTED against ELECTED (the winner's seated cost is exported beside it)
+
+**THE ASYMMETRY, FIXED AT THE SOURCE.** `finalize_selection` fills every loser's row from its
+`elected_cost` and the WINNER's from its `seated_cost` -- deliberately, so the winner's row describes the
+plan that ran. A re-derivation of the election that compares those two is comparing different quantities,
+and that was the leading explanation for the 2 domination hits. The winner's elected terms are now recorded
+BESIDE the seated ones: `ElectionTerm`/`MaterializationCandidate` carry `seated_differs` plus
+`elected_reuse`, `elected_restorable_evictions`, `elected_total_ns`, `elected_checkpoint_drops` (filled at
+the winner's index from `elected_cost`, emitted on the request log beside the row). `elected_*` is
+meaningful where `seated_differs` is true; elsewhere the row's own fields already ARE the elected ones.
+
+**THE GATE READS THE WINNER THROUGH `elected_*` AND EVERY LOSER THROUGH ITS OWN FIELDS.** A record written
+before this field exists returns `None` and is counted **`unattributable`**, reported on EVERY branch -- a
+missing field read as an elected cost of zero would be a winner that can never be dominated, which is the
+silent-nothing failure this repo keeps recording. Measured: **`unattributable=11680`** over the whole
+request log (every pre-split record), so the 2 historical hits **cannot be re-tested** and must be
+re-observed on a build carrying the field.
+
+**VALIDATED, IN BOTH DIRECTIONS.** (1) The phase driven twice over the full log returns **identical**
+verdicts: `PASS`, with the `decided_by` split `{1: 9, 0: 9}` preserved. (2) A **mutation test**: a synthetic
+record whose winner is dominated on the ELECTED terms FAILs, and the same shape with the loser's cost
+raised PASSes -- so the gate can still fail, which is the control the first version never had. (3) Host
+suites at baseline (`ninfer_resource_manager_test` `51 run, 1 failed` = the recorded `guided deep
+retention`). (4) DEPLOYED AND READ LIVE: `running == built` (`32f70df17ad18ebc`), freshness empty, sentinel
+re-armed, health 200, and a smoke request's winner row shows `seated_differs=False` with
+`elected_total_ns == total_ns` (126448497) -- the two agree exactly where no seal changed the plan.
+
+## 2026-10-02 — the 8-agent soak on `32f70df17ad18ebc`: GREEN, with two negatives that have denominators
+
+**THE REGRESSION GATE PASSED.** Operator's 8-agent agentic load at QA, `tools/ops/ninfer-watch.sh` armed for
+the window, tree frozen and proven (`running == built` = `32f70df17ad18ebc`, `find src include apps -newer
+build/apps/ninfer-serve` empty). **What must be absent, with counts, from TWO independent sources** (the
+watcher's full-fidelity log, 1,614 lines, and the raw journal for the same window, 1,965 lines -- the
+window is populated, so the zeros are real and not an empty read):
+
+| token | hits |
+|---|---|
+| `WORKER OOM` / `WORKER CRASH` / `WORKER RECOVER` | 0 / 0 / 0 |
+| `CUDA error`, `cudaError`, `bad_alloc`, `terminate called`, `Assertion`, `Segmentation`, `core dumped` | 0 |
+| `WEDGE` | 0 — and **no unit restart**: 0 `Started`/`Stopped` lines, the sentinel spoke nothing, and QA is still on the SAME pid and exe |
+| HTTP 500 | 0 |
+| `admission stalled` / `admission rejected` | 0 / 0 |
+| `subtraction underflow`, `non-strict release REFUSED`, `checkpoint StateImage INCOMPLETE`, `recycled-checkpoint` | 0 |
+| `post-recovery residual` | none at all (no stop in the window, so no shutdown residual) |
+| health transitions | one `no-reading -> 200` (the watcher's first poll), none after — no `200 -> 000` |
+
+**THE CHANGE UNDER TEST -- AND `blocked_host_allocation_bytes` IS AN INSTRUMENT THAT CANNOT FIRE.
+FINDING #1 OF THE REVIEW, CONFIRMED BY ME TWICE OVER.** I wrote that its 0 across the soak was a negative
+with a denominator. **It is not a measurement at all:**
+* The veto writes the shortfall at `pressure.cpp:2375` on `details.` -- the COMPOSED copy. Every caller
+  passes a copy (`pressure.cpp:2019` `AdmissionCandidate copy(...*admission.impl_)`;
+  `pressure_planner.cpp:1156`, `:1166`).
+* `record_election_shortfall` reads `candidates[index].candidate->blocked_host_allocation_bytes()`, the
+  ORIGINAL admission candidate -- whose field is 0 whenever any composition ran on it, because
+  `compose_pressure_candidate` THROWS if its input is already non-zero (`pressure.cpp:2042`).
+* The value lives at `pressure_planner.cpp:1173` (`projected->blocked_host_allocation_bytes`), on a copy
+  the planner keeps (`composed.emplace`) -- NOT on the candidate the row is built from.
+  **A SECOND PASS CORRECTED THIS ONE:** I wrote that "the composition that vetoes returns `nullopt`"
+  (`pressure.cpp:2021`), and **that is false** -- `compose_pressure_candidate` returns TRUE with the field
+  set (`:2381-2412`); it is `seal_materialization` that returns `nullopt` (`:2030-2034`), and the planner
+  DOES read the vetoed value per node (`pressure_planner.cpp:1176`, `:1185`). So a per-candidate figure was
+  obtainable at the assessment site and "cannot be per-candidate" overstated the case. The removal of the
+  ROW field is still right -- the row is built from the original candidate, not the composed copy -- but the
+  reason as originally written was not.
+* Request log: 2,339 rows carry the field across 11 instances, **0 non-zero**.
+So the soak's 0 is this repo's recorded failure mode -- an instrument measuring nothing, presented as a
+clean negative -- and my "both now have a denominator" sentence was exactly that error. **The field must be
+recorded where the composed copy lives (the assessment site) or as a request-level diagnostic; until then
+nothing may be concluded from its 0.** A host-only test that composes a candidate the pinned check vetoes
+and asserts a non-zero row FAILS on today's code, which is the proof.
+
+**`seated_differs` likewise carries no information** (see the falsified explanation above): it is a
+narrower copy of the fallback flag, and every one of the 153 records on this instance has `fallback=False`.
+
+**The request count I quoted was wrong too:** "1,831 requests" is not in the log -- the soak window has
+**105 `request_done` records**; the 582 candidate rows do match.
+
+**WHAT THIS SOAK DOES NOT ESTABLISH (review, 2026-10-02).** (a) "It is why the shape moved" -- the phase-3
+`evicted` 7 -> 0 is a reading from two different BINARIES and two different runs, not a control; the
+demote-gate restore means the comparison is void anyway. (b) **"#6 is pre-existing, not a regression" has
+no control** -- it is reasoning from "tonight's diffs are inert", and the demote-gate restore makes one of
+them a real behaviour change, so the statement must be re-derived, not asserted. (c) The soak verdict does
+not mention that **the 12:06:42 accounting underflow (a `WORKER RECOVER` plus 2 HTTP 500s) happened under
+THIS SAME 8-agent load on an earlier build of this tree**, so "soak green" without it overstates the record.
+
+**#6 OCCURRED DURING THE SOAK, 8 TIMES.** `owners_evicted_total` 1 -> 66, `private_evictions_demotable`
+0 -> 53, `evictions_with_victim_room` 0 -> 48, **`evictions_demote_possible` 0 -> 8** (the conjunction
+`victim_room && demote_possible`, which IS the #6 count). The alert stream's 8 eviction lines at 22:22:28
+are **NOT** the same events, which I claimed and a review refuted: they are the rate limit's FIRST EIGHT
+(`checked=1..8`), and only 2 of them carry `demote_possible=1`, while the counter moved by 8. All are
+`demotable=1 victim_room=1` at `host_state_slots` 58->37 of 62, with
+`demote_refusal` splitting 2 `none` / 6 `already-on-host` (the six destroy the HOST copy, which is why
+their `demote_possible=0` is defensible). **This is pre-existing engine behaviour, not a regression from
+tonight** — tonight's engine diffs are the two exports plus the elected/seated split, all behaviourally
+inert.
+
+**THE SUCCESSOR RATE: 19.9%, AND IT HAS NO COMPARABLE PRIOR -- CORRECTED, the operator says this was the
+STANDARD load.** `successors_with_option` / `successor_calls` over the soak is **1,711,811 / 8,594,494 =
+19.9%**. I first offered "the heavier load" as the explanation and then checked; it is wrong twice over:
+
+* The pre-soak CUMULATIVE 60.6% (715,010 / 1,180,802) is **not a baseline for the standard load** --
+  **but NOT for the reason I first wrote.** I said it contained tonight's e2e and MAT_DEBUG runs; a review
+  falsified that: QA's process started 21:59:21 and the arithmetic matches that ONE process (1,180,802 +
+  8,594,494 ~= 9,775,944), while the e2e and debug servers were separate processes on `:8085`. The real
+  reason is that it is QA's own idle/classifier traffic from the 20 minutes before the soak -- a different
+  population from the 8-agent load, not a superset of it.
+* The earlier "18% -> 39%" comparison is ALSO uncontrolled, and **the plan says so in the line that
+  recorded it**: "the two windows are NOT comparable (different load durations and traffic)". So 39% was
+  never a standard-load figure either.
+
+**Therefore the soak's 19.9% is the ONLY figure here taken on the standard load with a current binary, and
+there is no prior to set it against.** That is a sharper and less comfortable statement than the one I
+first wrote: the reason this cannot be compared is not the workload, it is that nobody has measured this
+rate on a controlled window of the standard load. Until one exists, **the soak neither confirms nor
+contradicts the gate fix**, and the 8-agent load is the natural place to take that reading -- one sample
+now, one after the next load, same binary.
+
+## 2026-10-02 — the review pass, triaged: three gate/arm defects fixed, the demote gate RESTORED, the dead field removed
+
+**VERDICT: NOT FIT TO COMMIT.** Four load-bearing findings. Fixed and mutation-verified the same night:
+
+* **The arm rename broke the anchor gate (mine).** `ninfer-start-test.sh` emitted `ARM_CHILD=` while
+  `ninfer-e2e.py:1557` still parsed `ANCHOR_CHILD=`, so `anchor_expected` was ALWAYS `None` and "the anchor
+  is ON and not being taken" could never FAIL. The count line is restored beside the arm line; the arm line
+  is a LIST and `!= "0"` would have been wrong even had the name matched.
+* **A domination was masked by the reuse path.** `if not anchor:` was tested before `elif dom:`, so a
+  domination on any other path returned a WARN -- and **both historical hits are on `root`**. `dom` is now
+  checked FIRST.
+* **The gate could pass silently.** `unattributable` printed in the detail and gated NOTHING; `total_ns <= 1`
+  placeholders were not excluded (only `> 0`); and it compared THREE terms, so a loser tying on elements 0-1
+  and worse on `owner_evictions` (element 4) read as a domination when it is a legitimate election. All
+  three fixed, and the winner's ELECTED elements 2 and 4 are now exported so all six terms can be compared.
+  Six mutation cases verified: control PASS; dominated-on-`root` FAIL; winner-without-elected FAIL;
+  `ns=1` placeholder skipped; worse-`owner_evictions` PASS; two-winners FAIL.
+* **`blocked_host_allocation_bytes` COULD NEVER BE NON-ZERO, and the soak's 0 was read as a result.** The
+  veto writes it on the COMPOSED copy (`pressure.cpp:2375`; every caller passes a copy) while the row read
+  the ORIGINAL (`compose_pressure_candidate` throws if its input is already non-zero, `:2042`), so no row
+  carries it. **A THIRD PASS FOUND THIS SENTENCE STILL FALSE:** I wrote "a vetoed composition returns
+  `nullopt` (`:2021`)" and that was never true -- `compose_pressure_candidate` returns TRUE with the field
+  set (`:2381-2412`); only `seal_materialization` returns `nullopt` (`:2030-2034`). 2,339 rows carried it, 0
+  non-zero. **REMOVED** -- from `ElectionTerm`, `MaterializationCandidate`, `election_shortfall_`,
+  `record_election_shortfall` and the request log -- because a field that cannot fire is worse than no
+  field: it invites exactly the misreading it produced. Replaced by **`memory.host_kv_blocked_max_bytes`**,
+  the magnitude of the largest veto, set at the ONE site where it exists and exported beside its
+  denominator `host_kv_blocked_checks`. Live reading after the deploy: both 0 with the denominator VISIBLE,
+  so the 0 says "the path never ran on this fresh process" rather than "nothing was vetoed".
+
+**THE DEMOTE GATE IS RESTORED, because the argument for removing it was wrong about its own condition.**
+`requested_host_bytes` IS `deficit.host.kv_bytes` (`pressure.cpp:602`) -- the host-KV DEFICIT -- so on a
+host WITH ROOM it is 0, `host_bytes_remaining` starts at 0, and the old gate ALREADY ran the pass. What the
+condition excludes is demoting into a host SHORT OF BYTES, which is a statement about the machine after
+all. So removing it was a no-op on the case it claimed to fix, it had no test, and the evidence cuts against
+it (the demote-to-evict ratio HALVED, 155->29 against 49->18) while the plan called the suppression
+ESTABLISHED from a window it also called not comparable. The restored gate carries that reasoning in its own
+comment so the next reader does not remove it again.
+
+**STILL OPEN FROM THE PASS:** the KV pre-grow inflates the pool's refusal/fragmentation counters (#5); and
+the reviewer could not reproduce several plan denominators (1,440 / 314 / 2,174), which the plan does not
+define -- what does reproduce is exactly 2 dominated records, both at 13:15-13:16, and 0 since 17:00.
+
+## 2026-10-02 — review #5: the pre-grow's refusals are now counted separately from real ones
+
+**THE DEFECT.** `pre_grow` -> `arena.grow_bytes(step)` -> `grow_span` -> `pool_->allocate`, so a SPECULATIVE
+pre-grow entered the pool's real-failure counters: `allocation_refusals_`, `allocation_ram_refusals_`, and
+`allocation_fragmented_misses_` whenever the pool held >= the requested bytes free. Measured on QA: 106
+refusals, 106 RAM refusals, 132 fragmented misses, **against `pregrows = 0`** -- so every one of them was a
+pre-grow that had pinned nothing, and the counters had stopped meaning "the pool failed to serve a real
+demand". A reader asking that question got a yes that meant nothing.
+
+**THE FIX: one flag, threaded, not a second code path.** `PinnedHostPool::allocate(bytes, bool speculative
+= false)` does the same work and returns the same answers; only the accounting differs. A speculative
+refusal increments a new `allocation_speculative_refusals_` and returns, and a speculative attempt does NOT
+enter `allocation_fragmented_misses_` -- that counter exists to prove a REAL allocation failed while free
+bytes sufficed, and a pre-grow is not one. Threaded `grow_span(bytes, speculative)` ->
+`grow_bytes(bytes, speculative)` -> the single speculative caller
+(`HostKVExtentStore::pre_grow`, `host_kv_store.h:447`). Exported as
+`memory.host_pinned_allocation_speculative_refusals`, BESIDE the real counters rather than merged into them,
+so both questions stay answerable.
+
+**VERIFIED BY A DIFFERENCE-ASSERTING TEST** (`tests/test_pinned_host_pool.cpp`,
+`test_speculative_refusals_are_separate`): with pins forced to fail, a speculative allocation leaves
+`allocation_refusals()` at 0 and moves the speculative counter to 1; the CONTROL -- an ordinary allocation
+under the same refusal -- moves `allocation_refusals()` to 1 and `allocation_ram_refusals()` to 1. One
+counter cannot be 0 and 1 at the same point, so the test discriminates rather than merely passing.
+Host suites at baseline. Deployed: `running == built` (`6f934ec6abde532e`), freshness empty, sentinel
+active, health 200. Live reading on the fresh process: refusals 0, speculative refusals 0, `pregrows` 0,
+and **`fragmented_misses` 1 with zero refusals** -- the real signal, visible on its own.
+
+**STILL NOT MEASURED (the reviewer called this PLAUSIBLE and it stands):** whether the pre-grow's own
+trigger, below the cap, pins ~1 GiB per fragmented planning session and ratchets toward `max_bytes` on a
+host with a recorded shmem-OOM risk. The separated counters are what would now measure it.
+
+## 2026-10-02 (late) — the first FULLY GREEN e2e (43 PASS / 14 WARN / 0 FAIL), and the arm marker's second defect
+
+**THE RUN.** Full suite on the tree carrying the review fixes, `tools/e2e/e2e-swap.sh` uncapped in the
+background: **`PASS: 43 PASS, 14 WARN, 0 FAIL`**, `rc=0` (the previous runs were `41 PASS / 15 WARN /
+2 FAIL`). Both former FAILs are gone:
+* `[demotion]` no longer reports `pages demoted to host but never restored`; it now PASSes
+  `demote/restore exercised (spill=860 h2d=1235 pages)` and `0 cold-starts` (that FAIL was the intermittent
+  #13 one).
+* **`[reuse-paths] PASS` -- the fixed gate's first run on real data**, and it reads exactly as designed:
+  `dominated=0`, **`unattributable=0`** (the new schema is live and complete, so the gate was reading every
+  row rather than passing on data it could not parse), and
+  `anchor_lost_to_eligible_alternative=1 by_decided_by={1: 1}` -- one anchor request reused less, decided by
+  `total_ns`, i.e. **the ordering working**, which is precisely what used to be reported as a FAIL. `n=290
+  anchor_records=13`. A real inversion would still FAIL (mutation-verified), so the gate discriminates.
+
+**THE ARM MARKER HAD A SECOND DEFECT, WHICH THE FIRST FIX DID NOT CURE.** I restored `ANCHOR_CHILD=` beside
+`ARM_CHILD=` inside the `bash -c`, and **neither line has ever appeared in a serve log** -- verified:
+`grep -c ANCHOR_CHILD ~/ninfer-serve.log` is 0 after a full swap, while `NINFER_EXIT=` on the same `>>`
+mechanism DOES land. **A PASS-4 CORRECTION: I wrote that "the difference is the command substitution", and
+that was WRONG** -- the cause is O_TRUNC vs O_APPEND (the child was started with a plain redirect, so writes
+while it streamed were overwritten; `NINFER_EXIT=` survived only because nothing writes after it). The
+substitution was a red herring that the two lines' TIMING suggested and their MECHANISM did not support.
+So the parser fix was necessary and not sufficient:
+`anchor_expected` would still have been None. Both markers are now emitted from the OUTER script -- it polls
+the pid file the child writes before it waits, reads that process's environ, and appends to the same `$LOG`
+the phase opens (`args.serve_log`). **Validated in isolation** against a live process (`ANCHOR_CHILD=1`,
+`ARM_CHILD=NINFER_BRANCH_ANCHOR=1`); it lands in a serve log only on the NEXT run, which is the confirmation
+to look for. The branches it feeds were not taken in this run (`anchor_records=13`), so no verdict above
+depends on it.
+
+## 2026-10-03 — the acceptance e2e on `7313086e40ef2c48`: 42 PASS / 15 WARN / 1 FAIL, and the arm marker LANDS
+
+**THE RUN.** Full suite, `tools/e2e/e2e-swap.sh` uncapped in the background, on the tree carrying the third
+pass's fixes. **`42 PASS, 15 WARN, 1 FAIL`**, `rc=1`, QA restored and verified (`running == built`,
+sentinel active, health 200).
+
+**THE ONE FAIL IS THE KNOWN INTERMITTENT ONE.** `[demotion] FAIL: pages demoted to host but never
+restored` -- the #13 accounting underflow (task #2, in progress), which appeared in 2 of the 6 runs before
+this one and is recorded rather than re-diagnosed here. **It is not new and not attributable to tonight.**
+
+**`[reuse-paths] PASS`, and the third pass's cold predicate runs clean on real data:** `dominated=0`,
+**`unattributable=0`**, `no_candidates=0`, with `anchor_lost_to_eligible_alternative=3 by_decided_by={1: 2,
+0: 1}` -- every one a term that outranks reuse (the cost model twice, the #6 ruling once), which is the
+ordering working. `n=290 anchor_records=25`.
+
+**THE ARM MARKER LANDED, FOR THE FIRST TIME EVER.** `grep -c ANCHOR_CHILD ~/ninfer-serve.log` = 1 and
+`ARM_CHILD=NINFER_BRANCH_ANCHOR=1`. Before tonight that line had NEVER appeared in a serve log, which is
+exactly why `anchor_expected` was always `None` and the "anchor is ON and not taken" FAIL branch was
+unreachable. Cause, CONFIRMED with a toy run twice each way: the child's log was opened O_TRUNC and NOT
+O_APPEND (`TRUNC marker=0/0`, `APPEND marker=1/1`), so an append made while the server streamed was
+overwritten; `NINFER_EXIT=` survived only because nothing writes after it. My first diagnosis -- the
+command substitution -- was wrong. **THE OFF ARM HAS SINCE BEEN RUN (2026-10-03 10:22, this line was
+stale):** `E2E_ANCHOR_OFF=1` wrote `ANCHOR_CHILD=0` and an empty `ARM_CHILD=`, and the phase then printed the
+anchor-OFF WARN. **But pass 4 showed that run CANNOT DISCRIMINATE:** phase 1 takes ZERO anchors in the ON arm
+too (`reuse paths {'?': 38, 'root': 4, 'private_endpoint': 28}`), so "that is the control working" would have
+printed either way -- and with no branch for "OFF arm but the anchor was taken", an OFF run whose disable did
+not take effect read PASS (measured: the ON window against the real OFF serve log gave PASS, twice). **That
+branch is now added and verified: the same pairing FAILs.** What the OFF swap actually proves is the
+ENVIRONMENT side -- the child's environ carries no `NINFER_BRANCH_ANCHOR` -- not the gate's two directions.
+
+**A TRAP I WALKED INTO MYSELF, and the shape of it is worth recording:** the launch command carried
+`find src include apps -newer build/apps/ninfer-serve` as its freshness check, so the literal
+`build/apps/ninfer-serve` sat on the command line, the swap's own `pkill -f` matched it, and my shell died
+with `exit 144` and no output. CLAUDE.md records this exact string doing this three times before. The swap
+itself survived and restored QA, as documented. **The lesson is not "avoid pkill" -- it is that the
+freshness check cannot share a command line with the swap; the two must be separate invocations.**
+
+## 2026-10-03 — soak #3 on `7313086e40ef2c48`: GREEN, and the separation VERIFIED the way the pass specified
+
+**⚠ CORRECTED BY PASS 4 -- MY ABSENCE CLAIM WAS FALSE AND THE WAY I MADE IT IS THE POINT.** I wrote "every
+token in the alert set is 0 in BOTH". It is not: **`private victim evicted: demotable=1` is IN the alert set
+(`ninfer-watch.awk:34`) and it fired SEVEN TIMES IN EACH SOURCE.** I had checked a hand-written token list --
+the one CLAUDE.md carries -- instead of deriving the set from `ninfer-watch.awk`, which that same file says
+is "the only specification of it, because one already drifted". **I reproduced the exact drift the rule
+exists to prevent, and it made me report an absence the logs contradict.**
+
+**What IS absent, two sources** (watcher log 2,298 lines; journal since 10:29, 2,730 lines -- window
+populated, so the zeros are real), checked against the awk's own set: `WORKER OOM/CRASH/RECOVER`, `CUDA
+error`, `bad_alloc`, `WEDGE`, **no unit restart**, **0 HTTP 5xx**. `evictions_demote_possible` +11, `owners_evicted_total` +72, `private_evictions_demotable`
++52, `evictions_with_victim_room` +41 -- the same order as soak #2. **The evictions: ONE batch of SEVEN at
+10:37:13, which I reported as "two batches, 14 lines" because I read the SAME events out of two sources and
+counted them twice.** The truth is **6 `already-on-host` + 1 `invalid-handle`, all `demote_possible=0`**.
+"Rate-limited to the first 8 per window" is wrong too -- the limit is **per process**
+(`demotable_eviction_checks_`), and **45 of the 53 eviction checks were never printed**. The batch also misses
+an eighth line at 10:36:01: `demotable=0 ... host_state_slots=110/110 ... demote_refusal=no-host-capacity`
+-- the one eviction of the window at full host capacity, i.e. the one that is NOT demotable.
+
+**THE SEPARATION, VERIFIED EXACTLY AS THE THIRD PASS SPECIFIED:**
+
+```
+host_state_pregrow_refusals                   0 -> 1282
+host_pinned_allocation_speculative_refusals   0 -> 1282   <- TRACKS it, exactly
+host_pinned_allocation_refusals               0 ->    0   <- FLAT, as required
+host_pinned_allocation_ram_refusals           0 ->    0   <- FLAT
+host_pinned_allocation_fragmented_misses      1 ->    1   <- unmoved
+```
+
+**1282 pre-grow refusals produced ZERO real allocation failures.** Before the fix those 1282 would have
+landed in `allocation_refusals` and `fragmented_misses` -- which is exactly the false "2,195 real
+refusals" reading recorded above, reproduced here as a controlled positive. This is the first load in
+which the two could be told apart, and they diverge.
+**`host_pinned_grow_refusals` reads 1282 -- still conflated**, precisely as the `types.h` warning added
+after the last pass says it is; that warning is now measured rather than predicted.
+
+## 2026-10-03 — pass 4: three load-bearing holes, ALL in my own tests and harness, and my soak entry was FALSE
+
+**VERDICT: not fit.** Pass 4 found **nothing wrong in the engine changes under review** -- the speculative
+threading through `pinned_host_pool`, `state_image` and `host_kv_arena` is sound. All three load-bearing
+findings are controls that cannot fail, which is the shape this repo's rules call load-bearing. Each fix is
+under 15 lines in `tests/` or `tools/e2e/`, so **the soak does not need re-running** (rule 5).
+
+**L1 -- NOTHING TESTED THE REVERSE DIRECTION, and the soak's reading depends on it.** Two mutants
+(`allocate_growing` and `reserve_slots` passing `true`) turned DEMAND refusals into speculative ones and
+passed every check the state fixture had. Under either, `host_pinned_allocation_refusals` would read 0 under
+real failure -- the instrument-measuring-nothing shape again. **Fixed:** the fixture now pins the demand path
+in both places and asserts the reverse. **Verified by those same two mutants: both now FAIL**
+(`and a DEMAND refusal through allocate_growing IS counted as real`, `a DEMAND refusal through reserve_slots
+moves the REAL counter`), original passes.
+
+**L2 -- `[reuse-paths]` still passed silently on a PARTIAL export.** Removing every loser, or just the
+`eligible` field, gave PASS twice on both windows: `resource_manager.h:2863` merges the election only when
+`index < election.size()`, so a short array leaves losers ineligible and the scan skips them. **Fixed** with a
+cross-check: if the record claims an eligible loser and no row backs it, the row is unattributable.
+**Verified on pass 4's fixtures: `on.winneronly` and `on.noelig` now FAIL, the real `on.jsonl` still PASSes**
+-- no false-FAIL on real data.
+
+**L3 -- THE OFF ARM COULD NOT FAIL, AND MY OFF RUN COULD NOT DISCRIMINATE.** No branch handled "OFF arm and
+the anchor was taken", so an OFF run whose disable did not take effect read PASS (measured: the ON window
+against the real OFF serve log, PASS twice). And phase 1 takes **zero** anchors in the ON arm too, so my OFF
+run's "control working" line would have printed either way -- it proves the ENVIRONMENT (the child's environ
+has no `NINFER_BRANCH_ANCHOR`), not the gate. **Fixed:** the branch is added and **verified -- the same
+pairing now FAILs.** **So the "verified in both directions" I reported was a claim about the MARKER.**
+
+**MY SOAK #3 ENTRY STATED AN ABSENCE THE LOGS CONTRADICT, and how I made the error is the point.** I wrote
+"every token in the alert set is 0 in BOTH". **`private victim evicted: demotable=1` IS in the alert set
+(`ninfer-watch.awk:34`) and fired SEVEN TIMES IN EACH SOURCE.** I had checked a hand-written token list --
+the one CLAUDE.md carries -- instead of deriving the set from the awk, which that same file says is "the only
+specification of it, because one already drifted". **I reproduced the exact drift the rule exists to
+prevent.** Also corrected there: the "two eviction batches, 14 lines" was ONE batch of seven counted twice
+across two sources; the rate limit is per PROCESS, not per window, and **45 of the 53 eviction checks were
+never printed**; and the batch missed an eighth line at 10:36:01 (`demotable=0 ... 110/110 ...
+demote_refusal=no-host-capacity`).
+
+**ALSO CORRECTED IN PLACE:** the "#13 known intermittent" framing of the demotion FAIL (its mechanism is not
+supported by this run -- 0 lines for the confirming tokens; **same symptom, cause unattributed**); the
+superseded "command substitution" cause, which still stood in the harness comment and in this file; the
+"~20% ... read twice and it does not move" paragraph, which the third sample falsified; the record saying the
+OFF arm was unrun; the "all six terms above reuse" wording (the key has TEN above reuse and five are
+exported, so the predicate is **sufficient, not necessary** -- the tie limitation is now recorded in the code
+rather than only here); the false "root, hit=0 by construction" claim (root rows WITH candidates exist); and
+the growth-side warning, which sat only at a counter that read 0 -- it is now at the two that read 1282.
+
+**RECORDED OPEN, at pass 4's direction:** the domination predicate's tie false-FAIL (it can only false-FAIL,
+never pass silently; `dominated=0` on all four real windows), and D8 -- two misplaced comments
+(`pinned_host_pool.h`, a test inserted between another test's comment and its function).
+
+## 2026-10-03 — the FULL ctest suite (which passes 3 and 4 both listed as unchecked): 134/136, 2 PRE-EXISTING
+
+**Why this run matters:** passes 3 and 4 both recorded "did not run full ctest" as a blind spot, and the
+host suites I had been running are a chosen subset. Full `ctest -j2`: **99% passed, 2 failed of 136**,
+377 s.
+
+| test | status | attribution |
+|---|---|---|
+| `ninfer_resource_manager_test` | Failed | **the recorded baseline** -- `51 run, 1 failed`, the pre-existing `guided deep retention` |
+| `ninfer_serve_options_test` | Failed | **PRE-EXISTING, not tonight's** -- see below |
+| 7 `*_real_test` targets | **Skipped** | GPU-gated: `loading/prefix/score/vision_workspace/dflash2/moe/dflash`. **The GPU surface is NOT covered by this run** |
+
+**`ninfer_serve_options_test` -- ATTRIBUTED BY SOURCE PROVENANCE, not by assumption.** It fails two
+assertions: `--default-thinking-budget 0` is ACCEPTED (the test requires `std::invalid_argument`), and
+`serve_usage_text` omits `--vision-cpu` (the flag IS parsed -- `apps/cli/options.cpp` has it -- but the help
+text does not list it). **`apps/` is unmodified in this tree**, so the built code IS HEAD's code, and no file
+I changed produces option parsing or usage text (my only serve edits are `request_log.cpp` and
+`stats_json.cpp`). **So the failure exists at HEAD.** Recorded as a pre-existing defect with two open
+questions of its own: should zero be rejected, and why is a parsed flag missing from serve help. **I did NOT
+prove it by rebuilding at HEAD** -- the provenance argument is what supports it, and that is stated rather
+than dressed up as a reproduction.
+
+**What the run establishes for tonight: 134 of 136 green, and the two failures are explainable without
+tonight's diff** -- so the four passes' fixes broke nothing across the whole host suite, which is a wider
+statement than the subset I had been running.
+
+## 2026-10-03 — the GPU-gated tests through `ninfer-gpu-window.sh`: 4 PASS, 3 not runnable here
+
+**Closes the GPU blind spot the full ctest left** (7 targets skipped). Run one window at a time --
+stop QA, whole GPU, restore, verify -- with `NINFER_TEST_ARTIFACT` set to the **v3** prod artifact
+(`/home/zenz/ninfer-models/swift15/qwen3_8_27b_nvfp4swift15.ninfer`, 21.2 GiB).
+
+| target | rc | reading |
+|---|---|---|
+| `prefix_real_test` | **0** | `ok`; `post-recovery residual (fail-all)` all-zero = a clean shutdown, not a recovery |
+| `score_real_test` | **0** | `OK causal_score_real` |
+| `vision_workspace_test` | **0** | `Vision workspace remains bounded for long text context` |
+| `dflash2_real_test` | **0** | `ok K=15 B=8 graph=1 optimized=1 accepted=21/23 state_d2h=0 state_h2d=0` |
+| `dflash_real_test` | 134 | `Qwen3.5 config: missing component dflash` -- needs a plain-dflash artifact; this one has **dflash2** |
+| `moe_real_test` | 1 | `35B Engine construction has an invalid load summary` -- needs the **35B-A3B** artifact, absent on this host |
+| `loading_real_test` | 77 | `SKIP: supply an explicit --artifact` -- takes a CLI argument; the window runner passes none |
+
+**The last three are ARTIFACT/RUNNER GAPS, not code results** -- not green and not failures; they cannot be
+evaluated here as things stand. **4 of the 7 GPU integration tests pass on tonight's build**, which is what
+the GPU surface can say.
+
+**AN ERROR OF MINE, worth the line:** the first attempt handed all seven the **v2** artifact
+(`/home/zenz/ninfer-models/qwen3_8_27b_nvfp4_NInfer/qwen3_8_27b_nvfp4.ninfer`) because its NAME matched the
+README's example, and the engine refused it every time -- `NInfer v2 artifact is not supported. Upgrade to
+v3 with: python3 tools/upgrade_ninfer_v2_to_v3.py`. **Seven windows and seven QA stop/restores spent on a
+filename.** The runner restored QA cleanly in all thirteen cycles across both attempts
+(`health=200 ninfer=active sentinel=active`), so the cost was time and not state -- but the lesson is the
+one this repo keeps teaching: the name is not the artifact, the version is.
+
+## 2026-10-03 — COMMITTED: `717b8ef4`, and what it does NOT carry
+
+**`fix(engine,e2e): instruments that could not fire, and the demote gate restored`** -- 37 files,
++4388/-123, local only (no push, no PR; those are separate instructions). It carries: the removal of the
+per-candidate veto field that could never fire and its replacement by `host_kv_blocked_max_bytes`; the
+speculative/demand separation for the pinned pool on BOTH pre-grow axes with its difference-asserting tests;
+the restored demote gate; the elected/seated export; the `phase_reuse_paths` domination verdict with the
+cold, partial-export and OFF-arm controls; the arm-marker O_TRUNC fix; the two new tools; and this record.
+It leaves the Sep-era `results/*.json` untracked -- those are earlier sessions' evidence and do not belong
+in this commit.
+
+**⚠ NOT CONVERGED BY A PASS, AND THAT IS RECORDED RATHER THAN GLOSSED.** The fourth pass returned THREE
+load-bearing findings; all three were fixed and each verified with mutants -- and **no review pass has seen
+those fixes.** Every pass so far (four of four) found real defects in work the previous pass had passed,
+including in fixes made in response to its own findings, so this is the exact class of change that has never
+come through clean unreviewed. Asked explicitly, the operator directed the commit anyway. **The commit body
+says so, and this line says so.** A fifth pass is still owed before a push.
+
+**Also carried into the commit knowingly:** the tie false-FAIL in the domination predicate (it can only
+false-FAIL, never pass silently; `dominated=0` on all four real windows) and two misplaced comments (D8).
+**And the tree now builds `afb51eb2`** -- a comment-only `types.h` edit landed after the soak, so the soak's
+green result strictly applies to `7313086e`, the binary it actually ran on.
+
+## 2026-10-03 — the upstream integration: a merge that dropped six local features, caught by pass 5, redone as a true three-way
+
+**THE FAILED MERGE.** The branch `fix/instruments-and-demote-gate` was re-based onto upstream by merging
+`origin/master` (39 commits) and re-squashing. The merge resolved 37 conflicts by classifying each file with
+a **hand-written token list** -- `resource_census|host_kv_blocked|elected_|speculative_refusal|...` -- and
+taking every non-matching file WHOLESALE from upstream. That is not a merge; it is an overwrite of every
+local hunk the list did not happen to name. **Six local features were silently dropped:**
+
+| feature | what it does | fork/master | after the bad merge |
+|---|---|---|---|
+| `rope_scaling_factor` assignment | **YaRN context extension** -- nothing wrote it, so `ProgramImpl` always got 1.0 while the CLI still accepted `--rope-scaling-factor` and the request log still printed it | present | **0 writers** (only the 1.0 default declaration) |
+| `plan_vision_workspace_offload` caller | `--vision-cpu` workspace planning; `startup.cpp` then dereferenced `*parameters.vision`, which `model.h` says is absent under offload | 2 callers | **0** |
+| `bind_sequence_kv` in `append_forced_tokens` | the **D2 cross-session KV fix** -- the prefill kernels read the shared scalar `io.text_kv_table_row`, so without the re-bind forced tokens write and attend through whichever lane bound last | 2 | **0** |
+| `[engine] fail-all cleanup:` | shutdown-occupancy line; **in `ninfer-watch.awk`'s alert set and named by CLAUDE.md as one of the two that report what a shutdown left unowned** | present | **0 in the binary** (`grep -ac` = 0, control `post-recovery residual` = 1) |
+| `NINFER_RELEASE_PROBE` / `NINFER_CAPTURE_PROBE` | probes in `release_shared_prefix` / `finish` | present | gone |
+| fork README section | 99 lines, documentation only | present | gone (still gone, accepted) |
+
+**The commit message from that merge said "No local feature was dropped." It was false, and it was about to
+become permanent.** Pass 5 caught it with the right instrument -- see below -- and the message has been
+amended to record the failure instead of asserting the opposite.
+
+**WHY EVERY GATE WAS GREEN OVER A TREE MISSING YaRN, `--vision-cpu` AND THE FORCED-TOKEN FIX.** The e2e
+(42/12/1), the merged-tree soak, ctest (134/136) and `dflash2_real_test` all ran and all passed. None of
+them covers YaRN, `--vision-cpu`, or the forced-token path on QA's configuration. **A green gate set over a
+tree missing features says nothing about those features**, and this is the third time this session a clean
+result came from an instrument that could not see the thing it was thought to be checking.
+
+**THE INSTRUMENT THAT FOUND IT, AND THE ONE IT REPLACES.** `git merge-file` said ONE conflict in each of
+`startup.cpp` and `commit.cpp`, not a wholesale difference -- because a true three-way only asks about
+OVERLAPPING hunks, so every local hunk upstream did not touch survives by construction. Pass 5's gate is a
+**token-free line-multiset diff** (`/tmp/rv5/lost.py`): for every line the pre-merge commit added over the
+merge base, does it survive at HEAD? Run TWICE with agreement required, with a positive control (the two
+additions that WERE re-applied must not be reported). **A list of tokens can only find losses whose names
+are already on the list** -- which is precisely the failure mode CLAUDE.md records for the monitor's alert
+set, and I reproduced it two levels at once.
+
+**THE RE-MERGE (`1b18ce76`, tree `b1fd1003`, `origin/master` + 1 commit).** `startup.cpp` and `commit.cpp`
+redone as true three-way merges from the base `594930e7`; one conflict each, both resolved on the merits
+(one is pure line-wrapping; the other is our `bind_dflash_prefill_sink` call in `commit.cpp`, where
+upstream's side is deliberately empty -- **kept, and recorded as OPEN**, since upstream removed it as "stale
+decode controls" and the merge's purpose is not dropping local work).
+
+```
+feature                          before      after
+fail-all cleanup in binary            0          1
+rope_scaling_factor writers           0          2
+bind_sequence_kv in forced path       0          2
+plan_vision_workspace_offload         0          2
+lost.py non-ops files        startup, commit, README   README only
+```
+`lost.py` run twice, both agreeing: 27 files, 402 lines -- of which the only non-`ops` one is README.md
+(documentation, named as such), everything else `src/ops/*`, `bench/ops/*`, `tests/ops/*` rewritten by
+upstream.
+
+**e2e ON THE RE-MERGED TREE: `42 PASS / 10 WARN / 1 FAIL`** -- same PASS and same FAIL as the pre-merge run,
+WARNs 15 -> 12 -> 10. The FAIL is `[demotion] pages demoted to host but never restored`, **same symptom as
+the intermittent one, cause still UNATTRIBUTED**. `[reuse-paths] PASS` with `dominated=0 unattributable=0
+no_candidates=0`. The re-merged tree is FROZEN at `feb2d03c858ccd9e` and QA runs it (`running == built`).
+
+**RECORDED OPEN, none of them settled by my choosing:**
+- **`bind_dflash_prefill_sink`** -- kept, but upstream removed it as stale; whether it is still needed is
+  untested. `dflash2_real_test` matching its baseline is the evidence it does no harm, not that it is required.
+- **The eviction delta on the lossy-merge soak** -- `owners_evicted_total` +117 (vs +66/+72/+83) and
+  `evictions_demote_possible` +22 (vs +8/+11/+11), alongside a SMALLER host tier (`host_state_capacity_slots`
+  70 vs 110). Upstream touched no planning/pressure/host-pool code, so the comparison is confounded: record
+  it as confounded, not as pressure and not as regression. **4 of the 8 printed evictions read
+  `restorable=1 victim_room=1 demote_possible=1 demote_refusal=none`** -- #6's strongest shape so far.
+- **Sample #4 of the successor rate: 17.32%** (`2,593,031 / 14,967,893`), joining 19.9 / 20.2 / 16.7. Four
+  standard loads span roughly 17-20%, far below the 39% the demote-gate change was credited with. It is a
+  range observed four times, NOT an estimate with known variance.
+- **The L1 state test returns 77 whatever `failures` is when no GPU is present** (`test_state_image.cpp`),
+  so ctest reports SKIP off-host and the assertions cannot fail there.
+- **`forced-token-probe.py`** greps for a line the lossy build removed; on the re-merged tree that line is
+  back, but the probe should be re-checked against the current binary rather than assumed.
+
+## 2026-10-03 — the rules that were only written down now have instruments
+
+**THE DIAGNOSIS, from the operator's question -- "did we update the instruments so these issues won't
+repeat?"** The honest answer was no. This repo has an exceptional written record and almost no enforcement:
+every lesson named below was already prose, and four of the five failures it produced happened *anyway* that
+night. A rule performed from memory is performed until the first busy night.
+
+Seven instruments, each built against a failure that actually occurred, each validated before commit:
+
+| instrument | the failure it prevents | validation |
+|---|---|---|
+| `tools/ops/merge-loss-check.sh` | the merge that dropped six local features; a token list can only find losses whose names are on it | two runs AGREE; positive control clean; **non-ops files: 1 (README, documentation)** |
+| `tools/ops/verify-deploy.sh` | "running == built" proved but "built == HEAD" not; a source edited DURING a build | run live: ok 1 and 2, and it *says* check 3 is unverified when no string is given |
+| `tools/ops/recover-after-killed-swap.sh` | a killed swap leaves QA down, the **sentinel** down (silent), and an orphan on :8085 | run on the healthy host: idempotent no-op, verified health=200 sentinel=active |
+| `tools/ops/watcher-token-reachability.sh` | `fail-all cleanup` deleted by a merge while the alert set kept the token | **it DISCRIMINATES: lossy=0, fixed=1** -- and see its limit below |
+| `tools/e2e/startup-smoke.sh` | the classes NO gate covered: YaRN and `--vision-cpu` startup | 3/3 start; run in a GPU window |
+| `tools/ops/check-no-staged-logs.sh` | 57 force-added `.log` files, undone by hand once | run staged: ok |
+| `tools/ops/reqs.sh` | the request log is a MIXED population -- **883 instances** in one file | run: lists them |
+
+Plus `e2e-swap.sh` and `ninfer-start-test.sh` no longer kill by path. That was not a note but a fix at the
+cause: `pkill -f "build/apps/ninfer-serve"` matches the CALLER's command line, which killed this session's
+shell **four times** (twice 2026-09-25, twice 2026-10-03), and **bracketing does not help** -- pkill takes an
+ERE, so `ninfer-serv[e]` still matches the caller's literal. They kill by PORT now, never by path.
+
+**TWO INSTRUMENT LIMITS FOUND WHILE BUILDING THEM, both worth more than the tools:**
+1. **`watcher-token-reachability.sh` catches 1 of the 6 losses.** It reports UNREACHABLE only when a token
+   matches nothing in `src/` -- the `fail-all cleanup` class, where the string is deleted outright. For
+   `rope_scaling_factor`, `bind_sequence_kv` and `plan_vision_workspace_offload` the IDENTIFIER survives as a
+   declaration while its USE is dropped, so the token still matches and the check is blind. Measured on the
+   lossy commit vs the fixed one: 19/21, 7/7, 2/3. **It is a token check with a token check's blindness** --
+   the merge-loss gate is the instrument for the other class, and neither subsumes the other.
+2. **`startup-smoke.sh` proves a configuration STARTS, not that its flag is APPLIED.** A YaRN factor that is
+   parsed and then ignored starts just as happily -- which is exactly the loss it was built for. Catching
+   that needs an assertion on a value the engine reports back, and no such line exists today.
+
+**AND THE INSTRUMENTS FOUND THINGS WHILE BEING BUILT, which is the argument for building them:**
+`watcher-token-reachability.sh` reported `private victim evicted: demotable=1` UNREACHABLE on its first run
+-- on a night that token had fired eight times. The cause: the alert set matches the RENDERED value while
+the source has a format specifier (`demotable=%d`). Fixed. Its second version matched only `alert|log` and
+**missed the `keep` rules entirely** -- and `fail-all cleanup` lives in a keep rule, so the check would not
+have caught the loss it was written for. Fixed. And `startup-smoke.sh`'s baseline CONTROL exposed two
+invocation errors of mine (`--artifact` is a ctest flag, not a server flag; `--max-concurrency` is required
+for 65536 KV) that would otherwise have read as three engine bugs.
+
+**STILL NOT BUILT, named rather than left implicit:** the dead `window*.sh` harnesses (0 references) still
+carry the path-based `pkill`; `ab-runner.sh` (3 sites), `e2e-swap-cmp.sh` (5) and `batched-window.sh` (3)
+do too and ARE live; and the mutation-test-with-a-green-control rule has no helper.
+
+### STANDARD-LOAD BASELINE — `successors_with_option / successor_calls`, one sample per standard load
+
+**WHY THIS EXISTS.** The rate has no comparable prior. The pre-soak cumulative is QA's OWN IDLE AND
+CLASSIFIER TRAFFIC BEFORE THE SOAK -- **and an earlier version of this sentence said it "contains diagnostic
+runs (e2e + `NINFER_MAT_DEBUG`)" and was corrected above the same night**, because those ran as separate
+processes on `:8085` (see the sample-#2 entry). The "18% -> 39%" pair the gate fix was credited with was
+recorded in this file as NOT comparable. So the only way to say
+anything about this rate is to take it the same way, on the same load, on the same binary, more than once.
+
+**THE READING IS ALWAYS THE DELTA over one standard load**, from `/stats` before and after:
+`pressure.successor_calls` and `pressure.successors_with_option`.
+
+| # | date | binary | window | calls | with option | rate |
+|---|---|---|---|---|---|---|
+| 1 | 2026-10-02 | `32f70df17ad18ebc` | the 8-agent soak, 22:19-22:29 | 8,594,494 | 1,711,811 | **19.9%** |
+| 2 | 2026-10-02 | `44ce03bb266237b8` | the 8-agent soak, 23:25-23:45 | 15,617,172 | 3,152,505 | **20.2%** |
+| 3 | 2026-10-03 | `7313086e40ef2c48` | the 8-agent soak, 10:29-10:5x | 11,063,414 | 1,850,832 | **16.7%** |
+
+**SAMPLE #3 FALSIFIED "~20%, CONSISTENT TO WITHIN A FIFTH OF A POINT".** Three standard loads now read
+**19.9%, 20.2%, 16.7%** -- a spread of 3.5 points, not 0.2. The third pass warned that "reproducible" was
+an overclaim from two samples; more data has now shown the overclaim was real and the agreement was
+coincidence. **What stands is only this: the standard load's rate sits in roughly 17-20%, and it is far
+below the 39% the demote-gate change was credited with and below the 60.6% QA's idle traffic gave.** The
+spread is now the interesting part -- sample #3 and #2 BOTH have the gate restored and differ by 3.5
+points, so whatever moves this rate is not the gate. Do not quote a single figure for it.
+
+**SAMPLE #2 IS THE FIRST READING THAT MEANS ANYTHING, AND IT SAYS ~20%.** Two standard loads, **different
+binaries**, different durations (8.6M vs 15.6M successor calls), and the rate lands at 19.9% and 20.2% --
+**consistent to within a fifth of a point** -- and NOT "reproducible", which is what an earlier version of
+this sentence claimed: two samples on two different BINARIES are consistent with each other, they do not
+establish variance. Two consequences, both uncomfortable: **the standard load's rate is far below both the
+39% the demote-gate change was credited with and the 60.6% QA's own idle pre-soak traffic gave.** The
+18% -> 39% pair was never a standard-load reading (this file already records that its two windows were not
+comparable). **⚠ "~20%, read twice and it does not move" stood here and a THIRD sample FALSIFIED it -- see the
+sample-#3 row above: the three reads are 19.9 / 20.2 / 16.7%, a 3.5-point spread, so the standard load's rate
+is roughly 17-20% and no single figure should be quoted.** Sample #2 is confounded as a CONTROLLED comparison --
+the demote-gate restore and the instrument changes arrived together on different builds -- so it says what
+the rate IS, not what the gate did.
+
+Sample #1's other readings, so #2 can be compared on more than the rate: `owners_evicted_total` +65,
+`private_evictions_demotable` +53, `evictions_with_victim_room` +48, `evictions_demote_possible` **+8**,
+`demote_option_refused_no_state_deficit` +2,350,384; and 0 across every absence token (two sources).
 
 ### 2. Open, in priority order
 
@@ -1448,8 +2335,42 @@ me at it), and my first proc-outlier table mixed rows from an instance five hour
    **Next injection sites, in order:** the capture commit path (force an abort after the fork/transfer
    started -- serves #11(a) and the `recycled-checkpoint DROPPED` counter, never fired); then an eviction
    path for the non-strict releases. The injector makes each one an env var, not a rebuild.
-4. **#2 — #13's accounting underflow.** Instrumented (the message now names the axis) and deployed;
-   waiting on one occurrence. Do not guess a fix before it names itself.
+4. **#2 — #13's accounting underflow.** **IT OCCURRED (2026-10-02 12:06:42), and it named both the axis
+   and the call site — so the "waiting on one occurrence" below is now closed.** Real agentic load at QA
+   (the operator's 8-agent run), ~150 requests in, 13 minutes after the deploy:
+   ```
+   [engine] WORKER RECOVER: Qwen3.5 resource subtraction underflow [device.main_kv_pages: have 1057, removing 1059]
+   [engine] post-recovery residual (recover): main_kv_pages=1060 backend_kv_pages=0 device_state_slots=1 host_state_slots=0 host_kv_bytes=1244528640
+   ERROR req#136 failed during generation | HTTP 500   (and req#116, same instant)
+   ```
+   Axis (`device.main_kv_pages`, off by **2**), from the throw site's own ordering: the check at
+   `context_work.cpp:252-257` tests `active_lanes` and `state_slots` *before* `main_kv_pages`, so both were
+   clean and only the KV page axis underflowed. Site, from the message's argument order — it renders
+   `"have <value>, removing <removed>"` and throws when `removed > value`, so `value=1057` is the PLANNED
+   `details.demand.final_removed` and `removed=1059` is the ACTUAL removal, i.e. **`materialization.cpp:635`**
+   (`(void)checked_resource_difference(details.demand.final_removed, removed);`), one line below the snapshot
+   comparison at `:634`. **The engine removed 1059 device main-KV pages where its plan said 1057.** This is
+   the site the 2026-09-25 correction below called "the likelier one" from reading; the occurrence CONFIRMS
+   it rather than assuming it.
+   **The injection point at `:613-631` was validated by this, and its comment's premise was wrong.** That
+   comment says three load attempts and five constructed scenarios produced no occurrence, "so the failure
+   has to be created" — real agentic load produced it naturally, one line above the injection. The state the
+   comment describes ("the source has just been destructively truncated and released, the views refreshed,
+   and the host extents dropped -- everything `checked_resource_difference` reads") is therefore the right
+   state; it is reached in ordinary traffic, not only by injection.
+   **Evidence:** `results/underflow-2026-10-02/` — `MANIFEST` (binary sha256 + the verbatim event),
+   `occurrence-120642.journal` (430 lines), `stats-at-reading.json`. Not committed as a log (`.gitignore:45`).
+   **NOT ATTRIBUTED to the uncommitted Parts 1+2 tree, and must not be read that way.** #2 is a RECORDED
+   pre-existing item (prior occurrence 2026-09-25 10:13) with no fix in that tree, and the retained journal
+   holds ~305 requests on pre-change binaries with zero recoveries before it — suggestive, but **not a
+   control**: different load instances, and this underflow plausibly needs a cancellation at deep host-KV
+   occupancy, which earlier runs may never have produced. The control is the same load on a pre-change
+   binary, and **it has not been run.**
+   **Its sequel is #9's stage one, and it was reproduced:** the recovery left occupancy owned by nothing
+   (1060 device main-KV pages, 1 device state slot, 1.24 GB host KV) — the same shape plan.md:3181 records
+   for 2026-09-25 (4045 / 1 / 418,775,040 B), at a new scale. **No wedge followed** (see the note below).
+   **Do not guess a fix before it names itself** — it has now named itself; the next step is a fix, not
+   another wait.
    **Correction 2026-09-25 (from a design pass that checked the claim):** the site is NOT established.
    The same message comes from `checked_resource_difference`, which has eleven call sites, and within
    `materialization.cpp` line **606** is the likelier one: 605 requires the *after* snapshot to exceed
@@ -2643,6 +3564,21 @@ it is an engine regression, which `git stash` settles in one run.
    negative. `feasible_preserving_alternatives` summed to 34,578 (median 217) against
    `preserving_alternatives_assessed` 87,817 -- so preserving alternatives ARE feasible on QA's traffic; what
    is not observable is an adopted destroying plan chosen against one.
+
+   **CAVEAT ON `preserving_alternatives_assessed` ITSELF (added 2026-10-03), and it bounds what those two
+   numbers can settle.** The counter increments for EVERY assessed target with `restorable_evictions == 0`
+   (`src/runtime/engine/context_cache/materialization_planner.h:539`), and that set INCLUDES
+   PARTIAL-CONSTRUCTION targets which have not yet covered the deficit. So **a NON-ZERO value is weak
+   evidence: `> 0` does not prove a COMPLETE preserving plan was ever in front of the planner.** The
+   asymmetry is the whole point of writing it down:
+     * `preserving_alternatives_assessed == 0` stays STRONG -- nothing preserving was assessed at all, so
+       with evictions taken that IS the #6 condition;
+     * `assessed > 0 && feasible == 0` must NOT be read as "preserving options existed and none was
+       adoptable" unless the assessments are known to have reached completion. It was read that way on
+       2026-10-01, on three loads, from a field whose non-zero value cannot support the inference.
+   The ungated counter is still the one that can EXONERATE. This caveat is why it cannot CONVICT. The same
+   caveat is stated at the increment's call site, `pressure.cpp:738-740`; that comment and this one are the
+   two copies, and neither should be relaxed without checking the other.
    (Kept below because the mechanism is real and the dead guard is real, but do not read it as the cause.)
    **AND `/stats` IS A SNAPSHOT, SO A COUNTER CAN READ 0 SECONDS AFTER THE EVENT.** Read at 20:32:40, ten
    seconds after the journal printed seven evictions, EVERY eviction counter still read 0 while
@@ -2840,6 +3776,40 @@ it is an engine regression, which `git stash` settles in one run.
    first show `host_state_pregrows` or `host_state_pregrow_refusals` move** -- a flat demote count with
    both counters at 0 means the pre-grow never fired, not that it had no effect. Nothing runnable here
    reaches a full pool. Nothing runnable here does (recorded at §1c).
+   **THE KV AXIS's PRE-GROW FIRED, AND IT ANSWERS THE PLAN'S OWN OPEN QUESTION (2026-10-02, QA under the
+   operator's 8-agent load, the uncommitted Part 1d).** First reading of the KV-axis trigger, after ~25 min:
+   `host_kv_pregrow_attempts=2  host_kv_pregrows=2  host_kv_pregrow_refusals=0  host_kv_pregrow_fragmented=2`,
+   with `host_kv_grows=3` and the arena's capacity going **8,053,063,680 -> 10,200,547,328** (7.5 -> 9.5 GiB,
+   i.e. exactly two 1 GiB spans, matching `pregrows=2`), occupied 7.97 GiB.
+   * **2 of 2 firings were the FRAGMENTED case, not exhaustion** — the plan asked whether the trigger
+     ("cannot place one step") would fire "on nearly every session" because fragmentation is common. It did
+     fire on every session it was given, and both times with free bytes present.
+   * **A field name that says the opposite of its value, corrected here rather than trusted:**
+     `host_kv_pregrow_fragmented` is incremented at `storage/context.cpp:1789` *inside* the `Grew` case,
+     beside `++host_kv_pregrows_` — it counts grows that were fragmentation-triggered. **The journal label
+     beside it reads `fragmented_skipped=%llu` (`context.cpp:1793`), and a reader taking that name at face
+     value would conclude two pre-grows were SKIPPED, which is the inverse of the measurement.** The label
+     is the defect; the counter is right. **FIXED IN THE SOURCE 2026-10-02: the label now reads
+     `fragmented_triggered=%llu`, with the reason written beside it so the next reader does not have to
+     re-derive it.** (It was recorded here first only so the reading could not be mis-taken while it stood;
+     grep found exactly two copies, this file and `context.cpp:1793`.)
+   * **`host_kv_fit_growable = 0`** — Part 1e's tri-state never reported `Growable`, so the narrowing's
+     premise is unexercised on this workload. (Part 1e itself is still open: task #40.) **UNIT CORRECTED
+     2026-10-02: this counter is ASSESSED SEARCH NODES, not planning runs** — the increment is inside
+     `compose_pressure_candidate` (`planning/pressure.cpp:2338`), called once per assessed node
+     (`pressure_planner.cpp:1144`/`:1154`), so one run can add thousands. A review found the claim; it was
+     checked against the call sites before being changed. **So the zero is weaker than it reads**: "no node
+     ever saw a growth-away case", not "no session had one". Every copy corrected in place
+     (`types.h`, `program_impl.h`, `pressure.cpp`); the counter name is unchanged, because it is published
+     in `/stats` and renaming it would silently change the meaning of every past reading.
+   * **`host_pinned_growth_headroom_bytes` is absent from `/stats`** — Part 1a's headroom query exists on the
+     pool and is exercised by a unit test, but `stats_json.cpp` does not export it, so the one figure that
+     would show the planner a growable-but-unpinned case is unreadable in production. Gap in the counter
+     chain, not in the mechanism.
+   * The pool was STILL fragmented at the same reading — `free 1,334,345,728` against
+     `largest_free_run 486,049,792`, across 13 chunks — so the pre-grow relieved the arena without making
+     the pool's own placement contiguous. That is the residual Part 2 was aimed at, and Part 2 is being
+     reverted (review: a production regression), so this strand is now **open with no implementer**.
    `ensure_host_state_headroom()` grows the host state pool by one slot when it is FULL, called once from
    the pressure planning session's constructor (not from the search -- see the commit). The tier-disabled
    guard is in, and its stated reason was CORRECTED: with `--host-state-slots 0` the pool is never
@@ -2968,6 +3938,673 @@ and nobody reads.
   `max_shared_prefixes` has NEITHER half -- only `shared_active_references` and the `reuse-select ...
   longer_lost=1` line. Neither is claimed to be a live defect; both are unreadable the same way the catalog
   was. (The shared pool's absence is what made two of the first version's documents contradict themselves.)
+  **CORRECTION 2026-10-02 — `longer_lost` IS a live defect and it is now MEASURED (the operator spotted it
+  in the load).** The "unreadable" above was true of the rate-limited JOURNAL line; the request log carries
+  the same signal UNCAPPED as `materialization.longer_lost` / `best_loser_reuse` / `chosen_reuse` /
+  `candidates[]`, so the rate was always there to be read.
+  **THE RATE, CORRECTED 2026-10-02 AFTER THE FIRST VERSION MIXED TWO POPULATIONS.** The request log carries
+  BOTH QA's traffic and the e2e test server's (see §5: the test server writes to QA's path), so the first
+  aggregate -- 15,413 records, `longer_lost` in 503 (3.3%) -- was a blend, and most of it was the e2e.
+  Classified by each instance's recorded `argv` port:
+  ```
+    port        reqs   longer_lost    rate    total loss      max
+    8080 (QA)   4,767            84    1.8%     1,248,271   54,963
+    8085 (e2e)  4,201           423   10.1%       200,549   20,241
+  ```
+  **So the production rate is 1.8%, not 3.3%, and the two populations have different shapes.** The 423
+  `winner=root` cases the first version called "the dominant pattern (84%)" are **the e2e's cold test
+  server reusing nothing** -- a fresh server has no cache to reuse, which is why they were numerous and
+  small and root-dominated. **Reading them as a QA defect was an error of exactly the kind this file keeps
+  paying for, and it is corrected here rather than left standing.** What remains on QA is 84 cases, total
+  1,248,271 tokens, max **54,963** -- the tail is QA's, and it is the shape today's 5 cases showed
+  (a shared prefix or a shorter private continuation beating a longer private one).
+  The engine's own comment calls it the defect: `resource_manager.h:2766`, "`longer_lost=1` is the defect: a
+  candidate reusing strictly more tokens was available and lost", computed at `:2793` as
+  `best_other_reuse > winner_reuse` over the planner's OWN constructed `candidates`.
+
+  **WHAT THE CANDIDATE ROWS SAY, QA ONLY (port 8080; the blended table that stood here first was mostly
+  e2e traffic and is replaced, not annotated):**
+  ```
+  winner   loser    n     total loss    max        req#165 prompt 84,159: chosen 22,931 vs loser 72,013
+  private  private  36     458,627    40,461      loser rows: reuse 67,834 (private), 72,013 (private)
+  shared   private  25     415,430    52,593      WINNER    : reuse 22,931 (SHARED)  -> loss 49,082
+  root     private  14     222,507    54,963
+  shared   shared    3     113,678    43,065      stop_reason: time_budget 83 of 84
+  private  shared    5      14,676    14,671
+  root     shared    1      23,353    23,353
+  ```
+  **THE PRODUCTION SHAPE IS COHERENT AND NARROWER THAN THE BLENDED ONE: in 75 of 84 QA cases (89%) the
+  loser is a PRIVATE CONTINUATION** -- the conversation's own longer state losing to a shorter private one
+  or to a shared prefix. That is the operator's "anchor not used", and it is a much sharper target than
+  "3.3% of requests". One QA case deserves its own line even in the OLD schema: `chosen_restorable_evictions
+  = 69` on a `winner=root` plan (reuse 0) that beat a private continuation reusing **54,963** -- both a
+  reuse failure and a #6-shaped one, and it is the `decided_by` field that would say which term did it.
+  **THE TWO WORST QA CASES, READ IN FULL (2026-10-02) -- THIS IS A SEVERE PRODUCTION DEFECT, NOT A TAIL
+  CURIOSITY, AND IT IS THE OPERATOR'S "ANCHOR NOT USED" EXACTLY:**
+  ```
+  req#201  prompt 55,412  hit 0  path=root
+     chosen_restorable_evictions=69   selected_maximal_fallback=True   selected_degradation_units=185
+     split_best_tokens=54,964   split_best_restorable=54,963   split_entries=69
+     candidate rows: PRIVATE reuse=54,963 goals=2,472 (adoptable) -- LOST to root
+  req#99   prompt 56,075  hit 0  path=root
+     chosen_restorable_evictions=0    selected_maximal_fallback=False  selected_degradation_units=7
+     split_best_tokens=53,172   split_best_restorable=53,171   split_entries=24
+     candidate rows: PRIVATE reuse=53,171 goals=1,715 (adoptable) -- LOST to root
+  ```
+  * The engine **evicted 69 restorable continuations AND re-prefilled all 55,412 tokens** while a candidate
+    reusing 54,963 was in the set and adoptable (`goals != 0`, which `materialization_budget.h:34` says is
+    what "could be adopted" means). `selected_maximal_fallback=True` says the search fell back to
+    evict-everything rather than seat that plan.
+  * **TWO INDEPENDENT INSTRUMENTS AGREE the data was there:** `split_best_restorable=54,963` (the deepest
+    RESTORABLE checkpoint at or below the deepest token-exact match) equals `best_loser_reuse=54,963`. That
+    is not a coincidence of one counter -- the §2f split scans the CATALOG directly, independently of the
+    candidate set.
+  * **Why this is exactly what the new instrument is for:** these records PREDATE it, so `eligible`,
+    `total_ns` and the per-candidate `restorable_evictions` are absent -- which is why the reason cannot be
+    read from them. The deployed build fills all three, so the next occurrence answers it: a loser with
+    `eligible=true` and LOWER `total_ns` that still lost is a genuine selection bug; a loser that lost on
+    `restorable_evictions` is the #6 ruling; `selected_maximal_fallback=True` beside it is a third
+    possibility worth separating.
+  * **THE 423 ROOT-WINS ARE THE E2E POPULATION, NOT QA** (see the port split above) -- a cold test server
+    has nothing to reuse, so its `root` wins are expected and mean nothing about the planner. Do not cite
+    that row as a production shape. On QA the mass is in the **70 cases where a shared prefix or a shorter
+    private continuation beat a longer PRIVATE one**, and today's 5 QA cases are all of that shape.
+  * **In all 5 of today's cases the loser would have reused nearly the WHOLE prompt** (loser 75,293 of
+    prompt 76,070; 72,013 of 84,159) — the engine held a continuation matching the request and re-prefilled
+    ~50k tokens anyway.
+  * **NOT the #6 eviction path:** `chosen_restorable_evictions=0` and `selected_maximal_fallback=false` in
+    every one of the five.
+  * **NOT search coverage:** the longer candidate is present in `candidates[]`, so it was constructed and
+    assessed and then LOST THE COMPARISON. `stop_reason=time_budget`/`budget_exhausted=true` is present in
+    all five, but it is the ordinary stop (9,232 of 15,413 requests, 60%), so **it is not established as
+    causal** — do not attribute this to the search budget on that correlation.
+  * **Pre-existing, not this tree:** pid 826 (2026-10-02 10:23, pre-change) reads 2.8% and pid 28425 (this
+    build) reads 2.8% on the same request count. Per-instance rates elsewhere run 0%–16.2%, so it is
+    workload-dependent.
+  * **`host_pinned_growth_headroom_bytes` NOW EXPORTED (2026-10-02), and its FIRST READING IS 26 GiB.**
+    It existed with a purity unit test but was in no stats chain, so the number a `Growable` verdict is
+    priced against was unreadable in production. `max_pinnable()` (`host_memory_budget.cpp:113`) computes
+    it as **`MemAvailable − reserve`**, clamped only by optional `max_bytes` / `shmem_cap_bytes` caps --
+    and **`shmem_cap_bytes` is 0, so `Shmem:` is parsed and does NOT gate**, which means the elastic pool's
+    only bound is MemAvailable minus the 4 GiB reserve. Read beside it at the same moment: `MemTotal`
+    56.5 GB, `MemFree` **13.8 GB**, `Cached` 39.1 GB, `Shmem` 12.1 GB, engine `VmRSS` 14.1 GB, pool
+    capacity 11.5 GiB. So the 26 GiB is a claim about *reclaimable cache*, not about free memory: pinning
+    it would evict page cache down to the reserve. **BUT DO NOT QUOTE `Cached` AS RECLAIMABLE CACHE -- a
+    review measured the same field at a different moment and found `Cached 21.9 GB` of which `Shmem 21.1 GB`,
+    i.e. almost all of it PINNED SHMEM, with file LRU only ~0.85 GB.** `Cached` CONTAINS `Shmem`, so the
+    figure above (Cached 39.1 / Shmem 12.1) reads as ~27 GB of file cache at that moment and ~0 at the
+    reviewer's -- two different moments, and the honest statement is that `max_pinnable` spends
+    `MemAvailable`, whose composition was not read. That is why the 26 GiB must be treated as a CEILING THE
+    POLICY WILL SPEND, not a measurement of room. **Whether that is a safe promise is NOT established and
+    is NOT asserted here** -- it is the first reading of a field that had none, and it needs the load (the
+    documented host failure mode is pinned-shmem OOM, and this is the figure that would precede it).
+  **NOT ESTABLISHED: why the cost comparison prefers the shorter-reuse candidate.** A fix was already
+  attempted on a guess and failed — reordering `FoldedCost::key()` produced BYTE-IDENTICAL selections
+  (`resource_manager.h:2761-2764`). The next instrument is the one named there: read the election itself
+  (what `candidate` is compared on), against req#165 as a concrete reproduction.
+
+  **ROOT CAUSE OF THE FLAG ITSELF, FOUND BY READING (2026-10-02) — `longer_lost` COMPARES THE WRONG TERM.**
+  `FoldedCost::key()` (`materialization_budget.h:277-292`) is a 14-element lexicographic tuple and
+  `reused_prompt_tokens` sits **ELEVENTH in 1-based counting, which is `decided_by` element 10**:
+  ```
+  0 restorable_evictions   1 total_ns   2 affected_selected_hits   3 newest_affected_hit_epoch
+  4 owner_evictions   5 checkpoint_drops   6 copy_operations   7 transferred_bytes
+  8 remaining_text_prefill   9 remaining_vision_prefill   10 (max - reused_prompt_tokens)   ...
+  ```
+  **THE INDICES ARE 0-BASED EVERYWHERE** (`std::get<I>` and `first_differing_key_element`), and this list
+  was written 1-based first, so "element 11" here and "element 10" in the code were the SAME element -- a
+  review caught the two bases side by side in one file. Converted rather than annotated.
+  `longer_lost` is computed as `best_other_reuse > winner_reuse` (`resource_manager.h:2793`) — **element 10
+  alone**. So it fires whenever ANY of the ten higher-ranked terms differs between the winner and a
+  higher-reuse candidate, which is the ORDINARY case, not the defect case. The flag cannot distinguish "the
+  planner chose badly" from "the planner applied a priority the key encodes deliberately". **That is the
+  instrument defect, and it is why the 2026-09-27 question ("did a longer source exist and get refused, or
+  was the snapshot simply the longest available?" — `types.h:934-940`) still has no answer: the instrument
+  built to answer it measures a term the election ranks eleventh.**
+  **Element 0 is the operator's own #6 ruling** — `restorable_evictions` FIRST, so a plan needing a
+  restorable-checkpoint eviction loses to one needing none, whatever the reuse. A longer PRIVATE candidate
+  that would evict a restorable checkpoint therefore loses by design to a shared prefix, and `longer_lost`
+  calls that a defect. That reading is NOT yet confirmed by a run (see below).
+  **FALSIFIED WHILE CHECKING, recorded so it is not retried:** the first hypothesis was that the longer
+  candidates were physically INFEASIBLE, hence never election-eligible. **Wrong.** `materialization_budget.h:34`
+  defines eligibility — "a candidate with `goals != 0` could be adopted" — and **all four of req#165's
+  candidates have `goals != 0`** (698/519/1486/456), so every one was adoptable. (`assessed_targets_without_goal=973`
+  of 981 counts the planner's internal TARGETS, a different population from the 4 catalog-entry `candidates[]`;
+  conflating the two is the trap.) So the loser WAS eligible and lost on a higher-ranked term.
+  **THE NEXT MEASUREMENT, and it needs no new code: `NINFER_MAT_DEBUG=1`** (read-only env, `materialization_planner.h:135`)
+  prints per assessed candidate `now= fut= total= prefill_tok= reused_tok= bytes= incumbent_now= ->inc=`.
+  That shows directly whether the 72k candidate's `total` was ABOVE the incumbent's (the cost model made a
+  call — then the question is whether the cost MODEL is right) or BELOW it while `->inc=0` (the comparison
+  is broken). It needs a QA restart, so it is not run yet.
+  **THE FIX — FIRST VERSION, 2026-10-02. SUPERSEDED BY THE REWORK IN "REVIEW PASS 1" BELOW; kept only to
+  show what the review found, because two of the three things it describes no longer exist
+  (`first_differing_selection_term` was DELETED, and the terms are no longer filled only in `assess_target`
+  nor last-wins). Read the pass-1 block for what is actually in the tree.**
+  1. The planner now records, per candidate, the ELECTION's own cost terms + eligibility in
+     `assess_target` (`materialization_planner.h`), the only place a candidate is folded against the
+     incumbent. Eligibility is deliberately the SAME predicate adoption uses (`goal.has_value()`, which
+     requires physical feasibility), so an ineligible candidate is no longer counted as a loser.
+  2. `MaterializationDiagnostics::ElectionTerm` transports them; `resource_manager` merges them into the
+     candidate rows.
+  3. `MaterializationDiagnostics::first_differing_selection_term()` names the deciding term, using `key()`'s
+     own numbering, and `longer_lost_decided_by` carries it -- so the flag says WHICH priority decided.
+     A `longer_lost_eligible` + `best_eligible_loser_reuse` pair is added BESIDE `longer_lost` rather than
+     replacing it, so the published field keeps its meaning and the two can be compared.
+  4. All three are emitted in the request log; the stale claims in `request_log.cpp` and `types.h` that
+     called `longer_lost` "the defect" are corrected IN PLACE where a reader meets them.
+  **TEST:** `tests/test_materialization_budget.cpp` pins the helper AGAINST `key()` (six arms, one per
+  carried term, each first required to be key-unequal so it cannot measure nothing), plus two controls --
+  a difference only on an UNCARRIED term must read 255, and an equal pair must read 255. Two mutants were
+  run: disabling the reuse branch, and forcing a constant 0 -- **both KILLED**, source restored to the
+  identical hash. `ninfer_materialization_budget_test`, `request_log`, `pinned_host_pool`, `kv_cache`,
+  `context_store` all pass; `resource_manager` at its recorded `51 run, 1 failed` baseline.
+  **REVIEW PASS 1 RETURNED "NOT FIT TO COMMIT" — FOUR LOAD-BEARING FINDINGS, ALL FIXED (2026-10-02).** The
+  first implementation was wrong in a way that repeated the very fault it was written to remove, and the
+  review proved it with a run rather than an argument:
+  1. **The attribution named the wrong element, and did so on the defect-shaped case.** It walked six terms
+     chosen by hand and jumped from element 5 straight to element 10, so a pair decided by
+     `newest_affected_hit_epoch` (3), `copy_operations` (6), `transferred_bytes` (7),
+     `remaining_text_prefill` (8) or `remaining_vision_prefill` (9) was reported as **element 10** -- the
+     value its own legend called "reuse itself decided, the real defect". A counter asserting the defect it
+     exists to stop asserting. **FIXED**: `first_differing_key_element` now walks `key()` itself with an
+     `index_sequence` fold, so it cannot drift and covers every element including the ordinals.
+  2. **On the search path the terms were not the costs the election compared.** `assess_target` overwrote
+     per assessment, so the WINNER's row held whatever target of that candidate was assessed LAST; and the
+     root-maximal seed and the seal fallback wrote no terms at all. **FIXED**: the planner keeps each
+     candidate's BEST GOAL-BEARING `FoldedCost` (never last-wins), overwrites the winner's entry with
+     `incumbent.cost` at the return site, and computes the attribution THERE.
+  3. **A real defect the review found while checking that:** the seal fallback swapped the sealed plan to
+     root-maximal and left `incumbent.cost` describing the PRESERVING plan -- and `make_diagnostics` runs
+     after it, so `chosen_restorable_evictions` and every `predicted_*` figure described a plan that was
+     never sealed, on the maximal-eviction path where the destruction is largest. **FIXED**: the fallback's
+     own assessment is folded and becomes `incumbent.cost`. This is a DIAGNOSTIC fix, not the instrument --
+     it changes what several published fields mean for fallback cases, so it belongs in the commit message.
+  4. **The test could not fail on the case that mattered.** Its expected values were a hand-written copy of
+     the indices (so a `key()` reorder left it green) and it had NO arm combining an uncarried term with
+     reuse -- exactly the case the helper got wrong. **FIXED**: the arms assert the exact index AND the
+     defining property walked over `key()`; the mixed arm (`copy_operations` 1 + reuse 4 vs reuse 5, expect
+     **6**) is now present. **Mutant M3 re-introduces the original bug (skip element 6) and is KILLED by
+     that arm** -- so finding 1 is a repo-resident result, not a reviewer's probe.
+  5. Also fixed: the ordinal hypothesis is now REACHABLE (the old helper could never return 11/12/13, so
+     "enumeration-order tie" was indistinguishable from "an unlooked-at term"); the two index bases were
+     unified to 0-based across seven copies including this file; the `host_pinned_growth_headroom_bytes`
+     comment was FALSE ("capacity plus growth" -- it is growth only, from a cached reading of unrecorded
+     age) and is corrected at both copies; and `decided_by == 255` now means "no eligible loser at all"
+     rather than also covering "eligible losers existed, none reusing anything".
+  **THE INVARIANT, now asserted in the test:** element 10 is `max - reused_prompt_tokens`, so a cost with
+  more reuse has a SMALLER key and wins there; a loser holding more reuse therefore lost on one of
+  elements 0..9. **(`longer_lost_eligible` && `decided_by == 10`) is impossible**, and a live reading that shows it
+  means the costs compared were not the election's -- an instrument fault, not a defect found.
+  **REVIEW PASS 2 — NOT CONVERGED. ONE LOAD-BEARING FINDING, AND IT WAS MY OWN PASS-1 REGRESSION.** The
+  fix for pass-1's finding 3 (`incumbent.cost = fallback_cost`) then fed that SAME cost to
+  `finalize_selection` → `attribute_selection`. But the election chose the PRESERVING plan; the fallback is
+  a different plan whose key can be WORSE than a loser's, and the election never ranked that pair.
+  `first_differing_key_element` is symmetric, so on the inverted pair it named an element where the LOSER
+  was better and presented it as the winner's reason -- `decided_by=0` reading "the #6 ruling decided" when
+  the winner had actually LOST on element 0 and been seated by a seal failure. The reviewer's probe: **974
+  of 977 inverted pairs yield `decided_by == 10`**, the value these docs call impossible. The 79
+  `selected_maximal_fallback:true` records in the log make the path real; none carried the field yet.
+  **FIXED TWO WAYS, ON PURPOSE.** (i) `finalize_selection` now takes `elected_cost` AND `seated_cost` -- the
+  attribution uses what the election ranked, the winner's row describes what ran -- because conflating the
+  two was the bug. (ii) `election_deciding_element` refuses to name an element when the winner does not
+  beat the loser, returning `kNotAnElectedWinner` (254), so the fault is INEXPRESSIBLE rather than merely
+  avoided. **Mutants M4 (drop the direction check) and M3 (the pass-1 skip-element-6 bug) are both KILLED.**
+  **Second finding, also fixed:** the root-maximal seed was compared and could lose, but its cost was never
+  written to `election_best_` -- so it read `eligible=false`, was excluded from the losers, and could make
+  `decided_by == 255` mean "no eligible loser" while the root sat right there (contradicting the narrowed
+  claim in `types.h`). One line beside the seed.
+  **Documentation, ~8 copies, all corrected in place:** the request-log legend a reader actually sees (still
+  pre-fix: six terms, and "255 = ... or the two agree on every carried term", both now false); the invariant
+  naming `longer_lost` in four places where it holds only for `longer_lost_eligible` (row-based
+  `longer_lost` counts INELIGIBLE candidates, so it can be true for a reason unrelated to the invariant);
+  "TIES on elements 0..10" -> 0..9; two stale planner comments; and a two-fold note in `types.h`
+  (`longer_lost`/`best_loser_reuse` use `summary().reusable_prompt_tokens`; the eligible pair uses the
+  election's `machine_work.reused_prompt_tokens` -- they agree so far but are not the same quantity).
+  **STILL OPEN, and named rather than glossed:** (a) the reviewer's request for a planner-FLOW test -- the
+  attribution CORE is now directly testable and mutation-checked, but nothing asserts that the winner's term
+  equals the seated cost or that the select-fast path fills its entries; (b) after a fallback,
+  `selected_degradation_units`, `owner_outcomes`, `checkpoint_outcomes`, `publication_slot` and
+  `source_mode` STILL describe the preserving plan (pre-existing, now documented at the assignment); (c) the
+  e2e below.
+  **THE E2E ON THE REWORKED TREE FAILED: 40 PASS / 16 WARN / 3 FAIL, against 42/14/0 on the previous
+  build.** One FAIL is already attributable and is NOT a regression: `[reuse-paths]` was WARN:INCONCLUSIVE
+  last run because no anchor prompt exceeded the 23353 pin (`anchor_longest_prompt=23167`); on the reworked
+  run it reached `30315`, so the check could evaluate for the first time and it FAILED -- "the anchor is
+  taken and is not lifting the ceiling", which is the operator's anchor-not-used shape measured by the
+  suite's own assertion. The other two (`[demotion] pages demoted to host but never restored`,
+  `[state-saturation] 1 worker recovery`) are in phases the suite itself marks non-deterministic, **and that
+  is a hypothesis, not a finding: a second run on the same tree is in flight to test whether they
+  reproduce.** They must not be waved away -- a 0 -> 3 FAIL change is the one signal that would mean this
+  rework altered behaviour rather than diagnostics.
+  **CORRECTION 2026-10-02 (review pass 3, CONFIRMED from mtimes): "the e2e has run twice on this tree" WAS
+  FALSE.** `e2e-swap.sh` does NOT BUILD -- it runs whatever is in `build/apps/` -- and both runs started
+  BEFORE the final source edits: run #1 at 13:28:47, run #2 at 13:41:17, while `materialization_planner.h`
+  was edited at 13:41:33, `materialization_budget.h` at 13:41:53 and `types.h` / `request_log.cpp` at
+  13:48:45. The binary those runs used was linked before all of them. **So neither e2e exercised the
+  pass-2 code, and the numbers below are evidence about a SUPERSEDED binary, not about the tree.** This is
+  CLAUDE.md's "source edited WHILE a build is running" trap one step later in the pipeline: a run that
+  starts before the source's mtime does not test that source. A third run on the frozen binary
+  (`sha256 d244ca7e8fd4e7e3…`, linked 14:00:38, `find -newer` empty, swap started after that link time)
+  is the one that counts. **The unit-level evidence is unaffected** -- the suite's arms and both mutants were
+  run against the current sources.
+  **ALSO FROM PASS 3, and it is a finding for the operator, not an instrument fault:** the `decided_by`
+  tally over 877 records is `{0:158, 1:543, 12:2, 255:174}`, and **2 records carry element 12 --
+  `candidate_ordinal`, the ENUMERATION-ORDER tie-break** that the legend calls the arbitrary shape. And
+  **ZERO records have `selected_maximal_fallback:true`**, so 254 and the elected/seated split are covered
+  by the unit arm and by reading, never by a run: a run with no fallback cannot be presented as a clean
+  test of 254.
+  **THE FOUR-RUN TABLE (2026-10-02), which is what the three FAILs must be judged against:**
+  ```
+   run    binary        verdict     demotion  state-saturation  reuse-paths
+   #1 13:28 superseded  40/16/3     FAIL      FAIL              FAIL
+   #2 13:41 superseded  42/15/1     PASS      PASS              FAIL
+   #3 14:00 frozen      40/13/3     FAIL      FAIL              FAIL
+   #4 14:18 instrumented 42/14/1    PASS      PASS              FAIL
+  ```
+  * **`[reuse-paths]` is the ONLY reproducible one: 4 of 4**, always `best_anchor` below the pin
+    (20,027 / 20,027 / 18,251 / 18,267 / 21,311 across five measurements, pin 23,353) while non-anchor paths
+    reach 30k+. That consistency is what makes it tractable.
+  * **`[demotion]` and `[state-saturation]` fail TOGETHER, twice in four runs** -- recorded as a PAIRING
+    because one cause could produce both, not as two independent flukes.
+  * **`#2/#13 did NOT reproduce in run #4** (zero `mat-remove skew`, zero recoveries): the event fired in one
+    of four runs. **An earlier claim that "the e2e now reproduces it on demand" was WRONG and is corrected in
+    `results/underflow-2026-10-02/MANIFEST`** -- the rarity the record describes is real. The skew instrument
+    (`materialization.cpp` at the `:635` site) is deployed and will name the mechanism on the next
+    occurrence, printing `planned`/`before`/`after`/`removed` together; **it cannot be scheduled.**
+  * **OPERATIONAL, AND NOW QUANTIFIED: THE SWAP'S RESTORE PATH RE-ARMS THE SENTINEL UNRELIABLY.**
+  * **A BUILD-CHECK INSTRUMENT ERROR OF MINE, WHICH MADE "BUILD CLEAN" FALSE (2026-10-02).** I checked
+    full-tree builds with `cmake --build build -j 2>&1 | grep -cE '^\\S*error'`. **That pattern does not
+    match gcc's actual error lines** -- `path:1411:60: error: ...` has a SPACE before `error:`, so `\\S*error`
+    (a non-space run immediately followed by `error`) never matches. It printed `0` while the build was
+    FAILING. The `--target ninfer-serve` builds were genuine (rc read directly); **the ALL-TARGET builds were
+    not, so every "0 errors" from that pattern is void.** What actually failed was the TEST targets:
+    `FakeProgram` in `tests/test_resource_manager.cpp` must mirror every new `Program` accessor, and a missing
+    one fails the test target ONLY -- invisible to a serve-only build. **Fix the pattern, not the habit: grep
+    `error:`.** Six accessors added to the fake; full build verified clean with the corrected grep, suites
+    re-run at baseline.
+    **Three observed failures on 2026-10-02**, each needing a manual `systemctl start` (14:25:50, 16:30:47,
+    16:42:5x). Between 15:00 and 16:42 the journal holds 5 stops and 5 starts -- but THREE of those starts
+    were mine, so the restore re-armed it twice of five. A swap that leaves it down leaves QA running with
+    **no wedge protection**, which is the state QA was in during both the 12:06 and 14:18 windows.
+    **Check the sentinel after EVERY swap; do not trust the restore path.**
+  * **OPERATIONAL, AND IT COST A RUN: `pkill -f` KILLED ITS OWN SWAP.** The pattern was bracketed
+    (`poll-deman[d]`) but the SAME command line contained `/tmp/poll-demand.sh` literally in a heredoc and a
+    `nohup`, so the pattern matched the calling shell AND the e2e task -- exit 144, the swap killed mid-run,
+    and the three-way breakage CLAUDE.md §5 describes (QA down, sentinel stopped, an orphaned test server
+    holding ~20 GiB of pinned host memory). Recovered in the prescribed order: orphan killed **BY PID** (never
+    `pkill -f`), stale `/tmp/ninfer-e2e-swap.lock` removed, `ninfer.service` started, sentinel started.
+    **Bracketing is only safe when the unbracketed text appears NOWHERE ELSE on the command line** -- and a
+    heredoc that writes the poller's own path is an occurrence. This is the SAME rule that killed a session
+    three times before; the new part is that the offender was a path in a heredoc, not a `--flag`.
+  **⚠ SUPERSEDED 2026-10-02 by a review pass -- READ THE CORRECTION BELOW BEFORE THIS PARAGRAPH.** The gate
+  was removed, then **RESTORED the same night** because the argument for removing it misdescribed its own
+  condition. The heading below said "CONFIRMED" and it should not have: it was reasoning from a reading of
+  the condition that the review falsified.
+  ~~**THE DEMOTE-PASS GATE IS FIXED AND MEASURED (2026-10-02, deploy a75a032a6bb57d6c). THE OPERATOR'S
+  DIAGNOSIS, CONFIRMED.**~~ `select_kv_pressure_actions` ran the `DemoteToHost` pass only when
+  `selection.host_bytes_remaining == 0` -- a fact about the PLAN'S OWN rolling host-byte budget, not about
+  the machine (`host_allocation_available` is `host_kv_arena != nullptr && host_kv_extents != nullptr`, i.e.
+  "the host tier EXISTS"). The operator put it plainly -- *"so the pass that builds it has to always run"* --
+  and the measurement agrees:
+  ```
+                                before (pid 155688)     after (pid 170515)
+   successors_with_option             ~18%                  39.0%     <- DOUBLED
+   no non-evicting successor            82%                   61%
+   private_owners_evicted                49                    18
+   private_owners_demoted               155                    29
+   recoveries / underflow                 0                     0
+  ```
+  **⚠ CORRECTED 2026-10-02 (review): "the gate was suppressing the demote option's generation" is FALSE.**
+  `requested_host_bytes` IS `deficit.host.kv_bytes` -- the host-KV DEFICIT -- so on a host WITH ROOM it is 0,
+  `host_bytes_remaining` starts at 0, and the gate ALREADY ran the pass. It only excluded demoting into a
+  host SHORT OF BYTES. Removing it was therefore a no-op on the case it claimed to fix, and the 18% -> 39%
+  movement it was credited with is NOT explained by it. The gate is RESTORED (see the section above); the
+  "81.5% of successors had no option" reading is real but unattributed. **What is NOT: that evictions fell.** 18 still occurred,
+  and the two windows are NOT comparable (different load durations and traffic), so the counts cannot be set
+  against each other -- 18 of 47 vs 49 of 204 is a HIGHER eviction share, not a lower one. **A controlled
+  before/after needs the same load with the gate flipped: a separate run, not yet made.**
+  **Gates passed:** e2e `41 PASS / 15 WARN / 2 FAIL`, the two FAILs being the known intermittent demotion
+  check and the anchor check (both failing before this change); zero recoveries and zero underflow in the
+  soak; none of the three regression risks the analysis pass named. **NOT committed.**
+  **THE VETO'S COUNTER IS FIXED BUT THE VETO IS NOT (same date).** `host_kv_fit_growable` counted ONLY the
+  `Growable` verdict, so **"the veto never fires" and "the veto always blocks" produced the same zero** -- the
+  absence-is-not-zero trap inside the instrument itself, and the reason this path resisted three attempts.
+  `memory.host_kv_blocked_checks` (the DENOMINATOR: nodes taking the pinned-capacity failure path at all) plus
+  `host_kv_fit_pinned` / `_growable` / `_blocked` now make it readable in one look. **Built, green, NOT
+  deployed.** The fix itself -- admitting `Growable` at `pressure.cpp:2378-2390`, for which Part 1 built the
+  pure headroom query and the site's own comment says it is what is needed -- awaits that read.
+  **A FALSE WEDGE COST THE FIRST SOAK (2026-10-02 20:11).** The sentinel armed on
+  `no engine progress for 252s` and restarted QA 25 s into the load. Three independent readings say the
+  engine was healthy: it printed `prefill 8.70k tok/s (43,500 tok)` 2 s after the arm; the capture
+  (`~/ninfer-watch/wedge-20261002-201138.waits`, so the path fix holds) shows 40 futex + 1 RUNNING thread --
+  a large prefill, not the 2026-09-26 convoy; and **the shutdown was CLEAN (88 s, `server stopped`), which a
+  wedged engine cannot do** (the shutdown needs the lock the wedge holds). Cause: **the 252 s no-progress
+  window spans the IDLE period** (no work ~20:07 to 20:11:16), so stall time accumulates while there is
+  nothing to do and fires on the first request after the engine wakes. **The baseline must reset when
+  work-in-flight reaches zero** -- and the non-zero-tok/s progress line should have disarmed class C.
+  **THE PRESERVATION PROBE'S EXONERATING HALF IS BUILT AND DEPLOYED (2026-10-02, deploy 9669164bf5c51aa3).**
+  A fresh analysis pass concluded the mechanism is **a preservation-blind GENERATOR feeding a
+  preservation-ranked ADOPTER**: `FoldedCost::key()` ranks `restorable_evictions` first and it WORKS (every
+  record with `feasible_preserving > 0` has `chosen_restorable == 0`), but the things that BUILD the plans
+  ignore preservation -- the seed is root-maximal (`materialization_planner.h:318-338`), construction selects
+  by `GuidanceCost::key()` whose first term is `estimated_total_ns` with **no restorable term anywhere**
+  (`:1240-1262`), its feasibility-first path prefers fewest `estimated_remaining_steps` so a one-step eviction
+  is preferred BY DESIGN (`:1276-1280`), and refinement makes exactly ONE cost-chosen move (`:699-747`,
+  `:859`). Consistent with that: **every evicting request had its search TRUNCATED** (935 of 1044 on
+  `time_budget`, 82 on `target_budget`, 0 on the "gain no longer justified work" reasons).
+  **But the alternative explanation -- that no preserving option EXISTED -- was not excluded, and that is
+  what this instrument separates.** At `pressure_planner.cpp:635-638`, `inspect_*_successors` returns the
+  owner's NON-EVICTING options and the eviction is appended AFTER, so an empty set means the eviction was the
+  only move and the checkpoint's destruction was UNAVOIDABLE. Reported as
+  `pressure.successor_calls` / `pressure.successors_with_option` -- with the denominator, because "no owner
+  lacked an option" and "no owner was examined" are otherwise the same reading.
+  **IF OWNERS ROUTINELY HAVE A NON-EVICTING SUCCESSOR, THE SEARCH IS THE DEFECT. IF THEY ROUTINELY DO NOT,
+  THE EVICTIONS ARE CORRECT and this whole line has been chasing a planner behaving properly.**
+  **WHAT IS NOT BUILT, and it is not a tweak:** the probe's other half asks whether a non-evicting option
+  that existed was FEASIBLE. That needs a per-owner successor query across a seam that does not exist -- the
+  enumeration is MODEL-side (`pressure_planner.cpp`) while the probe site is the RUNTIME planner
+  (`materialization_planner.h:869`) -- plus a synthetic swapped target assessed at seal. A design change, not
+  instrumentation. The analysis pass's proposed repair (iterate the swap for each evicted restorable owner,
+  admitted through `allow_work(..., complete=true)` so the 400 ms budget cannot starve it) depends on it.
+  **CORRECTION, MADE MINUTES AFTER THE PARAGRAPH BELOW: THE KV-SIDE DEMOTE ALREADY EXISTS, so "implement
+  the KV-side demote" is the wrong job.** `PressureKVDecisionKind::DemoteToHost` is a live enum
+  (`program_impl.h:135-140`, beside `DropDeviceDuplicate`/`DropHostDuplicate`) and is GENERATED per page in
+  `pressure.cpp:249-282` (`select_device_runs`), which chooses `DemoteToHost` when the host has no replica
+  and `DropDeviceDuplicate` when it does, under a strict per-page test: device-resident,
+  `writer_references == 0`, `source_pins == 0`, `replica_safe` (`!host_resident`), `!has_active_reference`,
+  `!protected_page`. **So the remaining question is not whether the relief exists but why eligible victims are
+  evicted despite it** -- and the burst's own lines hint: EVERY victim in one burst had `victim_dev_slots=0`,
+  nothing on the device to demote, so no KV demote is possible there and eviction is the only move; only
+  *not evicting* could have saved those, which is the aggregate plan-level question.
+  **A deep analysis pass was spawned on this question (2026-10-02) because four instruments in a row each
+  redirected rather than confirmed -- it is briefed with everything measured, everything falsified (#1-#6
+  below) and everything that already exists, so it does not re-tread them.**
+  **#6 NAMED BY MEASUREMENT AT LAST: THE STATE-SIDE DEMOTE DIES BECAUSE THE DEFICIT IS KV, NOT STATE
+  (2026-10-02, the operator's 8-agent load, deploy a20b45c8800ea13b).** The gate at `pressure.cpp:796` was
+  split into its one axis-choice clause and its six preconditions, and the split is 400:1:
+  ```
+   demote_option_refused_no_state_deficit    5,542,030     <- the deficit carries NO state slots
+   demote_option_refused_precondition           23,138
+   private_owners_evicted 47   evictions_with_victim_room 33   evictions_demote_possible 7   demoted 151
+   pool: capacity=100 occupied=60 pregrows=124
+  ```
+  **The state-side demote option is not REFUSED -- it is INAPPLICABLE.** It moves state slots; the deficit it
+  is asked to relieve is device KV pages. So it dies at the first clause and the planner evicts instead, which
+  does free device KV, at the cost of the checkpoint. **The fix is a KV-side demote** -- move the victim's
+  device KV pages into the host KV arena -- **CORRECTED 2026-10-02: this line said "where the journal shows
+  4-9% USED", which was the EARLY eviction lines; the instance a fresh pass measured has host KV at
+  6.37/8.05 GB, i.e. 79%, and the pinned pool is at its ceiling with 1804 policy refusals -- so the host is
+  NOT empty and the KV demote would be filling a tier that is already 79% full.** That is Part 1's axis,
+  which is also why `host_kv_fit_growable` read 0: the option never reached the tri-state, because this clause
+  killed it first.
+  **METHOD NOTE: this is the FIRST mechanism in #6's whole line named by a measurement rather than by my
+  reading** -- the preceding attempts (the option guard, the pre-grow trigger, `victim_room` as the defect
+  count) each came back 0 or refuted, and each would have aimed a fix at nothing.
+  **TWO CORRECTIONS TO CLAIMS MADE WHILE GETTING HERE, both in the load's own data:**
+  * **`already-on-host` is NOT benign -- I claimed it was, and the load's own lines refute it.** State on host + evicted = the host slots are freed and the copy is
+    DESTROYED; `restorable=1` means a checkpoint died. What is moot is the DEMOTE, not the loss.
+  * **`victim_room` is per-victim and the plan's need is AGGREGATE.** A burst evicted eight victims
+    (`host_state_slots` 108/110) to free ~26 slots, and each individually read `victim_room=1`
+    (`105 + 4 <= 110`). So `victim_room=1` does NOT mean the eviction was avoidable, and the "33% vs 92%"
+    contrast drawn from it rests on that mistake. The population with `victim_dev_slots=0` has nothing to
+    demote at all, and the real question there -- did the PLAN need the eviction -- is plan-level and
+    uninstrumented.
+  **`[demotion]` FAIL (`spill>0`, `h2d==0`) -- A LEAD, NOT A CONCLUSION, AND IT MAY BE THE CHECK.**
+  `ninfer-e2e.py:691` is `if spill_pages > 0 and h2d_pages > 0: PASS elif spill_pages > 0: FAIL` -- **there is
+  no inconclusive branch**, which is exactly the branch `reuse-paths` had to GAIN so that a workload which
+  cannot exercise a path stops reading as a failure. Every run of this phase reports **`PASS: 0 cold-starts
+  across 15 turns` BESIDE the FAIL** -- and zero cold-starts with zero restores is the consistent reading of
+  "nothing was demoted and then re-used", i.e. the phase spilled but never needed to read back. Run #2 had
+  `spill=1074 h2d=1290` (PASS), #1 and #3 had `h2d=0` (FAIL), so the outcome moves with the workload. **The
+  alternative -- that a demote genuinely failed to read back -- is NOT excluded and would be a real fault**,
+  so this needs the restore demand to be established (was a host-resident continuation re-selected?) before
+  either the check gains an inconclusive branch or the engine is blamed.
+  **`decided_by` ON THE ANCHOR REQUESTS ITSELF -- AND IT SETTLES WHY THE ANCHOR IS SHORT (2026-10-02).**
+  Of 817 anchor-path requests, 87 carry the instrument; **9 of those took the anchor over a LONGER ELIGIBLE
+  option**, and `decided_by` says why in every one:
+  ```
+   req#108  chosen 18,265  eligible loser 19,832   decided_by=1 (total_ns)
+   req#117  chosen 18,267  eligible loser 21,340   decided_by=0 (restorable_evictions)
+   req#130  chosen 21,311  eligible loser 22,850   decided_by=0
+   req#123  chosen 21,262  eligible loser 22,826   decided_by=0
+   req#102  chosen 16,586  eligible loser 18,215   decided_by=1
+   req#118  chosen 18,193  eligible loser 21,380   decided_by=1
+   req#114  chosen     14  eligible loser 21,310   decided_by=0
+  ```
+  **element 1 five times, element 0 four times -- NEVER element 10, never the enumeration ordinal.** So the
+  anchor's short reuse is not an arbitrary selection: the planner rejected the longer option on COST, or
+  because taking it would destroy a RESTORABLE checkpoint -- the operator's own #6 ruling. `req#114` is the
+  extreme case: the anchor delivered 14 tokens while 21,310 was available, and element 0 decided it.
+  **CONSEQUENCE FOR THE CHECK (`ninfer-e2e.py:1628`): its premise is incomplete.** It asserts that an anchor
+  prompt past the pin means the anchor should beat the pin, without allowing for the longer alternative being
+  DESTRUCTIVE. A FAIL there can therefore be a policy outcome, not a defect -- which is the same distinction
+  `longer_lost_decided_by` exists to draw, reaching the same conclusion from the other end.
+  **THE COST-MODEL QUESTION IS NOW ANSWERED, AND THE ANSWER IS "NOT ARBITRARY" (2026-10-02).** Reading the
+  losing side in all nine cases:
+  ```
+   req  decided_by  winner restorable  loser restorable   winner total_ns     loser total_ns
+   #114      0             1                5              136.5e9            644.9e9
+   #117      0             1                6              130.0e9            883.4e9
+   #130      0             1                5              141.8e9            735.2e9
+   #123      0             1               17               53.8e9          2,662.0e9
+   #108      1             1                0                1.74e9            17.4e9
+   #99       1             1                1              105.19e9          106.55e9
+  ```
+  The four element-0 cases are unambiguous -- **the longer option would have evicted 5 to 17 RESTORABLE
+  checkpoints**, i.e. the operator's #6 ruling deciding exactly as designed. The five element-1 cases are
+  cost, and there **`total_ns` is dominated by `future_loss_ns`** (req#99: 103.6e9 of 105.2e9), with a margin
+  as small as **1.3% for 1,587 more reused tokens** -- roughly break-even against prefill.
+  **SO: the anchor is short because its alternatives are DESTRUCTIVE or COST MORE, not because the anchor is
+  broken.** Two consequences, deliberately separated:
+  1. **The `[reuse-paths]` check's premise is incomplete** -- it asks whether an anchor past the pin beat the
+     pin, without allowing for the longer alternative being destructive, so a FAIL there can be a POLICY
+     OUTCOME. Repairing it means changing an ACCEPTANCE CRITERION, which CLAUDE.md makes the operator's call
+     -- and it would also remove the only signal currently showing the anchor's real cost. **NOT TOUCHED.**
+  2. **`predicted_now_ns` IS CALIBRATED, AND THE MODEL IS ~2.7x PESSIMISTIC -- THE FIRST CHECK ANYONE HAS RUN
+     ON IT (2026-10-02).** Predicted immediate cost against the request's ACTUAL prefill time, from the
+     request log (`predicted_now_ns` vs `timings_seconds.prefill`):
+     ```
+      population                        n     predicted_now   actual prefill   actual/predicted
+      all requests                  11,022     1.009 s          0.377 s        0.37x (p10 0.35, p90 0.49)
+      a LONGER eligible option lost     68     3.984 s          1.474 s        0.37x
+     ```
+     **The ratio is 0.35-0.49 across four orders of magnitude of prompt size**, so it is a CALIBRATION
+     CONSTANT (the modelled prefill rate is ~2.7x slower than the machine's), not noise. **But a uniform scale
+     factor largely CANCELS between candidates**, and an inflated `now` would if anything favour the
+     higher-reuse option -- so this does NOT explain the reuse sacrifices. It is a finding about the model's
+     calibration, stated as such.
+  3. **WHICH LOCATES THE CAUSE IN `future_loss_ns`, AND NAMES WHAT IS MISSING.** It dominates exactly the 68
+     longer-lost requests (median 16x `now`, p90 54x) while being 0.04x of `now` in ordinary traffic (11,055
+     requests) -- i.e. the term that decides the sacrifices is the one that is negligible everywhere else.
+     **It is also the only term of the three that has NEVER been checked against an outcome**, and unlike
+     `now` it has no fixed reference to calibrate against. **The audit is: for those 68, did the predicted
+     future losses materialise -- did the continuations sacrificed for them lose the reuse the model
+     predicted? THE REQUEST LOG CANNOT ANSWER IT, because "what the sacrifice cost" is not a field.** That
+     absence is the next instrument's specification, not a reason to skip the audit.
+  4. **The marginal `total_ns` cases are the engine-side lead and affect EVERY path, not just the anchor:**
+     when `future_loss_ns` is a PREDICTION and the margin is 1.3%, `decided_by=1` is deciding on a number
+     nobody has checked against what happened next. That audit -- `future_loss_ns` against the continuations'
+     ACTUAL fate -- is the thing to do next, and it is checkable from the request log.
+  **AND IT LEAVES THE ENGINE QUESTION SHARPER, not answered:** `best_anchor=21,311` is below the pin AND below
+  what the request's other paths reach (30k), so the anchor is being preferred over options that reuse MORE
+  and are not destructive. Whether the anchor's 14-21k reuse is genuinely worth more than a 21-30k prefix
+  match is a COST-MODEL question (`total_ns` decided 5 of the 9), not an anchor question -- and it is the
+  same question §2f has left open.
+  **THE 581-vs-21,311 "GAP" WAS NOT A FAULT -- THE THIRD TIME A LEAD DISSOLVED UNDER MEASUREMENT
+  (2026-10-02).** I claimed 581 requests meeting the anchor's capture condition above the pin, against a
+  delivered maximum of 21,311, located a retention fault. Tracing what the NEXT request in the same session
+  actually got says otherwise:
+  ```
+   581 requests met the capture condition above the pin; 580 have a later request in the same session
+     private_endpoint  'reached'   214      <- the deep match IS reached, by the endpoint
+     private_endpoint  'BELOW'     254
+     root              'BELOW'     106
+     private_long_anchor 'BELOW'     6      <- 1%
+  ```
+  **The deep matches are reached -- by `private_endpoint`, 214 times. The anchor is taken in 6 of 580 cases,
+  always shallower.** So nothing is being captured-and-lost: the anchor is a FALLBACK that the endpoint
+  correctly outranks on a session's own continuation. With the e2e's three sessions the endpoint always
+  covers the session's own reuse, which is exactly the case the anchor is NOT for.
+  **`decided_by` ON THE ANCHOR REQUESTS, AND THE CHECK IS REWRITTEN (2026-10-02).** Of 374 anchor records,
+  9 took the anchor while an ELIGIBLE ALTERNATIVE reused more -- 5 decided by `total_ns`, 4 by
+  `restorable_evictions` -- and 78 of 87 instrumented ones had NO longer eligible alternative at all, so a
+  median reuse of 14 tokens is usually what was available rather than a choice against better.
+  **`phase_reuse_paths` NO LONGER FAILS ON `PINNED_CEILING`.** Its own docstring had recorded since the phase
+  was rewritten that 23,353 "is QA's Claude Code system-prompt pin" and "the gate can neither pass on a
+  workload whose prompts never reach the pin NOR fail on one whose shared prefix is longer than it" -- and
+  used it anyway. Measured: the e2e's own `shared_stable_prefix` tops out at **22,790**, BELOW the constant,
+  so the FAIL was unreachable BY CONSTRUCTION. **A gate that cannot pass on the workload it runs on is not a
+  weak gate, it is a broken one** -- it teaches the reader to ignore the FAIL, which is how the anchor stayed
+  invisible behind WARN-INCONCLUSIVE for two runs. The verdict is now the per-request question the log can
+  answer: **did an anchor request reuse LESS than an eligible alternative it could have taken?** The constant
+  and the workload's own ceiling are printed as references. **Validated by replay over real records:**
+  e2e FAILs (9 of 374, causes named), QA WARN-inconclusive (0 of 443). **A ceiling test alone can never fail
+  once workload-relative** -- an anchor record whose split is past the ceiling has already reused past it,
+  since the anchor's reuse IS its frontier -- and that is why the verdict moved rather than the threshold.
+  **THIS IS AN ACCEPTANCE-CRITERION CHANGE, made on the operator's explicit direction (2026-10-02).**
+  **`STATS_PORT` MUST NOT BE SET FOR AN E2E RUN -- IT BREAKS THE SUITE'S OWN STATS READS (2026-10-02).**
+  Setting `STATS_PORT=8091` for the run that read the demand counters moved the test server's stats onto the
+  `--stats-port` listener, and the suite then failed to read them: **5 of that run's 7 FAILs were
+  `/stats unreachable — retention/restore cannot be evaluated`** (concurrent, thinking-sig, demotion,
+  state-saturation, queued-relief), plus a `URLError(ConnectionRefusedError)` in thinking-sig. The run's
+  verdict (37 PASS/11 WARN/7 FAIL) is therefore NOT comparable with the others and must not be quoted as one.
+  **The starter's own comment says `STATS_PORT` is for "a second, independent read of a counter" -- and it
+  is, for a SAMPLER: my sampler read `:8091` successfully throughout. What it is not is free to add: it
+  costs the suite its primary read.** To read a counter during an e2e, sample the port the suite itself
+  uses -- or accept that the counter is unavailable for that run.
+  **THE DEMAND-WINDOW INSTRUMENT'S FIRST REAL READING (2026-10-02, e2e with `STATS_PORT=8091`): the
+  over-claim is REAL BUT MINOR, and the DOMINANT EVIDENCE IS A QUESTION I HAD NOT ASKED.**
+  ```
+   selected=900   resident=6500   considered=333   -> considered is 4.3% of the bits summed
+  ```
+  * **`considered` (a checkpoint merely OFFERED) is 4.3%** -- so `candidate_keys` DOES contribute, contrary to
+    the "0" I read 40 seconds into the run and wrongly called a falsification. The counters grow with traffic;
+    an early sample is not a result, and I reported one as though it were.
+  * **`resident` DOMINATES at 84% (6,500 bits), against `selected` at 900 -- AND WHAT IT MEANS IS NOW
+    ANSWERED, so replace the guess that used to sit here.** `exact_resident_keys` is appended at exactly two
+    sites (`resource_manager.h:632`, `:660`), each immediately BEFORE the candidate is pushed into the
+    request's candidate set and gated on `inspect_admission` returning a plan with NONZERO reusable tokens.
+    So the three arms mean, precisely:
+    ```
+     selected  900 (10.5%)  the request USED it            (selected_source_key)
+     resident 6500 (84%)    the request COULD HAVE used it  (a viable candidate it did not select)
+     considered 333 (4.3%)  a shortlist opportunity that never became a viable candidate
+    ```
+    **The name misleads: `exact_resident_keys` reads as "this state is resident", but it holds CANDIDATE
+    keys -- resident enough to yield a plan, not taken by anyone.**
+  * **SO THE VALUATION IS 84% "OPTION" AND 10.5% "USE", AND THAT IS A MODELLING CHOICE, NOT A DATA FAULT.**
+    Pricing the loss of an OPTION is arguably right for a FUTURE-loss term -- a future request cannot be
+    known to be the one that would have used it. **But the consequence is concrete: a checkpoint that is
+    routinely offered and routinely declined is valued nearly as highly as one actually used**, and since
+    the window holds the last <=32 requests, a continuation that is a candidate for all of them accrues
+    near-maximum value whether or not any takes it. **This is where the two threads meet: `future_loss_ns`
+    is fed, and its dominant input is a deliberate choice of option value over realised use -- which is the
+    shape that lets it outweigh real cost by 16x exactly where reuse is sacrificed. Closing it needs a
+    JUDGEMENT (price options or uses?), not another reading.** So the valuation rests mostly on
+    `exact_resident_keys`, and **whether "resident" means "this request USED it" or merely "a matching entry
+    existed" is now the larger question** -- the same one I aimed at `candidate_keys`, at ~20x the magnitude.
+    `candidate_keys` is appended for every candidate CONSTRUCTED; `exact_resident_keys` for catalog entries
+    present in the index. If the latter is availability rather than use, THAT is the over-claim.
+  * **Method note, and it cost a wrong conclusion:** the sampler must be read at the END of a run, and the
+    port logged with each sample -- the test server's `--stats-port` listener (8091) binds but answered
+    `http=000` while its API port (8085) answered `/stats` 200 once, which is exactly the "no stats server /
+    wrong port / bad parse" ambiguity `ninfer-start-test.sh` records.
+  **`future_loss_ns` IS A PORTFOLIO VALUATION, NOT A HEURISTIC -- AND ITS DEMAND-WINDOW INSTRUMENT IS
+  BUILT AND DEPLOYED (2026-10-02).** `future_loss_ns` = `baseline_public_value - target_public_value` plus a
+  retention-weighted private transition loss, where each checkpoint contributes
+  `rebuild_ns - recovery_ns` -- the rebuild a FUTURE request avoids by reusing it -- distributed over the
+  last <=32 demand records by `demand_mask`, and `rebuild_ns` is priced by the same cost model as `now_ns`
+  (so the measured 2.7x prefill pessimism largely CANCELS rather than biasing the choice). So the answer is
+  "mis-fed or missing data", not "broken".
+  **THE HYPOTHESIS I BUILT THE INSTRUMENT FOR WAS THAT ITS INPUTS MIX OFFERS WITH USES.** `demand_matches`
+  was a three-way `||` over `candidate_keys` (filled as each candidate is CONSTRUCTED), `exact_resident_keys`
+  and `selected_source_key` -- so a checkpoint merely OFFERED would register demand at full saving value.
+  `ResourceManager::DemandEvidence` + `tally_demand_evidence` now split the set bits by evidence, reported as
+  `pressure.demand_bits_{selected,resident,considered}` in `/stats`, uncapped.
+  **FIRST READING FALSIFIES THE HYPOTHESIS ON LIGHT TRAFFIC: `selected=81 resident=36 considered=0` --
+  considered is 0.0%.** Every bit came from a source the request actually used or had resident. **BUT this
+  traffic is single-candidate** (20 similar requests, one session), so the request's own continuation is both
+  the candidate and the selected source and the precedence folds it into `selected` BY CONSTRUCTION. The case
+  the hypothesis needs -- many candidates offered, one taken -- is the operator's agentic load, so
+  **0% here is "this traffic cannot produce it", NOT "the over-claim is absent". Reported as falsified on
+  this traffic, not closed.**
+  **AND THE INSTRUMENT'S OWN FIRST BUILD REPORTED 0 FOR A DIFFERENT REASON:** the tally incremented the
+  MANAGER's counters while the stats read `program.demand_bits_*()`, which nothing filled -- two halves wired
+  to nothing in between. **"Not wired" and "measured zero" were indistinguishable**, the repository's oldest
+  trap, and the second deploy is what separated them. Found by the measured zero, fixed, and the dead
+  `program` plumbing removed rather than left as an unused accessor.
+  **THE `[reuse-paths]` FAIL IS NARROWED TO A SHALLOW ANCHOR FRONTIER (2026-10-02, by reading the
+  selection path).** `plan->summary.reusable_prompt_tokens = plan->reuse_base` (`request_plan.cpp:884`) and
+  `plan->reuse_base = selected.frontier` (`:683`), so **for an anchor request the REUSE *IS* the anchor
+  checkpoint's frontier** -- they are one quantity, not two. Consequences, each checkable:
+  * `best_anchor = 21,311` therefore means **the deepest anchor frontier was 21,311 while an anchor prompt
+    reached 25,061** -- the anchor lags the prompt by ~3.7k.
+  * **And it lags the reachable depth by ~9k**: `best_nonanchor_hit = 30,038` shows requests in the same
+    phase reaching 30k through other paths, so conversations DO get that deep while no anchor does.
+  * **The check's inconclusive guard tests the WRONG quantity**: it fires on `longest_anchor_prompt <=
+    PINNED_CEILING` (the PROMPT), but what decides whether an anchor can beat the pin is its FRONTIER --
+    25,061 vs 21,311 here, so the guard stayed silent and the FAIL fired. Since reuse == frontier, the
+    FAIL condition and the guard condition are the SAME question asked of two different depths.
+  **SO THE FIX SPLITS, AND ONLY ONE HALF IS THE ENGINE'S:**
+  (a) the CHECK should guard on the anchor frontier (a workload whose deepest anchor is below the pin cannot
+      answer the question) -- the same class of repair `reuse-paths` needed once before;
+  (b) the ENGINE question is the one that matters: with `max_long_anchors_per_continuation = 2` and a
+      REPLACEMENT when full (`capture.cpp:659-705`, anchors recorded at `group.frontier`), why does the
+      deepest RETAINED anchor sit at 21k when the conversation reaches 30k? **Do NOT "fix" the check first**
+      -- doing so would silence the only signal that currently shows (b), and (b) is the operator's defect.
+  (c) The next instrument is the anchor FRONTIERS beside the conversation depth, sampled on the capture
+      path -- the selection path is behaving exactly as written and has nothing left to give.
+  **THE `[reuse-paths]` FAIL IS THE OPERATOR'S ANCHOR DEFECT, AND THE SUITE IS NOW ABLE TO SAY SO.** The
+  check (`ninfer-e2e.py:1628`) FAILS when the BEST `private_long_anchor` reuse does not EXCEED
+  `PINNED_CEILING = 23,353` -- QA's Claude Code system prompt, i.e. the shared prefix every request already
+  carries. So the anchor path must beat the shared prefix, and it did not. **A LEAD, NOT A CONCLUSION, and
+  it points at Part 1:** `best_anchor` across the day's runs is 20,027 (pre-rework binary, 13:10) then
+  18,251 / 18,267 (reworked, 13:41 / 14:00) -- **already below the pin BEFORE the longer_lost rework**, so
+  the rework did not cause it; those runs returned WARN-INCONCLUSIVE only because their anchor prompts stayed
+  under the pin and the branch cannot call it. `plan.md`'s own record has the anchor WORKING on 2026-10-01
+  (58 of 58 anchor records above the pin, median 39,376). **The behaviour therefore changed between 10-01 and
+  10-02, which is when Part 1 (the KV pre-grow and the HostKVFit tri-state) landed** -- and Part 1 changes
+  the host-KV feasibility the planner decides on, so it is a live candidate. **The control is the pre-change
+  tree** (`git stash` -> rebuild -> e2e -> read `best_anchor`); the workload differs between 10-01 (58 anchor
+  records) and 10-02 (13-22), so "regression" is not established by the numbers alone and the control is
+  what decides. Do NOT fix the anchor before that control runs.
+  **RESOLVED BY THE SECOND RUN (2026-10-02): 42 PASS / 15 WARN / 1 FAIL -- about the SUPERSEDED binary.** `[demotion]` and
+  `[state-saturation]` did NOT reproduce -- they are the non-deterministic phase outcomes the suite flags
+  for itself, and the rework did not change behaviour. **`[reuse-paths]` DID reproduce, in both runs, with a
+  concrete number each time**: "an anchor request had a prompt past the 23353 pin (30315 / 26311) and the
+  BEST anchor reuse was only 16605 / 18251 -- the anchor is taken and is not lifting the ceiling". **That is
+  the operator's "anchor not used" MEASURED, reproducibly, by the suite's own assertion** -- and it could
+  NOT be measured before, because earlier workloads kept the anchor prompt under the pin and the check
+  returned WARN:inconclusive. This is the sharpest statement of the defect available: not a percentage over
+  a mixed log, but an assertion that fails on purpose when an anchor longer than the pin reuses less than it.
+  **FIRST READING OF THE REWORKED FIELD (2026-10-02, and the population is the e2e — NOT QA).** The only
+  instances carrying the field are the ones running the reworked build, i.e. the e2e swap, so this is a COLD
+  TEST SERVER population and is labelled as such; it says nothing yet about production. Over 447 records:
+  ```
+  (decided_by, longer_lost_eligible)   n         read as
+  (1, False)  250   (0, False)  91   (255, False) 93   no eligible LONGER loser: margin only, or none
+  (0, True)     8                                      the #6 preservation ruling decided
+  (1, True)     4                                      total_ns decided (a COST call)
+  (12, False)   1                                      an ENUMERATION-ORDER tie -- reachable now, was not before
+  ```
+  * **`(10, True)` DOES NOT OCCUR.** The invariant is confirmed on live records and not only in the unit test
+    -- element 10 is `max - reused_prompt_tokens`, so a longer loser cannot have lost there.
+  * **Where a longer eligible candidate did lose, it was element 0 or element 1 every time** -- the #6 ruling
+    or a cost call. `req#108` is the clean case: a loser reusing 19,832 lost to a winner reusing 18,265
+    because the winner's `total_ns` was **1.74e9 against 17.42e9, ten times cheaper**. That is not a defect,
+    it is the cost model working; and the 8 element-0 cases are the operator's own preservation ruling.
+  * **ONE CASE DOES NOT FIT AND IS LEFT OPEN, NOT EXPLAINED AWAY.** `req#247`: the winner's row reads
+    `reusable=0, restorable_evictions=3` while an eligible loser reads `reusable=577,
+    restorable_evictions=0` -- and element 0 prefers FEWER, so on the recorded costs the WINNER should have
+    lost. Two explanations and they are not equivalent: (a) the reviewer's open question 3 -- a loser's
+    `best` goal-bearing cost can be a target the election never ranked against the winner, so the comparison
+    is between non-comparable plans; or (b) the winner's recorded cost is still not the elected one on some
+    path. **This is exactly what the e2e-only population cannot settle**, and it is the first thing to check
+    when the QA load runs.
+  **WHAT IS STILL MISSING: the reading.** `longer_lost_decided_by` is empty of meaning until the load runs
+  on this build -- and that is the whole point, because the element it names is what decides whether the
+  planner chose badly, applied the #6 preservation ruling (element 0), or broke a tie
+  by ENUMERATION ORDER (an ordinal element, which is arbitrary and would be the real bug).
 - **`ninfer-start-test.sh` reinitialised `CT_FLAGS_EXTRA`, so a caller could not pass `--stats-port`.** Two
   runs read empty `/stats` behind `2>/dev/null` and the failure modes were indistinguishable; the harness now
   honours `STATS_PORT`. Any claim resting on a test-server `/stats` reading from before this is worthless.
@@ -2998,6 +4635,16 @@ and nobody reads.
   where nothing could write, a print firing only on exact multiples, a capped print read as a total, a
   sampled print read as a sequence, and a probe that reported a conclusion from two runs that sent
   nothing. Print skips and denominators; run it twice and require agreement.
+- **THE REQUEST LOG IS A MIXED POPULATION: THE E2E TEST SERVER WRITES TO QA'S PATH.** Observed
+  2026-10-02 during a swap: QA was `inactive` with the test server up on `:8085` (pid 60241), and
+  `/home/zenz/ninfer-requests.jsonl` was receiving `server_instance_id = serve-60241-*` records alongside
+  QA's. So an aggregate computed over that file mixes e2e, benchmark and QA traffic with no field marking
+  which is which except the instance id, and the e2e's cold-cache requests (a fresh server re-prefilling
+  16k tokens with `hit=14`) look exactly like a reuse defect. It also makes the WATCHER alert during a
+  swap on traffic that is not QA's -- `LOW PREFIX USE ... path=private_long_anchor hit=14/16523` fired
+  three times on 2026-10-02 from the test server alone. **Filter by `server_instance_id` and say which
+  instance a number comes from**; the per-instance figures in this file's `longer_lost` entry are QA-only
+  (instance 28425), while its 15,413-record aggregate is NOT and is labelled as such.
 - `journalctl -b -1` does not work on this host; use `--since/--until`.
 - A wedged engine is not fixed by `~/ninfer-ensure.sh`. Restart, then confirm `/health` 200 and the
   sentinel active.

@@ -2183,7 +2183,14 @@ int test_media_cache_runs_independent_misses_in_parallel() {
             const int now = ++active;
             int maximum   = maximum_active.load();
             while (now > maximum && !maximum_active.compare_exchange_weak(maximum, now)) {}
-            const auto limit = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+            // A 1-SECOND DEADLINE MADE THIS TEST FLAKY, AND IT WAS THE TEST'S FAULT, NOT THE POOL'S.
+            // The rendezvous below exists so all four callbacks are active together and `maximum_active`
+            // reaches 4; the deadline is only a safety net against a genuine hang. At one second it fired
+            // under load instead -- measured 2026-10-03: the commit gate ran it alongside other tests and
+            // it failed once in five runs, then passed 4/4 on reproduction. The pool HAS four threads here,
+            // so all four always start; the deadline only has to be long enough not to be the thing that
+            // decides the result.
+            const auto limit = std::chrono::steady_clock::now() + std::chrono::seconds(30);
             while (started.load() != static_cast<int>(pending.size()) &&
                    std::chrono::steady_clock::now() < limit) {
                 std::this_thread::yield();
@@ -2201,6 +2208,20 @@ int test_media_cache_runs_independent_misses_in_parallel() {
     std::array<fi::PreparedMedia, 4> results;
     for (std::size_t index = 0; index < pending.size(); ++index) {
         results[index] = cache->await(pending[index], {}, request_stats);
+    }
+    // THE MESSAGE NAMES THE CONDITION AND ITS VALUES. It said only "did not use the bounded
+    // preprocessing pool" for FIVE different conjuncts, so a failure was undiagnosable -- the same defect
+    // as `guided deep retention`, which reported no count either. A test that fails must say what it saw.
+    if (!(started == 4 && maximum_active == 4 && request_stats.misses == 4 &&
+          cache->stats().preprocess_threads == 4 && results.back().payload &&
+          results.back().payload->span().front() == 3)) {
+        std::cout << "    started=" << started.load() << " maximum_active=" << maximum_active.load()
+                  << " misses=" << request_stats.misses
+                  << " preprocess_threads=" << cache->stats().preprocess_threads
+                  << " payload=" << (results.back().payload ? "yes" : "no")
+                  << " span_front="
+                  << (results.back().payload ? results.back().payload->span().front() : 0)
+                  << " (expected 4/4/4/4/yes/3)\n";
     }
     return check(started == 4 && maximum_active == 4 && request_stats.misses == 4 &&
                      cache->stats().preprocess_threads == 4 && results.back().payload &&

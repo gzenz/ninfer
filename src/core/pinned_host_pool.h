@@ -62,10 +62,34 @@ public:
     // With no policy set, growth is allowed up to `config.max_bytes` only.
     void set_growth_policy(std::function<bool(std::size_t bytes)> policy) { policy_ = std::move(policy); }
 
+    // How many more bytes MAY be pinned right now, as a PURE query. Supplied by the caller because only it
+    // holds the free-RAM reading and the reserve (in production, `HostMemoryBudget::max_pinnable()`).
+    //
+    // THIS IS NOT THE GROWTH POLICY AND MUST NOT BE CONFUSED WITH IT. `policy_` ANSWERS
+    // `bool(bytes)`, which is the yes/no a growth attempt needs, and calling it is not free: in production
+    // it is `HostMemoryBudget::allow()`, which re-reads /proc/meminfo and mutates the budget's counters on
+    // every call. The planner needs the OTHER question -- "how much more could be pinned?" -- answered
+    // thousands of times inside a search that must have no side effects, so it gets a separate, `const`,
+    // side-effect-free hook. Schematically: `policy_(b)` decides whether to grow by `b`; this reports the
+    // budget the decision would be made against.
+    //
+    // A stale answer is tolerable and the reason is structural: the value is used to CLASSIFY a plan as
+    // "affordable if grown" and to size a diagnosis, never to admit -- any actual growth re-checks
+    // `policy_` inside `grow()` and can still refuse. It must never be lifted into a capacity the planner
+    // spends (that mistake is recorded at `pressure.cpp:2572-2588`).
+    void set_growth_headroom_query(std::function<std::size_t()> query) { headroom_ = std::move(query); }
+
     // Allocate `bytes`. Grows if free space cannot satisfy it and the policy allows. Returns nothing when
     // neither is possible -- the caller decides whether that is benign or fatal, which is why this does not
     // throw (the fixed pool's callers currently throw `bad_alloc` here, `materialization.cpp:1718-1720`).
-    [[nodiscard]] std::optional<Handle> allocate(std::size_t bytes) noexcept;
+    // `speculative` MARKS A GROWTH NOBODY ASKED FOR YET -- the session-start pre-grow. It performs the SAME
+    // work and returns the same answers; only the accounting differs, and that is the whole point. A refused
+    // pre-grow is not an allocation failure and a pre-grow that cannot be placed is not a fragmentation miss
+    // OF A DEMAND, so letting them into `allocation_refusals_` / `allocation_fragmented_misses_` made those
+    // counters stop measuring real failures: measured 2026-10-02, every one of QA's 106 refusals and 132
+    // fragmented misses was a speculative pre-grow (`pregrows=0`), so a reader asking "is the pool failing
+    // to serve real allocations" got a yes that meant nothing.
+    [[nodiscard]] std::optional<Handle> allocate(std::size_t bytes, bool speculative = false) noexcept;
 
     [[nodiscard]] bool  release(Handle handle) noexcept;
     [[nodiscard]] std::byte* data(Handle handle) const noexcept;
@@ -90,6 +114,12 @@ public:
     // that replaces "return nullopt, then throw bad_alloc": a caller can pre-grow by this much and re-plan,
     // which is what lets a demote happen instead of an eviction.
     [[nodiscard]] std::size_t shortfall_for(std::size_t bytes) const noexcept;
+
+    // PURE. Never grows, never counts, never touches the policy. 0 when no query is installed, which the
+    // caller must read as "no growth headroom known" rather than as an error.
+    [[nodiscard]] std::size_t growth_headroom_bytes() const noexcept {
+        return headroom_ ? headroom_() : 0U;
+    }
 
     [[nodiscard]] std::size_t chunk_of(Handle handle) const noexcept { return handle.chunk; }
     [[nodiscard]] std::size_t offset_of(Handle handle) const noexcept;
@@ -133,10 +163,19 @@ public:
     [[nodiscard]] std::uint64_t growth_policy_refusals() const noexcept { return growth_policy_refusals_; }
     [[nodiscard]] std::uint64_t growth_pin_failures() const noexcept { return growth_pin_failures_; }
     [[nodiscard]] std::uint64_t allocation_refusals() const noexcept { return allocation_refusals_; }
+    // The speculative half, kept BESIDE the real one rather than merged into it, so "no real allocation was
+    // refused" and "the pre-grow was refused often" can both be read.
+    [[nodiscard]] std::uint64_t allocation_speculative_refusals() const noexcept {
+        return allocation_speculative_refusals_;
+    }
     // The halves of `allocation_refusals`, which were one number for two different failures:
     // `ram` = no room and growth refused (RAM/policy), `post_grow` = grew and still could not place it
     // (believed unreachable; a broken growth contract if it ever fires). Sum is the total.
     [[nodiscard]] std::uint64_t allocation_ram_refusals() const noexcept { return allocation_ram_refusals_; }
+
+    // How many LIVE chunks currently belong to a class. PURE. Exists so a caller can CHECK that a consumer
+    // actually opted in: a missed call site reverts that consumer to `Any` with every counter at 0 and no
+    // error anywhere, which is the failure this makes visible at construction rather than at the next soak.
     [[nodiscard]] std::uint64_t allocation_post_grow_failures() const noexcept {
         return allocation_post_grow_failures_;
     }
@@ -178,6 +217,7 @@ private:
     ChunkSource                       source_;
     ChunkReleaser                     releaser_;
     std::function<bool(std::size_t)>  policy_;
+    std::function<std::size_t()>      headroom_;
     std::vector<Chunk>                chunks_;
     std::size_t                       capacity_            = 0;
     std::size_t                       occupied_            = 0;
@@ -186,6 +226,7 @@ private:
     std::uint64_t                     growth_policy_refusals_ = 0;
     std::uint64_t                     growth_pin_failures_    = 0;
     std::uint64_t                     allocation_refusals_ = 0;
+    std::uint64_t                     allocation_speculative_refusals_ = 0;
     std::uint64_t                     allocation_ram_refusals_   = 0;
     std::uint64_t                     allocation_post_grow_failures_ = 0;
     std::uint64_t                     allocation_fragmented_misses_  = 0;

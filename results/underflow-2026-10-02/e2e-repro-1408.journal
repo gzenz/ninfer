@@ -1,0 +1,21 @@
+[kv-binding] LANE-RELEASE lane=1 checks=0 diverged=0 unverifiable=0 foreign=352/2072
+[kv-binding] LANE-RELEASE lane=1 checks=0 diverged=0 unverifiable=0 foreign=352/2072
+[kv-binding] LANE-RELEASE lane=0 checks=0 diverged=0 unverifiable=0 foreign=352/2072
+[kv-binding] LANE-RELEASE lane=0 checks=0 diverged=0 unverifiable=0 foreign=352/2072
+[kv-binding] LANE-RELEASE lane=1 checks=0 diverged=0 unverifiable=0 foreign=352/2072
+[kv-binding] LANE-RELEASE lane=0 checks=0 diverged=0 unverifiable=0 foreign=352/2072
+[kv-binding] LANE-RELEASE lane=0 checks=0 diverged=0 unverifiable=0 foreign=352/2072
+[kv-binding] LANE-RELEASE lane=0 checks=0 diverged=0 unverifiable=0 foreign=352/2072
+[kv-binding] LANE-RELEASE lane=0 checks=0 diverged=0 unverifiable=0 foreign=352/2072
+[engine] WORKER RECOVER: Qwen3.5 resource subtraction underflow [device.main_kv_pages: have 131, removing 309]
+[kv-binding] LANE-RELEASE lane=0 checks=0 diverged=0 unverifiable=0 foreign=353/2074
+[engine] non-strict release REFUSED (state-write, blocker=checkpoint-references (still owned)): the caller dropped its handle and the store did not free the image. count=1
+[kv-binding] LANE-RELEASE lane=1 checks=0 diverged=0 unverifiable=0 foreign=353/2074
+[kv-binding] LANE-RELEASE lane=2 checks=0 diverged=0 unverifiable=0 foreign=353/2074
+[kv-binding] LANE-RELEASE lane=0 checks=0 diverged=0 unverifiable=0 foreign=353/2074
+[engine] fail-all cleanup: shared catalogued=0 released-refused=0 skipped=0 (reserved-capture=0 reserved-replacement=0) continuations-live=1
+[engine] post-recovery residual (recover): main_kv_pages=310 backend_kv_pages=0 device_state_slots=1 host_state_slots=0 host_kv_bytes=331481088
+[census] text address=18 active=0 occupied=1 row=0 reserved_pages=0 page_count=310 device_resident=310 host_resident=281 frontier=19833
+2026-10-02 14:07:23.486  ERROR req#261 failed during generation | openai-chat | HTTP 500 | internal error
+2026-10-02 14:07:23.486  ERROR req#264 failed during generation | openai-chat | HTTP 500 | internal error
+2026-10-02 14:07:23.486  ERROR req#266 failed during generation | openai-chat | HTTP 500 | internal error

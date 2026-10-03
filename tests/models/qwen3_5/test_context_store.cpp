@@ -217,6 +217,80 @@ void test_state_store(ninfer::DeviceContext& device) {
            "State Host/Device replica ownership closes without leaked slots");
 }
 
+// THE SESSION-START PRE-GROW for the host-KV axis, which had no equivalent while the STATE axis has had
+// one since §3 item 6 (measured firing, `17 -> 18` slots). The state pre-grow could not convert the one
+// eviction that workload produced, because that one was bound by host KV BYTES -- `host_kv` at 99.3% --
+// so this is the missing half of the same mechanism.
+//
+// It asserts the CAPACITY DIFFERENCE, which is the lesson the state axis's equivalent records: `pre_grow`
+// returning `Grew` while pinning nothing would satisfy a flag assertion and leave the demote unaffordable.
+//
+// The TRIGGER is the part worth pinning: `NotFull` only while the arena can place a whole STEP as one
+// contiguous run, and `Grew` the moment it cannot -- INCLUDING when free bytes remain. That second case is
+// what a "no free bytes at all" trigger would decline, and it is the measured case (99.3% leaves ~224 MiB,
+// which is not zero).
+void test_host_kv_pregrow(ninfer::DeviceContext& device) {
+    // NO DEVICE POOL HERE, deliberately: the pre-grow is decided from the HOST arena's extent map and the
+    // pool's growth policy alone, so a host layout is all this needs. (An earlier draft of this test carried
+    // the neighbouring fixture's device scaffolding and would not compile -- it was never used.)
+    (void)device;
+    const std::array geom{ninfer::KVPageGeometry{
+        .device_plane_order = ninfer::PagedKVPlaneOrder::PageMajor,
+        .planes             = {{.dtype = ninfer::DType::I8, .leading_extent = 8, .head_extent = 2},
+                               {.dtype = ninfer::DType::FP16, .leading_extent = 1, .head_extent = 2}},
+    }};
+    const ninfer::HostKVPageLayout host_layout = ninfer::plan_host_kv_page_layout(geom.front());
+    const std::array host_layouts{host_layout};
+    const std::size_t step = host_layout.page_stride * 8U;
+
+    ninfer::PinnedHostPool pool(
+        ninfer::PinnedHostPool::Config{step, 256U},
+        [](std::size_t bytes) { return std::malloc(bytes); },
+        [](void* base) { std::free(base); });
+    ninfer::HostKVArena arena(pool, step, step, host_layouts);
+    store::HostKVExtentStore extents(arena, 64);
+
+    expect(store::HostKVExtentStore::pre_grow(arena, extents) ==
+               store::HostKVExtentStore::HostKVPreGrow::NotFull,
+           "pre-grow: a fresh arena reports NotFull");
+    expect(arena.capacity_bytes() == step, "pre-grow: NotFull pinned nothing");
+
+    auto taken = arena.allocate(host_layout, 1);
+    expect(taken.has_value(), "pre-grow: fixture allocation");
+    expect(arena.free_bytes() > 0U, "pre-grow: the fixture still holds free BYTES");
+    expect(arena.largest_free_run_bytes() < step,
+           "pre-grow: and no longer a whole-step run -- the trigger condition");
+    const std::size_t capacity_before = arena.capacity_bytes();
+    const std::size_t free_before     = arena.free_bytes();
+
+    expect(store::HostKVExtentStore::pre_grow(arena, extents) ==
+               store::HostKVExtentStore::HostKVPreGrow::Grew,
+           "pre-grow: a fragmented arena grows rather than declining");
+    expect(arena.capacity_bytes() == capacity_before + step,
+           "pre-grow: and it added EXACTLY one step -- the difference, not a flag");
+    expect(arena.free_bytes() == free_before + step, "pre-grow: the new step is free, not occupied");
+
+    // REFUSED, on a FRESH arena. Reusing the one above does not work and the first version of this test
+    // tried to: after a successful pre-grow the arena holds a whole new step, so it is `NotFull` again and
+    // the refusal is never reached -- a fixture that cannot fail for the reason it claims.
+    ninfer::PinnedHostPool refusing_pool(
+        ninfer::PinnedHostPool::Config{step, 256U},
+        [](std::size_t bytes) { return std::malloc(bytes); },
+        [](void* base) { std::free(base); });
+    ninfer::HostKVArena refusing_arena(refusing_pool, step, step, host_layouts);
+    store::HostKVExtentStore refusing_extents(refusing_arena, 64);
+    auto held = refusing_arena.allocate(host_layout, 1);
+    expect(held.has_value(), "pre-grow: refusal-arm fixture allocation");
+    expect(refusing_arena.largest_free_run_bytes() < step, "pre-grow: the refusal arm is fragmented");
+    const std::size_t before_refusal = refusing_arena.capacity_bytes();
+    refusing_pool.set_growth_policy([](std::size_t) { return false; });
+    expect(store::HostKVExtentStore::pre_grow(refusing_arena, refusing_extents) ==
+               store::HostKVExtentStore::HostKVPreGrow::Refused,
+           "pre-grow: a refusing policy reports Refused, not silence");
+    expect(refusing_arena.capacity_bytes() == before_refusal,
+           "pre-grow: a refused pre-grow left the arena exactly as it was");
+}
+
 void test_kv_store(ninfer::DeviceContext& device) {
     ninfer::LayoutBuilder builder;
     ninfer::DeviceKVPagePoolSpec page_spec{
@@ -697,6 +771,7 @@ int main() {
         ninfer::DeviceContext device(0);
         test_state_store(device);
         test_kv_store(device);
+        test_host_kv_pregrow(device);
         device.synchronize();
     } catch (const std::exception& error) {
         std::cerr << "FAIL: unexpected exception: " << error.what() << '\n';

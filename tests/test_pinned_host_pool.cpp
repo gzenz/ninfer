@@ -68,6 +68,27 @@ ninfer::PinnedHostPool make_pool(FakeChunks& chunks, std::size_t chunk_bytes,
         [&chunks](void* base) { FakeChunks::unpin(&chunks, base); });
 }
 
+// THE REVIEW'S VERIFICATION FOR THE PRE-GROW SEPARATION, with its own control: a speculative refusal must
+// not enter the real-failure counters, and a real one must still enter them. Without the control this test
+// would pass on a pool that simply never counted anything.
+void test_speculative_refusals_are_separate() {
+    FakeChunks chunks;
+    ninfer::PinnedHostPool pool = make_pool(chunks, 1U << 20U);
+    chunks.fail_after = chunks.pins;  // every further pin fails, so growth is refused
+    const std::size_t want = 1U << 20U;
+
+    check(!pool.allocate(want, /*speculative=*/true).has_value(), "speculative allocation refused");
+    check(pool.allocation_speculative_refusals() == 1U, "the refusal IS counted, as SPECULATIVE");
+    check(pool.allocation_refusals() == 0U, "and NOT as a real allocation failure");
+    check(pool.allocation_ram_refusals() == 0U, "nor as a RAM refusal");
+
+    check(!pool.allocate(want).has_value(), "real allocation refused (the CONTROL)");
+    check(pool.allocation_refusals() == 1U, "the real refusal IS counted");
+    check(pool.allocation_ram_refusals() == 1U, "and as a RAM refusal");
+    check(pool.allocation_speculative_refusals() == 1U, "and the speculative count did not move");
+}
+
+
 void test_grows_on_demand() {
     FakeChunks chunks;
     ninfer::PinnedHostPool pool = make_pool(chunks, 1U << 20U);
@@ -111,6 +132,41 @@ void test_growth_preserves_addresses() {
         if (address[i] != std::byte{0x5A}) { intact = false; break; }
     }
     check(intact, "its contents survived the growth");
+}
+
+// THE FRAGMENTATION GUARD, WHICH THE EXISTING SPECULATIVE TEST CANNOT REACH. `test_speculative_refusals_
+// are_separate` builds an EMPTY pool, so `free_bytes() == 0` and the first placement attempt fails for SIZE
+// rather than placement -- meaning the `!speculative &&` guard in `allocate` is never exercised and deleting
+// it fails nothing. This fixture fragments the pool first (free bytes, no contiguous run of the request),
+// which is the only shape where the guard has an effect, and carries a non-speculative control.
+// Measured: delete `!speculative &&` and the third assertion below fails.
+void test_fragmentation_guard_excludes_speculative() {
+    FakeChunks chunks;
+    ninfer::PinnedHostPool pool = make_pool(chunks, 4U << 20U);
+    auto a = pool.allocate(1U << 20U);
+    auto b = pool.allocate(1U << 20U);
+    auto c = pool.allocate(1U << 20U);
+    auto d = pool.allocate(1U << 20U);
+    check(a && b && c && d, "four quarter-chunk allocations");
+    (void)pool.release(*a);
+    (void)pool.release(*c);
+    check(pool.largest_free_run() < (2U << 20U), "the pool is fragmented: free bytes, no 2 MiB run");
+    chunks.fail_after = chunks.pins;  // growth refused, so the request reaches the failure branch
+
+    const std::uint64_t frag0 = pool.allocation_fragmented_misses();
+    const std::uint64_t spec0 = pool.allocation_speculative_refusals();
+    const std::uint64_t real0 = pool.allocation_refusals();
+
+    auto spec = pool.allocate(2U << 20U, /*speculative=*/true);
+    check(!spec.has_value(), "the speculative 2 MiB request is refused");
+    check(pool.allocation_speculative_refusals() == spec0 + 1U, "it is counted as SPECULATIVE");
+    check(pool.allocation_fragmented_misses() == frag0,
+          "and NOT as a fragmentation miss (a pre-grow is not a failed demand)");
+
+    auto real = pool.allocate(2U << 20U);
+    check(!real.has_value(), "the real 2 MiB request is refused (the CONTROL)");
+    check(pool.allocation_refusals() == real0 + 1U, "it IS counted as a real refusal");
+    check(pool.allocation_fragmented_misses() == frag0 + 1U, "and IS a fragmentation miss");
 }
 
 void test_fragmentation_is_visible() {
@@ -318,6 +374,36 @@ void test_revision_marks_size_changes() {
 // 256 KiB run at 768 KiB, and a 128 KiB request fits both. First-fit takes the one it meets first (512 KiB,
 // and splits its FRONT, cutting it to 384 KiB); best-fit takes the tightest (256 KiB) and leaves the 512 KiB
 // run whole. `largest_free_run` distinguishes them, 512 KiB against 384 KiB.
+// THE GROWTH-HEADROOM QUERY MUST BE PURE, and this is the assertion that says so. The planner calls it
+// inside a 400 ms-bounded search that must have no side effects; in production the value comes from
+// `HostMemoryBudget::max_pinnable()`, which is `const` over a CACHED reading, while the growth policy it
+// sits beside (`HostMemoryBudget::allow()`) re-reads /proc/meminfo and mutates counters on every call.
+// The mutation this test exists to kill: making `growth_headroom_bytes()` fall back to `policy_` or to
+// `grow()` -- either would make the call counts below move.
+void test_growth_headroom_is_pure() {
+    FakeChunks chunks;
+    ninfer::PinnedHostPool pool = make_pool(chunks, 1U << 20U);
+    // No query installed: 0, and NOT an error state.
+    check(pool.growth_headroom_bytes() == 0U, "no query installed reads as 0");
+
+    std::size_t policy_calls = 0;
+    pool.set_growth_policy([&policy_calls](std::size_t) { ++policy_calls; return true; });
+    std::size_t query_calls = 0;
+    pool.set_growth_headroom_query([&query_calls] { ++query_calls; return std::size_t{7U} << 20U; });
+
+    const std::uint64_t grows_before = pool.growth_count();
+    const std::uint64_t pins_before  = chunks.pins;
+    for (int i = 0; i < 100; ++i) {
+        (void)pool.growth_headroom_bytes();
+    }
+    check(query_calls == 100U, "the query is consulted once per call");
+    check(policy_calls == 0U,
+          "BUT the growth policy is never consulted -- that is the whole separation, and the mutant fails here");
+    check(pool.growth_count() == grows_before && chunks.pins == pins_before,
+          "and nothing was grown or pinned by asking");
+    check(pool.growth_headroom_bytes() == (std::size_t{7U} << 20U), "the value is passed through unchanged");
+}
+
 void test_best_fit_protects_the_large_run() {
     FakeChunks chunks;
     ninfer::PinnedHostPool pool = make_pool(chunks, 1U << 20U);  // 1 MiB chunk
@@ -356,6 +442,7 @@ void test_first_fit_consumes_the_oldest_chunk_first() {
 int main() {
     test_grows_on_demand();
     test_growth_preserves_addresses();
+    test_fragmentation_guard_excludes_speculative();
     test_fragmentation_is_visible();
     test_shrink_refuses_while_live();
     test_handles_survive_a_shrink();
@@ -366,6 +453,8 @@ int main() {
     test_can_serve_and_shortfall();
     test_carve_exact_is_pure_and_strict();
     test_revision_marks_size_changes();
+    test_growth_headroom_is_pure();
+    test_speculative_refusals_are_separate();
     test_best_fit_protects_the_large_run();
     test_first_fit_consumes_the_oldest_chunk_first();
 

@@ -489,6 +489,79 @@ int exercise_host_arena_growth(ninfer::DeviceContext& device, ninfer::HostKVPage
 }
 
 
+// THE THREE-VALUED FIT, which exists because two values cannot say "not affordable from pinned memory,
+// affordable if grown" -- the distinction the pressure planner needs and the source names as the defect
+// (`pressure.cpp`: a plan affordable by growing "reads as blocked and the caller may evict where a demote
+// was possible"). Two things this asserts that a bool cannot: that a shortfall is REPORTED, and that
+// asking the question is PURE (the planner runs it inside a 400 ms-bounded search that must not act).
+int exercise_host_arena_fit_tristate(ninfer::DeviceContext& device, ninfer::HostKVPageLayout host_layout,
+                                     const std::string& label) {
+    (void)device;
+    int failures = 0;
+    const ninfer::HostKVPageLayout layouts[] = {host_layout};
+    ninfer::PinnedHostPool pool(
+        ninfer::PinnedHostPool::Config{host_layout.page_stride * 8U, 256U},
+        [](std::size_t bytes) { return std::malloc(bytes); },
+        [](void* base) { std::free(base); });
+    ninfer::HostKVArena arena(pool, host_layout.page_stride * 8, host_layout.page_stride * 8,
+                              std::span<const ninfer::HostKVPageLayout>(layouts));
+
+    auto held   = arena.allocate(host_layout, 2);
+    auto filler = arena.allocate(host_layout, 6);  // fills the span exactly
+    failures += expect(held.has_value() && filler.has_value(), label + " tri-state fixture allocation");
+
+    const std::uint64_t grows_before = arena.growth_count();
+    const std::size_t capacity_before = arena.capacity_bytes();
+
+    // A request with no releases: nothing is free, so it cannot be pinned.
+    {
+        const std::array wanted{ninfer::HostKVAllocationRequest{.layout = &host_layout, .pages = 2}};
+        const auto result = arena.fit_after_suballocation_releases({}, wanted, 0U);
+        failures += expect(result.fit == ninfer::HostKVFit::Blocked,
+                           label + " a request with no room and no headroom is Blocked");
+        failures += expect(result.unsatisfied_spans == 1U, label + " and one span was counted unsatisfied");
+    }
+
+    // The SAME request with a release that frees exactly enough: Pinned, and no shortfall.
+    {
+        const ninfer::HostKVSuballocationRelease freed[]{
+            ninfer::HostKVSuballocationRelease{.allocation = held->handle(), .begin_page = 0, .page_count = 2}};
+        const std::array wanted{ninfer::HostKVAllocationRequest{.layout = &host_layout, .pages = 2}};
+        const auto result = arena.fit_after_suballocation_releases(freed, wanted, 0U);
+        failures += expect(result.fit == ninfer::HostKVFit::Pinned,
+                           label + " a release that frees enough makes it Pinned");
+        failures += expect(result.shortfall_bytes == 0U, label + " Pinned carries no shortfall");
+        // THE CONTROL FOR THE BOOLEAN: the old form must agree on this case.
+        failures += expect(arena.can_allocate_after_suballocation_releases(freed, wanted),
+                           label + " the boolean form agrees on the Pinned case");
+    }
+
+    // A request too large for the released room: the shortfall decides Growable vs Blocked.
+    {
+        const ninfer::HostKVSuballocationRelease freed[]{
+            ninfer::HostKVSuballocationRelease{.allocation = held->handle(), .begin_page = 0, .page_count = 2}};
+        const std::array wanted{ninfer::HostKVAllocationRequest{.layout = &host_layout, .pages = 4}};
+        const auto generous = arena.fit_after_suballocation_releases(freed, wanted, 1U << 30U);
+        failures += expect(generous.fit == ninfer::HostKVFit::Growable,
+                           label + " headroom covering the shortfall makes it Growable");
+        failures += expect(generous.shortfall_bytes >= host_layout.page_stride,
+                           label + " the shortfall names at least the missing bytes");
+        failures += expect(generous.unsatisfied_spans == 1U, label + " one unsatisfied request, one span");
+        // ONE BYTE SHORT of the reported shortfall: Blocked. This is the pair that pins the arithmetic.
+        const auto stingy = arena.fit_after_suballocation_releases(freed, wanted,
+                                                                  generous.shortfall_bytes - 1U);
+        failures += expect(stingy.fit == ninfer::HostKVFit::Blocked,
+                           label + " headroom one byte short is Blocked");
+    }
+
+    // PURITY: every query above must have acted on nothing.
+    failures += expect(arena.growth_count() == grows_before,
+                       label + " the fit query GREW a span -- it must be pure");
+    failures += expect(arena.capacity_bytes() == capacity_before,
+                       label + " the fit query changed capacity -- it must be pure");
+    return failures;
+}
+
 // MULTI-SPAN, and this test exists because the rest of this file cannot see the class of bug it covers.
 // `exercise_host_arena_growth` is the only other test whose arena reaches a second span, and NOTHING else
 // splits, releases or simulates in a non-zero span -- so a dropped or defaulted span is correct by
@@ -682,6 +755,16 @@ int main() {
                     },
             },
             "K8V4 asymmetric PageMajor");
+        failures += exercise_host_arena_fit_tristate(
+            context, ninfer::plan_host_kv_page_layout(ninfer::KVPageGeometry{
+                         .device_plane_order = ninfer::PagedKVPlaneOrder::PageMajor,
+                         .planes =
+                             {
+                                 {ninfer::DType::I8, 8, 2, 256},
+                                 {ninfer::DType::FP16, 1, 2, 256},
+                             },
+                     }),
+            "fit-tristate");
         failures += exercise_host_arena_multispan(
             context,
             ninfer::plan_host_kv_page_layout(ninfer::KVPageGeometry{

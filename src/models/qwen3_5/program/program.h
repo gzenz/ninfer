@@ -954,6 +954,7 @@ public:
     [[nodiscard]] std::uint64_t shared_replacements() const noexcept;
     [[nodiscard]] std::uint64_t demotable_evictions() const noexcept;
     [[nodiscard]] std::uint64_t evictions_with_victim_room() const noexcept;
+    [[nodiscard]] std::uint64_t evictions_demote_possible() const noexcept;
     [[nodiscard]] std::uint64_t demotable_eviction_checks() const noexcept;
     [[nodiscard]] std::uint64_t pressure_options() const noexcept;
     [[nodiscard]] std::uint64_t demote_options() const noexcept;
@@ -976,6 +977,15 @@ public:
     [[nodiscard]] std::uint64_t publication_goal_blocked_cell_only() const noexcept;
     [[nodiscard]] std::uint64_t publication_goal_blocked_other() const noexcept;
     void add_publication_cell_probes(std::uint64_t count) noexcept;
+    [[nodiscard]] std::uint64_t options_refused_no_kv() const noexcept;
+    void note_pressure_successor_outcome(bool nonevicting_available) noexcept;
+    [[nodiscard]] std::uint64_t pressure_successor_calls() const noexcept;
+    [[nodiscard]] std::uint64_t pressure_successors_with_option() const noexcept;
+    [[nodiscard]] std::uint64_t demote_option_refused_no_state_deficit() const noexcept;
+    [[nodiscard]] std::uint64_t demote_option_refused_precondition() const noexcept;
+    [[nodiscard]] std::uint64_t options_refused_active_lanes() const noexcept;
+    [[nodiscard]] std::uint64_t options_refused_evicting_current() const noexcept;
+
     struct PrefixSplit {
         std::uint32_t tokens      = 0;
         std::uint32_t restorable  = 0;

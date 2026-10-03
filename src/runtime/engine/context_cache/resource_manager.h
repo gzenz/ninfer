@@ -1408,8 +1408,18 @@ public:
         out.pressure_shared_owners_replaced    = program.shared_replacements();
         out.pressure_private_evictions_demotable = program.demotable_evictions();
         out.pressure_evictions_with_victim_room  = program.evictions_with_victim_room();
+        out.pressure_evictions_demote_possible   = program.evictions_demote_possible();
         out.pressure_private_eviction_checks    = program.demotable_eviction_checks();
         out.pressure_demote_options             = program.demote_options();
+        out.pressure_options_refused_no_kv            = program.options_refused_no_kv();
+        out.pressure_demote_option_refused_no_state_deficit =
+            program.demote_option_refused_no_state_deficit();
+        out.pressure_successor_calls        = program.pressure_successor_calls();
+        out.pressure_successors_with_option = program.pressure_successors_with_option();
+        out.pressure_demote_option_refused_precondition =
+            program.demote_option_refused_precondition();
+        out.pressure_options_refused_active_lanes     = program.options_refused_active_lanes();
+        out.pressure_options_refused_evicting_current = program.options_refused_evicting_current();
         out.pressure_options                    = program.pressure_options();
         // WIRED WITH THE COUNTERS, not after them: the catalog-cell counters shipped incremented at nine sites
         // and never copied, so /stats served a hardcoded zero that read like a clean finding.
@@ -1491,6 +1501,13 @@ public:
         }
         out.pressure_publication_cell_losses    = program.publication_cell_losses();
         out.pressure_publication_cell_probes    = program.publication_cell_probes();
+        // FROM THE MANAGER'S OWN COUNTERS. The first version read `program.demand_bits_*()`, which only
+        // `add_demand_bits()` fills -- and nothing called it, so the tally incremented one set of counters
+        // while the stats read another and the instrument reported 0 on live traffic. Two halves, wired to
+        // nothing in between; the measured 0 is what caught it.
+        out.pressure_demand_bits_selected       = demand_bits_selected_;
+        out.pressure_demand_bits_resident       = demand_bits_resident_;
+        out.pressure_demand_bits_considered     = demand_bits_considered_;
         out.pressure_publication_cell_at_risk_runs = program.publication_cell_at_risk_runs();
         out.pressure_goal_blocked_cell_only        = program.publication_goal_blocked_cell_only();
         out.pressure_goal_blocked_other            = program.publication_goal_blocked_other();
@@ -1772,6 +1789,10 @@ private:
     }
 
     static constexpr std::size_t kDemandWindowCapacity = 32U;
+    // Set bits in the demand window, split by the evidence that set them. See `tally_demand_evidence`.
+    mutable std::uint64_t demand_bits_selected_   = 0;
+    mutable std::uint64_t demand_bits_resident_   = 0;
+    mutable std::uint64_t demand_bits_considered_ = 0;
 
     static void append_unique(std::vector<PrefixShortlistKey>& destination,
                               const PrefixShortlistKey& key) {
@@ -1780,13 +1801,53 @@ private:
         }
     }
 
+    // WHY A DEMAND BIT WAS SET. The portfolio valuation sums a saving per SET BIT
+    // (`context_portfolio_value.h:89-92`), so the total rests on the MIX of evidence behind those bits --
+    // and the three-way `||` this replaces could not tell them apart. `candidate_keys` is filled as each
+    // candidate is CONSTRUCTED (`append_unique(provisional_demand.candidate_keys, *key)` in the candidate
+    // loop), so membership means the checkpoint was OFFERED, not taken; `selected_source_key` is what the
+    // request actually used. Pricing an offer and a use alike is what lets a routinely-offered-never-taken
+    // continuation look demanded, which makes the planner preserve it and refuse reuse.
+    enum class DemandEvidence : std::uint8_t { None, Selected, ResidentOnly, ConsideredOnly };
+
+    [[nodiscard]] static DemandEvidence demand_evidence(const PrefixDemandRecord& demand,
+                                                        const PrefixShortlistKey& key) noexcept {
+        if (demand.selected_source_key && *demand.selected_source_key == key) {
+            return DemandEvidence::Selected;
+        }
+        if (std::find(demand.exact_resident_keys.begin(), demand.exact_resident_keys.end(), key) !=
+            demand.exact_resident_keys.end()) {
+            return DemandEvidence::ResidentOnly;
+        }
+        if (std::find(demand.candidate_keys.begin(), demand.candidate_keys.end(), key) !=
+            demand.candidate_keys.end()) {
+            return DemandEvidence::ConsideredOnly;
+        }
+        return DemandEvidence::None;
+    }
+
+    // ONE DEFINITION, so the mask and the tally cannot drift: `demand_matches` is now expressed in terms of
+    // the evidence rather than repeating the same three finds.
     [[nodiscard]] static bool demand_matches(const PrefixDemandRecord& demand,
                                              const PrefixShortlistKey& key) noexcept {
-        return std::find(demand.candidate_keys.begin(), demand.candidate_keys.end(), key) !=
-                   demand.candidate_keys.end() ||
-               std::find(demand.exact_resident_keys.begin(), demand.exact_resident_keys.end(),
-                         key) != demand.exact_resident_keys.end() ||
-               (demand.selected_source_key && *demand.selected_source_key == key);
+        return demand_evidence(demand, key) != DemandEvidence::None;
+    }
+
+    // COUNT THE BITS BY EVIDENCE over the same window the mask is built from, so the split is measured over
+    // exactly the population the valuation reads. Reported through `program` into `/stats` as three
+    // uncapped totals: if `considered` dominates, the future-loss term is pricing OFFERS as DEMAND.
+    // `mutable` because the callers are `const` inspection paths that must not mutate ENGINE state, while
+    // these three counters are pure diagnostics. Widening constness instead would be the larger claim.
+    void tally_demand_evidence(const PrefixShortlistKey& key) const noexcept {
+        const std::size_t begin = demand_window_.size() == kDemandWindowCapacity ? 1U : 0U;
+        for (std::size_t index = begin; index < demand_window_.size(); ++index) {
+            switch (demand_evidence(demand_window_[index], key)) {
+            case DemandEvidence::Selected:       ++demand_bits_selected_;   break;
+            case DemandEvidence::ResidentOnly:   ++demand_bits_resident_;   break;
+            case DemandEvidence::ConsideredOnly: ++demand_bits_considered_; break;
+            case DemandEvidence::None: break;
+            }
+        }
     }
 
     [[nodiscard]] static ReuseDomainId reuse_domain(const std::optional<CacheSessionKey>& session,
@@ -2211,6 +2272,7 @@ private:
             if (!rebuild) {
                 throw std::logic_error("prepared shared candidate has no canonical rebuild work");
             }
+            tally_demand_evidence(*key);
             shared_candidates.push_back(ProjectedSharedCandidate{
                 .key              = *key,
                 .evidence         = opportunity.evidence,
@@ -2231,6 +2293,7 @@ private:
             const std::uint64_t rebuild  = cost_model_.prefill_ns(checkpoint.rebuild_work);
             const std::uint64_t recovery = price_checkpoint_recovery_work(
                 cost_model_, program.checkpoint_recovery_work(handle, checkpoint.ref));
+            tally_demand_evidence(checkpoint.shortlist_key);
             projected_checkpoints.push_back(ContextPortfolioCheckpointValue{
                 .owner       = owner,
                 .demand_mask = demand_mask_for(checkpoint.shortlist_key, provisional_demand),
@@ -2779,21 +2842,7 @@ private:
             const auto reuse_of = [](const Candidate& item) -> std::uint32_t {
                 return item.plan ? item.plan->summary().reusable_prompt_tokens : 0U;
             };
-            const std::uint32_t winner_reuse       = reuse_of(candidate);
-            std::uint32_t       best_other_reuse   = 0U;
-            bool                best_other_is_shared = false;
-            for (const Candidate& other : candidates) {
-                if (&other == &candidate) { continue; }
-                const std::uint32_t other_reuse = reuse_of(other);
-                if (other_reuse > best_other_reuse) {
-                    best_other_reuse     = other_reuse;
-                    best_other_is_shared = other.shared_source.has_value();
-                }
-            }
-            const bool longer_lost = best_other_reuse > winner_reuse;
-            selection_chosen_reuse = winner_reuse;
-            selection_best_loser   = best_other_reuse;
-            selection_longer_lost  = longer_lost;
+            const std::uint32_t winner_reuse = reuse_of(candidate);
             candidate_rows.reserve(candidates.size());
             for (std::size_t index = 0; index < candidates.size(); ++index) {
                 const Candidate& item = candidates[index];
@@ -2808,8 +2857,50 @@ private:
                     row.cell_only = probe_tally[index].cell_only;
                     row.other     = probe_tally[index].other;
                 }
+                // THE ELECTION'S OWN TERMS, from the planner -- the only place they exist. Without them a
+                // loss cannot be attributed to the term that decided it, and the flag has to be read as an
+                // assertion about reuse alone, which is element 10 of the ordering rather than the decision.
+                if (index < planned->diagnostics.election.size()) {
+                    const MaterializationDiagnostics::ElectionTerm& term =
+                        planned->diagnostics.election[index];
+                    row.eligible               = term.eligible;
+                    row.restorable_evictions   = term.restorable_evictions;
+                    row.total_ns               = term.total_ns;
+                    row.affected_selected_hits = term.affected_selected_hits;
+                    row.owner_evictions        = term.owner_evictions;
+                    row.checkpoint_drops       = term.checkpoint_drops;
+                    row.seated_differs                = term.seated_differs;
+                    row.elected_reuse                 = term.elected_reuse;
+                    row.elected_restorable_evictions  = term.elected_restorable_evictions;
+                    row.elected_total_ns              = term.elected_total_ns;
+                    row.elected_affected_selected_hits= term.elected_affected_selected_hits;
+                    row.elected_owner_evictions       = term.elected_owner_evictions;
+                    row.elected_checkpoint_drops      = term.elected_checkpoint_drops;
+                }
                 candidate_rows.push_back(row);
             }
+            std::uint32_t best_other_reuse     = 0U;
+            bool          best_other_is_shared = false;
+            for (const auto& row : candidate_rows) {
+                if (row.winner) { continue; }
+                if (row.reuse > best_other_reuse) {
+                    best_other_reuse     = row.reuse;
+                    best_other_is_shared = row.shared_source;
+                }
+            }
+            const bool longer_lost = best_other_reuse > winner_reuse;
+            selection_chosen_reuse = winner_reuse;
+            selection_best_loser   = best_other_reuse;
+            selection_longer_lost  = longer_lost;
+            // THE ELIGIBLE COMPARISON AND THE ATTRIBUTION ARE NOT COMPUTED HERE. They come from the planner
+            // (`MaterializationPlanner::finalize_selection`), which is the only place the election's own
+            // `FoldedCost`s and the seated winner's cost exist. Deriving them from these ROWS was tried and
+            // was wrong: a row holds a candidate's best GOAL-BEARING assessment rather than the cost that
+            // seated the winner. (The root-maximal seed is now recorded and the winner's row is the SEATED
+            // cost, so the two paths this comment used to name are no longer blind -- but a row is still a
+            // diagnostic, and the comparison must come from the election's own costs.) The entry point is
+            // `election_deciding_element`, NOT the raw `first_differing_key_element`, which is symmetric and
+            // will name an element where the loser was better if handed a pair the election never ranked.
             // `longer_lost` is the ONLY case worth acting on, so it is never rate-limited away. The 8-sample
             // limit meant "the planner consistently picks the longer candidate" rested on the process's first
             // eight admissions -- before any shared prefix was even captured -- while ~70 later selections
@@ -2949,6 +3040,9 @@ private:
         choice.diagnostics_.chosen_reuse       = selection_chosen_reuse;
         choice.diagnostics_.best_loser_reuse   = selection_best_loser;
         choice.diagnostics_.longer_lost        = selection_longer_lost;
+        // `best_eligible_loser_reuse` / `longer_lost_eligible` / `longer_lost_decided_by` already arrived
+        // in `choice.diagnostics_` via `planned->diagnostics`; recomputing them here would overwrite the
+        // planner's answer with a row-based one, which is the fault this block used to have.
         provisional_demand.selected_source_key = candidate.source_key;
         choice.demand_                         = std::move(provisional_demand);
         for (const PressureOwnerOutcome& outcome : planned->owner_outcomes) {

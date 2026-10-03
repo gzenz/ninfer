@@ -235,7 +235,9 @@ HostKVArena::HostKVArena(PinnedHostPool& pool, std::size_t initial_bytes, std::s
     }
 }
 
-bool HostKVArena::grow_bytes(std::size_t bytes) noexcept { return grow_span(bytes); }
+bool HostKVArena::grow_bytes(std::size_t bytes, bool speculative) noexcept {
+    return grow_span(bytes, speculative);
+}
 
 bool HostKVArena::grow_for(std::uint32_t pages, std::size_t page_stride) noexcept {
     if (pages == 0U || page_stride > std::numeric_limits<std::size_t>::max() / pages) { return false; }
@@ -256,13 +258,13 @@ std::size_t HostKVArena::span_bytes(std::uint32_t span) const noexcept {
     return span < spans_.size() ? spans_[span].bytes : 0U;
 }
 
-bool HostKVArena::grow_span(std::size_t bytes) noexcept {
+bool HostKVArena::grow_span(std::size_t bytes, bool speculative) noexcept {
     if (pool_ == nullptr || bytes == 0U) {
         ++growth_refusals_;
         return false;
     }
     const std::size_t wanted = std::max(bytes, span_growth_bytes_);
-    auto allocation         = pool_->allocate(wanted);
+    auto allocation         = pool_->allocate(wanted, speculative);
     if (!allocation) {
         ++growth_refusals_;  // could not pin: a refusal the caller can see, not an exception
         return false;
@@ -452,33 +454,37 @@ std::optional<HostKVAllocationRecipe> HostKVArena::plan_after_releases(
     return recipe;
 }
 
-bool HostKVArena::can_allocate_after_suballocation_releases(
+HostKVArena::Placement HostKVArena::simulate_after_suballocation_releases(
     std::span<const HostKVSuballocationRelease> proposed_releases,
     std::span<const HostKVAllocationRequest> target_allocations) const {
-    if (proposed_releases.empty() && target_allocations.empty()) { return true; }
+    Placement out;
+    out.simulated = free_extents_;
+    if (proposed_releases.empty() && target_allocations.empty()) {
+        out.valid = true;
+        return out;
+    }
 
-    std::vector<FreeExtent> simulated = free_extents_;
     // SPAN-AWARE, through the SAME helper: this lambda was offset-only and coalesced across span
     // boundaries, so it declared 8 contiguous pages available across two 4-page spans and a plan
     // was called affordable that could not be allocated.
     const auto insert_extent = [&](FreeExtent extent) {
-        insert_extent_ordered(simulated, extent);
+        insert_extent_ordered(out.simulated, extent);
     };
 
     for (std::size_t index = 0; index < proposed_releases.size(); ++index) {
         const HostKVSuballocationRelease& release = proposed_releases[index];
-        if (!valid_handle(release.allocation) || release.page_count == 0) { return false; }
+        if (!valid_handle(release.allocation) || release.page_count == 0) { return out; }
         const Descriptor& descriptor = descriptors_[release.allocation.descriptor_];
         if (release.begin_page > descriptor.pages ||
             release.page_count > descriptor.pages - release.begin_page) {
-            return false;
+            return out;
         }
         const std::uint32_t end = release.begin_page + release.page_count;
         for (std::size_t prior = 0; prior < index; ++prior) {
             const HostKVSuballocationRelease& other = proposed_releases[prior];
             if (other.allocation != release.allocation) { continue; }
             const std::uint32_t other_end = other.begin_page + other.page_count;
-            if (release.begin_page < other_end && other.begin_page < end) { return false; }
+            if (release.begin_page < other_end && other.begin_page < end) { return out; }
         }
         const std::size_t stride = layouts_[descriptor.layout].page_stride;
         insert_extent(FreeExtent{
@@ -528,26 +534,76 @@ bool HostKVArena::can_allocate_after_suballocation_releases(
             required_descriptors += retained_runs - 1U;
         }
     }
-    if (required_descriptors > available_descriptors) { return false; }
+    out.descriptors_short = required_descriptors > available_descriptors;
 
     for (const HostKVAllocationRequest& request : target_allocations) {
-        if (request.layout == nullptr || request.pages == 0) { return false; }
+        if (request.layout == nullptr || request.pages == 0) { return out; }
         const std::optional<std::uint32_t> layout_index = find_layout(*request.layout);
         if (!layout_index ||
             request.layout->page_stride > std::numeric_limits<std::size_t>::max() / request.pages) {
-            return false;
+            return out;
         }
         const std::size_t bytes =
             request.layout->page_stride * static_cast<std::size_t>(request.pages);
         const auto extent =
-            std::find_if(simulated.begin(), simulated.end(),
+            std::find_if(out.simulated.begin(), out.simulated.end(),
                          [&](const FreeExtent& free) { return free.bytes >= bytes; });
-        if (extent == simulated.end()) { return false; }
+        if (extent == out.simulated.end()) {
+            // CONTINUE, do not bail. The boolean form stopped at the first request that did not fit, which
+            // is all it needed; the tri-state needs the SHORTFALL, and that is a property of every
+            // unsatisfied request. Each costs exactly one span, sized `max(bytes, span step)` -- the size
+            // `grow_span` would pin -- because `HostKVExtentStore::prepare` grows one span per contiguous
+            // allocation it makes and then re-checks inside `grow_span`.
+            ++out.unsatisfied;
+            out.unsatisfied_bytes += std::max(bytes, span_growth_bytes_);
+            continue;
+        }
+        ++out.satisfied;
         extent->offset += bytes;
         extent->bytes -= bytes;
-        if (extent->bytes == 0) { simulated.erase(extent); }
+        if (extent->bytes == 0) { out.simulated.erase(extent); }
     }
-    return true;
+    out.valid = true;
+    return out;
+}
+
+bool HostKVArena::can_allocate_after_suballocation_releases(
+    std::span<const HostKVSuballocationRelease> proposed_releases,
+    std::span<const HostKVAllocationRequest> target_allocations) const {
+    // A thin reading of the simulation above: one definition of the walk, two spellings of the question.
+    const Placement placement =
+        simulate_after_suballocation_releases(proposed_releases, target_allocations);
+    return placement.valid && placement.unsatisfied == 0 && !placement.descriptors_short;
+}
+
+HostKVFitResult HostKVArena::fit_after_suballocation_releases(
+    std::span<const HostKVSuballocationRelease> proposed_releases,
+    std::span<const HostKVAllocationRequest> target_allocations,
+    std::size_t growth_headroom_bytes) const {
+    const Placement placement =
+        simulate_after_suballocation_releases(proposed_releases, target_allocations);
+    HostKVFitResult result;
+    if (!placement.valid || placement.descriptors_short) {
+        // Malformed input, or the arena's own descriptor table is exhausted. BOTH map to `Blocked`: the
+        // first is not a fit question at all, and for the second -- a span does add descriptors, so it is
+        // growth-recoverable in principle -- this query does not model the table growth and MUST NOT
+        // promise room it cannot count. Conservative, and identical to today's behaviour.
+        return result;
+    }
+    result.shortfall_bytes   = placement.unsatisfied_bytes;
+    result.unsatisfied_spans = placement.unsatisfied;
+    if (placement.unsatisfied == 0) {
+        result.fit = HostKVFit::Pinned;
+    } else if (placement.unsatisfied_bytes <= growth_headroom_bytes) {
+        result.fit = HostKVFit::Growable;
+    }
+    return result;
+}
+
+std::size_t HostKVArena::largest_free_run_bytes() const noexcept {
+    std::size_t best = 0;
+    for (const FreeExtent& extent : free_extents_) { best = std::max(best, extent.bytes); }
+    return best;
 }
 
 bool HostKVArena::apply_recipe(HostKVAllocationRecipe&& recipe,

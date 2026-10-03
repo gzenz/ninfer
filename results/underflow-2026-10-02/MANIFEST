@@ -1,0 +1,59 @@
+# #2/#13 accounting underflow — first natural occurrence, 2026-10-02 12:06:42
+
+Binary running when it occurred:
+  sha256  8a5c0476c66ad09d602517abfc4d98e48dfe6fbbaa90988ccaa7972972db247f
+  path    /proc/28425/exe
+  equals  build/apps/ninfer-serve at the time (verified before the revert build)
+  start   Fri 2026-10-02 11:53:14 CEST
+  Note: this binary is the Part 1+2 tree (uncommitted). The underflow is a
+  RECORDED pre-existing open item (plan.md §0b id map: session #2 = code #13),
+  with a prior occurrence 2026-09-25 10:13 and NO fix in this tree. Attribution
+  to this change is therefore NOT established -- the control (same load on a
+  pre-change binary) has not been run.
+
+Artifacts (local; *.log is gitignored by policy and never force-added):
+  occurrence-120642.journal  journalctl -u ninfer.service 12:06:00..12:08:30, 430 lines
+  stats-at-reading.json      /stats at 12:1x, after the occurrence
+
+The event, verbatim:
+  [engine] WORKER RECOVER: Qwen3.5 resource subtraction underflow [device.main_kv_pages: have 1057, removing 1059]
+  [engine] non-strict release REFUSED (state-write, blocker=checkpoint-references (still owned))
+  [engine] fail-all cleanup: shared catalogued=0 released-refused=0 skipped=0 ...
+  [engine] post-recovery residual (recover): main_kv_pages=1060 backend_kv_pages=0 device_state_slots=1 host_state_slots=0 host_kv_bytes=1244528640
+  ERROR req#136 failed during generation | HTTP 500
+  ERROR req#116 failed during generation | HTTP 500
+
+Attribution (by the throw site, materialization.cpp:250-260 + :633-635):
+  The check tests active_lanes and state_slots BEFORE main_kv_pages, so both were
+  clean and only the KV page axis underflowed, by 2.
+  The message renders "have <value>, removing <removed>" with value=planned
+  final_removed and removed=actual, i.e. line 635:
+      (void)checked_resource_difference(details.demand.final_removed, removed);
+  --> the engine removed 1059 device main-KV pages where its plan said 1057.
+  This is the site plan.md:1489 called "the likelier one" by reading; the
+  occurrence confirms it rather than assuming it.
+
+## E2E REPRODUCES #2/#13 ON DEMAND (2026-10-02 14:0x, e2e run on the frozen binary)
+
+The same underflow fired inside the e2e, in phase 13 (state-saturation), on the same axis and with the
+same sequel as the QA occurrence above:
+
+  [engine] WORKER RECOVER: Qwen3.5 resource subtraction underflow [device.main_kv_pages: have 131, removing 309]
+  [engine] post-recovery residual (recover): main_kv_pages=310 backend_kv_pages=0 device_state_slots=1 host_state_slots=0 host_kv_bytes=331481088
+
+WHY THIS MATTERS MORE THAN THE QA ONE: #2/#13 was recorded as "instrumented, awaiting an occurrence" --
+it fires rarely and unpredictably, which is why the fix could not start. The e2e produced it here.
+
+**CORRECTED 2026-10-02, LATER THE SAME HOUR: THE E2E DOES NOT PRODUCE IT ON DEMAND, AND THE FIRST VERSION
+OF THIS PARAGRAPH SAID IT DID.** Two further e2e runs on the instrumented binary (1eddb0cd5bc82e7b) produced
+**zero** occurrences and **zero** `mat-remove skew` lines -- so the event fired in ONE of three e2e runs. The
+rarity the record describes is real and this capture does not change it. What the capture does give is a
+second, independent instance with the axis and the numbers (planned 131 / actual 309) against which a
+later occurrence can be compared. The numbers differ from QA's (131/309 vs 1057/1059) and
+the axis is identical: the ACTUAL removal exceeds the PLANNED `final_removed` at materialization.cpp:635,
+i.e. the source released more device main-KV pages than the plan predicted.
+
+The e2e's own check mislabels it: ninfer-e2e.py:1346 calls any non-P4.2 recovery "saturated restore failed
+(relief did not free a slot)", asserting a cause. It is the underflow, not a relief failure.
+
+  e2e-repro-1408.journal   the serve-log window around the occurrence

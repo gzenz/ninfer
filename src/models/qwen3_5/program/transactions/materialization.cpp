@@ -632,6 +632,45 @@ void ProgramImpl::prepare_consumed_source(MaterializationTransaction& transactio
 
     const detail::PhysicalResources after   = owner_exclusive_resources(source);
     const detail::PhysicalResources removed = checked_resource_difference(before, after);
+    // NAME THE MECHANISM BEFORE THE THROW, because two OPPOSITE fixes follow from two candidates and the
+    // message cannot tell them apart. `details.demand.final_removed` is `owner_exclusive_resources(source)`
+    // sampled at PLAN TIME (`request_plan.cpp:1013-1014`), while `before`/`after` are sampled HERE -- so the
+    // check is only sound while the source's exclusive counts are unchanged in between. The candidates:
+    //   (a) the source legitimately GAINED exclusivity (a lane sharing it was released between plan and
+    //       execution), so `before` exceeds the plan's snapshot and the delta is CORRECT -- the assertion is
+    //       comparing two instants, and relaxing it is the fix;
+    //   (b) the removal OVER-COUNTS (pages attributed to this source that it does not exclusively own), which
+    //       is a real accounting fault and the opposite fix.
+    // `before` beside `planned` separates them: (a) shows before > planned with before - after == the excess;
+    // (b) shows before <= planned while the delta still exceeds it. Printed UNCAPPED and unconditionally on
+    // the skew, since this event is rare by nature -- a capped print would hide the very occurrences the
+    // instrument exists for.
+    if (removed.device.main_kv_pages > details.demand.final_removed.device.main_kv_pages ||
+        removed.device.backend_kv_pages > details.demand.final_removed.device.backend_kv_pages ||
+        removed.device.state_slots > details.demand.final_removed.device.state_slots ||
+        removed.host.kv_bytes > details.demand.final_removed.host.kv_bytes ||
+        removed.host.state_slots > details.demand.final_removed.host.state_slots) {
+        std::fprintf(
+            stderr,
+            "[engine] mat-remove skew: planned main_kv=%u backend_kv=%u dev_slots=%u host_slots=%u "
+            "host_kv=%zu | before main_kv=%u backend_kv=%u dev_slots=%u host_slots=%u host_kv=%zu "
+            "| after main_kv=%u backend_kv=%u dev_slots=%u host_slots=%u host_kv=%zu "
+            "| removed main_kv=%u backend_kv=%u dev_slots=%u host_slots=%u host_kv=%zu "
+            "| source_index=%u reuse=%d\n",
+            details.demand.final_removed.device.main_kv_pages,
+            details.demand.final_removed.device.backend_kv_pages,
+            details.demand.final_removed.device.state_slots,
+            details.demand.final_removed.host.state_slots,
+            details.demand.final_removed.host.kv_bytes,
+            before.device.main_kv_pages, before.device.backend_kv_pages, before.device.state_slots,
+            before.host.state_slots, before.host.kv_bytes,
+            after.device.main_kv_pages, after.device.backend_kv_pages, after.device.state_slots,
+            after.host.state_slots, after.host.kv_bytes,
+            removed.device.main_kv_pages, removed.device.backend_kv_pages, removed.device.state_slots,
+            removed.host.state_slots, removed.host.kv_bytes,
+            transaction.source_index, static_cast<int>(details.reuse));
+        std::fflush(stderr);
+    }
     (void)checked_resource_difference(details.demand.final_removed, removed);
 }
 
@@ -2231,6 +2270,16 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
                     // against the denominator printed on the line itself, never across the change.
                     if (demotable) { ++demotable_evictions_; }
                     if (victim_room && state_restorable) { ++evictions_with_victim_room_; }
+                    // **THE #6 POPULATION, EXACTLY.** `victim_room` says the victim's OWN slots fitted;
+                    // `demote_possible` says the store's demote preconditions were all met
+                    // (`demote_refusal == None`). Together they are "a demote was fully available and the
+                    // victim was evicted anyway" -- the operator's ruling, countable. The two halves are
+                    // already reported (`evictions_with_victim_room`, and `demote_possible` on the printed
+                    // line) but their CONJUNCTION was not, and the print is rate-limited to the first 8 then
+                    // every 512th: measured 2026-10-02, 57 evictions produced 8 lines, and 7 of those 8 were
+                    // `already-on-host` -- a refusal that is CORRECT, so the printed sample overstated the
+                    // defect by 7x. This counter cannot be sampled away.
+                    if (victim_room && demote_possible) { ++evictions_demote_possible_; }
                     ++demotable_eviction_checks_;
                     if (demotable_eviction_checks_ <= 8ULL ||
                         demotable_eviction_checks_ % 512ULL == 0ULL) {

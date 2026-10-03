@@ -109,6 +109,24 @@ public:
     // The largest single request that would be allowed right now. 0 when nothing more may be pinned.
     [[nodiscard]] std::size_t max_pinnable() const noexcept;
 
+    // Take a NEW memory reading without deciding anything, so the next `max_pinnable()` reflects this
+    // moment rather than the last `allow()`.
+    //
+    // WHY THIS EXISTS SEPARATELY FROM `allow`. The planner needs a PURITY-SAFE answer to "how much more
+    // may be pinned?" -- it runs inside a 400 ms-bounded search that must have no side effects, and
+    // `allow()` is not pure: it calls `read_host_memory()` and mutates `reading_`, `refusals_`,
+    // `approvals_`, `last_veto_` and `last_veto_mem_available_` on EVERY call. A search loop calling it
+    // per assessed node would re-read /proc/meminfo thousands of times and destroy the budget's own
+    // refusal counters -- the same class of mistake as pinning inside the search, which was removed once
+    // already (see the comment above `ensure_host_state_headroom`).
+    //
+    // NOR is `allow_with(reading, 0)` a substitute: `bytes == 0` returns `GrowthVeto::NothingWanted`, so
+    // it is counted as a REFUSAL and would corrupt `refusals()`.
+    //
+    // So: refresh ONCE per planning session (next to the pre-grow), then answer from the cache. Pure
+    // queries are `max_pinnable()` and `veto_for()`, both `const`.
+    void refresh_reading() noexcept { reading_ = read_host_memory(); }
+
     [[nodiscard]] const HostMemoryReading& reading() const noexcept { return reading_; }
     [[nodiscard]] const HostMemoryBudgetConfig& config() const noexcept { return config_; }
 

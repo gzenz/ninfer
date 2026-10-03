@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# The real gate lives in tools/ops/pre-commit.sh so it is TRACKED and reviewable.
+exec bash "$(git rev-parse --show-toplevel)/tools/ops/pre-commit.sh"

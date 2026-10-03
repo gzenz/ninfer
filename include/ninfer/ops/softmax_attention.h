@@ -123,15 +123,17 @@ void packed_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
  * through the inert tail; an empty row uses zero positions. Other tail values are safe dummies.
  * Tail columns do not mutate cache and produce exact BF16 zero.
  *
- * The registered prompt route consumes the paged cache directly and requires zero transient
- * workspace. Small-T routes may use the split state returned by the capacity query below.
+ * Attention consumes the paged cache directly. Caller-owned transient storage is bounded by the
+ * capacity query below; implementations that need no partial state return zero capacity.
  *
  * The caller guarantees that the maximum p+1 over live rows lies within envelope. The envelope is
  * a host launch/workspace resource promise over that batch maximum, not a mask and not persistent
  * state. A masked physical width may exceed max_visible_keys when its live prefix is shorter.
- * Inputs, output, every cache plane/table, and live workspace suballocations are pairwise
- * non-overlapping. The Op overwrites every addressed cache row but owns no cache allocation,
- * frontier, request identity, or commit authority.
+ * With fixed tensor views, geometry and cache storage, calls with W<=16 remain CUDA Graph
+ * update-compatible across valid envelopes. Live row lengths determine the KV work partition within
+ * each capture. Inputs, output, every cache plane/table, and live workspace suballocations are
+ * pairwise non-overlapping. The Op overwrites every addressed cache row but owns no cache
+ * allocation, frontier, request identity, or commit authority.
  */
 void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                               const Tensor& positions, const Tensor& valid_columns,
@@ -157,7 +159,7 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
 /**
  * Return transient capacity for every W in the inclusive interval at one exact batch size. The
  * head geometry, cache dtype, and execution envelope are fixed implementation-profile inputs.
- * Invalid profiles or intervals throw; an interval containing only prompt routes returns zero.
+ * Invalid profiles or intervals throw. The returned capacity may be zero.
  */
 [[nodiscard]] std::size_t causal_softmax_attention_workspace_capacity_bytes(
     AttentionHeadGeometry geometry, KvCacheStorage cache_storage,

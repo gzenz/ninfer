@@ -122,9 +122,22 @@ std::string format_stats_json(const ninfer::RuntimeStats& s, const ninfer::Memor
         // and moving what it counts would silently change the meaning of every past reading.
         {"private_evictions_demotable", s.pressure_private_evictions_demotable},
         {"evictions_with_victim_room", s.pressure_evictions_with_victim_room},
+        // The conjunction: victim_room AND demote_possible. This IS the #6 count.
+        {"evictions_demote_possible", s.pressure_evictions_demote_possible},
         {"private_eviction_checks", s.pressure_private_eviction_checks},
         {"options", s.pressure_options},
         {"demote_options", s.pressure_demote_options},
+        // The three ways a demote option is NOT generated. `evicting_current` is the policy choice.
+        {"options_refused_no_kv", s.pressure_options_refused_no_kv},
+        // `no_state_deficit` = wrong relief axis (the fix); `precondition` = no demote existed (correct).
+        {"demote_option_refused_no_state_deficit", s.pressure_demote_option_refused_no_state_deficit},
+        // The preservation probe's exonerating half: calls - with_option = owners evicted with no
+        // non-evicting successor to have chosen.
+        {"successor_calls", s.pressure_successor_calls},
+        {"successors_with_option", s.pressure_successors_with_option},
+        {"demote_option_refused_precondition", s.pressure_demote_option_refused_precondition},
+        {"options_refused_active_lanes", s.pressure_options_refused_active_lanes},
+        {"options_refused_evicting_current", s.pressure_options_refused_evicting_current},
         {"capture_skips_transaction_or_fork", s.capture_skips_transaction_or_fork},
         {"capture_skips_cancelled", s.capture_skips_cancelled},
         {"capture_skips_nothing_to_publish", s.capture_skips_nothing_to_publish},
@@ -133,6 +146,10 @@ std::string format_stats_json(const ninfer::RuntimeStats& s, const ninfer::Memor
         {"publication_cell_losses", s.pressure_publication_cell_losses},
         // The denominator beside it: goal-probe calls, not an outcome. See the RuntimeStats comment.
         {"publication_cell_probes", s.pressure_publication_cell_probes},
+        // The demand window's bits by evidence. `considered` counts OFFERS, not uses.
+        {"demand_bits_selected", s.pressure_demand_bits_selected},
+        {"demand_bits_resident", s.pressure_demand_bits_resident},
+        {"demand_bits_considered", s.pressure_demand_bits_considered},
         // Uncapped, because the journal line that reports these is rate-limited to 8 then every 512th.
         {"publication_cell_at_risk_runs", s.pressure_publication_cell_at_risk_runs},
         // WHY GOALS FAILED, UNCONDITIONALLY -- see the RuntimeStats comment. The `veto_*` fields below are
@@ -195,12 +212,18 @@ std::string format_stats_json(const ninfer::RuntimeStats& s, const ninfer::Memor
         // strict, or /proc/meminfo was unreadable (the fail-closed path, which otherwise hides inside the
         // same number as a full machine).
         {"host_pinned_largest_free_run_bytes", m.host_pinned_largest_free_run_bytes},
+        // The headroom the planner's KV feasibility reads. It existed and had a purity test but was never
+        // exported, so the `Growable` arm could be exercised and still read 0 here -- indistinguishable from
+        // a query that was never wired.
+        {"host_pinned_growth_headroom_bytes", m.host_pinned_growth_headroom_bytes},
         {"host_pinned_growth_policy_refusals", m.host_pinned_growth_policy_refusals},
         {"host_pinned_growth_pin_failures", m.host_pinned_growth_pin_failures},
         // Allocation failures. `fragmented_misses` is the fragmentation proof -- the first placement failed
         // while free BYTES were sufficient -- and it is the reachable one; `post_grow_failures` is believed
         // unreachable and is a growth-contract check, NOT evidence. Neither was exported before.
         {"host_pinned_allocation_refusals", m.host_pinned_allocation_refusals},
+        // The speculative half, beside the real one -- see the MemorySummary comment.
+        {"host_pinned_allocation_speculative_refusals", m.host_pinned_allocation_speculative_refusals},
         {"host_pinned_allocation_ram_refusals", m.host_pinned_allocation_ram_refusals},
         {"host_pinned_allocation_post_grow_failures", m.host_pinned_allocation_post_grow_failures},
         {"host_pinned_allocation_fragmented_misses", m.host_pinned_allocation_fragmented_misses},
@@ -211,6 +234,17 @@ std::string format_stats_json(const ninfer::RuntimeStats& s, const ninfer::Memor
         {"host_state_pregrow_attempts", m.host_state_pregrow_attempts},
         {"host_state_pregrows", m.host_state_pregrows},
         {"host_state_pregrow_refusals", m.host_state_pregrow_refusals},
+        {"host_kv_pregrow_attempts", m.host_kv_pregrow_attempts},
+        {"host_kv_pregrows", m.host_kv_pregrows},
+        {"host_kv_pregrow_refusals", m.host_kv_pregrow_refusals},
+        {"host_kv_pregrow_fragmented", m.host_kv_pregrow_fragmented},
+        {"host_kv_fit_growable", m.host_kv_fit_growable},
+        {"host_kv_blocked_checks", m.host_kv_blocked_checks},
+        // The magnitude beside the count. It is a PROCESS-LIFETIME HIGH-WATER MARK, not a per-request
+        // figure -- an earlier version of this line said "request-level", which the owning comment retracts.
+        {"host_kv_blocked_max_bytes", m.host_kv_blocked_max_bytes},
+        {"host_kv_fit_pinned", m.host_kv_fit_pinned},
+        {"host_kv_fit_blocked", m.host_kv_fit_blocked},
         {"host_kv_grows", m.host_kv_grows},
         {"host_kv_grow_refusals", m.host_kv_grow_refusals},
         {"host_state_occupied_slots", m.host_state_occupied_slots},

@@ -53,7 +53,11 @@ sudo mv /lib/x86_64-linux-gnu/libnvidia-ptxjitcompiler.so.1 /lib/x86_64-linux-gn
 export PATH=/usr/local/cuda/bin:$HOME/.local/bin:$HOME/bin:$PATH
 export LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/lib/wsl/lib:${LD_LIBRARY_PATH:-}
 
-MODEL="${MODEL:-$HOME/ninfer-models/official-v3/qwen3_8_27b_nvfp4.ninfer}"
+# THE OLD DEFAULT NAMED A DIRECTORY THAT DOES NOT EXIST (`official-v3/`), so any caller that did not pass
+# MODEL -- pre-commit.sh did not -- handed the server a nonexistent artifact. It is now the artifact QA and
+# the recorded e2e acceptance runs both use, so a bare call reproduces the acceptance configuration instead
+# of a second, weaker one. Pass MODEL= explicitly to test a different artifact.
+MODEL="${MODEL:-$HOME/ninfer-models/swift15/qwen3_8_27b_nvfp4swift15.ninfer}"
 LOG="${LOG:-$HOME/ninfer-serve.log}"
 
 if [ "$CTX" = "200k" ]; then
@@ -75,10 +79,38 @@ else
   SPEC_FLAGS="--spec mtp --draft-tokens 5 --lm-head-draft"
 fi
 
-BIN="${BIN:-$HOME/ninfer/build/apps/ninfer-serve}"
+# EXPORT BIN -- it is not optional, and the reason is the launch form below.
+#
+# The server is started as `bash -c '"$BIN" "$1" ...' _ "$MODEL"`, and that body is SINGLE-QUOTED, so `$BIN`
+# is expanded by the CHILD shell, not this one. A plain assignment is NOT inherited, so any caller that does
+# not put BIN in the environment leaves the child with an EMPTY COMMAND WORD: `line 1: : command not found`,
+# NINFER_EXIT=127, and a log whose only content is that one line. That is exactly how pre-commit.sh's e2e
+# block failed -- it calls this script bare.
+#
+# e2e-swap.sh was never affected, because it passes `BIN=...` as a command-PREFIX assignment, which bash
+# exports. So the bug hid behind the one caller that happened to be correct, and the gate that was supposed
+# to catch this class of failure was itself the thing that could not run. Exporting here fixes it for every
+# caller at once, which is the point: the script owns its defaults, so a bare call must work.
+export BIN="${BIN:-$HOME/ninfer/build/apps/ninfer-serve}"
 
-pkill -f "build/apps/ninfer-serve" -9 2>/dev/null || true
-pkill -f "ninfer-serve-(CANDIDATE|BASELINE)" 2>/dev/null || true
+# A MISNAMED OR MISSING ARTIFACT SHOULD SAY SO, not surface as a 127 from an empty command word or as a
+# model-load error minutes later. These two checks turn both into one line naming the path.
+[ -x "$BIN" ]   || { echo "FATAL: server binary is not executable: $BIN" >&2; exit 2; }
+[ -r "$MODEL" ] || { echo "FATAL: model artifact is not readable: $MODEL" >&2; exit 2; }
+
+# STOP ANY PREVIOUS TEST SERVER BY PORT AND BY RECORDED PID -- NEVER BY PATH. `pkill -f
+# "build/apps/ninfer-serve"` matches the CALLER's command line, so any caller whose command mentions that
+# path (a freshness check, a `git status` line, a variable holding it) killed its own shell mid-run: twice
+# on 2026-09-25 and twice on 2026-10-03. Bracketing the pattern does NOT help -- pkill takes an ERE, so
+# `ninfer-serv[e]` still matches the caller's literal string. Only dropping the path match does.
+for _p in "${PORT:-8085}" "${PROD_PORT:-8080}"; do
+  _pid="$(ss -ltnp 2>/dev/null | sed -n "s/.*:${_p} .*pid=\([0-9]*\).*/\1/p" | head -1)"
+  # never kill QA by accident: :8080 IS the operator's server, so only ever kill a NON-systemd listener
+  [ -n "$_pid" ] && [ "$_pid" != "$(systemctl show -p MainPID --value ninfer.service 2>/dev/null)" ] \
+    && kill -9 "$_pid" 2>/dev/null || true
+done
+unset _p _pid
+[ -s "$HOME/ninfer-test.pid" ] && kill -9 "$(cat "$HOME/ninfer-test.pid")" 2>/dev/null || true
 sleep 2
 # Shed page cache before load: the pinned shmem (host-KV arena + host-state pool)
 # is non-reclaimable, so reclaimable page cache is the headroom we can return.
@@ -142,10 +174,35 @@ unset _mat_name _mat_value
 # needs `env -u`; and a presence test would treat `E2E_ANCHOR_OFF=0` as "off". The comparison is therefore
 # against the VALUE, and the child's environment is written to the log so the arm is recorded rather than
 # inferred.
-ANCHOR_ENV=(env "NINFER_BRANCH_ANCHOR=${NINFER_BRANCH_ANCHOR:-1}")
+# ARMS ARE BUILT AS (unsets...) (assignments...), AND THE ORDER IS LOAD-BEARING. GNU `env` stops option
+# parsing at the first NAME=VALUE, so `env A=1 -u B cmd` treats `-u` as the COMMAND: the server never
+# starts and the swap dies with "e2e server did not come up". That is exactly what the first version of
+# this block did on the OFF arm -- the arm whose whole job is to be the control. Unserts are collected
+# separately and emitted FIRST.
+#
+# `-u` rather than `X=`: `std::getenv` returns non-NULL for an EMPTY value, so an off arm that assigns
+# `X=` ENABLES the feature it is the control for. QA's own environ carries `NINFER_BRANCH_ANCHOR=1`, which
+# is why the anchor's off arm needs `-u` rather than merely not setting it.
+ARM_UNSET=()
+ARM_SET=("NINFER_BRANCH_ANCHOR=${NINFER_BRANCH_ANCHOR:-1}")
 if [ "${E2E_ANCHOR_OFF:-0}" = "1" ]; then
-  ANCHOR_ENV=(env -u NINFER_BRANCH_ANCHOR)
+  ARM_UNSET+=(-u NINFER_BRANCH_ANCHOR)
+  ARM_SET=()
 fi
+# SIBLING-RETAIN ARM (2026-10-02), read by PRESENCE at `resource_manager.h:603`.
+if [ "${E2E_SIBLING_RETAIN:-0}" = "1" ]; then
+  ARM_SET+=(NINFER_SIBLING_RETAIN=1)
+else
+  ARM_UNSET+=(-u NINFER_SIBLING_RETAIN)
+fi
+ANCHOR_ENV=(env "${ARM_UNSET[@]}" "${ARM_SET[@]}")
+# TRUNCATE HERE, THEN APPEND EVERYWHERE. The child used to be started with a plain redirect to $LOG --
+# O_TRUNC and NOT O_APPEND -- so it wrote at its own offset and any `>>` line added while it streamed was
+# OVERWRITTEN by later server output. That is why ANCHOR_CHILD= and ARM_CHILD= never appeared in a serve
+# log while NINFER_EXIT= did (nothing writes after that one), and the first diagnosis blamed the command
+# substitution, which was never the cause. Explicit truncate first, then O_APPEND for both writers.
+: > "$LOG"
+rm -f "$HOME/ninfer-test.pid"
 nohup "${ANCHOR_ENV[@]}" bash -c '"$BIN" "$1" \
   --host 0.0.0.0 --port "${PORT:-8080}" \
   --default-max-tokens 131072 --pending-timeout-ms 900000 \
@@ -157,11 +214,32 @@ nohup "${ANCHOR_ENV[@]}" bash -c '"$BIN" "$1" \
   '"$CTX_FLAGS"' '"$CT_FLAGS_EXTRA"' &
   SRV=$!
   echo "$SRV" > '"$HOME"'/ninfer-test.pid
-  echo "ANCHOR_CHILD=$(tr '"'"'\0'"'"' '"'"'\n'"'"' < /proc/$SRV/environ | grep -c NINFER_BRANCH_ANCHOR)" >> '"$LOG"'
   wait "$SRV"
   echo "NINFER_EXIT=$?" >> '"$LOG"' 2>&1' _ "$MODEL" \
-  > "$LOG" 2>&1 &
+  >> "$LOG" 2>&1 &
 
+# THE ARM MARKERS, written HERE rather than inside the child. `phase_reuse_paths` reads `ANCHOR_CHILD=` to
+# learn which arm it is looking at, and `ARM_CHILD=` records both flags for the reader; the version that
+# wrote them from inside the `bash -c` NEVER LANDED -- both lines were absent from every serve log while
+# `NINFER_EXIT=` (same `>>` mechanism, no command substitution) was present, which is what made
+# `anchor_expected` always None and the anchor gate unable to fail. The child writes its pid before it waits,
+# so poll for that and read the process's own environ: no nested quoting, and the file is the one the phase
+# opens (`args.serve_log`).
+for i in $(seq 1 60); do
+  sleep 3
+  if [ -s "$HOME/ninfer-test.pid" ]; then
+    _srv="$(cat "$HOME/ninfer-test.pid" 2>/dev/null)"
+    if [ -n "$_srv" ] && [ -r "/proc/$_srv/environ" ]; then
+      {
+        printf 'ANCHOR_CHILD=%s\n' "$(tr '\0' '\n' < "/proc/$_srv/environ" | grep -c NINFER_BRANCH_ANCHOR)"
+        printf 'ARM_CHILD=%s\n' "$(tr '\0' '\n' < "/proc/$_srv/environ" | grep -E 'NINFER_BRANCH_ANCHOR|NINFER_SIBLING_RETAIN' | tr '\n' ' ')"
+      } >> "$LOG"
+      unset _srv
+      break
+    fi
+    unset _srv
+  fi
+done
 for i in $(seq 1 60); do
   sleep 3
   if curl -sf "http://localhost:${PORT:-8080}/health" > /dev/null 2>&1; then

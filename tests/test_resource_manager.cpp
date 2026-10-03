@@ -335,8 +335,8 @@ struct FakeAdmissionCandidate {
     std::uint32_t shared_source_id          = 0;
     std::uint32_t shared_source_content_key = 0;
     std::uint32_t shared_source_frontier    = 0;
-
     [[nodiscard]] const RequestPlanSummary& summary() const noexcept { return value; }
+
 
     [[nodiscard]] const ninfer::runtime::IdentityMaterializationAssessment&
     identity_assessment() const noexcept {
@@ -695,6 +695,18 @@ public:
     // eviction/pressure TUs, which the fake does not model -- the fake never evaluates a victim's room or
     // enumerates demote options, so zero is its truthful count, not a placeholder for one.
     [[nodiscard]] std::uint64_t evictions_with_victim_room() const noexcept { return 0U; }
+    // THE FAKE MUST MIRROR THE REAL PROGRAM'S ACCESSORS, and a missing one is a COMPILE failure of the test
+    // target only -- which is why `--target ninfer-serve` never saw it and a full build did. See the note on
+    // the grep: the same blind spot let a real error read as "0 errors" for several builds today.
+    [[nodiscard]] std::uint64_t evictions_demote_possible() const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t options_refused_no_kv() const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t options_refused_active_lanes() const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t options_refused_evicting_current() const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t demote_option_refused_no_state_deficit() const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t demote_option_refused_precondition() const noexcept { return 0U; }
+    void note_pressure_successor_outcome(bool) noexcept {}
+    [[nodiscard]] std::uint64_t pressure_successor_calls() const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t pressure_successors_with_option() const noexcept { return 0U; }
     [[nodiscard]] std::uint64_t pressure_options() const noexcept { return 0U; }
     [[nodiscard]] std::uint64_t demote_options() const noexcept { return 0U; }
 
@@ -3673,6 +3685,15 @@ void test_guided_pressure_reaches_deep_retention_before_maximal_fallback() {
         require(std::find(program.started_action_ids.begin(), program.started_action_ids.end(),
                           2000U + owner_id) == program.started_action_ids.end(),
                 "guided pressure search evicted a parked owner");
+    }
+    // THE MESSAGE CARRIES THE COUNT. It said only "returned to eager breadth-first assessment", so a
+    // failure could not distinguish 9 from 900 -- the number IS the diagnosis. Bound and actual are both
+    // printed, so the gap is visible in the failure rather than needing a re-run with a temporary print.
+    if (program.pressure_target_assessments > 8) {
+        std::cout << "    guided pressure search assessed " << program.pressure_target_assessments
+                  << " targets (bound 8, owners " << owner_count
+                  << ", required actions " << program.required_pressure_actions
+                  << ", alternatives " << program.private_pressure_alternatives << ")\n";
     }
     require(program.pressure_target_assessments <= 8,
             "guided pressure search returned to eager breadth-first assessment");

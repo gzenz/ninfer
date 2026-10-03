@@ -81,7 +81,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--spec mtp|dflash|dflash2 --draft-tokens N] "
            "[--rope-scaling-factor F] [--rope-scaling-original-context N] "
            "[--default-max-tokens N] [--default-thinking-budget N] "
-           "[--vision] [--no-cuda-graph] [--no-prefix-reuse] "
+           "[--vision] [--vision-cpu] [--no-cuda-graph] [--no-prefix-reuse] "
            "[--chat-template FILE] [--lm-head-draft] [--no-thinking] [--preserve-thinking] "
            "[--tolerant-tool-calls] [--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
@@ -103,6 +103,7 @@ std::string serve_usage_text(const char* argv0) {
            "default\n"
            "       --log-stats-interval-ms defaults to 5000; 0 disables periodic throughput logs\n"
            "       --vision enables media and loads the fixed Vision GPU allocations\n"
+           "       --vision-cpu enables the same with the ViT encoder on CPU (saves VRAM; slower)\n"
            "       --kv-capacity auto leaves " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            " MiB of sizing headroom\n"
@@ -319,7 +320,14 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--default-max-tokens") {
             options.default_max_tokens = static_cast<std::uint32_t>(parse_nonnegative_int(require_value("--default-max-tokens"), "default-max-tokens"));
         } else if (arg == "--default-thinking-budget") {
-            options.default_thinking_budget = static_cast<std::uint32_t>(parse_nonnegative_int(require_value("--default-thinking-budget"), "default-thinking-budget"));
+            const std::uint64_t budget =
+                parse_nonnegative_int(require_value("--default-thinking-budget"), "default-thinking-budget");
+            // REJECTED AT ZERO, deliberately: 0 is not a smaller cap, it is "cap thinking at nothing",
+            // which silently disables the bound the caller asked for. The option is a POSITIVE budget.
+            if (budget == 0) {
+                throw std::invalid_argument("--default-thinking-budget must be greater than 0");
+            }
+            options.default_thinking_budget = static_cast<std::uint32_t>(budget);
         } else if (arg == "--vision") {
             options.enable_vision = true;
         } else if (arg == "--vision-cpu") {

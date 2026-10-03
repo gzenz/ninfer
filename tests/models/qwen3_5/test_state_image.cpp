@@ -268,12 +268,48 @@ void test_host_state_pregrow() {
     {
         // REFUSED -> the budget says no, and the caller counts it rather than staying silent.
         auto [pinned, pool] = make_pool(host_layout.image_bytes);  // room for the first chunk only
+        // CAPTURED BEFORE THE FIXTURE'S OWN REFUSAL, so the demand path can be pinned below too.
+        const std::uint64_t real_at_entry = pinned->allocation_refusals();
         expect(pool->reserve_slots(2) == 1U, "refusal fixture gets one slot, not two");
+        // THE DEMAND PATH IS REAL. `reserve_slots` is called by real demand as well (the initial
+        // reservation, and the capture path through `reserve_logical_destination_growing`), so a change
+        // that made it pass `speculative=true` would turn real refusals into speculative ones and
+        // `host_pinned_allocation_refusals` would read 0 under real failure -- the same "instrument
+        // measuring nothing" shape this whole separation exists to remove. Measured: two such mutants pass
+        // every check this fixture had before this assertion.
+        expect(pinned->allocation_refusals() == real_at_entry + 1U,
+               "a DEMAND refusal through reserve_slots moves the REAL counter");
         const auto held = pool->allocate();
         expect(held.has_value() && pool->occupied() == pool->capacity(),
                "refusal fixture fills its single slot");
+        // THE COUNTERS, AND AS DELTAS. The return value alone cannot tell a SPECULATIVE refusal from a real
+        // one, and this is the path a review found routing pre-grow refusals into the real allocation
+        // counters (`host_state_pregrow_refusals` 2195 == `host_pinned_allocation_refusals` 2195, which
+        // produced a false conclusion before the two were compared). Without these, flipping
+        // `/*speculative=*/true` back to `false` at `state_image.cpp` fails NOTHING.
+        //
+        // DELTAS, not absolutes: this fixture's own `reserve_slots(2)` above already refuses its second slot
+        // NON-speculatively, so the real counters are non-zero before the pre-grow is even called. An
+        // absolute assertion here fails on a correct build -- measured, and it is why this is written the
+        // long way.
+        const std::uint64_t real0  = pinned->allocation_refusals();
+        const std::uint64_t ram0   = pinned->allocation_ram_refusals();
+        const std::uint64_t spec0  = pinned->allocation_speculative_refusals();
         expect(q36::pre_grow_host_state_pool(*pool) == q36::HostStatePreGrow::Refused,
                "a budget refusal is REPORTED, not silently absent");
+        expect(pinned->allocation_speculative_refusals() == spec0 + 1U,
+               "a refused STATE pre-grow is counted as SPECULATIVE");
+        expect(pinned->allocation_refusals() == real0,
+               "and does NOT move the real allocation-refusal counter");
+        expect(pinned->allocation_ram_refusals() == ram0,
+               "nor the RAM one");
+        // THE REVERSE DIRECTION, explicitly: a demand allocation on the same refusing pool must still be
+        // REAL. Without this the trade is pinned only one way.
+        expect(!pool->allocate_growing().has_value(), "a demand allocation on the full pool is refused");
+        expect(pinned->allocation_refusals() == real0 + 1U,
+               "and a DEMAND refusal through allocate_growing IS counted as real");
+        expect(pinned->allocation_speculative_refusals() == spec0 + 1U,
+               "while the speculative count is unmoved by it");
     }
 }
 

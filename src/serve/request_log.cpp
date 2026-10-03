@@ -355,10 +355,14 @@ Json materialization_json(const ninfer::MaterializationDiagnostics& diagnostics)
          diagnostics.assessed_targets_without_goal_infeasible},
         {"assessed_targets_without_goal_unadoptable",
          diagnostics.assessed_targets_without_goal_unadoptable},
-        // THE CANDIDATE SET, per request. `longer_lost` true beside a `best_loser_reuse` above
-        // `chosen_reuse` is the defect: a longer source was available and refused. Each row then says what
-        // happened to that candidate -- how many goal probes it got, how many produced an adoptable goal,
-        // and how many were blocked by the publication cell alone versus anything else.
+        // THE CANDIDATE SET, per request. Each row says what happened to that candidate -- how many goal
+        // probes it got, how many produced an adoptable goal, and how many were blocked by the publication
+        // cell alone versus anything else -- plus the election terms it was ranked on.
+        // CORRECTED 2026-10-02: "`longer_lost` true ... is the defect" was WRONG and cost a live reading.
+        // `longer_lost` compares `reused_prompt_tokens` ALONE, which is element 10 of `FoldedCost::key()`;
+        // ten terms outrank it, so the flag fires whenever any of them differs -- the ordinary case. The
+        // defect-shaped reading is `longer_lost_eligible` (eligible candidates only), and `decided_by` names
+        // the term responsible.
         {"candidates", [&] {
              Json array = Json::array();
              for (const auto& row : diagnostics.candidates) {
@@ -369,13 +373,53 @@ Json materialization_json(const ninfer::MaterializationDiagnostics& diagnostics)
                                       {"other", row.other},
                                       {"winner", row.winner},
                                       {"private_source", row.private_source},
-                                      {"shared_source", row.shared_source}});
+                                      {"shared_source", row.shared_source},
+                                      // WHAT THE ELECTION RANKED IT ON, so a loss is attributable. Without
+                                      // these a `longer_lost` can only be read as "reuse lost", which is
+                                      // element 10 of an ordering with ten terms above it.
+                                      {"eligible", row.eligible},
+                                      {"restorable_evictions", row.restorable_evictions},
+                                      {"total_ns", row.total_ns},
+                                      {"affected_selected_hits", row.affected_selected_hits},
+                                      {"owner_evictions", row.owner_evictions},
+                                      {"checkpoint_drops", row.checkpoint_drops},
+                                      // COMPARE ELECTED AGAINST ELECTED -- see `ElectionTerm`. The winner's
+                                      // row above is its SEATED cost; these are the terms the election used.
+                                      {"seated_differs", row.seated_differs},
+                                      {"elected_reuse", row.elected_reuse},
+                                      {"elected_restorable_evictions", row.elected_restorable_evictions},
+                                      {"elected_total_ns", row.elected_total_ns},
+                                      {"elected_affected_selected_hits", row.elected_affected_selected_hits},
+                                      {"elected_owner_evictions", row.elected_owner_evictions},
+                                      {"elected_checkpoint_drops", row.elected_checkpoint_drops}});
              }
              return array;
          }()},
         {"chosen_reuse", diagnostics.chosen_reuse},
         {"best_loser_reuse", diagnostics.best_loser_reuse},
         {"longer_lost", diagnostics.longer_lost},
+        // THE COMPARISON THAT CAN BE CALLED A DEFECT (eligible candidates only), and WHICH TERM DECIDED it.
+        // `longer_lost` alone fires on any of the ten terms ranked above reuse, so it is the ordinary case
+        // rather than the defect case. CORRECTED 2026-10-02 (a review found this legend still pre-fix):
+        // `decided_by` is an index into `FoldedCost::key()` over ALL FOURTEEN elements -- 0 =
+        // restorable_evictions, 1 = total_ns, 2 = affected_selected_hits, 3 = newest_affected_hit_epoch,
+        // 4 = owner_evictions, 5 = checkpoint_drops, 6 = copy_operations, 7 = transferred_bytes,
+        // 8 = remaining_text_prefill, 9 = remaining_vision_prefill, 10 = reused_prompt_tokens,
+        // 11 = current_session_binding, 12 = candidate_ordinal, 13 = target_ordinal.
+        // **255 means NO ELIGIBLE LOSER EXISTED AT ALL** and nothing else -- the old text's "or the two agree
+        // on every carried term" is false, because every element is walked now.
+        // **254 means THE COSTS ARE NOT A COMPARABLE PAIR**: the recorded winner does not beat this loser
+        // on `key()`, so no element can honestly be named. It is emitted by `election_deciding_element`, and
+        // seeing it means the attribution was handed a cost the election did not rank -- the seal-fallback
+        // shape. Read it as an instrument fault, never as a finding.
+        // **AND READ IT WITH `longer_lost_eligible`, NOT `longer_lost`**: the invariant below holds for the
+        // eligible comparison only. Row-based `longer_lost` can be true because of an INELIGIBLE longer
+        // candidate, while a legitimate `decided_by == 10` comes from a SHORTER eligible loser.
+        // It is computed by the planner from the cost the ELECTION compared, which on a seal fallback is
+        // NOT the cost that was sealed -- see `finalize_selection`.
+        {"best_eligible_loser_reuse", diagnostics.best_eligible_loser_reuse},
+        {"longer_lost_eligible", diagnostics.longer_lost_eligible},
+        {"longer_lost_decided_by", diagnostics.longer_lost_decided_by},
         // THE SPLIT (§2f): the deepest token-exact match against ANY stored ledger, the deepest restorable
         // checkpoint at or below it, and the entry count examined.
         {"split_best_tokens", diagnostics.split_best_tokens},

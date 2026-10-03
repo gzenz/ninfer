@@ -161,7 +161,8 @@ std::optional<PinnedHostPool::Handle> PinnedHostPool::try_allocate(std::size_t a
     return std::nullopt;
 }
 
-std::optional<PinnedHostPool::Handle> PinnedHostPool::allocate(std::size_t bytes) noexcept {
+std::optional<PinnedHostPool::Handle> PinnedHostPool::allocate(std::size_t bytes,
+                                                               bool speculative) noexcept {
     if (bytes == 0U) { return std::nullopt; }
     const std::size_t aligned_bytes = align_up(bytes);
     if (auto handle = try_allocate(aligned_bytes); handle) { return handle; }
@@ -175,9 +176,15 @@ std::optional<PinnedHostPool::Handle> PinnedHostPool::allocate(std::size_t bytes
     // could never fire while the real fragmentation path was counted nowhere. Measured 2026-10-01:
     // `free_bytes` 1798 MiB against `largest_free_run` 90 MiB, with a state image needing ~187 MiB -- the
     // pool held far more than enough BYTES and no single place to put one.
-    if (free_bytes() >= aligned_bytes) { ++allocation_fragmented_misses_; }
+    // A SPECULATIVE failure is counted separately and does NOT enter the fragmentation signal: the signal
+    // exists to prove that a REAL allocation failed while free bytes sufficed, and a pre-grow is not one.
+    if (!speculative && free_bytes() >= aligned_bytes) { ++allocation_fragmented_misses_; }
     if (!grow(aligned_bytes)) {
         // (2) NO ROOM AND GROWTH REFUSED -- a RAM/policy fact: the pool could neither place it nor grow.
+        if (speculative) {
+            ++allocation_speculative_refusals_;
+            return std::nullopt;
+        }
         ++allocation_refusals_;
         ++allocation_ram_refusals_;
         return std::nullopt;

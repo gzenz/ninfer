@@ -298,8 +298,23 @@ select_kv_pressure_actions(const KVAddressSpaceStore& addresses, LogicalKVPageSt
         }
     };
     select_device_runs(true);
-    if (device_remaining != 0 && selection.host_bytes_remaining == 0 && host_allocation_available &&
-        host_extents != nullptr) {
+    // THE GATE, RESTORED 2026-10-02 AFTER A REVIEW FALSIFIED THE REASON IT WAS REMOVED.
+    //
+    // It was removed on the argument that `selection.host_bytes_remaining` is "a fact about the plan's own
+    // accounting, not about the machine", so a host WITH ROOM could still come back with no non-evicting
+    // successor because this pass had not been permitted to run. **That argument is wrong about its own
+    // condition.** `requested_host_bytes` IS `deficit.host.kv_bytes` (`:602`) -- the host-KV DEFICIT -- so on
+    // a host with room the deficit is 0, `host_bytes_remaining` starts at 0, and the gate ALREADY permitted
+    // this pass. What the condition actually excludes is demoting into a host that is SHORT OF BYTES, which
+    // is a statement about the machine after all. So removing it was a no-op on the case it claimed to fix,
+    // it had no test (`grep host_bytes_remaining tests/` matches nothing), and the evidence cuts against it:
+    // across the two windows the demote-to-evict ratio HALVED (demotes 155 -> 29 against evictions
+    // 49 -> 18), while the plan recorded the suppression as ESTABLISHED from a window it also recorded as
+    // not comparable. The 81.5%-no-option reading that motivated the removal is real but unattributed; it is
+    // not evidence about this gate. Restoring, and the controlled before/after the plan asks for is still
+    // unmade.
+    if (device_remaining != 0 && selection.host_bytes_remaining == 0 &&
+        host_allocation_available && host_extents != nullptr) {
         select_device_runs(false);
     }
     return selection;
@@ -710,8 +725,32 @@ ProgramImpl::inspect_pressure_option(const SequenceState& sequence,
                                      std::span<const StateImageHandle> released_states,
                                      const qwen3_5::detail::PressureDecision* current) const {
     ++pressure_options_;  // the denominator for `demote_options_`: how often an option is inspected at all
-    if (!sequence.kv || deficit.device.active_lanes != 0 ||
-        (current != nullptr && current->evicts_continuation)) {
+    // WHY NO DEMOTE OPTION WAS GENERATED, COUNTED BY CLAUSE. The three clauses want three DIFFERENT fixes,
+    // so the total is useless on its own: `!sequence.kv` is a source with no KV to demote,
+    // `active_lanes != 0` is a concurrent lane in flight, and `current->evicts_continuation` is a plan that
+    // has already evicted -- only the LAST is a policy choice.
+    // **CORRECTION 2026-10-02, and the claim that stood here was FALSE:** this said "298 of 357 (83%) NEVER
+    // ASSESSED a preserving alternative at all". A re-read of the request log over **1044 records with
+    // `chosen_restorable_evictions > 0` found NOT ONE with `preserving_alternatives_assessed == 0`** (min 65,
+    // median 1495) -- the 83% came from two instances whose counters were TRANSPOSED by the 2026-10-01
+    // argument-order defect, i.e. it was an instrument artefact read as a finding. The real shape is the
+    // opposite: preserving targets ARE assessed, and `feasible_preserving_alternatives` is 0 in all 1044.
+    // CAVEAT on that counter itself (`materialization_planner.h`, `preserving_alternatives_assessed_` --
+    // cited by SYMBOL, because the line number that stood here said 537 and the increment had moved to 539):
+    // it counts every assessed target with `restorable_evictions == 0`, INCLUDING partial-construction
+    // targets that have not covered the deficit yet, so > 0 does not prove a COMPLETE preserving plan was
+    // assessed. The asymmetry is the point: `== 0` is strong evidence, `> 0` is weak. The second copy of this
+    // caveat is in `plan.md`, Current state §3, where the pair is read.
+    if (!sequence.kv) {
+        ++options_refused_no_kv_;
+        return std::nullopt;
+    }
+    if (deficit.device.active_lanes != 0) {
+        ++options_refused_active_lanes_;
+        return std::nullopt;
+    }
+    if (current != nullptr && current->evicts_continuation) {
+        ++options_refused_evicting_current_;
         return std::nullopt;
     }
 
@@ -778,12 +817,33 @@ ProgramImpl::inspect_pressure_option(const SequenceState& sequence,
             .added   = checked_resource_difference(option.effect.added, initial_effect.added),
         };
         const detail::PhysicalResources residual = pressure_residual(deficit, extension_effect);
-        if ((residual.device.state_slots == 0 && residual.host.state_slots == 0) ||
+        // WHY THE DEMOTE OPTION DIES, SPLIT BY WHAT IT MEANS -- the seven conditions want OPPOSITE fixes.
+        // Measured 2026-10-02: 16 of 48 evictions (33%) evicted a victim whose own slots fitted and for
+        // which the store reported `demote_refusal=none`, so a demote WAS available at execution while the
+        // plan had none. The key ranks `restorable_evictions` first, so a preserving plan would have won had
+        // one been CONSTRUCTED -- and the claim that this clause is where that fails is NOT what the numbers
+        // say. **CORRECTED 2026-10-02: an earlier version of this comment read "`preserving_alternatives_
+        // assessed == 0` in 83% of evictions", and that was FALSE.** The 83% came from two instances whose
+        // counters had been transposed in the reading; over the eviction-bearing records carrying the field
+        // (1,497 at the time of writing, and NOT ONE of them) there is no record with
+        // `preserving_alternatives_assessed == 0` (the counter is gated on a logical goal, so a 0 there means
+        // either "assessed and goal-less" or "never assessed", and the recorded data shows the former). The
+        // 33% figure above stands on the eviction lines themselves; the "never assessed" half does not.
+        // **The first clause is the only one that is a POLICY/AXIS choice**: the
+        // deficit carries no state slots, so this state-side relief is inapplicable and the relief actually
+        // wanted is a KV demote (Part 1's axis, where `host_kv_fit_growable` read 0). The other six say no
+        // demote exists at all, and an eviction there is CORRECT. Counting them together would aim the fix
+        // at whichever happened to be common.
+        const bool no_state_deficit =
+            residual.device.state_slots == 0 && residual.host.state_slots == 0;
+        const bool demote_precondition_failed =
             checkpoint_was_dropped || already_changed || !state_store->valid(state) ||
             state_store->role(state) != StateImageRole::CheckpointImmutable ||
             state_store->source_pins(state) != 0 ||
-            std::find(released_states.begin(), released_states.end(), state) !=
-                released_states.end()) {
+            std::find(released_states.begin(), released_states.end(), state) != released_states.end();
+        if (no_state_deficit || demote_precondition_failed) {
+            if (no_state_deficit) { ++demote_option_refused_no_state_deficit_; }
+            else                  { ++demote_option_refused_precondition_; }
             return false;
         }
         const StateReplicaResidency residency = state_store->residency(state);
@@ -2324,7 +2384,43 @@ bool ProgramImpl::compose_pressure_candidate(
         if (host_kv_extents == nullptr ||
             !host_kv_extents->can_allocate_after_page_releases(
                 host_releases, host_last_reference_releases, host_requests)) {
+            ++host_kv_blocked_checks_;  // the DENOMINATOR for the tri-state above: how often this path runs
             details.blocked_host_allocation_bytes = std::max<std::size_t>(1, requested_bytes);
+            // AND THE MAGNITUDE. Recorded here because this is where it is computed; it reaches no
+            // per-candidate row because the row is built from the ORIGINAL candidate while the veto writes
+            // to the composed copy. **A second pass corrected this comment:** it used to say "the caller of
+            // a vetoed composition returns `nullopt`", and that is FALSE -- `compose_pressure_candidate`
+            // returns TRUE with the field set (`:2381-2412`); it is `seal_materialization` that returns
+            // `nullopt` (`:2030-2034`), and the planner DOES read the vetoed value per node
+            // (`pressure_planner.cpp:1176`, `:1185`). So a per-candidate figure was reachable there, and
+            // "can never reach a row" was an overstatement of a real reason.
+            host_kv_blocked_max_bytes_ = std::max(host_kv_blocked_max_bytes_,
+                                                  static_cast<std::uint64_t>(requested_bytes));
+            // AND WHY IT WAS BLOCKED, which the boolean cannot say. Asked ONLY on the failure path, so the
+            // common case pays nothing, and PURE (the arena's `fit_...` is `const` and simulates on a copy;
+            // the headroom comes from the pool's cached-reading query, never from `allow()`). `Growable`
+            // here means the reported headroom covers the spans this plan needs -- i.e. the plan was one
+            // pre-grow away -- and the count of those is what says whether the session-start pre-grow has
+            // closed this or whether seal-time growth is still needed.
+            // THE COUNTER'S UNIT IS AN ASSESSED SEARCH NODE, NOT A PLANNING RUN -- this function is called
+            // once per node (`pressure_planner.cpp:1144`/`:1154`), so one run can add thousands. Read it as
+            // a rate over nodes, never as a session count; a review caught the original comment asserting
+            // the other unit, which is the direction that makes a zero look like proof.
+            if (host_kv_extents != nullptr) {
+                const HostKVFitResult fit = host_kv_extents->fit_after_page_releases(
+                    host_releases, host_last_reference_releases, host_requests,
+                    pinned_host_pool != nullptr ? pinned_host_pool->growth_headroom_bytes() : 0U);
+                // **ALL THREE VERDICTS, because counting `Growable` alone makes two opposite facts read the
+                // same.** `host_kv_fit_growable == 0` meant "no node ever saw a growable case" AND "every
+                // failing node was Blocked" -- the absence-is-not-zero trap inside the instrument itself, and
+                // it is why the veto could not be aimed at. With `blocked_checks` as the denominator, a zero
+                // here says whether the path is even reached.
+                switch (fit.fit) {
+                case HostKVFit::Pinned:   ++host_kv_fit_pinned_;   break;
+                case HostKVFit::Growable: ++host_kv_fit_growable_; break;
+                case HostKVFit::Blocked:  ++host_kv_fit_blocked_;  break;
+                }
+            }
         }
     }
 

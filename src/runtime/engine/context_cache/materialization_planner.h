@@ -145,6 +145,13 @@ public:
         queue_.reserve(frontier_capacity);
         pending_.reserve(frontier_capacity);
         identity_costs_.clear();
+        // PER-CANDIDATE ELECTION COSTS. Filled at THREE sites, not one: the identity loop above (the fold
+        // the SELECT-FAST path elects on), the root-maximal seed, and `assess_target` -- the last of which
+        // KEEPS THE BEST GOAL-BEARING COST rather than the last one assessed. Reported so a loss can be
+        // attributed to the key element that decided it: `reused_prompt_tokens` is element 10 of the
+        // ordering, so a higher-reuse candidate losing is the ORDINARY case whenever any of the ten terms
+        // above it differ.
+        election_best_.assign(candidates.size(), std::nullopt);
         target_ledger_.reset(candidates.size() + 1U + kTargetBudget);
 
         // The mandatory root-maximal fallback does not count as an ordinary feasible seed.
@@ -186,6 +193,15 @@ public:
                 };
             }
             candidate_seeded[index] = goal.has_value();
+            // THE IDENTITY FOLD IS THE ONLY COST THIS CANDIDATE HAS UNTIL IT IS ASSESSED, and the
+            // SELECT-FAST path below elects a winner from `identity_best` without ever calling
+            // `assess_target` -- `no_pressure` returns that way. Recording it here is what makes that path
+            // report WHY its winner won; without it a `no_pressure` request emitted every row as
+            // `eligible=false, decided_by=255`, i.e. nothing, which was measured on the first smoke request
+            // after the deploy. `assess_target` replaces it with a real assessment when one happens.
+            if (goal && index < election_best_.size()) {
+                election_best_[index] = cost;
+            }
             const bool needs_pressure =
                 !goal.has_value() &&
                 (identity.physical_status == MaterializationPhysicalStatus::Feasible ||
@@ -260,6 +276,8 @@ public:
                 result.publication_slot = identity_best->publication_slot;
                 result.source_mode      = identity_best->source_mode;
                 result.diagnostics      = diagnostics;
+                finalize_selection(identity_best->candidate_index, identity_best->cost,
+                                   identity_best->cost, result.diagnostics);
                 return result;
             }
         }
@@ -319,6 +337,14 @@ public:
             incumbent = make_incumbent(root_maximal, root_candidate_index, assessment,
                                        std::move(assessed), cost, *goal);
             mark_target(assessment.stable_target_ordinal, kTargetDiscovered | kTargetAssessed);
+            // RECORD THE SEED, or the root is compared and can lose without being countable as a loser.
+            // This target is marked assessed above, so `assess_target` never revisits it and no other site
+            // would fill the entry: a later winner would then report `decided_by == 255` -- documented as
+            // "NO ELIGIBLE LOSER EXISTED AT ALL" -- while an eligible loser (the root) sat right there. A
+            // review found the gap in the same pass that found the fallback attribution fault.
+            if (root_candidate_index < election_best_.size()) { election_best_[root_candidate_index] = cost; }
+            if (root_candidate_index < candidates.size()) {
+            }
         }
 
         if (!identity_best) { search_started = Clock::now(); }
@@ -490,6 +516,22 @@ public:
 ++goal_probes_by_site_[2];
                 goal = logical_goal(assessment.candidate, assessment.source_mode,
                                     assessment.owner_outcomes);
+            }
+            // RECORD WHAT THIS CANDIDATE WOULD BE RANKED ON. `eligible` is deliberately the SAME condition
+            // adoption uses (`goal.has_value()`, which requires physical feasibility) -- an ineligible
+            // candidate was never compared, so calling it a loser is the defect this row exists to remove.
+            // (Removed 2026-10-02: this said "the LAST assessment for a candidate wins", which is exactly
+            // what the block below replaced. A review found the superseded line still standing above it.)
+            // THE BEST GOAL-BEARING COST FOR THIS CANDIDATE, not the last one assessed. The search
+            // assesses many targets per candidate (the seed, every expansion child, the rescue), so
+            // last-wins would let a later, worse, never-adopted target of the WINNING candidate describe the
+            // winner -- and a review found exactly that. `less` is `key()`, so this keeps the best plan the
+            // candidate actually had. Only goal-bearing assessments count: a goal is what makes a plan
+            // electable, which is the same condition `becomes_incumbent` uses, so this vector IS the
+            // eligible set.
+            if (expected_candidate < election_best_.size()) {
+                std::optional<FoldedCost>& best = election_best_[expected_candidate];
+                if (goal && (!best || cost.less(*best))) { best = cost; }
             }
             // COUNTED HERE, beside the goal decision: a target with no goal is one that was ASSESSED and
             // could not be adopted -- which is what separates "the relief step was generated and rejected"
@@ -963,6 +1005,14 @@ public:
                          static_cast<unsigned long>(incumbent.candidate_index));
             dbg_flush();
         }
+        // THE COST THE ELECTION COMPARED, kept across the fallback below. The fallback REPLACES the sealed
+        // plan with root-maximal, whose key can be WORSE than a loser's -- the election never ranked that
+        // pair -- so attributing against it would name an element where the LOSER was better and present it
+        // as the winner's reason (`decided_by=0` reading "the #6 ruling decided" when the winner actually
+        // LOST on element 0 and was seated by a seal failure). Since `first_differing_key_element` is
+        // symmetric it cannot signal that reversal; the fix is to never compare the wrong pair. A review
+        // caught this, with 974 of 977 reversed pairs yielding the supposedly-impossible `decided_by == 10`.
+        const FoldedCost elected_cost = incumbent.cost;
         if (!sealed) {
             // The selected preserving target (a demote-to-host) lost its host allocation to a
             // concurrent demote between assess and seal. Fall back to the root-maximal eviction
@@ -990,6 +1040,12 @@ public:
                 }
                 return std::nullopt;
             }
+            // THE FOLDED COST OF THE PLAN THAT IS ABOUT TO BE SEALED, taken here because `root_assessed` is
+            // moved into `seal` below. See the assignment at `incumbent.cost` further down for why it must
+            // replace the preserving plan's.
+            const FoldedCost fallback_cost =
+                fold_assessment(candidates[incumbent.candidate_index], root_assessed.assessment(),
+                                pressure.owner_policy, pressure.checkpoint_policy, machine_cost);
             sealed = session.seal(std::move(root_assessed), prompt,
                                   FinalScheduleIntent{.shared_capture_frontiers = shared_frontiers});
             if (!sealed) {
@@ -1003,6 +1059,25 @@ public:
                 return std::nullopt;
             }
             incumbent.root_maximal = true;
+            // THE RECORD MUST DESCRIBE THE PLAN THAT WAS SEALED. Until 2026-10-02 `incumbent.cost` was left
+            // as the PRESERVING plan's, while the sealed plan was this evict-everything fallback -- and
+            // `make_diagnostics(incumbent.cost, ...)` runs AFTER here, so `chosen_restorable_evictions` and
+            // every `predicted_*` figure for a fallback case described a plan that was never sealed. The
+            // fallback is precisely the maximal-eviction path, so the numbers read LOW exactly where the
+            // destruction is largest: `req#201` reported `chosen_restorable_evictions=69` BESIDE
+            // `selected_maximal_fallback=true` with a lowering reuse of 54,963, and which plan owned those 69
+            // evictions could not be told from the record. A review found it against the fallback flag.
+            incumbent.cost = fallback_cost;
+            // **ONLY THE COST FIELDS WERE UPDATED HERE, AND THAT IS NOT THE WHOLE RECORD.** After a
+            // fallback, `predicted_now_ns` / `predicted_future_loss_ns` / `predicted_total_ns` /
+            // `chosen_restorable_evictions` come from `incumbent.cost` and now describe the sealed plan,
+            // while these still describe the PRESERVING one that was never sealed:
+            // `selected_degradation_units` (`incumbent.degradation_units`), `owner_outcomes` and
+            // `checkpoint_outcomes` (whose claims drive `private_claims_` / `shared_claims_` dispositions in
+            // `resource_manager`), `publication_slot` and `source_mode`. This is PRE-EXISTING, not caused by
+            // the cost assignment -- a review separated the two -- and it is left as an open item rather
+            // than half-fixed, because whether the CLAIMS need the fallback's outcomes is a separate
+            // question that the e2e's demotion and state-saturation phases would have to answer.
         }
         // The seal (and any fallback) is committed; release the claim so a concurrent
         // materialization can seal immediately, before this one builds its result.
@@ -1078,6 +1153,7 @@ public:
         result.owner_outcomes      = std::move(incumbent.owner_outcomes);
         result.checkpoint_outcomes = std::move(incumbent.checkpoint_outcomes);
         result.diagnostics         = diagnostics;
+        finalize_selection(incumbent.candidate_index, elected_cost, incumbent.cost, result.diagnostics);
         return result;
     }
 
@@ -1606,6 +1682,96 @@ private:
         target_ledger_.mark(ordinal, mark);
     }
 
+    // WHERE THE WINNER'S REASON IS COMPUTED, from `incumbent.cost` and each candidate's BEST GOAL-BEARING
+    // cost -- the costs the election actually compared. It cannot be computed from the request log's
+    // candidate rows: on the search path a row holds the last assessment for its candidate (a review found
+    // this), and the root-maximal seed and the seal fallback write no row terms at all, so a row-based
+    // comparison would attribute a win to a plan that was never seated.
+    //
+    // The loser it names is the ELIGIBLE candidate with the most reuse, matching the published
+    // `best_loser_reuse`'s intent; "eligible" is carried by this vector itself, since an entry exists only
+    // for a goal-bearing assessment (the same condition `becomes_incumbent` uses).
+    // Ship the per-candidate terms WITH the winner's entry replaced by the cost it was actually seated on,
+    // then attribute. Done at the return sites because that is the only place `incumbent.cost` exists.
+    // TWO COSTS, DELIBERATELY. `elected_cost` is what the ELECTION ranked and is the only correct basis for
+    // the attribution. `seated_cost` is what was actually SEALED -- `elected_cost` unless the seal failed
+    // and the root-maximal fallback replaced it -- and is what the winner's ROW should describe, since that
+    // is the plan that ran. Passing one cost for both purposes is the fault a review found: on the fallback
+    // path the winner's row would then claim terms the election never weighed, and `decided_by` would name
+    // an element where the loser was BETTER.
+    void finalize_selection(std::uint32_t winner_index, const FoldedCost& elected_cost,
+                            const FoldedCost& seated_cost, MaterializationDiagnostics& out) const {
+        out.election.clear();
+        out.election.reserve(election_best_.size());
+        for (std::size_t index = 0; index < election_best_.size(); ++index) {
+            MaterializationDiagnostics::ElectionTerm term;
+            const FoldedCost* cost = election_best_[index] ? &*election_best_[index] : nullptr;
+            if (index == static_cast<std::size_t>(winner_index)) { cost = &seated_cost; }
+            if (cost != nullptr) {
+                // An entry exists only for a GOAL-BEARING assessment (or the winner, which was seated by
+                // one), and a goal is exactly what makes a plan electable -- so this is the eligibility
+                // bit, not a convenience.
+                term.eligible               = true;
+                term.restorable_evictions   = cost->restorable_evictions;
+                term.total_ns               = cost->total_ns;
+                term.affected_selected_hits = cost->affected_selected_hits;
+                term.owner_evictions        = cost->owner_evictions;
+                term.checkpoint_drops       = cost->checkpoint_drops;
+            }
+            // THE WINNER'S ELECTED COST, RECORDED BESIDE ITS SEATED ONE -- see `ElectionTerm`. `cost` above
+            // is `seated_cost` for the winner, so these are the only terms that may be compared against a
+            // loser's, and `seated_differs` tells a reader when the two disagree.
+            if (index == static_cast<std::size_t>(winner_index)) {
+                term.seated_differs               = !(seated_cost.key() == elected_cost.key());
+                term.elected_reuse                 = elected_cost.reused_prompt_tokens;
+                term.elected_restorable_evictions  = elected_cost.restorable_evictions;
+                term.elected_total_ns              = elected_cost.total_ns;
+                term.elected_affected_selected_hits= elected_cost.affected_selected_hits;
+                term.elected_owner_evictions       = elected_cost.owner_evictions;
+                term.elected_checkpoint_drops      = elected_cost.checkpoint_drops;
+            }
+            out.election.push_back(term);
+        }
+        attribute_selection(winner_index, elected_cost, out);
+    }
+
+    void attribute_selection(std::uint32_t winner_index, const FoldedCost& winner_cost,
+                             MaterializationDiagnostics& out) const noexcept {
+        std::uint32_t     best_loser_reuse = 0U;
+        const FoldedCost* best_loser       = nullptr;
+        for (std::size_t index = 0; index < election_best_.size(); ++index) {
+            if (index == static_cast<std::size_t>(winner_index) || !election_best_[index]) { continue; }
+            const FoldedCost& candidate = *election_best_[index];
+            // THE LOSER NAMED IS THE ONE WITH THE MOST REUSE -- the published `best_loser_reuse` notion,
+            // because a LONGER candidate is what this pair is about. The `best_loser == nullptr` arm takes
+            // the earliest eligible loser instead, so that a set of eligible losers which all reuse NOTHING
+            // still yields an attribution; without it, `decided_by == 255` conflated "no eligible loser at
+            // all" with "eligible losers existed, none reusing anything" (a review's finding 9). 255 now
+            // means the former and nothing else.
+            if (best_loser == nullptr || candidate.reused_prompt_tokens > best_loser_reuse) {
+                best_loser_reuse = candidate.reused_prompt_tokens;
+                best_loser       = &candidate;
+            }
+        }
+        out.best_eligible_loser_reuse = best_loser_reuse;
+        out.longer_lost_eligible =
+            best_loser != nullptr && best_loser_reuse > winner_cost.reused_prompt_tokens;
+        // `election_deciding_element`, NOT `first_differing_key_element`: the wrapper checks that the
+        // winner actually BEATS this loser before naming an element. The raw helper is symmetric, so on an
+        // inverted pair -- which is what a fallback cost produces, see `finalize_selection` -- it would name
+        // an element where the LOSER was better and present it as the winner's reason. With the wrapper that
+        // case is `kNotAnElectedWinner` (254): loud, and impossible to read as a finding.
+        out.longer_lost_decided_by    = best_loser != nullptr
+                                            ? election_deciding_element(winner_cost, *best_loser)
+                                            : kNoDifferingKeyElement;
+        // THE INVARIANT, and it is why `decided_by == 10` must never be read as a finding:
+        // `key()` element 10 is `max - reused_prompt_tokens`, so a cost with MORE reuse has a SMALLER key
+        // and wins on element 10. A loser that has more reuse therefore LOST on one of elements 0..9, and
+        // `first_differing_key_element` can only return 10 when the loser has LESS reuse. So
+        // (`longer_lost_eligible` && `decided_by == 10`) is IMPOSSIBLE, and a reading that shows it means
+        // the two costs are not the ones the election compared -- an instrument fault, not a defect found.
+    }
+
     [[nodiscard]] static MaterializationDiagnostics
     complete_diagnostics(const FoldedCost& cost, std::uint32_t targets_evaluated,
                          std::uint64_t projection_work, Clock::time_point planning_started,
@@ -1648,6 +1814,12 @@ private:
     std::vector<QueueEntry> queue_;
     std::vector<PendingEntry> pending_;
     std::vector<FoldedCost> identity_costs_;
+    // THE BEST GOAL-BEARING COST PER CANDIDATE, index-aligned with the `candidates` span -- the costs the
+    // election compared. `nullopt` means the candidate never had a goal-bearing assessment, i.e. it was
+    // never electable. Deliberately NOT "the last assessment" (a later, worse target of the winning
+    // candidate would then describe the winner) and not the request log's rows (which are written later,
+    // from a different fold, and not at all on two of the winner's paths).
+    std::vector<std::optional<FoldedCost>> election_best_;
     // #6 (2026-09-27): how many targets this planning run assessed FEASIBLE whose cost evicted no
     // restorable victim -- i.e. how many plans existed that would have preserved one. Counted in
     // `assess_target` because BOTH paths (the seeded candidate and the search) mark feasibility there, so

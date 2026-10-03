@@ -346,10 +346,10 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                     }
                     (void)workspace::gdn_recurrent_output(layout, config, last);
                     if (path == GdnWorkspacePath::Prefill) {
-                        scratch(layout,
-                                ops::gated_delta_net_workspace_capacity_bytes(
-                                    dimension(config.gdn->linear_num_key_heads),
-                                    dimension(config.gdn->linear_num_value_heads), first, last));
+                        scratch(layout, ops::gated_delta_net_workspace_capacity_bytes(
+                                            dimension(config.gdn->linear_num_key_heads),
+                                            dimension(config.gdn->linear_num_value_heads),
+                                            first, last));
                     }
                     (void)workspace::gdn_normalized_output(layout, config, last);
                     add_scratch(layout, gdn.output, first, last);
@@ -720,8 +720,18 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     if (plan.features.vision) {
         const std::uint32_t merged = static_cast<std::uint32_t>(
             std::min<std::uint64_t>(plan.capacity, kMaximumVisionItemTokens));
-        out.vision = execution::VisionContext::plan_workspace(
-            *parameters.model.config().vision, *parameters.vision, merged, out.general_capacity);
+        if (plan.features.vision_cpu_offload) {
+            // `--vision-cpu`: only the final embedding handoff is device-resident (encoder runs on
+            // the host with the model's dequantized weights); no device encode scratch is planned.
+            out.vision = execution::plan_vision_workspace_offload(
+                *parameters.model.config().vision,
+                static_cast<std::int32_t>(parameters.model.config().text.hidden_size), merged,
+                out.general_capacity);
+        } else {
+            out.vision = execution::VisionContext::plan_workspace(
+                *parameters.model.config().vision, *parameters.vision, merged,
+                out.general_capacity);
+        }
         out.capacity = std::max(out.capacity, out.vision->capacity_bytes);
     }
     return out;
@@ -737,13 +747,27 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
         throw std::invalid_argument(
             "loaded components do not match the requested execution options");
     }
-    if (parameters.draft &&
-        options.max_context > parameters.model.config().draft->max_position_embeddings) {
-        throw std::invalid_argument("max_context exceeds the selected draft position capacity");
+    if (options.rope_scaling_factor < 1.0F) {
+        throw std::invalid_argument("rope_scaling_factor must be >= 1.0");
     }
-    if (options.max_context == 0 ||
-        options.max_context > parameters.model.config().text.max_position_embeddings) {
-        throw std::invalid_argument("max_context exceeds the configured position capacity");
+    // YaRN extension is supported with the sliding-window masked draft (DFlash2): its draft
+    // context is a fixed-size window buffer addressed by un-scaled logical positions, so the
+    // only position-scaling-sensitive component is the target model (already scaled), and the
+    // extended frontier never feeds the draft's attention. The full-context masked draft (DFlash)
+    // has a draft-attention layer that reads the entire paged context, whose KV and per-round cost
+    // grow with the extended position range, so it stays gated.
+    if (options.rope_scaling_factor > 1.0F &&
+        options.speculative.backend == SpeculativeBackend::DFlash) {
+        throw std::invalid_argument(
+            "rope_scaling_factor is not supported with the full-context DFlash speculative "
+            "backend");
+    }
+    const std::uint32_t effective_max = static_cast<std::uint32_t>(
+        std::min(static_cast<float>(parameters.model.config().text.max_position_embeddings) *
+                     (options.rope_scaling_factor > 1.0F ? options.rope_scaling_factor : 1.0F),
+                 static_cast<float>(ops::kCausalAttentionMaximumVisibleKeys)));
+    if (options.max_context == 0 || options.max_context > effective_max) {
+        throw std::invalid_argument("max_context exceeds the variant effective context capacity");
     }
     if (options.prefill_chunk == 0 || options.prefill_chunk % kPrefillChunkAlignment != 0) {
         throw std::invalid_argument("prefill_chunk must be a nonzero multiple of 128");
@@ -827,6 +851,8 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->use_cuda_graph      = inputs.use_cuda_graph;
     impl->causal_scoring      = inputs.causal_scoring;
     impl->device              = inputs.device;
+    impl->rope_scaling_factor = inputs.rope_scaling_factor;
+    impl->rope_scaling_original_context = inputs.rope_scaling_original_context;
     impl->context_cache       = inputs.context_cache;
     impl->kv_storage          = inputs.kv_storage;
     impl->persistent          = persistent_layout(*impl);
@@ -893,6 +919,8 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .use_cuda_graph      = options.use_cuda_graph,
         .causal_scoring      = options.purpose == EnginePurpose::CausalScoring,
         .device              = options.device,
+        .rope_scaling_factor = options.rope_scaling_factor,
+        .rope_scaling_original_context = options.rope_scaling_original_context,
         .context_cache       = options.context_cache,
     };
     const std::uint32_t logical_pages = page_count(inputs.capacity);

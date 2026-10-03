@@ -108,6 +108,11 @@ public:
 
     [[nodiscard]] ninfer::RuntimeStats runtime_stats() const { return engine_->runtime_stats(); }
 
+    // Current number of in-flight requests (queued or running), plus the
+    // high-water mark since startup. Both read the mutex-guarded capacity.
+    [[nodiscard]] std::size_t in_flight() const;
+    [[nodiscard]] std::size_t max_in_flight() const;
+
     [[nodiscard]] bool is_available() const { return engine_->is_available(); }
 
     [[nodiscard]] ninfer::MediaCacheSummary media_cache_summary() const {

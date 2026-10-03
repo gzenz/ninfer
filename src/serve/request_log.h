@@ -65,9 +65,13 @@ ServerLogEnvironment query_server_log_environment(int device);
 // blocks. Every line carries server_instance_id because request ids restart at one per process.
 class JsonlRequestLog {
 public:
+    // max_mib=0 disables size-based rotation (unbounded, the historical behaviour);
+    // otherwise the active file is rotated once it reaches max_mib, retaining `keep`
+    // rotated files (<path>.1 .. <path>.keep, oldest dropped).
     explicit JsonlRequestLog(const std::string& path,
                              const std::string& protected_artifact_path = {},
-                             std::shared_ptr<spdlog::logger> logger     = {});
+                             std::shared_ptr<spdlog::logger> logger     = {},
+                             std::uint32_t max_mib = 0, std::uint32_t keep = 4);
 
     JsonlRequestLog(const JsonlRequestLog&)            = delete;
     JsonlRequestLog& operator=(const JsonlRequestLog&) = delete;
@@ -91,6 +95,7 @@ public:
 
 private:
     void append(std::string record);
+    void rotate_locked(); // caller holds mutex_; output_ open
 
     std::string path_;
     std::string server_instance_id_;
@@ -98,6 +103,9 @@ private:
     std::mutex mutex_;
     std::shared_ptr<spdlog::logger> logger_;
     bool failed_ = false;
+    std::uint64_t max_bytes_ = 0; // 0 = no rotation
+    std::uint32_t keep_      = 4;
+    std::uint64_t written_bytes_ = 0;
 };
 
 } // namespace ninfer::serve

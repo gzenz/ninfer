@@ -8,6 +8,8 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <chrono>
+#include <cstdlib>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -28,6 +30,37 @@ using namespace ninfer::test;
 namespace {
 
 constexpr std::int32_t kHeadDim          = 256;
+
+// PROGRESS, AND IT FLUSHES. Two defects this fixes, both measured on 2026-10-03 while investigating why
+// this test took 8-17 minutes and produced NO output at all:
+//
+//   * `std::cout` to a REDIRECTED stream is BLOCK-BUFFERED, so the run printed nothing until it exited.
+//     A reader cannot tell "working" from "hung" from a silent log, and that silence is exactly how this
+//     test was first mistaken for a hang. Every line here ends in `std::endl`, which flushes.
+//   * one line per DTYPE meant the first dtype -- minutes of work across many case groups -- was a black
+//     box. A stall now names the group it stalled in, which is what made the WSL2 9P driver-store stall
+//     (`p9_client_rpc`, D state, 0% CPU and 0% GPU) visible at all.
+//
+// Elapsed seconds are wall-clock from the first call, so a slow host is visible in the log rather than
+// inferred after the fact. On this host the same test runs 2-5x slower than on native Linux, because the
+// WSL2 CUDA driver path goes through a 9P mount to the Windows driver store.
+void progress(const std::string& what) {
+    static const auto origin = std::chrono::steady_clock::now();
+    const auto elapsed =
+        std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - origin)
+            .count();
+    std::cout << "[attention] " << elapsed << "s  " << what << std::endl;
+}
+
+// THE LONGEST CASES, SKIPPABLE FOR A BOUNDED RUN. `{1, 131072, 262144}` is a 262,144-token context
+// checked against a SCALAR C++ oracle -- `kHeadDim`-wide loops over 256k positions, per head, five dtypes.
+// It dominates the runtime and is the reason this test cannot run inside a commit gate.
+// `NINFER_ATTENTION_QUICK=1` skips it and SAYS SO on stdout, so a quick run can never be read as a full
+// one. The FULL run is the default and is what a GPU window should use.
+bool attention_quick_mode() {
+    static const bool quick = std::getenv("NINFER_ATTENTION_QUICK") != nullptr;
+    return quick;
+}
 constexpr std::int32_t kQuantGroup       = 64;
 constexpr std::int32_t kQuantGroups      = kHeadDim / kQuantGroup;
 constexpr std::int32_t kFp8QuantGroup    = kHeadDim;
@@ -2366,8 +2399,13 @@ int run_graph_envelope_cases(KvCacheStorage storage) {
         for (int width : {1, 4, 8, 16})
             failures += run_a1_case(geometry, storage, {width, 17, 2048, 965u},
                                     MappingPattern::Fragmented, {}, short_limits);
-        failures += run_a1_case(geometry, storage, {1, 32768, 131072, 966u},
-                                MappingPattern::Fragmented, {}, long_limits);
+        if (attention_quick_mode()) {
+            progress("SKIPPED the 131072-token graph-envelope case (NINFER_ATTENTION_QUICK set)");
+        } else {
+            progress("131072-token graph-envelope case");
+            failures += run_a1_case(geometry, storage, {1, 32768, 131072, 966u},
+                                    MappingPattern::Fragmented, {}, long_limits);
+        }
         BatchAttentionCase replay{16,
                                   {17, 31, 0},
                                   {7, 16, 0},
@@ -2626,9 +2664,14 @@ int run_small_prefill_cases(KvCacheStorage storage) {
     for (const auto& geometry : kGeometries) {
         failures += run_a1_case(geometry, storage, {34, 8191, 32768, 1301u, false, true},
                                 MappingPattern::Fragmented, append_queries);
-        failures += run_a3_case(geometry, storage,
-                                {129, 32768, 131072, 1302u, false, false, 1.8f * std::sqrt(3.0f)},
-                                MappingPattern::Fragmented, cached_queries);
+        if (attention_quick_mode()) {
+            progress("SKIPPED the 131072-token small-prefill case (NINFER_ATTENTION_QUICK set)");
+        } else {
+            progress("131072-token small-prefill case");
+            failures += run_a3_case(geometry, storage,
+                                    {129, 32768, 131072, 1302u, false, false, 1.8f * std::sqrt(3.0f)},
+                                    MappingPattern::Fragmented, cached_queries);
+        }
         failures += run_a3_case(geometry, storage, {257, 8192, 16384, 1303u},
                                 MappingPattern::Offset, boundary_queries);
         failures += run_batch_case(
@@ -2644,13 +2687,19 @@ int run_small_prefill_cases(KvCacheStorage storage) {
 }
 
 int run_storage_cases(KvCacheStorage storage) {
+    const std::string tag = cache_name(storage);
+    progress(tag + ": workspace-capacity contract");
     int failures = verify_workspace_capacity_contract(storage);
     if (storage == KvCacheStorage::Nvfp4Group16) {
+        progress(tag + ": nvfp4 cases");
         failures += run_nvfp4_cases();
+        progress(tag + ": quantized batch cases");
         failures += run_quantized_batch_cases(storage, 720u);
         failures += report_quantization_quality(storage, 724u);
     } else if (storage == KvCacheStorage::Fp8KeyNvfp4Value) {
+        progress(tag + ": k8v4 cases");
         failures += run_k8v4_cases();
+        progress(tag + ": quantized batch cases");
         failures += run_quantized_batch_cases(storage, 815u);
         failures += report_quantization_quality(storage, 819u);
     }
@@ -2665,14 +2714,25 @@ int run_storage_cases(KvCacheStorage storage) {
                                     MappingPattern::Fragmented, queries);
         failures += run_a3_case(kGeometries[1], storage, {1024, 8192, 9216, 952u},
                                 MappingPattern::Fragmented, queries);
-        failures += run_a3_case(kGeometries[0], storage, {1, 131072, 262144, 953u},
-                                MappingPattern::Fragmented);
+        if (attention_quick_mode()) {
+            progress(tag + ": SKIPPED the 262144-token context case (NINFER_ATTENTION_QUICK set)");
+        } else {
+            progress(tag + ": 262144-token context case (the expensive one)");
+            failures += run_a3_case(kGeometries[0], storage, {1, 131072, 262144, 953u},
+                                    MappingPattern::Fragmented);
+        }
     }
+    progress(tag + ": batch cases");
     failures += run_batch_cases(storage);
+    progress(tag + ": graph-envelope cases");
     failures += run_graph_envelope_cases(storage);
+    progress(tag + ": verify-width cases");
     failures += run_verify_width_cases(storage);
+    progress(tag + ": numerical-profile cases");
     failures += run_numerical_profile_cases(storage);
+    progress(tag + ": small-prefill cases");
     failures += run_small_prefill_cases(storage);
+    progress(tag + ": done");
     return failures;
 }
 
@@ -2683,11 +2743,17 @@ int run_softmax_attention_causal_cache_tests(std::optional<KvCacheStorage> selec
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
     }
+    if (attention_quick_mode()) {
+        std::cout << "[attention] NINFER_ATTENTION_QUICK is set: the 262144-token context case is SKIPPED. "
+                     "This is NOT the full run.\n"
+                  << std::flush;
+    }
     int failures = 0;
     for (const auto storage :
          {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
           KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value}) {
         if (selected && storage != *selected) continue;
+        progress(std::string("=== dtype ") + cache_name(storage));
         const int current = run_storage_cases(storage);
         std::cout << (current ? "FAIL" : "PASS") << " causal_softmax_attention "
                   << cache_name(storage) << " public-contract correctness\n";

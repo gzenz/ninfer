@@ -2,6 +2,8 @@
 #include "models/qwen3_5/program/internal.h"
 
 #include "core/arena.h"
+#include "core/host_memory_budget.h"
+#include "core/pinned_host_pool.h"
 #include "core/gdn_replay_records.h"
 #include "core/host_kv_arena.h"
 #include "ninfer/ops/gdn_replay.h"
@@ -15,6 +17,11 @@
 #include "models/qwen3_5/program/storage/kv_store.h"
 #include "models/qwen3_5/program/storage/state_store.h"
 #include "models/qwen3_5/program/prefix_identity.h"
+// For `runtime::DivergencePosition`, which a split carries beside its probe index. Header-only and
+// std/types-only itself, so this adds no dependency of substance.
+#include "runtime/engine/context_cache/materialization_budget.h"
+#include "models/qwen3_5/program/kv_row_binding.h"
+#include "models/qwen3_5/program/shared_slot_release.h"
 #include "models/qwen3_5/program/planning/resource_projection.h"
 #include "models/qwen3_5/execution/text.h"
 #include "models/qwen3_5/execution/vision.h"
@@ -22,6 +29,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <unordered_map>
 #include <array>
 #include <limits>
 #include <memory>
@@ -305,6 +313,11 @@ struct RewriteCheckpoint {
     bool valid                 = false;
     RewriteCheckpointKind kind = RewriteCheckpointKind::TurnClosure;
     std::uint32_t frontier     = 0;
+    // W1-B (plan form): the content epoch of the StateImage this checkpoint points at, recorded when
+    // the checkpoint was installed. Compared against the live epoch when the state is selected for
+    // reuse, so a state whose content moved underneath its owner record is detectable -- the
+    // "wrong bytes behind valid bookkeeping" class the plan was written for.
+    std::uint64_t state_epoch  = 0;
     runtime::PrefillWork rebuild_work;
 };
 
@@ -312,6 +325,7 @@ struct LongAnchorCheckpoint {
     StateImageHandle state;
     std::uint32_t frontier = 0;
     std::uint32_t ordinal  = 0;
+    std::uint64_t state_epoch = 0;  // W1-B: see RewriteCheckpoint.
     runtime::PrefillWork rebuild_work;
 };
 
@@ -369,7 +383,23 @@ struct SequenceState {
     std::vector<std::uint32_t> shared_prefix_references;
     runtime::PrefillWork rebuild_work;
     std::uint32_t rebuild_tail_begin = 0;
+    // Owner binding (FNV-1a over the session key, 0 when the request carried none). A private
+    // checkpoint may only be adopted by the session that produced it; recording the owner here
+    // is what makes that checkable, because the continuation slot keeps the value from the
+    // owning session's admission and nothing else survives the lane's release.
+    std::uint64_t session_key_hash = 0;
+    // The prompt length this sequence was admitted with. The ledger is seeded from the prompt, so
+    // at a turn's first decode step `ledger.size()` must equal this; a lane whose ledger size
+    // matches a *different* prompt length was seeded from another request, which is the one
+    // content carrier the binding audits never looked at.
+    std::uint32_t admitted_prompt_tokens = 0;
 };
+
+// (removed 2026-09-24) GeneratedTokenTails and PromptRecords: leftovers of the deleted
+// NINFER_PROMPT_PROBE. GeneratedTokenTails was still written once per generated token in the
+// ordinary-decode commit loop and read by nothing, so it grew one deque per session-key hash for
+// the life of the process -- an unbounded allocation on the hottest path, which is exactly what the
+// same rule deleted the prompt probe for.
 
 struct SharedPrefixState {
     std::optional<SequenceKVBundle> kv;
@@ -379,15 +409,9 @@ struct SharedPrefixState {
     std::uint32_t backend_frontier = 0;
     std::int32_t rope_delta        = 0;
     bool tail_hidden_valid         = false;
+    std::uint64_t state_epoch      = 0;  // W1-B: see RewriteCheckpoint.
     runtime::PrefillWork rebuild_work;
     std::uint32_t active_references = 0;
-};
-
-enum class SharedPrefixSlotRole : std::uint8_t {
-    Free,
-    ReservedCapture,
-    ReservedReplacement,
-    Catalogued,
 };
 
 struct SharedPrefixSlot {
@@ -461,7 +485,8 @@ public:
     ~ProgramImpl() noexcept;
 
     [[nodiscard]] RequestBasePlan plan_request(const PreparedPromptData& prompt,
-                                               const runtime::ResolvedExecutionOptions& options);
+                                               const runtime::ResolvedExecutionOptions& options,
+                                     std::optional<std::uint32_t> branch_anchor_frontier = std::nullopt);
     [[nodiscard]] std::vector<float> causal_score(PreparedPromptData&& prompt,
                                                   std::uint32_t first_target);
     [[nodiscard]] std::optional<AdmissionCandidate> inspect_admission(
@@ -498,21 +523,95 @@ public:
     progress_context_transaction(runtime::CancellationFlagView cancellation);
     void finalize_context_transaction() noexcept;
     [[nodiscard]] bool has_context_transaction() const noexcept;
+    [[nodiscard]] bool try_claim_seal_window() noexcept;
+    void release_seal_window() noexcept;
     [[nodiscard]] PrefillProgress advance_prefill(SequenceHandle sequence,
                                                   runtime::ExecutionTiming* failed_timing);
     [[nodiscard]] CaptureAssessment
+    // `site` names the CALLER (baseline / candidate / candidate-shared / shared-replacement / reserve).
+    // It exists only for the diagnostic line: this function is called several times for one capture, so a
+    // count of lines is a count of calls, and without the tag the reading cannot say which phase produced
+    // it -- which is exactly how an earlier trace was misread.
     inspect_capture(const CaptureOffer& offer, const SharedPrefixHandle* exact_shared,
                     const SharedPrefixHandle* replacement,
                     std::optional<runtime::CheckpointRef> private_replacement,
-                    bool permit_shared_publication) const;
+                    bool permit_shared_publication, const char* site) const;
     [[nodiscard]] std::vector<runtime::CheckpointRecoveryAlternativeWork>
     checkpoint_recovery_work(const ContinuationHandle& owner,
                              runtime::CheckpointRef checkpoint) const;
     [[nodiscard]] std::vector<runtime::CheckpointRecoveryAlternativeWork>
     checkpoint_recovery_work(const SharedPrefixHandle& owner,
                              runtime::CheckpointRef checkpoint) const;
+    // THE SPLIT (plan.md §2f), and it is deliberately not a counter: for a stored continuation, the deepest
+    // token-exact common prefix with an incoming prompt, whether the IDENTITY CHAIN agrees at that depth, and
+    // the deepest restorable checkpoint at or below it. The two numbers together are what names the cause:
+    //   tokens deep, identity FALSE -> the tokens match but the render differs (a re-rendered earlier turn);
+    //   tokens shallow (e.g. 23k where another request reaches 34k from the same entry) -> the PROMPT diverged;
+    //   tokens deep, restorable shallow -> placement or retention, which is ours.
+    // No engine in the survey needs a session id for this; the comparison is the whole answer.
+    struct PrefixSplit {
+        std::uint32_t tokens         = 0;  // longest token-exact common prefix
+        std::uint32_t restorable     = 0;  // deepest restorable checkpoint frontier at or below `tokens`
+        bool          identity_ok    = false;
+        // WHY THE MATCH STOPPED: 0 = the tokens differ here, 1 = the stored ledger ended, 2 = the prompt ended.
+        // Without it `tokens` cannot distinguish "the prompt diverged" from "the ledger ran out", and a field
+        // whose zero and whose finding look identical will be read as whichever the reader expects.
+        std::uint8_t  match_end      = 0;
+        // THIS entry's own ledger length, i.e. the denominator `match_end` needs: `diverged` only asserts the
+        // match stopped short of BOTH lengths, and without this the stop cannot be localised to an index.
+        std::uint32_t stored         = 0;
+        std::uint32_t probe_index = 0;  // where the match stopped; 0 unless it diverged
+        // WHICH TURN OF THE PROMPT'S OWN HISTORY the divergence falls in, and how far into it the
+        // match got. `probe_index` localises the stop to a token; on its own that is unreadable,
+        // because the prompt's token layout is not retained anywhere a reader can consult. Set only
+        // when the match diverged (the only case where attribution means anything) and PROMPT-SIDE
+        // ONLY -- the stored ledger's boundaries are not retained.
+        runtime::DivergencePosition divergence;
+    };
+    // Takes the prompt DATA, not just its tokens: the identity chain is a stricter test than the token
+    // comparison (`prefix_matches` = same tokens AND same render), and `identity_ok` is the field that
+    // separates "the tokens diverge here" from "the tokens match but the history was rendered differently".
+    [[nodiscard]] PrefixSplit prefix_split(const ContinuationHandle& owner,
+                                           const PreparedPromptData& prompt) const;
+    [[nodiscard]] PrefixSplit prefix_split(const SharedPrefixHandle& owner,
+                                           const PreparedPromptData& prompt) const;
     [[nodiscard]] bool shared_capture_matches(const CaptureOffer& offer,
                                               const SharedPrefixHandle& shared) const;
+    // A CAPTURE THAT DOES NOT HAPPEN IS INDISTINGUISHABLE FROM ONE THAT WAS NEVER NEEDED unless it is counted.
+    // Consuming a checkpoint is mandatory and re-creating it is optional: the release happens at activation,
+    // and the replacement is an optional capture that can be skipped for any of five reasons -- so a
+    // conversation's continuation can end up with a deep token ledger and shallow keys, offering only its old
+    // anchors, with nothing anywhere saying why. That is the mechanism behind "the newest fork is not resumed
+    // from", and these are its counters.
+    enum class CaptureSkipReason : std::uint8_t {
+        TransactionOrFork,   // another context transaction is open, or a state fork is unsettled
+        Cancelled,           // the request was cancelled
+        NothingToPublish,    // the assessment would publish neither a private nor a shared checkpoint
+        StalePressurePlan,   // a pressure plan that no longer fits the revision/frontier/demand
+        NotFeasibleNoPressure,  // PRIVATE-ONLY and not physically feasible, WITH NO PRESSURE PLANNING -- so
+                                // nothing was evicted or demoted to make room for it
+        Count,
+    };
+    std::array<std::uint64_t, static_cast<std::size_t>(CaptureSkipReason::Count)> capture_skips_{};
+
+    void note_capture_skip(CaptureSkipReason reason) noexcept {
+        ++capture_skips_[static_cast<std::size_t>(reason)];
+    }
+    [[nodiscard]] static const char* capture_skip_reason_name(CaptureSkipReason reason) noexcept {
+        switch (reason) {
+            case CaptureSkipReason::TransactionOrFork: return "transaction-or-fork";
+            case CaptureSkipReason::Cancelled: return "cancelled";
+            case CaptureSkipReason::NothingToPublish: return "nothing-to-publish";
+            case CaptureSkipReason::StalePressurePlan: return "stale-pressure-plan";
+            case CaptureSkipReason::NotFeasibleNoPressure: return "not-feasible-no-pressure";
+            case CaptureSkipReason::Count: break;
+        }
+        return "unknown";
+    }
+    [[nodiscard]] std::uint64_t capture_skips(CaptureSkipReason reason) const noexcept {
+        return capture_skips_[static_cast<std::size_t>(reason)];
+    }
+
     void skip_capture(CaptureOffer&& offer);
     [[nodiscard]] runtime::ContextTransactionReserveStatus
     reserve_active_capture(CaptureOffer&& offer, const SharedPrefixHandle* exact_shared,
@@ -543,6 +642,113 @@ public:
     [[nodiscard]] ReleaseResult release_continuation(ContinuationHandle&& continuation) noexcept;
     [[nodiscard]] ReleaseResult release_shared_prefix(SharedPrefixHandle&& shared) noexcept;
     void fail_all_cleanup() noexcept;
+    // #9 diagnostic: what the KV address spaces still hold, per address. Called by the engine's recovery
+    // path so a non-zero residual can be attributed to an owner instead of remaining an amount.
+    void resource_census() const noexcept;
+    // Shared-prefix replacements observed (see `shared_replacements_`).
+    [[nodiscard]] std::uint64_t shared_replacements() const noexcept { return shared_replacements_; }
+    // #6's numerator and denominator. Exported because the journal print is rate-limited: after the
+    // first 8 evictions the only way to see the counter move is here.
+    [[nodiscard]] std::uint64_t demotable_evictions() const noexcept { return demotable_evictions_; }
+
+    [[nodiscard]] std::uint64_t evictions_with_victim_room() const noexcept {
+        return evictions_with_victim_room_;
+    }
+    [[nodiscard]] std::uint64_t evictions_demote_possible() const noexcept {
+        return evictions_demote_possible_;
+    }
+    [[nodiscard]] std::uint64_t demotable_eviction_checks() const noexcept {
+        return demotable_eviction_checks_;
+    }
+    [[nodiscard]] std::uint64_t pressure_options() const noexcept { return pressure_options_; }
+    // THE PRESERVATION PROBE'S EXONERATING HALF. See the site: an owner whose `pressure_successors` came
+    // back EMPTY had no non-evicting option, so destroying its checkpoint was unavoidable. Reported with its
+    // denominator, because "no owner lacked a non-evicting option" and "no owner was examined" are the same
+    // reading otherwise.
+    void note_pressure_successor_outcome(bool nonevicting_available) noexcept {
+        ++pressure_successor_calls_;
+        if (nonevicting_available) { ++pressure_successors_with_option_; }
+    }
+    [[nodiscard]] std::uint64_t pressure_successor_calls() const noexcept {
+        return pressure_successor_calls_;
+    }
+    [[nodiscard]] std::uint64_t pressure_successors_with_option() const noexcept {
+        return pressure_successors_with_option_;
+    }
+    [[nodiscard]] std::uint64_t demote_option_refused_no_state_deficit() const noexcept {
+        return demote_option_refused_no_state_deficit_;
+    }
+    [[nodiscard]] std::uint64_t demote_option_refused_precondition() const noexcept {
+        return demote_option_refused_precondition_;
+    }
+    [[nodiscard]] std::uint64_t options_refused_no_kv() const noexcept { return options_refused_no_kv_; }
+    [[nodiscard]] std::uint64_t options_refused_active_lanes() const noexcept {
+        return options_refused_active_lanes_;
+    }
+    [[nodiscard]] std::uint64_t options_refused_evicting_current() const noexcept {
+        return options_refused_evicting_current_;
+    }
+    [[nodiscard]] std::uint64_t demote_options() const noexcept { return demote_options_; }
+    // The private catalog's TWO readings, kept apart because they answer different questions. `losses` is
+    // the event -- a request where the cell alone made a better-reusing candidate unadoptable -- and is what
+    // the alert rests on -- NOT a capacity verdict, see the awk comment: it fires only when a candidate had no
+    // adoptable route at all, and the obvious case (Retain forced to consume) is excluded by construction.
+    // `probes` is the raw count of goal-probe calls, ~1,900 per
+    // planning run (45,533 over the 24 of one measured case, ~1,900 each -- NOT the old cell-free count's
+    // 4,500, which is a different quantity), kept only as the DENOMINATOR that says the loss count was
+    // measured rather than never asked:
+    // without it, `losses == 0` cannot be told from a planner that stopped probing. The first version of
+    // this instrument reported the probe count AS the loss and was wrong by three orders of magnitude.
+    [[nodiscard]] std::uint64_t publication_cell_losses() const noexcept {
+        return publication_cell_losses_;
+    }
+    [[nodiscard]] std::uint64_t publication_cell_probes() const noexcept {
+        return publication_cell_probes_;
+    }
+    // Returns the new count so the caller can rate-limit its print on it -- the reason the eviction site
+    // and the pool's growth both return a count instead of void.
+    std::uint64_t note_publication_cell_loss() noexcept { return ++publication_cell_losses_; }
+    // Runs where at least one non-winner candidate hit the cell-only failure. The diagnostic beside the loss,
+    // for deciding whether the loss is REACHABLE here; log-only, and not an alert.
+    std::uint64_t note_publication_cell_at_risk() noexcept { return ++publication_cell_at_risk_; }
+    // The at-risk TOTALS. The journal print is capped (8 then every 512th), so the printed line count is a
+    // SAMPLE: reading a count off it is the documented trap for the eviction print and was made here too.
+    void add_publication_cell_at_risk(std::uint32_t at_risk, std::uint32_t goals, std::uint32_t other,
+                                      std::uint32_t reuse) noexcept {
+        publication_cell_at_risk_runs_ += at_risk;
+        publication_cell_veto_goals_ += goals;
+        publication_cell_veto_other_ += other;
+        publication_cell_veto_reuse_ += reuse;
+    }
+    [[nodiscard]] std::uint64_t publication_cell_at_risk_runs() const noexcept {
+        return publication_cell_at_risk_runs_;
+    }
+    [[nodiscard]] std::uint64_t publication_cell_veto_goals() const noexcept {
+        return publication_cell_veto_goals_;
+    }
+    [[nodiscard]] std::uint64_t publication_cell_veto_other() const noexcept {
+        return publication_cell_veto_other_;
+    }
+    [[nodiscard]] std::uint64_t publication_cell_veto_reuse() const noexcept {
+        return publication_cell_veto_reuse_;
+    }
+    // GOAL PROBE FAILURES BY REASON, UNCONDITIONALLY. The three `veto_*` totals above are gated on
+    // `at_risk != 0` (a candidate that failed on the cell AND would have out-reused the winner), so on a run
+    // where no candidate out-reuses the winner they all read 0 while thousands of goals were still refused --
+    // which is exactly the state measured on 2026-10-01 and exactly why "why do targets have no goal?" was
+    // unanswerable. Called once per planning run, from the same per-candidate tally the loss predicate reads.
+    void add_publication_goal_blocked(std::uint64_t cell_only, std::uint64_t other) noexcept {
+        publication_goal_blocked_cell_only_ += cell_only;
+        publication_goal_blocked_other_ += other;
+    }
+    [[nodiscard]] std::uint64_t publication_goal_blocked_cell_only() const noexcept {
+        return publication_goal_blocked_cell_only_;
+    }
+    [[nodiscard]] std::uint64_t publication_goal_blocked_other() const noexcept {
+        return publication_goal_blocked_other_;
+    }
+    void add_publication_cell_probes(std::uint64_t count) noexcept { publication_cell_probes_ += count; }
+
     [[nodiscard]] detail::PhysicalResources admission_capacity() const noexcept;
     [[nodiscard]] bool isolated_request_feasible(const RequestBasePlan& base) const noexcept;
 
@@ -574,6 +780,8 @@ public:
     const bool vision_enabled;
     const bool use_cuda_graph;
     const bool causal_scoring;
+    const float rope_scaling_factor;
+    const std::uint32_t rope_scaling_original_context;
     const std::size_t kv_payload_bytes;
     const std::size_t graph_allowance_bytes;
     const WorkspacePlan workspace_plan;
@@ -591,9 +799,15 @@ public:
     std::size_t text_host_kv_page_stride    = 0;
     std::size_t backend_host_kv_page_stride = 0;
     std::unique_ptr<qwen3_5::StateImageDevicePool> state_images;
+    // THE SHARED PINNED BUDGET. Declared BEFORE the consumers so it outlives them, and used by both the
+    // host state slots and (next) the host KV arena: one pile of pinned RAM split on demand, which is what
+    // the two fixed, mutually-blind allocations were not.
+    std::unique_ptr<ninfer::HostMemoryBudget> host_memory_budget;
+    std::unique_ptr<ninfer::PinnedHostPool>   pinned_host_pool;
     std::unique_ptr<qwen3_5::HostStatePool> host_state_images;
     std::unique_ptr<StateImageStore> state_store;
     std::optional<GdnReplayRecords> replay_records;
+    std::optional<DeviceBuffer> ingress_shadow;
     std::optional<ops::GdnReplayFoldPlan> replay_fold;
     std::optional<DFlashPersistentState> dflash;
     qwen3_5::RoundState io;
@@ -604,6 +818,11 @@ public:
 
     std::vector<SequenceState> continuation_states;
     std::vector<ContinuationSlot> continuation_slots;
+    // Who last WROTE each linear-attention state slot, and at which step. The proven ordering
+    // result is that a victim emits the canary of the request admitted immediately before it, so
+    // the cheapest decisive audit is whether any lane ever READS a slot another lane wrote last.
+    std::unordered_map<std::int32_t, std::pair<std::uint32_t, std::uint64_t>> slot_last_writer;
+    std::uint64_t step_counter = 0;
     std::vector<SharedPrefixState> shared_prefix_states;
     std::vector<SharedPrefixSlot> shared_prefix_slots;
     std::array<std::uint32_t, kMaximumConcurrency> active_continuations{};
@@ -709,6 +928,12 @@ private:
     std::optional<PendingTransaction> pending_transaction_;
     std::uint64_t next_transaction_id_ = 1;
 
+    // Serializes the materialization seal window (final assess -> seal) so a concurrent
+    // demote cannot steal the incumbent's allocation and bump a victim's slot generation
+    // between assess and seal. Claimed by the planner, released after seal (success or
+    // failure) or on the planner's early exit.
+    std::atomic<bool> seal_window_claimed_ = false;
+
     enum class PressureTransitionPhase : std::uint8_t {
         HostReleases,
         CopyPreparation,
@@ -758,6 +983,13 @@ private:
             bool checkpoint_drop_published = false;
             bool mutation_published        = false;
             std::uint64_t spill_pages      = 0;
+            // Attribution for the two demote axes, recorded where the information exists: this work's
+            // KV went to host (spill_pages is set only on PressureKVDecisionKind::DemoteToHost), and
+            // whether the same action also published a state transfer. The state counter cannot see a
+            // KV-only demotion, and CheckpointSummary carries no KV residency, so without these two
+            // /stats showed degraded=2 demoted=0 with 899 pages on host (live, 2026-09-25).
+            bool kv_demoted_to_host        = false;
+            bool state_transfer_published  = false;
         };
 
         std::uint64_t id = 0;
@@ -832,6 +1064,115 @@ private:
     std::vector<TokenId> materialization_ledger_;
     qwen3_5::detail::ResidentPrefixIdentity materialization_identity_;
     qwen3_5::detail::PrefixShortlistDigests materialization_prefix_digests_;
+    // W1-A: which lane the shared KV row scalars name (see kv_row_binding.h). A host-side record of
+    // what `bind_sequence_kv` last wrote, so a prefill step can see whether the row it is about to
+    // use is still its own. The 2026-09-25 cross-session contamination (D2) was exactly this scalar
+    // naming another lane while a lane was mid-prefill.
+    qwen3_5::detail::KvRowBinding kv_row_binding_;
+    // W1-B: the invariant a published shared prefix must satisfy is that the frontier it advertises
+    // is the frontier its state was frozen at. These count it in every build; the mismatch was
+    // previously visible only under NINFER_MAT_DEBUG, which is how a live hazard stayed unmeasured.
+    std::uint64_t shared_publishes_                      = 0;
+    std::uint64_t shared_publish_frontier_mismatches_    = 0;
+    // W1-B's observation, now a DROP counter: the abort arm drops a recycled checkpoint instead of
+    // restoring its epoch (see the arm in `capture.cpp`). It has no denominator and can only read zero --
+    // the branch is unreachable by the argument in plan.md §2 item 3. It is kept for the one reason given
+    // at that counter (`capture.cpp`, `recycled_checkpoint_drops_`): if the reachability argument is ever
+    // refuted, the first evidence will be this counter firing.
+    // #11(a): the abort arm now DROPS a recycled rewrite checkpoint rather than restoring its epoch, so
+    // this counts drops. The old `recycled_checkpoint_restores_` counter is gone with the behaviour: it
+    // could only ever read 0 (the branch is unreachable), and a counter that can only read zero is a
+    // claim, not an instrument.
+    std::uint64_t recycled_checkpoint_drops_             = 0;
+    // Replacements RESERVED: a capture that displaced a catalogued shared owner in
+    // `prepare_active_capture`. Counted at the reservation (`capture.cpp:554-559`), NOT at publication,
+    // and the two differ: the abort path can return the slot to `Catalogued`
+    // (`SharedSlotReleaseAction::Catalogue`, `capture.cpp:1006-1008`) without decrementing, so a
+    // transaction that reserved a replacement and then aborted is counted here and replaced nothing.
+    // That is the honest reading of what this measures -- the path being REACHED -- which is also why it
+    // is worth having (`/stats` `pressure_shared_owners_replaced`); it is not a count of replacements
+    // that took effect, and the earlier wording here ("a shared catalogued slot replaced by a new
+    // capture") overstated it. Read back through `Program::shared_replacements()`.
+    std::uint64_t shared_replacements_                   = 0;
+    // #11(b): a checkpoint priced with no settled StateImage replica. Counted with its denominator, never
+    // thrown on -- see the comment at the observation site.
+    // `mutable`: the observation site is a const pricing walk, which is where the condition has to be
+    // seen. Counters only -- nothing here changes behaviour.
+    mutable std::uint64_t incomplete_checkpoint_states_   = 0;
+    mutable std::uint64_t checkpoint_state_checks_        = 0;
+    // W1.2: a private checkpoint adopted by a different session. CORRECTED 2026-09-26: this is NOT a
+    // violated invariant -- the design supports it, safely. `resource_manager.h:420-423` forces
+    // `retain = true` exactly when the sessions differ, so the other session keeps its state and the
+    // adopter forks its endpoint instead of consuming it. The counter is an observation, not an alarm:
+    // what is true is *harmless* by construction, and for a different reason than the old sentence
+    // ("should be impossible") claimed.
+    std::uint64_t cross_session_adoptions_               = 0;
+    // The non-strict releases deliberately discard the `[[nodiscard]] bool` their stores return, so a
+    // refusal -- the address or image not actually freed -- is invisible. That is a leak in the exact
+    // shape of #9's: the books drop the handle, the pages stay. Counted and named here rather than
+    // guessed at; no behaviour change.
+    std::uint64_t nonstrict_release_refusals_            = 0;
+    // W2/#6, measure-first: a private victim committed as `Evicted` while the host tier still had a free
+    // state slot AND host KV room -- i.e. one that could have been demoted instead of destroyed. The
+    // demotion half is already counted where it happens (`operations.pressure_private_owners_demoted_kv_only`),
+    // so this is the missing numerator of "evicted for lack of host room" versus "evicted anyway". It is
+    // deliberately at the COMMIT site (`evict_private_result`) and not in the planner: the planner's two
+    // disposition assignments run per candidate evaluated, so counting there would count search steps.
+    std::uint64_t demotable_evictions_                   = 0;
+    // #6's per-victim shape (2026-09-27): a victim evicted that was RESTORABLE **and** whose own host state
+    // slots would have fit in the room left -- i.e. the pool-level `demotable` flag was right about room in
+    // the way that matters for THIS victim. The KV half stays pool-level; see the site's comment.
+    std::uint64_t evictions_with_victim_room_             = 0;
+    // The #6 population: victim_room AND demote_possible. The conjunction, not either half.
+    std::uint64_t evictions_demote_possible_              = 0;
+    // Every eviction the check above ran for -- the denominator. Without it a zero numerator cannot be
+    // told from a gate that never had a chance to be true.
+    std::uint64_t demotable_eviction_checks_             = 0;
+    // #6's generation half: how often the planner inspected an option at all, and how often the option it
+    // built chose to DEMOTE rather than drop. Read as a ratio; either number alone is uninterpretable.
+    // MUTABLE, because the decision they count is made in a `const` method (`inspect_pressure_option`
+    // inspects and builds; it mutates nothing observable). A telemetry counter is the standard case for this,
+    // and the alternative -- routing the count out through the returned option so the caller can aggregate it
+    // -- would push plumbing through every call site for one diagnostic. The method is worker-serialised, so
+    // there is no concurrent increment.
+    mutable std::uint64_t pressure_options_              = 0;
+    mutable std::uint64_t demote_options_                = 0;
+    // The three refusal clauses of `inspect_pressure_option`, counted apart because they want different
+    // fixes. **CORRECTED 2026-10-02: this line said "83% of restorable-checkpoint evictions never assessed a
+    // preserving alternative", which is FALSE and was read off two instances whose counters were transposed
+    // by the 2026-10-01 argument-order defect. Over 1044 evicting records, NOT ONE has
+    // `preserving_alternatives_assessed == 0` (min 65). Preserving targets ARE assessed; see the site.
+    mutable std::uint64_t options_refused_no_kv_             = 0;
+    // Why the state-side demote option died. `no_state_deficit` is the axis choice; `precondition` is
+    // "no demote existed", where the eviction is correct.
+    mutable std::uint64_t demote_option_refused_no_state_deficit_ = 0;
+    // The preservation probe: how often an owner had a non-evicting successor at all, over how often the
+    // question was asked. `calls - with_option` is the population where the eviction was UNAVOIDABLE.
+    mutable std::uint64_t pressure_successor_calls_       = 0;
+    mutable std::uint64_t pressure_successors_with_option_ = 0;
+    mutable std::uint64_t demote_option_refused_precondition_     = 0;
+    mutable std::uint64_t options_refused_active_lanes_      = 0;
+    mutable std::uint64_t options_refused_evicting_current_  = 0;
+    // #6's other half, as a LOSS rather than a probe count: a request whose winning plan reused strictly
+    // fewer tokens than a candidate that the publication cell alone had made unadoptable. See the
+    // RuntimeStats field for why the probe count beside it must never be presented as this number.
+    std::uint64_t publication_cell_losses_               = 0;
+    std::uint64_t publication_cell_probes_               = 0;
+
+    std::uint64_t publication_cell_at_risk_              = 0;
+    std::uint64_t publication_cell_at_risk_runs_         = 0;
+    std::uint64_t publication_cell_veto_goals_           = 0;
+    std::uint64_t publication_cell_veto_other_           = 0;
+    std::uint64_t publication_cell_veto_reuse_           = 0;
+    std::uint64_t publication_goal_blocked_cell_only_    = 0;
+    std::uint64_t publication_goal_blocked_other_        = 0;
+    // W1-B (plan form): the durable {owner, state content epoch} pairing. Counted in every build with
+    // its denominator; deliberately not enforced until a mismatch has actually been observed -- a throw
+    // on this path kills the worker (the wedge, 2026-09-25), and an unobserved condition is not a licence
+    // to introduce one.
+    std::uint64_t state_epoch_checks_                    = 0;
+    std::uint64_t state_epoch_mismatches_                = 0;
+    std::uint64_t state_epoch_unrecorded_                = 0;
 
     struct ActiveCaptureTransaction {
         std::uint64_t id         = 0;
@@ -846,6 +1187,22 @@ private:
         std::uint64_t replacement_generation = 0;
         StateImageHandle source_state;
         StateImageHandle destination_state;
+        // W1-B: the position the state image was frozen at, recorded at the freeze. The published
+        // entry advertises `group.frontier`; `sequence.text_kv_valid` is the position the frozen
+        // state corresponds to -- NOT `execution_frontier`, which is written only at decode and
+        // forced commits and is therefore still 0 while a prompt prefill (where shared captures are
+        // offered) is running. The first version recorded `execution_frontier` and reported a 1/1
+        // mismatch that was the instrument reading the wrong quantity.
+        //
+        // What this can and cannot detect, per a 2026-09-25 review: each of the three sites that
+        // create an offer (`prefill.cpp` zero-prefill and mid-prefill, `commit.cpp` for the finalized
+        // prompt) triggers on the same cursor `text_kv_valid` holds, so the comparison is equal *by
+        // construction* -- it can fire only on drift between the offer and the freeze, and
+        // it never inspects the StateImage itself. The recorded corpus (62 `SHARED-PUBLISH` lines)
+        // is one mid-prefill event in one workload repeated 62 times, all `group_frontier=12516`;
+        // it settles that `execution_frontier` was the wrong quantity and is not evidence that
+        // states match frontiers.
+        std::uint32_t frozen_text_frontier = 0;
         qwen3_5::CaptureStatePlacement state_placement = qwen3_5::CaptureStatePlacement::DeviceFork;
         std::optional<StateImageTransfer> state_snapshot;
         std::optional<KVAddressSpaceHandle> active_text_destination;
@@ -871,7 +1228,6 @@ private:
         bool recycles_private_state        = false;
         bool replacement_removed           = false;
         bool prepared                      = false;
-        std::uint64_t recycled_state_epoch = 0;
         bool transfer_enqueue_pending      = false;
         bool transfer_submitted            = false;
         std::uint8_t transfer_timer_mask   = 0;
@@ -960,6 +1316,51 @@ private:
     owner_exclusive_resources(const SharedPrefixState& shared) const;
     [[nodiscard]] detail::PhysicalResources physical_occupancy() const noexcept;
     [[nodiscard]] bool physical_peak_fits(detail::PhysicalResources peak) const noexcept;
+
+    // Give idle pinned host memory back. Gated on the TRANSFER STREAM being idle: a chunk can look free while
+    // a D2H/H2D copy onto it is still in flight, and unpinning then is a use-after-free. Never trims below
+    // `retain_bytes`, so a demote that just succeeded cannot immediately lose its room and thrash.
+    void maintain_host_memory(std::size_t retain_bytes) noexcept;
+    // Make the host state pool one slot bigger when it is FULL, before planning prices anything (§3
+    // item 6). Called once per planning session -- never per search node, where pinning would be a side
+    // effect inside the cost model's loop.
+    void ensure_host_state_headroom() noexcept;
+    // The KV analogue, from the same place and for the same reason -- see the note in `host_kv_store.h`.
+    // The state pre-grow is measured firing and could not convert the one eviction this workload produced,
+    // because that one was bound by host KV BYTES rather than state slots.
+    void ensure_host_kv_headroom() noexcept;
+    // "the pool was full at planning and we asked it to grow" vs "it grew": two counters because a refusal
+    // and a success look identical from outside, and because a growth that never happens must be
+    // distinguishable from one that happens constantly.
+    std::uint64_t host_state_pregrow_attempts_  = 0;
+    std::uint64_t host_state_pregrows_          = 0;
+    std::uint64_t host_state_pregrow_refusals_  = 0;
+    // Same three, for the KV axis. `fragmented` is the FOURTH and it is the measurement, not a failure --
+    // and NOT a refusal either: it counts the pre-grows that FIRED on fragmentation (the arena held free
+    // bytes but no single step-sized run), incremented inside the `Grew` case beside `pregrows_`
+    // (`storage/context.cpp:1789`). This comment said the trigger "declines to grow", which is the exact
+    // inverse and matched the journal label it was read beside (`fragmented_skipped`, since renamed to
+    // `fragmented_triggered`). It measures how often growth was triggered by fragmentation rather than
+    // exhaustion -- 1 GiB spans at ~1 s each -- which is what says whether the pre-grow is affordable.
+    std::uint64_t host_kv_pregrow_attempts_      = 0;
+    std::uint64_t host_kv_pregrows_              = 0;
+    std::uint64_t host_kv_pregrow_refusals_      = 0;
+    std::uint64_t host_kv_pregrow_fragmented_    = 0;
+    // ASSESSED SEARCH NODES -- NOT planning runs -- where a KV demote read as blocked from pinned capacity
+    // but the PURE fit query says the reported growth headroom would have covered it. The unit matters
+    // because the increment is inside `compose_pressure_candidate` (`planning/pressure.cpp:2338`), which
+    // `pressure_planner` calls once per assessed search NODE (`:1144`/`:1154`), so one run can add
+    // thousands; this said "PLANNING RUNS" until a review checked the call sites. What it still measures is
+    // the thing the fix's acceptance rests on -- "the pre-grow already made this affordable" (0) versus "a
+    // demote was one growth away and we evicted instead" (non-zero) -- but 0 now means "no NODE saw one",
+    // which is weaker than "no session had one", and must not be quoted as the latter.
+    std::uint64_t host_kv_fit_growable_          = 0;
+    // The DENOMINATOR and the other two verdicts. See the site: `fit_growable == 0` conflated "the failure
+    // path is never reached" with "every failing node was Blocked".
+    std::uint64_t host_kv_blocked_checks_        = 0;
+    std::uint64_t host_kv_blocked_max_bytes_     = 0;
+    std::uint64_t host_kv_fit_pinned_            = 0;
+    std::uint64_t host_kv_fit_blocked_           = 0;
     [[nodiscard]] StateImageHandle
     selected_state(const SequenceState& sequence, ReusePath reuse,
                    std::optional<runtime::CheckpointRef> checkpoint) const;
@@ -1170,6 +1571,27 @@ private:
                                         std::uint32_t backend_pages);
     void bind_sequence_kv(SequenceState& sequence);
     void unbind_sequence_kv(SequenceState& sequence) noexcept;
+    // W1-A: release a lane's ownership of the shared row scalars and emit the cumulative counter
+    // totals. Called from every lane-end path -- `unbind_sequence_kv` (a publishing finish) and both
+    // strict releases (a non-publishing finish) -- because emitting from only one of them was a seam
+    // a review found: `clear_lane_strict` freed the KV and never reported or released anything.
+    void release_kv_row_binding(std::uint32_t lane) noexcept;
+    // Report a non-strict release that refused (see `nonstrict_release_refusals_`). Rate-limited: the
+    // condition can persist for a whole cleanup.
+    // `blocker` is optional because only the sites that hold a STATE store can classify: the KV release sites
+// in materialization/capture do not, and passing nullptr says so rather than guessing ("unclassified").
+void note_nonstrict_release_refusal(const char* what, const char* blocker = nullptr) noexcept;
+    // Publish this lane's own DFlash prefill-sink controls (lane, source/destination slots, backend
+    // row) into the single device ingress the sink reads. Must be called at every prefill step, not
+    // only at materialization: other lanes' decode rounds overwrite that ingress.
+    void bind_dflash_prefill_sink(SequenceState& sequence);
+    // The (text, backend) row pair a sequence's KV addresses are bound to -- the single derivation
+    // that both `bind_sequence_kv` and the W1-A observation use, so the two cannot drift apart.
+    [[nodiscard]] std::pair<std::int32_t, std::int32_t> bound_kv_rows(
+        const SequenceState& sequence) const;
+    [[nodiscard]] const qwen3_5::detail::KvRowBinding& kv_row_binding() const noexcept {
+        return kv_row_binding_;
+    }
     void ensure_sequence_kv_mapped(SequenceState& sequence, std::uint32_t main_tokens,
                                    std::uint32_t backend_tokens = 0);
     void trim_sequence_kv(SequenceState& sequence, std::uint32_t main_tokens,
@@ -1228,6 +1650,10 @@ struct PressurePlanningSessionImpl {
         std::uint32_t owner_index = 0;
         std::vector<PressureDecision> decisions;
         std::uint16_t eviction_choice = 0;
+        // Bounded rank (0..N-1) of this private victim's re-prefill cost, used to make the
+        // planner's cost objective prefer demoting the highest-value victims to host over
+        // evict-and-drop. Zero for shared victims. See populate_options.
+        std::uint64_t value_weight = 0;
     };
 
     struct CandidateOptions {
@@ -1282,7 +1708,7 @@ struct PressurePlanningSessionImpl {
     identity_target(runtime::PlanningCandidateId candidate) const;
     [[nodiscard]] qwen3_5::PressureTargetHandle
     root_maximal_target(runtime::PlanningCandidateId root_candidate);
-    [[nodiscard]] qwen3_5::PressureTargetHandle
+    [[nodiscard]] std::optional<qwen3_5::PressureTargetHandle>
     maximal_target(runtime::PlanningCandidateId candidate);
     [[nodiscard]] qwen3_5::PressureConstructionCursor
     begin_construction(qwen3_5::PressureTargetHandle target, bool restore = false);
@@ -1329,9 +1755,14 @@ struct PressurePlanningSessionImpl {
     [[nodiscard]] const TargetNode*
     find_target(std::uint32_t candidate_index,
                 std::span<const std::uint16_t> choices) const noexcept;
-    [[nodiscard]] std::uint32_t intern_target(std::uint32_t candidate_index,
-                                              std::span<const std::uint16_t> choices,
-                                              bool root_maximal = false);
+    // THE ARENA BOUND IS A SEARCH BOUND. A non-`terminal` call returns `nullopt` when the target
+    // arena cannot take one more node (the room the terminal calls need is reserved out of its
+    // reach); `terminal` marks the calls that must hand back a handle, and is unreachable in
+    // practice -- see `terminal_target_reserve` in `pressure_target_arena.h` for what that reserve is
+    // and how it is sized (by oversizing, not by derivation).
+    [[nodiscard]] std::optional<std::uint32_t>
+    intern_target(std::uint32_t candidate_index, std::span<const std::uint16_t> choices,
+                  bool root_maximal = false, bool terminal = false);
     void index_target(std::uint32_t target_index);
     void populate_options(std::uint32_t candidate_index);
     [[nodiscard]] std::vector<PressureDecision>

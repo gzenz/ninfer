@@ -89,6 +89,20 @@ struct PromptIdentity {
     // by an earlier turn. Prefill splits at these frontiers so resumed and root execution use the
     // same GDN decomposition; they are not capture requests by themselves.
     std::vector<std::uint32_t> rewrite_execution_frontiers;
+    // Index n is the token frontier at which input message n begins, so the vector is sized
+    // messages + 1 with the last entry the end of the prompt; `nullopt` where the template has no
+    // independent boundary there (a leading instruction folded into the preamble). This exists so a
+    // token-level divergence can be attributed to a MESSAGE: without it, "the match stopped at token
+    // 23401" says nothing about which turn of the history the two renders first disagreed on.
+    //
+    // PROMPT-SIDE ONLY. The stored ledger's boundaries are not retained, so this maps where the
+    // incoming prompt's divergence falls in ITS OWN history -- it does not say where the stored
+    // render sat. A reader must not turn one into the other.
+    std::vector<std::optional<std::uint32_t>> message_frontiers;
+    // The role of the message STARTING at the frontier of the same index; sized messages (one
+    // SHORTER than `message_frontiers`, whose last entry is the end of the prompt and starts no
+    // message). A divergence at an index >= this size is at or past the end of the prompt.
+    std::vector<ChatRole> message_roles;
 };
 
 inline constexpr std::size_t kPreparedSessionKeyCapacity = kMaximumContextCacheSessionKeyBytes;

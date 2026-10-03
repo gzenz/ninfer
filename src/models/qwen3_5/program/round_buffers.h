@@ -35,6 +35,12 @@ struct OrdinaryDecodeIngress {
     std::array<std::int32_t, kMaximumConcurrency> text_kv_table_rows{};
     std::array<std::int32_t, kMaximumConcurrency> state_source_slots{};
     std::array<std::int32_t, kMaximumConcurrency> state_destination_slots{};
+    // Per-row visible-key count (frontier + 1). RETRACTED MECHANISM (fourth review): this is
+    // INERT at width 1 -- the SmallT kernel takes each row's key window from its own `positions`
+    // entry and the mask only bounds output columns, so it cannot affect the served path. The
+    // earlier "batch MAXIMUM frontier" justification was contradicted by the kernel source and by
+    // the plan's own cleared-table row; kept as a guard for width > 1; NINFER_MASK_PROBE is inert as wired (see decode.cpp).
+    std::array<std::int32_t, kMaximumConcurrency> valid_columns{};
     std::array<ops::SamplingConfig, kMaximumConcurrency> sampling{};
 };
 
@@ -186,6 +192,7 @@ struct OrdinaryDecodeState {
     Tensor text_kv_table_rows;
     Tensor state_source_slots;
     Tensor state_destination_slots;
+    Tensor valid_columns;
     const ops::SamplingConfig* sampling = nullptr;
     Tensor sampled_tokens;
     Tensor logits;

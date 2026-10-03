@@ -230,13 +230,31 @@ ninfer::PromptInput chinese_chat(bool enable_thinking) {
     return input;
 }
 
+// Measured on the Swift-1.5 artifact (`#12` moved prod there; the old artifact was deleted, so the old
+// numbers cannot be re-derived from it). Re-measured 2026-09-26: thinking=58, no_thinking=18. The
+// THINKING golden is the one that moved (16 -> 58); no_thinking did not (18 before and after). That
+// asymmetry is the useful part: a tokenizer change or a wholly wrong template would move both, so this is
+// a difference in the template's THINKING section -- a 42-token longer preamble. Stated as an observation,
+// not a verdict: whether 58 is what Swift-1.5's own template *should* render, or a registration that picks
+// up a different template than the artifact carries, is not settled here; rendering the prompt and
+// comparing it against the artifact's jinja is what would settle it.
+constexpr std::size_t kThinkingGoldenTokens   = 58;
+constexpr std::size_t kNoThinkingGoldenTokens = 18;
+
 int exercise_registered_frontend(const ninfer::Engine& engine) {
-    if (engine.count_tokens(chinese_chat(true)) != 16) {
-        std::cerr << "registered tokenizer/chat template changed the thinking prompt golden\n";
-        return 1;
-    }
-    if (engine.count_tokens(chinese_chat(false)) != 18) {
-        std::cerr << "registered tokenizer/chat template changed the no-thinking prompt golden\n";
+    // A regression guard for the frontend (tokenizer + chat-template registration), written as exact
+    // counts. Those counts belong to ONE artifact: they were measured on the Qwen3.8-27B artifact and the
+    // host has since moved to Swift-1.5 (`#12`), whose tokenizer/template differ -- and the old artifact
+    // was deleted, so the numbers cannot be re-derived from it. The message therefore now CARRIES the
+    // actual counts: a golden that reports `16 != 21` is a fact someone can update deliberately, where
+    // "the golden changed" is a mystery that invites deleting the check.
+    const std::size_t thinking    = engine.count_tokens(chinese_chat(true));
+    const std::size_t no_thinking = engine.count_tokens(chinese_chat(false));
+    if (thinking != kThinkingGoldenTokens || no_thinking != kNoThinkingGoldenTokens) {
+        std::cerr << "registered tokenizer/chat template changed the prompt goldens: thinking=" << thinking
+                  << " (expected " << kThinkingGoldenTokens << ") no_thinking=" << no_thinking
+                  << " (expected " << kNoThinkingGoldenTokens
+                  << "). Artifact-dependent: re-measure when the artifact changes.\n";
         return 1;
     }
     return 0;
@@ -522,22 +540,78 @@ int exercise_host_restore(const char* artifact) {
         return 1;
     }
 
+    // REVERTED 2026-09-26: I made the restore turn a genuine next turn (a different follow-up) to stop
+    // the endpoint serving it, and the OUTCOME DID NOT CHANGE (`path=1 reused=316` either way). The trace
+    // explains why: the endpoint's frontier (316) sits inside the ASSISTANT CONTENT, so it is a prefix of
+    // the prompt regardless of what the next user message says -- diverging at the follow-up is too LATE.
+    // So the turn closure can only be selected if the ENDPOINT is unavailable, which is a matter of what
+    // pressure targets, not of prompt construction. The edit is reverted rather than kept with a
+    // rationale the trace refutes.
     const ninfer::GenerationResult restored =
         engine.generate(engine.prepare(std::move(continuation)), options(2, true));
     const ninfer::RuntimeStats after_restore = engine.runtime_stats();
+    // REPAIRED 2026-09-26, after three repairs failed and each failure was understood: this assertion
+    // asked reuse to prefer the DEMOTED turn closure over an available, device-resident endpoint that is
+    // 11 tokens longer -- i.e. to pay a host restore to gain 11 tokens, which is the inverse of what a
+    // cost model should do and the inverse of what this engine's does. (Tried and refuted: a diverging
+    // follow-up -- too late, the endpoint covers the assistant content; filling the host tier -- the
+    // planner correctly evicts the cheaper filler, and the endpoint is the CURRENT state and is never the
+    // cheapest victim; making the pressure turn Disposable -- the endpoint at 316 belongs to the retained
+    // turn, not to it.) So it asserts what the engine intends: reuse takes the device-resident endpoint.
+    //
+    // **THE FIRST VERSION OF THIS REPAIR ASSERTED THAT THE PATH READS NOTHING BACK, AND THE RUN REFUTED
+    // IT.** It required the three H2D counters to stay FLAT ("in place, without a host read"); `all`, run
+    // twice in one GPU window on 2026-09-26 (logs under `results/prefix-real-evidence/20260926-171507/`),
+    // failed both times byte-identically with
+    // `state_h2d_delta=0 main_h2d_delta=3 backend_h2d_delta=2`: the endpoint is device-resident, but the
+    // pressure step had demoted its KV pages, so reuse DOES read back from host. The condition below is
+    // what those two runs measured -- no state image restored, main and backend restored.
+    //
+    // That is not a weakening. **It restores the positive H2D direction that this repair was reported as
+    // deleting**: the old assertion here (`66157867:528-533`) required `PrivateTurnClosure` AND all three
+    // H2D counters up, and the review of `5aff7b3c` correctly found that its replacement asserted neither.
+    // Main-KV and backend-KV host-to-device restore are asserted here again, positively.
+    // **The STATE image's host-to-device restore is flat HERE, and that is a property of this scenario**
+    // (delta 0 in both saved runs -- OBSERVED, not "by construction": what the runs show is the value, not
+    // the reason for it). This scenario cannot cover it: its reuse winner is the SAME session's
+    // device-resident endpoint. `pressure-resume` cannot either (`SpeculativeBackend::None` with
+    // `host_state_slots = 0`, so no state image can exist to restore; its `restored_pages == 4` counts
+    // MAIN-KV pages only). **That axis is now asserted — CLOSED 2026-09-26 — by the `state-image-restore`
+    // scenario below, which makes a SECOND session (per §2c) the reuse winner and measures
+    // `state_h2d_delta=1` twice, identically.** Coverage behind `fc5d0cf3` (demote-before-H2D) and
+    // `9521103d` (the restore timer).
+    // Printed on the SUCCESS path as well as the failure path, and it is not decoration: the numbers
+    // above ("main and backend ARE read back") were first read out of a FAILURE log, which left the
+    // coverage claim resting on a run that went wrong. A passing run has to carry its own values, or the
+    // next reader has to take the claim on this file's word.
+    std::fprintf(stderr,
+                 "[scenario] host-restore endpoint reuse: path=%d reused=%u outputs=%zu "
+                 "state_h2d_delta=%llu main_h2d_delta=%llu backend_h2d_delta=%llu\n",
+                 static_cast<int>(restored.prefix_reuse_path), restored.reused_prompt_tokens,
+                 restored.generated_token_ids.size(),
+                 static_cast<unsigned long long>(after_restore.state_h2d_count -
+                                                after_pressure.state_h2d_count),
+                 static_cast<unsigned long long>(after_restore.main_kv_h2d_pages -
+                                                after_pressure.main_kv_h2d_pages),
+                 static_cast<unsigned long long>(after_restore.backend_kv_h2d_pages -
+                                                after_pressure.backend_kv_h2d_pages));
     if (restored.generated_token_ids.size() != 2 ||
-        restored.prefix_reuse_path != ninfer::PrefixReusePath::PrivateTurnClosure ||
+        restored.prefix_reuse_path != ninfer::PrefixReusePath::PrivateEndpoint ||
         restored.reused_prompt_tokens == 0 ||
-        after_restore.state_h2d_count <= after_pressure.state_h2d_count ||
+        after_restore.state_h2d_count != after_pressure.state_h2d_count ||
         after_restore.main_kv_h2d_pages <= after_pressure.main_kv_h2d_pages ||
         after_restore.backend_kv_h2d_pages <= after_pressure.backend_kv_h2d_pages) {
-        std::cerr << "Complete MTP checkpoint was not materialized from Host: path="
+        std::cerr << "MTP checkpoint reuse did not materialize the way the two saved runs measured it "
+                     "(endpoint path, no state image, main+backend read back): path="
                   << static_cast<int>(restored.prefix_reuse_path)
                   << " reused=" << restored.reused_prompt_tokens
                   << " outputs=" << restored.generated_token_ids.size()
-                  << " state=" << after_restore.state_h2d_count
-                  << " main=" << after_restore.main_kv_h2d_pages
-                  << " backend=" << after_restore.backend_kv_h2d_pages
+                  << " state_h2d_delta="
+                  << (after_restore.state_h2d_count - after_pressure.state_h2d_count)
+                  << " main_h2d_delta="
+                  << (after_restore.main_kv_h2d_pages - after_pressure.main_kv_h2d_pages)
+                  << " backend_h2d_delta="
+                  << (after_restore.backend_kv_h2d_pages - after_pressure.backend_kv_h2d_pages)
                   << " degraded=" << after_restore.pressure_private_owners_degraded
                   << " evicted=" << after_restore.pressure_private_owners_evicted << '\n';
         return 1;
@@ -545,6 +619,127 @@ int exercise_host_restore(const char* artifact) {
 
     // The uncached pressure request and checkpoint resume use different valid prefill splits, so
     // the pressure result is a completion and transfer trigger rather than an exact-token oracle.
+    return 0;
+}
+
+// #17's route (plan.md §2 item 6): the STATE image's host-to-device restore, asserted alone.
+//
+// `host_restore` demotes the complete MTP checkpoint -- state, main KV and backend KV all go to host (it
+// asserts the D2H direction) -- but the turn that then reuses it is the SAME session continuing, so the
+// reuse winner is that session's device-resident endpoint and the state image stays flat: measured
+// `state_h2d_delta=0` on two saved runs (results/prefix-real-evidence/20260926-171507/). Main-KV and
+// backend-KV H2D are asserted positively there. The state image was the half with no assertion anywhere;
+// that is what the scenario below supplies, and it runs inside `all` rather than only on request.
+//
+// The missing ingredient is a reuse winner that IS the demoted checkpoint. plan.md §2c gives the shape: two
+// sessions, the SAME prompt, different `session_key`s, where the second ADOPTS the first's private
+// continuation (`CROSS-SESSION-ADOPT`). MEASURED path is 2 = `PrivateTurnClosure`, not
+// `PrivateEndpoint` (1) -- see `include/ninfer/types.h`; the first version of this comment named the
+// endpoint, copying it from the other scenario in plan.md §2c that did take one. So this scenario keeps
+// `host_restore`'s host tier and its demotion step, and changes only the reuser: session A publishes and is
+// pressured into demoting, then session B -- a different key, the identical prompt -- takes that checkpoint.
+//
+// It is a MEASUREMENT, and a negative is one of its two results: if the adopter restores main/backend KV
+// from host without restoring the state image either, then the state image is not on this path at all and
+// the axis is elsewhere (recorded as such rather than as a pass). The PRECONDITION is asserted first,
+// because a run in which no state image moved device-to-host would measure nothing and would look
+// like a clean zero. (The precondition proves MOVEMENT, not demotion: `state_d2h_count` is fed by both
+// pressure demotion and a capture that places a checkpoint straight on host.)
+int exercise_state_image_restore(const char* artifact) {
+    auto engine_options = host_restore_engine_options(artifact);
+    // THE NEGATIVE CONTROL, and it is the point of the knob: with `NINFER_STATE_IMAGE_HOST_SLOTS=0` the
+    // engine has no host state pool, so no state image can be demoted and none can be restored. The
+    // scenario must then FAIL -- at the precondition or at the H2D check -- which is what shows the
+    // assertion can fail at all. Two passing runs prove the instrument is deterministic; they do not prove
+    // it discriminates, and a test that cannot fail is the defect this repo keeps recording.
+    if (const char* override_slots = std::getenv("NINFER_STATE_IMAGE_HOST_SLOTS")) {
+        engine_options.context_cache.host_state_slots =
+            static_cast<std::uint32_t>(std::atoi(override_slots));
+    }
+    ninfer::Engine engine(std::move(engine_options));
+    auto options = [](std::uint32_t outputs, bool reuse) {
+        ninfer::RequestOptions request;
+        request.execution.requested_output_tokens = outputs;
+        request.execution.sampling.temperature    = 0.0F;
+        request.execution.allow_prefix_reuse      = reuse;
+        request.stop.include_model_defaults       = false;
+        return request;
+    };
+
+    // The session key is the parameter: everything else about A's prompt and B's prompt is identical, which
+    // is what makes B's request a candidate to adopt A's private continuation.
+    const auto retained_input = [](const char* session) {
+        std::string text;
+        text.reserve(6U * 300U);
+        for (std::uint32_t index = 0; index < 300; ++index) { text += "alpha "; }
+        ninfer::ChatMessage message;
+        message.role = ninfer::ChatRole::User;
+        message.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text, .text = std::move(text), .media = {}});
+        ninfer::PromptInput input;
+        input.messages.push_back(std::move(message));
+        input.options.enable_thinking   = false;
+        input.context_cache.session_key = session;
+        input.context_cache.retention   = ninfer::CacheRetentionHint::LiveSession;
+        return input;
+    };
+
+    const ninfer::GenerationResult source =
+        engine.generate(engine.prepare(retained_input("state-h2d-a")), options(5, true));
+    if (source.prompt.prompt_tokens <= 256 || source.generated_token_ids.size() != 5) {
+        std::cerr << "state-image-restore source request did not complete\n";
+        return 1;
+    }
+
+    // A continues: this is the step that must demote A's checkpoint to host.
+    ninfer::PromptInput continuation = retained_input("state-h2d-a");
+    ninfer::ChatMessage assistant;
+    assistant.role              = ninfer::ChatRole::Assistant;
+    assistant.reasoning_content = source.reasoning;
+    assistant.parts.push_back(ninfer::MessagePart{
+        .kind = ninfer::MessagePartKind::Text, .text = source.content, .media = {}});
+    continuation.messages.push_back(std::move(assistant));
+    ninfer::ChatMessage followup;
+    followup.role = ninfer::ChatRole::User;
+    followup.parts.push_back(ninfer::MessagePart{
+        .kind = ninfer::MessagePartKind::Text, .text = "Continue briefly.", .media = {}});
+    continuation.messages.push_back(std::move(followup));
+
+    const ninfer::RuntimeStats before_pressure = engine.runtime_stats();
+    const ninfer::GenerationResult pressure_result =
+        engine.generate(engine.prepare(continuation), options(2, false));
+    const ninfer::RuntimeStats after_pressure = engine.runtime_stats();
+    if (pressure_result.generated_token_ids.size() != 2 ||
+        after_pressure.state_d2h_count <= before_pressure.state_d2h_count) {
+        std::cerr << "state-image-restore PRECONDITION failed: no state image moved device-to-host "
+                     "(demotion OR host capture; state_d2h "
+                  << before_pressure.state_d2h_count << " -> " << after_pressure.state_d2h_count
+                  << "), so a flat H2D below would measure nothing\n";
+        return 1;
+    }
+
+    // B: the same prompt, a different session -- the demoted checkpoint is the reuse winner.
+    const ninfer::GenerationResult adopter =
+        engine.generate(engine.prepare(retained_input("state-h2d-b")), options(5, true));
+    const ninfer::RuntimeStats after_reuse              = engine.runtime_stats();
+    const std::uint64_t       state_h2d_delta           = after_reuse.state_h2d_count - after_pressure.state_h2d_count;
+    const std::uint64_t       main_h2d_delta            = after_reuse.main_kv_h2d_pages - after_pressure.main_kv_h2d_pages;
+    const std::uint64_t       backend_h2d_delta         = after_reuse.backend_kv_h2d_pages - after_pressure.backend_kv_h2d_pages;
+    std::fprintf(stderr,
+                 "[scenario] state-image restore via cross-session adoption: path=%d reused=%u outputs=%zu "
+                 "state_h2d_delta=%llu main_h2d_delta=%llu backend_h2d_delta=%llu\n",
+                 static_cast<int>(adopter.prefix_reuse_path),
+                 adopter.reused_prompt_tokens,
+                 adopter.generated_token_ids.size(),
+                 static_cast<unsigned long long>(state_h2d_delta),
+                 static_cast<unsigned long long>(main_h2d_delta),
+                 static_cast<unsigned long long>(backend_h2d_delta));
+    if (adopter.generated_token_ids.size() != 5 || adopter.reused_prompt_tokens == 0 ||
+        state_h2d_delta == 0) {
+        std::cerr << "state-image-restore: the adopter did not restore a state image from host "
+                     "(this is the open item, not a crash: record which axis it used instead)\n";
+        return 1;
+    }
     return 0;
 }
 
@@ -590,19 +785,37 @@ int exercise_shared_replacement_and_full_capacity_reuse(const char* artifact) {
         return input;
     };
 
+    // The observed half uses a TOOL, not `plain_prompt`, and that is the whole point of the change:
+    // `tool_prompt` declares an ExplicitBoundary/ToolBoundary shared marker, so this turn PUBLISHES a
+    // shared stable prefix and occupies the single slot (`max_shared_prefixes` is 1). The Bravo half
+    // below then publishes a different candidate and must DISPLACE it -- which is the replacement this
+    // scenario is named for and which had quietly stopped happening once per-session prompts stopped
+    // being shareable. `plain_prompt` has no tools and no system message, so it has no shared candidate
+    // at all and the slot stayed empty.
     std::string observed_text;
     for (std::uint32_t index = 0; index < 4; ++index) { observed_text += "observed-prefix "; }
+    const std::string alpha_tool =
+        R"({"type":"function","function":{"name":"alpha","parameters":{"type":"object","properties":{"key":{"type":"string"}},"required":["key"]}}})";
     const ninfer::GenerationResult observed_first =
-        engine.generate(engine.prepare(plain_prompt(observed_text)), capture_request);
+        engine.generate(engine.prepare(tool_prompt(alpha_tool, observed_text)), capture_request);
     const ninfer::RuntimeStats after_observed_first = engine.runtime_stats();
     const ninfer::GenerationResult observed_second =
-        engine.generate(engine.prepare(plain_prompt(observed_text)), capture_request);
+        engine.generate(engine.prepare(tool_prompt(alpha_tool, observed_text)), capture_request);
     const ninfer::RuntimeStats after_observed_second = engine.runtime_stats();
+    // The second, IDENTICAL turn publishes no new capture: there is nothing new at that frontier, and the
+    // engine captures at a frontier once. This asserted `+ 1` until the frontend stopped publishing a
+    // session's whole prompt as a shared stable prefix (`frontend.cpp`), which is what used to give the
+    // repeat a second, shared capture to publish. The count is now expected NOT to advance, which is the
+    // behaviour the removal was for: a repeat of the same prompt is a reuse, not a publication.
+    // Relative, not absolute: with the tool, the first turn publishes TWO captures (its private one and
+    // the structural shared prefix), so the old `!= 1` was asserting the pre-change shape. What matters
+    // is that the first turn captured at all and the identical repeat adds nothing -- and that a shared
+    // prefix was actually published is pinned below, by the displacement the Bravo half must cause.
     if (observed_first.generated_token_ids.size() != 1 ||
         observed_second.generated_token_ids.size() != 1 ||
-        after_observed_first.active_captures_completed != 1 ||
+        after_observed_first.active_captures_completed < 1 ||
         after_observed_second.active_captures_completed !=
-            after_observed_first.active_captures_completed + 1U) {
+            after_observed_first.active_captures_completed) {
         std::cerr << "observed-prefix private/shared capture sequence changed: "
                   << after_observed_first.active_captures_completed << '/'
                   << after_observed_second.active_captures_completed << '\n';
@@ -613,11 +826,44 @@ int exercise_shared_replacement_and_full_capacity_reuse(const char* artifact) {
         engine.prepare(plain_prompt("Unrelated private endpoint.")), capture_request);
     const ninfer::GenerationResult observed_reuse =
         engine.generate(engine.prepare(plain_prompt(observed_text)), capture_request);
+    // COVERAGE GAP, asserted as the intended outcome rather than the old one. This step used to require
+    // the promoted prefix to come back as `SharedStablePrefix` with reuse -- which worked while the
+    // frontend published a session's WHOLE prompt as a shared stable prefix. It deliberately stopped
+    // ("a per-session prompt tail is not a stable prefix: it is exactly what private checkpoints are
+    // for", `frontend.cpp`), and these prompts carry no shared marker at all: the measured plan trace for
+    // this scenario's OBSERVED-PREFIX half is `reuse=0,1,2` with no `5` -- that trace aborted at turn 2
+    // before this change, so it covers that half only; a full run now holds exactly ONE `reuse=5`, from
+    // the Bravo half below. So the promoted prefix is NOT reusable across
+    // sessions, and this asserts that -- which is the policy -- while recording that the *shared
+    // *replacement* half now has no material to exercise it: `max_shared_prefixes` is 1 here, and with
+    // no observed-prefix publication the Bravo half publishes into an EMPTY slot, so no existing shared
+    // owner is ever displaced. (`pressure_shared_owners_evicted` had appeared only inside a failure
+    // MESSAGE, never as a standing reading, so nothing showed whether the pressure path moves at all.) A
+    // scenario that covers replacement would have to give the observed prompt a STRUCTURAL shared
+    // boundary (a tool marker, or a leading instruction boundary via a System/Developer message), so
+    // Bravo must displace it from the single slot. What is NOT lost, stated so nobody rebuilds the wrong
+    // thing: `tests/models/qwen3_5/test_shared_slot_release.cpp` covers the replacement slot-release
+    // disposition at unit level, and `anthropic-prefix-regression` covers shared reuse in the engine.
+    // **Real-engine shared replacement is uncovered**, and that is the gap this comment leaves visible.
     if (observed_filler.generated_token_ids.size() != 1 ||
-        observed_reuse.generated_token_ids.size() != 1 ||
-        observed_reuse.prefix_reuse_path != ninfer::PrefixReusePath::SharedStablePrefix ||
-        observed_reuse.reused_prompt_tokens == 0) {
-        std::cerr << "promoted shared prefix was not reusable after private eviction: path="
+        observed_reuse.generated_token_ids.size() != 1) {
+        std::cerr << "observed-prefix filler or reuse turn did not complete: "
+                  << observed_filler.generated_token_ids.size() << '/'
+                  << observed_reuse.generated_token_ids.size() << '\n';
+        return 1;
+    }
+    // The outcome here is DETERMINED by the setup, so assert it exactly rather than only "not shared":
+    // `max_private_continuations` is 1 and the filler displaced the private endpoint, so with no shared
+    // candidate there is nothing left to reuse. Root with zero reuse is what the pre-change run measured
+    // at this point (`path=0 reused=0`); asserting only "not shared" would let a broken private eviction
+    // pass unnoticed. The value is printed so the next reader can check it rather than trust this note.
+    std::fprintf(stderr, "[scenario] shared-replacement observed_reuse: path=%d reused=%u\n",
+                 static_cast<int>(observed_reuse.prefix_reuse_path),
+                 observed_reuse.reused_prompt_tokens);
+    if (observed_reuse.prefix_reuse_path != ninfer::PrefixReusePath::Root ||
+        observed_reuse.reused_prompt_tokens != 0) {
+        std::cerr << "promoted per-session prefix was reusable after private eviction, which the "
+                     "frontend's shared-marker rule forbids, or the private eviction did not happen: path="
                   << static_cast<int>(observed_reuse.prefix_reuse_path)
                   << " reused=" << observed_reuse.reused_prompt_tokens << '\n';
         return 1;
@@ -634,6 +880,35 @@ int exercise_shared_replacement_and_full_capacity_reuse(const char* artifact) {
     const ninfer::RuntimeStats after_replacement = engine.runtime_stats();
     if (replacement.generated_token_ids.size() != 1) {
         std::cerr << "shared replacement fixture did not produce its deterministic stop token\n";
+        return 1;
+    }
+    // THE REPLACEMENT, asserted -- and the counter it asserts on did not exist until this change. The
+    // observed half publishes a shared prefix into the single slot; this turn publishes a different one,
+    // so a catalogued owner must have been displaced. The first attempt at this assertion used
+    // `pressure_shared_owners_evicted` and read `0/0`, because that stat is incremented only by the
+    // KV-pressure shared-victim path (`resource_manager.h:2761`) and cannot fire for a replacement --
+    // an assertion that could never fail. `pressure_shared_owners_replaced` is counted where the
+    // displacement is decided (`capture.cpp`, `replaces_shared`), reads 1 here on two runs, and is
+    // surfaced in `/stats`, so the same question can be asked of production.
+    //
+    // MEASURED 2026-09-26: the print reads `owners_replaced=1 owners_evicted=0` on two runs, so THIS
+    // scenario displaces through the structural-publication path and the KV-PRESSURE path evicts no
+    // shared owner here. Where that other stat IS asserted: `exercise_artifact` requires it UNCHANGED
+    // across the shared/rewrite rotation (`:1409`) -- a must-not-move assertion inside the `all`
+    // scenario, so its reach depends on `all` running to completion AND that run being saved. The golden
+    // mismatch that used to abort `all` was repaired in `66157867`, and `all` has since been saved
+    // passing twice (`results/prefix-real-evidence/20260926-172831/`, `-172847/`).
+    std::fprintf(stderr, "[scenario] shared-replacement owners_replaced=%llu owners_evicted=%llu "
+                         "(after the Bravo turn; evicted is the KV-PRESSURE path)\n",
+                 static_cast<unsigned long long>(
+                     after_replacement.pressure_shared_owners_replaced),
+                 static_cast<unsigned long long>(
+                     after_replacement.pressure_shared_owners_evicted));
+    if (after_replacement.pressure_shared_owners_replaced <=
+        after_observed_second.pressure_shared_owners_replaced) {
+        std::cerr << "single shared slot was never displaced: replaced="
+                  << after_observed_second.pressure_shared_owners_replaced << '/'
+                  << after_replacement.pressure_shared_owners_replaced << '\n';
         return 1;
     }
     // Remove the exact private endpoint without publishing another shared marker. The following
@@ -705,10 +980,14 @@ int exercise_shared_replacement_and_full_capacity_reuse(const char* artifact) {
 
 int exercise_anthropic_prefix_regression(const char* artifact) {
     ninfer::Engine engine(anthropic_prefix_regression_engine_options(artifact));
+    // COMPARED AGAINST THE FLOOR, NOT THE MARKER CAP. It read `kMaximumExplicitPromptCacheMarkers`
+    // because those two were the same number until 2026-10-01, when the cap was raised for the client A/B
+    // and the floor was decoupled -- after which this assertion failed on CORRECT code (concurrency 1 gives
+    // max(1, floor), not the cap). Both sides now name `kDefaultSharedPrefixFloor`.
     if (!engine.options().context_cache.max_shared_prefixes ||
-        *engine.options().context_cache.max_shared_prefixes !=
-            ninfer::kMaximumExplicitPromptCacheMarkers) {
-        std::cerr << "single-concurrency Engine did not expose four default shared prefixes\n";
+        *engine.options().context_cache.max_shared_prefixes != ninfer::kDefaultSharedPrefixFloor) {
+        std::cerr << "single-concurrency Engine did not expose the default shared-prefix floor ("
+                  << ninfer::kDefaultSharedPrefixFloor << ")\n";
         return 1;
     }
 
@@ -1265,13 +1544,24 @@ int exercise_rewrite_checkpoints(ninfer::Engine& engine, RewriteCheckpointCacheT
     const ninfer::GenerationResult first_replay =
         engine.generate(engine.prepare(input_with_history(1, true)), options(true));
     const ninfer::RuntimeStats after_first_replay = engine.runtime_stats();
+    // BOTH topologies select the private response checkpoint, and the shared alias no longer shadows it.
+    // This was `SharedStablePrefix` under the alias until the frontend stopped publishing a session's
+    // whole prompt as a shared stable prefix -- "a per-session prompt tail is not a stable prefix: it is
+    // exactly what private checkpoints are for" (`frontend.cpp`, the shared-marker rule). The only shared
+    // candidate left is the STRUCTURAL boundary (frontier 101 here) while the private response checkpoint
+    // sits at 300, so the longer private prefix is the better reuse and is what the engine picks. The
+    // measured trace agrees: `[plan] ... reuse=5 reuse_base=101` is *considered* and `reuse=3
+    // reuse_base=300` is executed. Asserting the shared path here would assert that a shorter prefix wins,
+    // which is the opposite of what reuse is for.
     const ninfer::PrefixReusePath expected_first_replay =
-        shared_alias ? ninfer::PrefixReusePath::SharedStablePrefix
-                     : ninfer::PrefixReusePath::PrivateResponseReplay;
+        ninfer::PrefixReusePath::PrivateResponseReplay;
     if (first_replay.generated_token_ids.size() != 4 ||
         first_replay.prefix_reuse_path != expected_first_replay ||
         first_replay.reused_prompt_tokens == 0 ||
-        (shared_alias && first_replay.reused_prompt_tokens <= exact_replay.reused_prompt_tokens)) {
+        // The comment above argues the *longer* private prefix wins; nothing asserted it, so a checkpoint
+        // at a shorter frontier than the baseline would have passed. Keep that guard, minus the shared
+        // comparison the old form made.
+        first_replay.reused_prompt_tokens < exact_replay.reused_prompt_tokens) {
         std::cerr << "normalized first response selected the wrong cache frontier: path="
                   << static_cast<int>(first_replay.prefix_reuse_path)
                   << " expected=" << static_cast<int>(expected_first_replay)
@@ -1810,6 +2100,11 @@ int exercise_materialization_source_pressure_protection(const char* artifact) {
 
     ninfer::PromptInput branch = pressure_turn(*long_text, "source-pressure-branch",
                                                ninfer::CacheRetentionHint::LiveSession);
+    // 96, its calibrated value. An edit of mine changed this to 400 by accident -- a `replace(..., 1)`
+    // meant for the NEW underflow scenario matched this identical boilerplate first, so the existing
+    // scenario started running a heavier load than its assertions were written for and failed with
+    // `stop=queue_exhausted`. Found by bisecting with `git stash` after the battery flagged it; the
+    // cost was one wrong "the engine regressed" reading on the way.
     std::string suffix;
     for (std::uint32_t index = 0; index < 96; ++index) { suffix += " delta"; }
     ninfer::ChatMessage followup;
@@ -2094,10 +2389,18 @@ int exercise_artifact(const char* artifact) {
         if (const int result = exercise_vision(engine); result != 0) { return result; }
     }
     if (const int result = exercise_host_restore(artifact); result != 0) { return result; }
+    // NEXT TO host_restore ON PURPOSE: together they are the two halves of the host tier's coverage. The
+    // scenario below owns the STATE image's host-to-device axis, which host_restore cannot reach (its reuse
+    // winner is the same session's device-resident endpoint). A review found the first version of this
+    // scenario was reachable only by setting `NINFER_PREFIX_REAL_SCENARIO=state-image-restore` by hand, so
+    // #17's closure rested on an assertion no routine run executed -- it runs in `all` now.
+    if (const int result = exercise_state_image_restore(artifact); result != 0) { return result; }
     {
-        // Production C=1/H=1 topology: repeated exact use promotes the shared prefix under one
-        // cache Device slot; its Fork/Restore and the later ResponseReplay must then rotate
-        // without a session identity or dropping either owner.
+        // Production C=1/H=1 topology. This used to read "repeated exact use promotes the shared prefix
+        // under one cache Device slot"; a per-session prompt is no longer published as a shared stable
+        // prefix (`frontend.cpp`), so no promotion happens here and the shared half of the exercise
+        // publishes into an empty slot. What still runs: the private ResponseReplay rotation across the
+        // tool loop, and the store's own shared-slot release, which is covered at unit level.
         ninfer::Engine engine(shared_replacement_engine_options(artifact));
         if (const int result =
                 exercise_rewrite_checkpoints(engine, RewriteCheckpointCacheTopology::SharedAlias);
@@ -2118,6 +2421,272 @@ int exercise_artifact(const char* artifact) {
     }
     if (const int result = exercise_concurrent_resource_settlement(artifact); result != 0) {
         return result;
+    }
+    return 0;
+}
+
+int exercise_feasibility_orphan(const char* artifact) {
+    // #10's POSITIVE PATH, with a REAL orphan. The first attempt at this was reverted because the thing
+    // it skipped was a logical destination with no slots -- a state no cleanup path could mistake for
+    // occupancy. The orphan used here is measured, not constructed by hand: injecting a failure inside
+    // the KV restore leaves `main_kv_pages=117` and `host_kv_bytes=8454144` owned by nothing (two runs,
+    // byte-identical, `results/n9-evidence/`). With the pool at 128 pages that drops usable capacity to
+    // about eleven, and a request that needs more than eleven while being well under the total is exactly
+    // the band the feasibility predicate is about: previously it was called feasible and blocked forever;
+    // with the fix it must be refused, and QUICKLY.
+    ninfer::Engine engine(pressure_resume_engine_options(artifact));
+    const std::optional<std::string> long_text =
+        exact_repeated_prompt_text(engine, 7683, "alpha");
+    const std::optional<std::string> short_text =
+        exact_repeated_prompt_text(engine, 350, "bravo");
+    if (!long_text || !short_text) {
+        std::cerr << "feasibility-orphan fixture could not construct its geometry\n";
+        return 1;
+    }
+    const ninfer::GenerationResult source = engine.generate(
+        engine.prepare(pressure_turn(*long_text, "orphan-source",
+                                     ninfer::CacheRetentionHint::Disposable)),
+        fixed_output(31));
+    const ninfer::GenerationResult resident = engine.generate(
+        engine.prepare(pressure_turn(*short_text, "orphan-resident",
+                                     ninfer::CacheRetentionHint::LiveSession)),
+        fixed_output(1));
+    if (source.generated_token_ids.size() != 31 || resident.generated_token_ids.size() != 1) {
+        std::cerr << "feasibility-orphan fixture did not establish its residents\n";
+        return 1;
+    }
+
+    // THE SPILL STEP, which the first version of this scenario omitted -- and the omission was invisible
+    // until the run reported `injected=0`: without a spill there is nothing to restore, so the injection
+    // site is never reached and no orphan is ever made. `pressure-resume` does this with a second short
+    // live session, and the pressure it provokes is what pushes the long source's pages to host.
+    const std::optional<std::string> trigger_text =
+        exact_repeated_prompt_text(engine, 350, "charlie");
+    if (!trigger_text) {
+        std::cerr << "feasibility-orphan fixture could not construct its pressure trigger\n";
+        return 1;
+    }
+    const ninfer::RuntimeStats before_trigger = engine.runtime_stats();
+    const ninfer::GenerationResult trigger = engine.generate(
+        engine.prepare(pressure_turn(*trigger_text, "orphan-trigger",
+                                     ninfer::CacheRetentionHint::LiveSession)),
+        fixed_output(1));
+    const ninfer::RuntimeStats after_trigger = engine.runtime_stats();
+    const std::uint64_t spilled =
+        after_trigger.pressure_spill_pages - before_trigger.pressure_spill_pages;
+    const std::uint64_t d2h = after_trigger.main_kv_d2h_pages - before_trigger.main_kv_d2h_pages;
+    std::cout << "feasibility-orphan: spilled=" << spilled << " d2h=" << d2h << '\n';
+    if (trigger.generated_token_ids.size() != 1) {
+        std::cerr << "feasibility-orphan fixture did not complete its pressure trigger\n";
+        return 1;
+    }
+
+    // The restore that the injection fails, leaving the orphan. The throw reaches us -- the engine
+    // recovers internally and the request fails -- so it must be caught here or the scenario ends here.
+    bool oom_seen = false;
+    try {
+        (void)engine.generate(engine.prepare(pressure_turn(*long_text, "orphan-source",
+                                                           ninfer::CacheRetentionHint::Disposable)),
+                              fixed_output(1));
+    } catch (const std::exception& error) {
+        oom_seen = true;
+        std::cout << "feasibility-orphan: the injected failure surfaced as: " << error.what() << '\n';
+    }
+    std::fprintf(stderr, "[orphan] A: before runtime_stats\n");
+    std::fflush(stderr);
+    const ninfer::RuntimeStats after_orphan = engine.runtime_stats();
+    std::fprintf(stderr, "[orphan] B: after runtime_stats (occupied=%u)\n",
+                 after_orphan.device_main_kv_occupied_pages);
+    std::fflush(stderr);
+
+    // ISOLATION: with `NINFER_ORPHAN_ONLY` set, stop here. That separates "the engine crashes with an
+    // orphan present" from "the band request crashes", which are different findings and the first is the
+    // stronger one.
+    if (std::getenv("NINFER_ORPHAN_ONLY") != nullptr) {
+        std::cout << "feasibility-orphan: ORPHAN ONLY -- reached the end without a band request, "
+                     "occupied=" << after_orphan.device_main_kv_occupied_pages << '\n';
+        return 0;
+    }
+
+    // The band request: bigger than what is left, far smaller than the pool.
+    const std::optional<std::string> band_text =
+        exact_repeated_prompt_text(engine, 2000, "charlie");
+    if (!band_text) {
+        std::cerr << "feasibility-orphan fixture could not construct its band prompt\n";
+        return 1;
+    }
+    const auto started = std::chrono::steady_clock::now();
+    std::size_t  band_tokens = 0;
+    bool         band_failed = false;
+    try {
+        const ninfer::GenerationResult band = engine.generate(
+            engine.prepare(pressure_turn(*band_text, "orphan-band",
+                                         ninfer::CacheRetentionHint::Disposable)),
+            fixed_output(1));
+        band_tokens = band.generated_token_ids.size();
+    } catch (const std::exception& error) {
+        band_failed = true;
+        std::cout << "feasibility-orphan: the band request was refused: " << error.what() << '\n';
+    }
+    const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                             std::chrono::steady_clock::now() - started)
+                             .count();
+    std::cout << "feasibility-orphan: injected=" << (oom_seen ? 1 : 0)
+              << " band_tokens=" << band_tokens << " band_refused=" << (band_failed ? 1 : 0)
+              << " elapsed_s=" << elapsed << " occupied=" << after_orphan.device_main_kv_occupied_pages
+              << '\n';
+    // What is asserted, and nothing more: the band request must not HANG. Whether it is refused or
+    // served is what this scenario exists to observe; a 900 s block is the wedge's stage two and is the
+    // outcome the fix forbids. Sixty seconds is generous against a 900 s deadline and far above any
+    // healthy path.
+    if (elapsed >= 60) {
+        std::cerr << "feasibility-orphan: a request against orphaned occupancy took " << elapsed
+                  << "s -- it was blocked rather than resolved\n";
+        return 1;
+    }
+    return 0;
+}
+
+int exercise_underflow_shared_source(const char* artifact) {
+    // #2's constructive route, built from a reading rather than a hope: the accounting underflow at
+    // `materialization.cpp:635` fires when `removed > final_removed`, and the asymmetry is WHEN the two
+    // are sampled -- `final_removed` at PLAN time, `before`/`after` inside `prepare_consumed_source`,
+    // with the pressure transition committed at `:2374` BEFORE that call at `:2385`. So it needs a
+    // transaction whose own pressure release removes a CO-OWNER of the source's state or KV: shared at
+    // plan time becomes exclusive at removal time.
+    //
+    // The shape: one SHARED prefix with two owners. A publishes it (the tool declaration is a structural
+    // shared marker -- `plain_prompt` has none, which is why the older scenarios could not build this),
+    // B reuses it, and A then runs a branch that materializes from its own source while pressure has to
+    // free room. Whether pressure picks B (rather than the protected source itself) is the planner's
+    // choice, so this is a MEASUREMENT: the underflow is looked for in the log, and a negative here is a
+    // result about where the axis is NOT.
+    auto options                              = pressure_resume_engine_options(artifact);
+    options.context_cache.max_shared_prefixes = 2;  // pressure_resume_engine_options sets 0
+    ninfer::Engine engine(std::move(options));
+
+    const std::optional<std::string> long_text =
+        exact_repeated_prompt_text(engine, 3811, "alpha");
+    if (!long_text) {
+        std::cerr << "underflow fixture could not construct exact prompt geometry\n";
+        return 1;
+    }
+    const std::string tool_json =
+        R"({"type":"function","function":{"name":"alpha","parameters":{"type":"object","properties":{"key":{"type":"string"}},"required":["key"]}}})";
+    const auto shared_turn = [&](std::string session) {
+        ninfer::PromptInput input = pressure_turn(*long_text, std::move(session),
+                                                  ninfer::CacheRetentionHint::LiveSession);
+        input.options.tool_jsons.push_back(tool_json);
+        // The MARKER, not just the tool. The first version of this scenario pushed only the tool and read
+        // `shared_selections=0` -- nothing was published, because a structural shared candidate comes from
+        // an explicit `SharedStablePrefix` marker at the tool boundary (as the shared-replacement
+        // scenario's `tool_prompt` does), not from the presence of a tool.
+        input.context_cache.markers.push_back(ninfer::PromptCacheMarker{
+            .kind             = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+            .evidence         = ninfer::SharedCandidateEvidence::ExplicitBoundary,
+            .location         = ninfer::PromptCacheMarkerLocation::ToolBoundary,
+            .after_tool_count = 1,
+        });
+        return input;
+    };
+
+    // Owner one publishes the shared prefix; owner two reuses it, so it has two owners.
+    const ninfer::GenerationResult publisher = engine.generate(engine.prepare(shared_turn("underflow-a")),
+                                                               fixed_output(1));
+    ninfer::RuntimeStats after_publish = engine.runtime_stats();
+    const ninfer::GenerationResult reuser = engine.generate(engine.prepare(shared_turn("underflow-b")),
+                                                            fixed_output(1));
+    ninfer::RuntimeStats after_reuse = engine.runtime_stats();
+    if (publisher.generated_token_ids.size() != 1 || reuser.generated_token_ids.size() != 1) {
+        std::cerr << "underflow fixture did not complete both shared owners\n";
+        return 1;
+    }
+
+    // FILL THE POOL FIRST. The first version went straight to the branch and read `occupied=67` of 128
+    // pages with `spill=0 d2h=0` -- the fork shares pages with its source, so two owners cost less than
+    // two copies, and nothing needed room. Distinct long content is what makes the pool tight enough for
+    // pressure to have a victim at all (this mirrors how `pressure-resume` fills before its pressure
+    // step). One filler at a different text: distinct, so it cannot dedup into what is already there.
+    const std::optional<std::string> filler_text =
+        exact_repeated_prompt_text(engine, 3900, "bravo");
+    if (!filler_text) {
+        std::cerr << "underflow fixture could not construct its filler geometry\n";
+        return 1;
+    }
+    const ninfer::GenerationResult filler = engine.generate(
+        engine.prepare(pressure_turn(*filler_text, "underflow-filler",
+                                     ninfer::CacheRetentionHint::LiveSession)),
+        fixed_output(1));
+    if (filler.generated_token_ids.size() != 1) {
+        std::cerr << "underflow fixture did not complete its filler turn\n";
+        return 1;
+    }
+
+    // The branch: owner one's own source plus a suffix, which needs room and therefore pressure.
+    ninfer::PromptInput branch = shared_turn("underflow-a");
+    std::string suffix;
+    for (std::uint32_t index = 0; index < 96; ++index) { suffix += " delta"; }
+    ninfer::ChatMessage followup;
+    followup.role = ninfer::ChatRole::User;
+    followup.parts.push_back(ninfer::MessagePart{
+        .kind = ninfer::MessagePartKind::Text, .text = std::move(suffix), .media = {}});
+    branch.messages.push_back(std::move(followup));
+    const ninfer::GenerationResult branched =
+        engine.generate(engine.prepare(std::move(branch)), fixed_output(1));
+    const ninfer::RuntimeStats after_branch = engine.runtime_stats();
+
+    std::cout << "underflow-shared-source: publisher_path="
+              << static_cast<int>(publisher.prefix_reuse_path)
+              << " consumer_path=" << static_cast<int>(reuser.prefix_reuse_path)
+              << " consumer_reused=" << reuser.reused_prompt_tokens
+              << " path=" << static_cast<int>(branched.prefix_reuse_path)
+              << " shared_selections="
+              << (after_reuse.shared_stable_prefix_selections -
+                  after_publish.shared_stable_prefix_selections)
+              << " shared_publishes_seen="
+              << (after_reuse.shared_stable_prefix_selections > 0 ? 1 : 0)
+              << " shared_evicted="
+              << (after_branch.pressure_shared_owners_evicted -
+                  after_reuse.pressure_shared_owners_evicted)
+              << " private_evicted="
+              << (after_branch.pressure_private_owners_evicted -
+                  after_reuse.pressure_private_owners_evicted)
+              << " degraded="
+              << (after_branch.pressure_private_owners_degraded -
+                  after_reuse.pressure_private_owners_degraded)
+              // Spill and Device-to-Host, which the eviction counters do NOT cover: the first version of
+              // this print reported `evicted=0 degraded=0` and I read that as "no pressure", when the
+              // engine may have been spilling instead. A denial of a shape is only as good as the
+              // counters it was read from.
+              // The planner's SEARCH, which is where the demote-preferring alternative is looked for
+              // (`materialization_planner.h:303-315`): how often it ran and how often its budget cut it
+              // off. Its own comment calls the budget "a CUT-OFF, not a completeness bound", and this is
+              // the pair of numbers that tests that claim.
+              << " searches=" << (after_branch.pressure_searches - after_reuse.pressure_searches)
+              << " search_cutoff="
+              << (after_branch.pressure_search_budget_exhaustions -
+                  after_reuse.pressure_search_budget_exhaustions)
+              << " root=" << after_branch.root_selections
+              << " spill=" << (after_branch.pressure_spill_pages - after_reuse.pressure_spill_pages)
+              << " d2h=" << (after_branch.main_kv_d2h_pages - after_reuse.main_kv_d2h_pages)
+              << " occupied=" << after_branch.device_main_kv_occupied_pages
+              << "\n";
+    if (branched.generated_token_ids.size() != 1) {
+        std::cerr << "underflow fixture did not complete the branch\n";
+        return 1;
+    }
+    // PRESSURE-DRIVEN SHARED EVICTION, asserted. `pressure_shared_owners_evicted` was recorded as
+    // uncovered (`#13`): the `shared-replacement` scenario displaces a shared owner by PUBLICATION
+    // (`owners_replaced`), and the pressure path had no engine-side scenario at all -- its only
+    // assertion lived in `exercise_artifact`, which aborts early. This construction reaches it: with the
+    // pool filled to 127 of 128 pages the branch needs room, and the planner evicts a shared owner to
+    // get it. That is a different mechanism from the structural publication, and it is now covered.
+    if (after_branch.pressure_shared_owners_evicted <= after_reuse.pressure_shared_owners_evicted) {
+        std::cerr << "pressure did not evict a shared owner: evicted="
+                  << after_reuse.pressure_shared_owners_evicted << '/'
+                  << after_branch.pressure_shared_owners_evicted
+                  << " occupied=" << after_branch.device_main_kv_occupied_pages << '\n';
+        return 1;
     }
     return 0;
 }
@@ -2277,6 +2846,281 @@ int main() {
         options.context_cache.max_shared_prefixes = 0;
         ninfer::Engine engine(std::move(options));
         result = exercise_rewrite_checkpoints(engine, RewriteCheckpointCacheTopology::PrivateOnly);
+    } else if (scenario == "recycling-capture") {
+        // POSITIVE CONTROL for the claim in plan.md §2 item 3 that `recycles_private_state` is
+        // unreachable, i.e. that #11(a)'s recycling branch is dead. It is not a vehicle that reaches the
+        // branch, and it no longer delegates to `exercise_rewrite_checkpoints` (the earlier version did,
+        // and the comment describing that survived the rewrite; corrected 2026-09-26).
+        //
+        // `recycles_private_state` is set only when a rewrite capture group exists AND a live
+        // `rewrite_state` carries `rewrite_checkpoint.valid` AND that checkpoint's slot differs from the
+        // state's write slot AND the store agrees it can recycle it as a fork destination
+        // (`capture.cpp:110-112`). The two halves are mutually exclusive: the planner strips
+        // `group.rewrite` unless the disposition is `ReplaceAtCommittedFrontier`
+        // (`request_plan.cpp:808-813`), and every `Replace` activation branch clears the checkpoint --
+        // including the shared/long-anchor route, at `prefill.cpp:383-384`.
+        //
+        // So the scenario walks the shapes most likely to refute that, and the probe does the judging:
+        // with NINFER_CAPTURE_PROBE=1, `inspect_capture` aborts the moment `recycles_private_state` is
+        // true. The scenario itself asserts only that both turns ran and no capture aborted; a pass is
+        // not evidence of correct reuse behaviour, which is recorded in plan.md rather than implied here.
+        // `tools/e2e/recycling-reachability.sh` runs this and eleven other scenarios that way.
+        auto options                              = engine_options(artifact);
+        options.speculative.backend               = ninfer::SpeculativeBackend::DFlash2;
+        options.speculative.draft_tokens          = 7;  // prod's --draft-tokens
+        options.max_context                       = 1024;
+        options.kv_capacity                       = ninfer::KvCapacityPolicy::explicit_capacity(1024);
+        options.prefill_chunk                     = 256;
+        // The host tier is what makes a capture take the HostSnapshot (transfer) placement, and the
+        // transfer-enqueue branch is where the recycling hazard lives: with device forks only, the
+        // `capture-submitted` site is reached once in the whole run and no checkpoint is ever live
+        // there. Device state capacity is 2 slots, not 1: one slot proved tight enough to push the
+        // rewrite checkpoint into the HOST replica, and `can_recycle_checkpoint_destination`
+        // (`state_store.h:336-343`) requires a device slot and no host slot, so a checkpoint in host
+        // cannot be recycled however the rest of the conditions fall.
+        options.context_cache.device_state_slots          = 2;
+        options.context_cache.host_state_slots            = 2;
+        options.context_cache.host_kv_capacity_bytes      = 256ULL << 20;
+        options.context_cache.max_private_continuations   = 2;
+        // Shared prefixes are enabled so turn 2 can be served by the shared path rather than by its own
+        // rewrite checkpoint -- the one route the planner could take without the disposition having to
+        // be `RetainExisting`. (An earlier comment here claimed that route leaves `rewrite_state`
+        // untouched and cited `prefill.cpp:729`; both were wrong, and the run showed it -- the
+        // `preserving_source` branch that serves the shared path clears the handle at `:383-384`.)
+        options.context_cache.max_shared_prefixes         = 4;
+        options.context_cache.max_long_anchors_per_continuation = 0;
+        ninfer::Engine engine(std::move(options));
+
+        // A DIAGNOSTIC scenario: it asserts nothing about reuse and ends by reporting what it measured
+        // (`captures`/`aborts` per turn), because the question it exists to answer is whether the
+        // recycling branch is reachable at all -- read with NINFER_CAPTURE_PROBE=1, which aborts if
+        // `recycles_private_state` is ever true. Its premise is that #11(a)'s precondition looks
+        // unreachable by construction (see plan.md §2 item 3 for the argument and its line references);
+        // this scenario is the positive control for that claim, and it deliberately walks the shapes most
+        // likely to refute it: a turn-closure capture that publishes a private rewrite checkpoint, then a
+        // second turn with a NEW closure served by the SHARED prefix, which is the one route the planner
+        // could take without the disposition having to be `RetainExisting`.
+        //
+        // Several comments here were rewritten on 2026-09-26 after a review pass showed the originals
+        // reasoned from a misread of `prefill.cpp` (the branch at `:729` is the invalid-path `throw`, not
+        // the long-anchor/shared branch, and `SharedStablePrefix` reaches a checkpoint-clearing path
+        // -- the unconditional reset at `prefill.cpp:383-384`). The earlier version of this scenario ran
+        // both turns with reuse OFF and claimed the capturing turn needed that; the trace refuted it.
+        auto text_message = [](ninfer::ChatRole role, std::string text) {
+            ninfer::ChatMessage message;
+            message.role = role;
+            message.parts.push_back(ninfer::MessagePart{
+                .kind = ninfer::MessagePartKind::Text, .text = std::move(text), .media = {}});
+            return message;
+        };
+        auto assistant_call = [&](std::string reasoning, std::string id, std::string key) {
+            ninfer::ChatMessage message = text_message(ninfer::ChatRole::Assistant, "");
+            message.reasoning_content   = std::move(reasoning);
+            message.tool_calls.push_back(ninfer::ToolCall{
+                .id = std::move(id), .name = "lookup", .arguments_json = "{\"key\":\"" + key + "\"}"});
+            return message;
+        };
+        // `question` is a parameter, not a constant, so the capturing turn can diverge from turn 1
+        // *before* the private checkpoint's frontier. Keeping turn 1's question makes turn 2's prompt a
+        // superset of turn 1's, `prefix_matches` still matches the private checkpoint at 300, that
+        // checkpoint wins the selection on length over the shared prefix at 101, and the executed path
+        // is the rewrite-restore (`path=3`). Diverging moves the executed path to the shared one
+        // (`path=5`) -- which was worth measuring, and which still does not keep the checkpoint alive.
+        auto input_with_history = [&](int completed, bool preserve_thinking,
+                                      const char* question =
+                                          "Use the lookup results to determine the deterministic "
+                                          "checkpoint value.") {
+            ninfer::PromptInput input;
+            input.messages.push_back(text_message(ninfer::ChatRole::User, question));
+            if (completed >= 1) {
+                input.messages.push_back(
+                    assistant_call("The first lookup should be alpha.", "call_alpha", "alpha"));
+                ninfer::ChatMessage tool =
+                    text_message(ninfer::ChatRole::Tool, "{\"value\":17,\"next\":\"beta\"}");
+                tool.tool_call_id = "call_alpha";
+                input.messages.push_back(std::move(tool));
+            }
+            input.options.preserve_thinking = preserve_thinking;
+            input.options.tool_jsons.push_back(
+                R"({"type":"function","function":{"name":"lookup","parameters":{"type":"object","properties":{"key":{"type":"string"}},"required":["key"]}}})");
+            return input;
+        };
+        // Mirror the exercise's own turn shapes, because those provably capture in this harness (the
+        // injection fires twice inside it); a reduced shape of my own captured NOTHING --
+        // `captures=0` after both turns -- so the first version of this scenario could not reach the
+        // injection site at all, which its own counter is what revealed.
+        auto request_options = [](bool reuse) {
+            ninfer::RequestOptions request;
+            request.execution.requested_output_tokens = 4;
+            request.execution.sampling.temperature    = 0.0F;
+            request.execution.allow_prefix_reuse      = reuse;
+            request.stop.include_model_defaults       = false;
+            return request;
+        };
+        auto turn = [&](const char* label, int completed, bool preserve, bool reuse,
+                        const char* question = nullptr) {
+            const ninfer::GenerationResult generated =
+                engine.generate(engine.prepare(question ? input_with_history(completed, preserve,
+                                                                            question)
+                                                    : input_with_history(completed, preserve)),
+                                request_options(reuse));
+            const ninfer::RuntimeStats stats = engine.runtime_stats();
+            std::cout << "recycling-capture " << label
+                      << ": path=" << static_cast<int>(generated.prefix_reuse_path)
+                      << " outputs=" << generated.generated_token_ids.size()
+                      << " captures=" << stats.active_captures_completed
+                      << " aborts=" << stats.active_captures_aborted << '\n';
+            return generated;
+        };
+
+        // Turn shape, and what the runs before this one got wrong. `recycles_private_state` needs five
+        // things at one capture, and two of them pull in opposite directions:
+        //
+        //   * `group.rewrite` must survive the planner, which happens ONLY when
+        //     `rewrite_disposition == ReplaceAtCommittedFrontier` (`request_plan.cpp:808-813`) -- i.e.
+        //     when the incoming closure is NEWER than the retained checkpoint's frontier.
+        //   * `sequence.rewrite_state`/`rewrite_checkpoint` must survive the prefill -- and they never
+        //     do, on any branch, once the disposition is `Replace`: `preserve_rewrite` is false
+        //     (`prefill.cpp:526-527`), Root clears the `valid` flag (`:580-581`), the
+        //     `preserving_source` branch that `SharedStablePrefix` and `PrivateLongAnchor` both take
+        //     clears the handle unconditionally (`:383-384`, branch at `:302`), and `PrivateEndpoint`
+        //     and the rewrite-restore clear it too (`:643-647`, `:699-702`). The `else` at `:729` is a
+        //     `throw` for an invalid reuse path.
+        //
+        // So the two requirements are mutually exclusive: this scenario is the positive control for
+        // that, not a vehicle that reaches the branch. It walks the shapes most likely to REFUTE the
+        // claim -- turn 1 publishes a private rewrite checkpoint, turn 2 arrives with a new closure
+        // served by the shared prefix -- and the abort in `inspect_capture` (NINFER_CAPTURE_PROBE=1)
+        // fires if the claim is wrong. Across 12 scenarios and 161 assessments it never fired, and a
+        // live `rewrite_state` never appeared at a capture at all. See plan.md §2 item 3 for the counts
+        // and `results/recycling-reachability/20260926-103341/` for the logs; the numbers are kept there
+        // and not here, because this comment went stale against them twice.
+        const ninfer::GenerationResult first =
+            turn("turn 1 (publishes the checkpoint)", 0, true, true);
+        // A DIFFERENT question, so the prompt diverges before frontier 300 and the shared prefix at
+        // 101 is the only source that matches.
+        const ninfer::GenerationResult second =
+            turn("turn 2 (diverges, shared reuse, new closure)", 1, true, true,
+                 "Answer a different question: summarise the second lookup in one short clause.");
+        // What this asserts, and nothing more: both turns produced output and no capture aborted. It is
+        // a DIAGNOSTIC scenario -- its real output is the probe trace (NINFER_CAPTURE_PROBE=1, which
+        // aborts if the recycling branch turns out to be reachable), and a pass here says only that the
+        // shapes ran. Said explicitly because the previous version ended in an unconditional
+        // `result = 0` and would have passed with every turn broken.
+        const ninfer::RuntimeStats final_stats = engine.runtime_stats();
+        if (first.generated_token_ids.empty() || second.generated_token_ids.empty() ||
+            final_stats.active_captures_aborted != 0) {
+            std::cerr << "recycling-capture: a turn produced no output, or a capture aborted\n";
+            return 1;
+        }
+        std::cout << "recycling-capture: diagnostic only -- the assertion is that both turns ran; the "
+                     "finding is in the probe trace\n";
+        result = 0;
+    } else if (scenario == "capture-host-snapshot") {
+        // #9: coverage for the abort's host-snapshot release -- `capture.cpp:826`,
+        // `abort-snapshot-destination`, a NON-STRICT release whose refusal is exactly the leak's shape
+        // (the handle is dropped, its host state slot and host KV are not freed). Without this scenario
+        // that branch has NO coverage: `HostSnapshot` placement is chosen only when the device state
+        // pool is FULL and a host tier exists (`capture.cpp:218-233`), and every capture in the
+        // 2026-09-26 injection run took `placement=0` (DeviceFork) because no scenario both filled the
+        // pool and had a host tier -- three had the host tier and never filled the pool, the rest had
+        // `host_state_slots = 0`.
+        //
+        // So: ONE device state slot, occupied by another session that stays resident, with a host tier
+        // to snapshot into. The capturing turn's own capture must then find the pool full.
+        //
+        // Read it with NINFER_CAPTURE_PROBE=1 -- the capture's `assess` line should read `placement=1`
+        // (`DeviceFork` is 0, `HostSnapshot` is 1); if it says 0 the precondition was not built and the
+        // run is evidence of nothing. To test the abort path, add NINFER_INJECT_THROW=capture-submitted
+        // (harmful-controls build) and look for `non-strict release REFUSED (abort-snapshot-destination)`
+        // or a non-zero `post-recovery residual`: either one is the leak, named.
+        auto options                                    = engine_options(artifact);
+        options.speculative.backend                     = ninfer::SpeculativeBackend::DFlash2;
+        options.speculative.draft_tokens                = 7;
+        options.max_context                             = 1024;
+        options.kv_capacity                             = ninfer::KvCapacityPolicy::explicit_capacity(1024);
+        options.prefill_chunk                           = 256;
+        options.max_concurrency                         = 2;
+        options.context_cache.device_state_slots        = 1;
+        options.context_cache.host_state_slots          = 2;
+        options.context_cache.host_kv_capacity_bytes    = 256ULL << 20;
+        options.context_cache.max_private_continuations = 2;
+        options.context_cache.max_shared_prefixes       = 0;
+        options.context_cache.max_long_anchors_per_continuation = 0;
+        ninfer::Engine engine(std::move(options));
+
+        // The occupant is SUBMITTED, not generated: a turn that runs to completion has its state
+        // demoted to host by the tiering, which frees the device slot -- and the first version of this
+        // scenario did exactly that and still read `placement=0`, i.e. it measured an unfilled pool.
+        // Held in flight, its device state is live while the capturing turn runs.
+        auto occupant = engine.submit(
+            engine.prepare(
+                session_turn("hs-occupant", "Give one deterministic token for the occupant.")),
+            fixed_output(24));
+        // The capturing turn. Thinking is left ON because the rewrite capture group comes from the
+        // chat template's closure boundary (`chat_template.cpp:402`), and `session_turn` disables it.
+        ninfer::PromptInput capturing_input =
+            session_turn("hs-capture", "Describe deterministic scheduling in one paragraph.");
+        capturing_input.options.enable_thinking = true;
+        // The capturing turn is expected to FAIL when the fault control is armed -- that is how the
+        // abort (and therefore the orphan) is produced -- so the fault is caught here and the scenario
+        // proceeds. Without this the injected bad_alloc unwound the whole scenario and the tail below
+        // never ran, which is how the first version of this reported nothing at all.
+        std::optional<ninfer::GenerationResult> capturing;
+        const bool fault_armed = std::getenv("NINFER_INJECT_THROW") != nullptr;
+        try {
+            capturing.emplace(
+                engine.generate(engine.prepare(std::move(capturing_input)), fixed_output(4)));
+        } catch (const std::exception& error) {
+            // Only a fault we ARMED may be swallowed. Swallowing unconditionally would hide a real
+            // failure of the ordinary path behind a pass -- and the first version of this did exactly
+            // that, dropping the `generated_token_ids.empty()` assertion with it. (That version existed
+            // to serve a #10 tail that has since been reverted; the gating stays because it is right on
+            // its own.)
+            if (!fault_armed) { throw; }
+            std::cerr << "capture-host-snapshot: capturing turn failed as armed: " << error.what() << '\n';
+        }
+        // The occupant is failed too by a recovery (`recover_from_oom_locked` forces an error on every
+        // active slot), and `wait()` therefore throws when a fault is armed. Left uncaught this terminated
+        // the scenario (rc=134) before anything after it ran. Gated on `fault_armed` for the same reason
+        // as the capture above: an unarmed failure must not be swallowed.
+        ninfer::GenerationResult occupant_result;
+        try {
+            occupant_result = occupant.wait();
+        } catch (const std::exception& error) {
+            if (!fault_armed) { throw; }
+            std::cerr << "capture-host-snapshot: occupant failed as armed: " << error.what() << '\n';
+        }
+
+        const ninfer::RuntimeStats stats = engine.runtime_stats();
+        std::cout << "capture-host-snapshot occupant_tokens=" << occupant_result.generated_token_ids.size()
+                  << " capture_tokens=" << (capturing ? capturing->generated_token_ids.size() : 0U)
+                  << " path=" << (capturing ? static_cast<int>(capturing->prefix_reuse_path) : -1)
+                  << " captures=" << stats.active_captures_completed
+                  << " aborts=" << stats.active_captures_aborted
+                  << " (expect the capture's assess line to read placement=1; placement=0 means the "
+                     "device pool was not full and this run proves nothing)\n";
+        // Asymmetric on purpose, and said out loud: with a fault armed the OCCUPANT is expected to fail
+        // too (the recovery errors every active slot), so a run that proceeds far enough to print its
+        // stats line still returns 1 -- an armed run is a diagnostic, not a pass. An unarmed run must
+        // produce both turns.
+        if (occupant_result.generated_token_ids.empty() ||
+            (!fault_armed && (!capturing || capturing->generated_token_ids.empty()))) {
+            std::cerr << "capture-host-snapshot: a turn produced no output\n";
+            return 1;
+        }
+
+        result = 0;
+    } else if (scenario == "feasibility-orphan") {
+        // The injection is NOT set here on purpose: the caller sets `NINFER_INJECT_THROW=mat-reserve-replica`
+        // to create the orphan. That gives the CONTROL in the same binary -- run it with the variable and
+        // the orphan exists; run it without and the identical code path executes with none -- which is what
+        // separates "the engine mishandles orphaned occupancy" from "this scenario is broken".
+        result = exercise_feasibility_orphan(artifact);
+    } else if (scenario == "underflow-shared-source") {
+        result = exercise_underflow_shared_source(artifact);
+    } else if (scenario == "state-image-restore") {
+        result = exercise_state_image_restore(artifact);
     } else if (scenario == "stream-observations") {
         auto options          = engine_options(artifact);
         options.enable_vision = false;

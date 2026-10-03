@@ -25,9 +25,18 @@ struct ServeOptions {
     std::filesystem::path chat_template_path;
     std::string host = "127.0.0.1";
     int port         = 8080;
+    // Optional second port for a dedicated single-thread /stats + /health
+    // server. 0 (default) disables it; the main server keeps serving both
+    // routes on `port` either way.
+    int stats_port   = 0;
     std::string api_key;                          // empty => no auth
     std::optional<std::string> model_id_override; // unset => artifact metadata.name
     std::string request_log_jsonl;                // empty => structured request logging disabled
+    // Size-based rotation of the JSONL request log. max_mib=0 disables rotation
+    // (unbounded, the historical behaviour); keep is how many rotated files
+    // (<path>.1 .. <path>.keep) to retain, oldest dropped.
+    std::uint32_t request_log_max_mib = 0;
+    std::uint32_t request_log_keep    = 4;
     std::uint32_t max_context          = 8192;
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(8192);
     std::uint32_t max_concurrency      = 1;
@@ -44,13 +53,18 @@ struct ServeOptions {
     std::size_t response_store_max_bytes   = kDefaultResponseStoreBytes;
     int device                             = 0;
     KvCacheStorage kv_cache                = KvCacheStorage::BFloat16;
+    float rope_scaling_factor              = 1.0f;
+    std::uint32_t rope_scaling_original_context = 262144;
     SpeculativeOptions speculative;
     ContextCacheOptions context_cache;
     bool enable_vision      = false;
+    bool vision_cpu_offload = false;
     bool use_cuda_graph     = true;
     bool allow_prefix_reuse = true;
     std::optional<bool> enable_thinking;
     std::optional<bool> preserve_thinking;
+    bool tolerant_tool_calls =
+        false; // recover complete Qwen calls with malformed wrapper/suffix output
     std::optional<std::uint32_t> default_thinking_budget;
     int default_max_tokens = kDefaultMaxTokens;
     bool enable_cors       = false; // send permissive CORS headers for browser UIs

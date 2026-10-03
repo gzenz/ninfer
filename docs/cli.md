@@ -92,6 +92,12 @@ GPU residency is frozen when the Engine starts:
 - Vision is disabled by default, omitting its weights and Vision-specific unified-workspace extent;
 - `--vision` loads the weights, expands the one Program workspace for Vision encode/handoff, and
   enables image/video input.
+- `--vision-cpu` enables media input plus the Vision offload: the Vision encoder weights are
+  dequantized into host DRAM at load, the ViT runs on the CPU during prefill, and only the final
+  embedding handoff is loaded onto the device. The device Program workspace is sized for the
+  handoff region only, and the device encoder scratch is not reserved. This saves the device
+  memory for the ~1.7 GB Qwen3.x Vision encoder but makes prefill slower when the prompt carries
+  media
 - the one-request CLI uses root-only context mode, so it does not reserve an extra Device
   checkpoint StateImage or capture a continuation that no later request could consume.
 
@@ -215,7 +221,10 @@ The table lists executable defaults. The examples above select FP8 KV and MTP3.
 | `--spec mtp\|dflash\|dflash2` | speculative backend | off |
 | `--draft-tokens N` | MTP `1..5`; DFlash/DFlash2 `1..15` | unset |
 | `--lm-head-draft` | optimized proposal head | off |
+| `--rope-scaling-factor F` | YaRN position-scaling factor `1.0..32.0`; `1.0` disables scaling, larger values extend the effective context limit by the factor | `1.0` |
+| `--rope-scaling-original-context N` | YaRN ramp threshold; positions at or below it are unscaled | `262144` |
 | `--vision` | enable image/video input and load Vision GPU allocations | off |
+| `--vision-cpu` | enable image/video input with the Vision encoder on the CPU (weights stay in host DRAM, saving device memory). Implies `--vision` | off |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--chat-template FILE` | use a local Jinja template | artifact template |
 | `--no-thinking` | disable thinking | template default |
@@ -269,8 +278,17 @@ it does not override individual CUDA event creation flags.
 
 ## Context and memory
 
-The official artifacts have a native context limit of 262,144 tokens. The practical allocation
-on one RTX 5090 depends on the selected artifact, media workload, output budget, and KV-cache type.
+The official artifacts have a native context limit of 262,144 tokens. `--rope-scaling-factor`
+applies YaRN linear position scaling to extend it: positions at or below
+`--rope-scaling-original-context` are unchanged, larger positions map to
+`original_context + (position - original_context) / factor`, and `--max-context` may then exceed the
+native limit up to `min(native * factor, 8388608)`. The factor must be at least `1.0` and is
+supported with `--spec mtp`, `--spec dflash2` (the sliding-window draft keeps its context in a
+fixed window addressed by un-scaled logical positions), and ordinary decode; it is not supported
+with the full-context `--spec dflash` backend. KV capacity still bounds the physical pool, so
+long contexts need enough device memory (often with a quantized `--kv-dtype`). The practical
+allocation on one RTX 5090 depends on the selected artifact, media workload, output budget, and
+KV-cache type.
 The artifact describes its model configuration and weight representations;
 `--kv-dtype` independently selects runtime KV storage. The prepared prompt must fit
 `--max-context`; generation stops at the remaining context capacity when necessary.

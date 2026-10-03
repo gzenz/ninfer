@@ -1,10 +1,11 @@
 #include "models/qwen3_5/program/planning/pressure_planner.h"
+#include "models/qwen3_5/program/planning/pressure_value_ranking.h"
+#include "models/qwen3_5/program/planning/pressure_target_arena.h"
 
 namespace ninfer::models::qwen3_5::detail {
 
 namespace planning_detail {
 
-inline constexpr std::size_t kOptionalTargetCapacity = 4096;
 
 void hash_mix(std::uint64_t& hash, std::uint64_t value) noexcept {
     hash ^= value;
@@ -42,6 +43,15 @@ PressurePlanningSessionImpl::PressurePlanningSessionImpl(
         throw std::logic_error("pressure planning session cannot start in the current state");
     }
 
+    // BEFORE any candidate is priced: if the host state pool is full, grow it by one slot so the demote
+    // options the search is about to assess can be affordable at all. See ensure_host_state_headroom.
+    program->ensure_host_state_headroom();
+    // AND the KV axis, which had no equivalent until now. The state pre-grow is measured firing and still
+    // could not convert the one eviction that workload produced: that one was bound by host KV BYTES
+    // (`host_kv` at 99.3%) while a state slot was free -- the inverse of the shape the state pre-grow
+    // addresses, and the exact case this adds.
+    program->ensure_host_kv_headroom();
+
     candidates.assign(physical_candidates.begin(), physical_candidates.end());
     candidate_ids.assign(admission_candidate_ids.begin(), admission_candidate_ids.end());
     for (std::size_t index = 0; index < candidate_ids.size(); ++index) {
@@ -78,7 +88,7 @@ PressurePlanningSessionImpl::PressurePlanningSessionImpl(
 
     candidate_options.resize(candidates.size());
     const std::size_t maximum_targets =
-        candidates.size() + 1U + planning_detail::kOptionalTargetCapacity;
+        planning_detail::target_arena_maximum(candidates.size());
     const std::size_t maximum_successors_per_owner =
         11U + owner.context_cache.max_long_anchors_per_continuation.value_or(0);
     if (!owners.empty() &&
@@ -200,7 +210,9 @@ PressurePlanningSessionImpl::PressurePlanningSessionImpl(
             }
         }
         choice_scratch.assign(options.victims.size(), 0);
-        if (intern_target(static_cast<std::uint32_t>(index), choice_scratch) != index) {
+        const std::optional<std::uint32_t> identity_ordinal =
+            intern_target(static_cast<std::uint32_t>(index), choice_scratch, false, /*terminal=*/true);
+        if (!identity_ordinal || *identity_ordinal != index) {
             throw std::logic_error("pressure identity target ordinal changed");
         }
     }
@@ -305,9 +317,22 @@ PressurePlanningSessionImpl::victim_choices(const TargetNode& target) const {
         .subspan(target.victim_choice_offset, target.victim_choice_count);
 }
 
-std::uint32_t PressurePlanningSessionImpl::intern_target(std::uint32_t selected_candidate,
-                                                         std::span<const std::uint16_t> choices,
-                                                         bool root_maximal) {
+// THE ARENA BOUND IS A SEARCH BOUND, NOT A REQUEST FAILURE.
+//
+// `construction_target` always treated it that way -- it returns `nullopt`, the planner records
+// `ExpansionCapacity`, and the request goes on with a shorter search. The other callers did not:
+// reaching the bound threw `std::length_error`, which the journal reports as
+// `WORKER RECOVER: pressure target arena is full [target-count]` and the client sees as an HTTP 500
+// on top of a worker recovery. So one condition had two treatments and the fatal one won.
+//
+// The rule now: a SEARCH caller (no `terminal`) gets `nullopt` when the arena cannot take one more
+// node, and the room the calls that cannot degrade need is reserved out of its reach. `terminal`
+// marks those calls -- and is expected to be unreachable, because it is what the reserve protects;
+// if it does fire, `terminal_target_reserve` is wrong and the message says so rather than reading as
+// an ordinary full arena.
+std::optional<std::uint32_t> PressurePlanningSessionImpl::intern_target(
+    std::uint32_t selected_candidate, std::span<const std::uint16_t> choices, bool root_maximal,
+    bool terminal) {
     if (selected_candidate >= candidate_options.size() ||
         choices.size() != candidate_options[selected_candidate].victims.size()) {
         throw std::logic_error("pressure target does not match its candidate victim domain");
@@ -316,12 +341,110 @@ std::uint32_t PressurePlanningSessionImpl::intern_target(std::uint32_t selected_
         existing->root_maximal = existing->root_maximal || root_maximal;
         return static_cast<std::uint32_t>(existing - targets.data());
     }
-    const std::size_t maximum = candidates.size() + 1U + planning_detail::kOptionalTargetCapacity;
-    if (targets.size() >= maximum || targets.size() == targets.capacity() ||
-        choices.size() > target_choice_arena.capacity() - target_choice_arena.size() ||
-        target_choice_arena.size() > std::numeric_limits<std::uint32_t>::max() ||
-        choices.size() > std::numeric_limits<std::uint32_t>::max()) {
-        throw std::length_error("pressure target arena is full");
+    // AN EXISTING TARGET IS ALWAYS RETURNED, which is why the bound is only consulted for a NEW
+    // node: re-interning a target the arena already holds costs nothing and must never truncate.
+    const std::size_t maximum = planning_detail::target_arena_maximum(candidates.size());
+    // WHICH ARENA, WITH ITS NUMBERS. This throw reaches the journal as `WORKER RECOVER: <what()>`, and the
+    // bare message made four different conditions indistinguishable -- so an occurrence said only that "the
+    // pressure target arena is full", while the useful facts are WHICH bound was hit and how close the others
+    // were. Prod hit this once on 2026-09-27, 12 s after eight restorable victims were evicted, and the
+    // hypothesis that the search was truncated before it could price a demote could not be tested against a
+    // message that carries no counters. The three candidate bounds:
+    //   * `targets` -- the target nodes, reserved to candidates + 1 + kSearchTargetBudget (4096);
+    //   * `target_choice_arena` -- the victim choices, reserved to
+    //     `(maximum_targets + maximum_scratch_targets) * owners` (see the reserve at the session's
+    //     construction); the bound is a REMAINING-capacity test, i.e. an incoming choice set that does not
+    //     fit, or one that would eat the terminal calls' reserved room;
+    //   * the two uint32 casts, which are overflow guards and should never fire.
+    // THE SEARCH IS HELD BELOW THE RESERVE; THE TERMINAL CALLS ARE NOT. Two bounds are checked
+    // because the two arenas are separate: the target nodes, and the victim choices they point at
+    // (a new node stores one choice per owner, so its room is reserved in the same unit).
+    const planning_detail::TargetArenaState arena{
+        .targets          = targets.size(),
+        .target_capacity  = targets.capacity(),
+        .choices_used     = target_choice_arena.size(),
+        .choices_capacity = target_choice_arena.capacity(),
+        .incoming_choices = choices.size(),
+        .candidates       = candidates.size(),
+        .owners           = owners.size(),
+        .terminal         = terminal,
+    };
+    const planning_detail::TargetArenaVerdict verdict = planning_detail::target_arena_verdict(arena);
+    if (verdict != planning_detail::TargetArenaVerdict::Room) {
+        const char* which = verdict == planning_detail::TargetArenaVerdict::TargetBound ? "target-count"
+                            : verdict == planning_detail::TargetArenaVerdict::ChoiceBound
+                                ? "choice-arena"
+                                : "uint32-overflow";
+        char detail[320];
+        std::snprintf(detail, sizeof(detail),
+                      "pressure target arena is full [%s]: targets=%zu/%zu (limit=%zu) "
+                      "choice_arena=%zu/%zu incoming_choices=%zu owners=%zu candidates=%zu "
+                      "terminal=%d reserve=%zu",
+                      which, arena.targets, arena.target_capacity,
+                      planning_detail::target_arena_limit(arena.candidates, arena.terminal),
+                      arena.choices_used, arena.choices_capacity, arena.incoming_choices,
+                      arena.owners, arena.candidates, terminal ? 1 : 0,
+                      planning_detail::terminal_target_reserve(candidates.size()));
+        // A SEARCH CALLER STOPS; A TERMINAL ONE CANNOT. The latter is unreachable by construction --
+        // `terminal_target_reserve` exists so the calls that must hand back a handle always find room
+        // -- and firing there means the reserve is wrong, which the message has to say rather than
+        // reading as "the arena was full again". `OrdinalOverflow` is an accounting break and is
+        // fatal for both.
+        if (verdict == planning_detail::TargetArenaVerdict::OrdinalOverflow) {
+            throw std::length_error(detail);
+        }
+        if (!terminal) {
+            // THE STOP IS PRINTED, because a counter alone cannot be told from a counter that is not
+            // running: `pressure_target_arena_truncations` reaching `/stats` on a 5 s publication means
+            // a reader watching the journal would see NOTHING while the search was being cut short --
+            // and "the planner stopped searching" is exactly the event that explains a thin plan.
+            // Rate-limited like the near-full print beside it (first 8, then every 512th), so a
+            // persistently saturated planner stays visible without flooding.
+            static std::uint64_t truncation_seen = 0;
+            ++truncation_seen;
+            if (truncation_seen <= 8U || truncation_seen % 512U == 0U) {
+                std::fprintf(stderr,
+                             "[engine] pressure search truncated [%s]: %s (truncations=%llu)\n",
+                             which, detail, static_cast<unsigned long long>(truncation_seen));
+                std::fflush(stderr);
+            }
+            return std::nullopt;
+        }
+        throw std::length_error(detail);
+    }
+    // NEAR-FULL, BEFORE IT THROWS. The throw above is rare; whether it is *APPROACHED* on every pressured
+    // request is the question that decides whether the evictions are search truncation. Reported at 7/8 of
+    // either bound and rate-limited like the eviction print (first 8, then every 512th), so a saturated
+    // planner is visible on the requests that SURVIVE as well as the one that dies -- a print that fires only
+    // on the throw would leave "not saturated" and "never near" indistinguishable.
+    //
+    // WHAT IT IS NOT: a high-water mark, and it must not be read as one. It is rate-limited to the first 8
+    // events and then every 512th, so a long run prints 8 lines and goes silent -- the maximum in a run is
+    // the maximum OF THE FIRST EIGHT EVENTS, not of the run. It also fires spuriously when an arena is
+    // EMPTY: with no choices at all, `0 * 8 >= 0 * 7` is true, which produced five of the eight lines in
+    // one measured log. Both are why a per-planning-run maximum belongs in the request record.
+    {
+        static std::uint64_t near_full_seen = 0;
+        const std::size_t choice_remaining = target_choice_arena.capacity() - target_choice_arena.size();
+        const bool near_targets = targets.size() * 8U >= maximum * 7U;
+        // AN EMPTY ARENA IS NOT NEAR-FULL. `0 >= 0` is what made this print meaningless on owner-less
+        // requests; the bound is only informative when there is a bound to approach.
+        const bool near_choices =
+            choices.size() != 0 && choice_remaining != 0 &&
+            choices.size() * 8U >= choice_remaining * 7U;
+        if (near_targets || near_choices) {
+            ++near_full_seen;
+            if (near_full_seen <= 8U || near_full_seen % 512U == 0U) {
+                std::fprintf(stderr,
+                             "[engine] pressure arena near-full: targets=%zu/%zu (maximum=%zu) "
+                             "choice_arena=%zu/%zu incoming_choices=%zu near=%s seen=%llu\n",
+                             targets.size(), targets.capacity(), maximum, target_choice_arena.size(),
+                             target_choice_arena.capacity(), choices.size(),
+                             near_targets ? (near_choices ? "both" : "targets") : "choices",
+                             static_cast<unsigned long long>(near_full_seen));
+                std::fflush(stderr);
+            }
+        }
     }
     const std::uint32_t offset = static_cast<std::uint32_t>(target_choice_arena.size());
     target_choice_arena.insert(target_choice_arena.end(), choices.begin(), choices.end());
@@ -413,6 +536,62 @@ void PressurePlanningSessionImpl::populate_options(std::uint32_t selected_candid
         }
         victim.eviction_choice = static_cast<std::uint16_t>(decisions.size());
     }
+
+    // Value-aware demote-vs-evict priority: rank the private victims by re-prefill cost so the
+    // planner's cost objective prefers demoting the highest-value (most expensive to rebuild)
+    // victims to host and evict-and-dropping the cheapest. The weight is a bounded rank
+    // (0..N-1) rather than the raw cost, keeping it comparable to degradation_units so it
+    // steers the search without overwhelming feasibility. Shared victims stay weight 0.
+    //
+    // The ranking itself is the dependency-free value_weights_for_victims (unit-tested in
+    // isolation); here we only gather each victim's shared flag and re-prefill cost.
+    {
+        using PlanningContractAccess = qwen3_5::detail::RuntimeContractAccess;
+        std::vector<std::uint8_t> is_shared;
+        std::vector<std::uint64_t> rebuild_cost;
+        is_shared.reserve(options.victims.size());
+        rebuild_cost.reserve(options.victims.size());
+        for (std::size_t victim_index = 0; victim_index < options.victims.size(); ++victim_index) {
+            const Owner& owner = owners[options.victims[victim_index].owner_index];
+            is_shared.push_back(owner.shared ? 1U : 0U);
+            std::uint64_t cost = 0;
+            if (!owner.shared) {
+                const auto& sequence =
+                    program->continuation_states[PlanningContractAccess::index(*owner.private_handle)];
+                const qwen3_5::ContinuationSummary summary = program->continuation_summary(sequence);
+                // Price the BEST restorable checkpoint this victim holds, not the endpoint alone.
+                // Pricing only `summary.endpoint` gave rebuild cost 0 to any victim whose only
+                // restorable checkpoint is a rewrite. `value_weights_for_victims` sorts ascending and
+                // assigns weight = rank, so cost 0 means the LOWEST weight -- and the eviction charge
+                // is `degradation_units + value_weight` (below), so dropping such a victim was
+                // effectively free. The search then evicted exactly the victims this ranking exists to
+                // protect. Measured on prod 2026-09-26: seven of the eight victims evicted with host
+                // state slots AND host KV free read `endpoint=0 rewrite=1` with frontiers of
+                // 52k-77k tokens. All three checkpoint inventories are the same type
+                // (`CheckpointSummary`), so the rewrite's rebuild work was available and unread.
+                const qwen3_5::CheckpointSummary* best = nullptr;
+                const auto consider = [&best](const qwen3_5::CheckpointSummary& candidate) {
+                    if (best == nullptr ||
+                        candidate.rebuild_work.tokens > best->rebuild_work.tokens) {
+                        best = &candidate;
+                    }
+                };
+                if (summary.endpoint) { consider(*summary.endpoint); }
+                if (summary.rewrite) { consider(*summary.rewrite); }
+                for (const auto& anchor : summary.long_anchors) { consider(anchor); }
+                if (best != nullptr) {
+                    planning_saturating_add(cost, best->rebuild_work.tokens);
+                    planning_saturating_add(cost, best->rebuild_work.attention_pairs);
+                }
+            }
+            rebuild_cost.push_back(cost);
+        }
+        const std::vector<std::uint32_t> weights =
+            detail::value_weights_for_victims(is_shared, rebuild_cost);
+        for (std::size_t victim_index = 0; victim_index < options.victims.size(); ++victim_index) {
+            options.victims[victim_index].value_weight = weights[victim_index];
+        }
+    }
     options.populated = true;
 }
 
@@ -444,6 +623,18 @@ std::vector<PressureDecision> PressurePlanningSessionImpl::pressure_successors(
     }
     const PressureDecision& eviction =
         victim_options.decisions[victim_options.eviction_choice - 1U];
+    // **THE HALF OF THE PRESERVATION PROBE THAT EXONERATES, counted where the successors already exist.**
+    // `inspect_*_successors` returns the owner's NON-EVICTING options; the eviction is appended AFTER, so an
+    // EMPTY `successors` here means this owner had no non-evicting option at all -- the eviction was the only
+    // move and destroying its checkpoint was UNAVOIDABLE. Measured 2026-10-02 (a fresh analysis pass): the
+    // sealed evicting plans all had their search TRUNCATED (935 of 1044 on `time_budget`, 82 on
+    // `target_budget`, 0 on the "further gain did not justify more work" reasons), which points at the search
+    // -- but the planners' GENERATORS ignore preservation while only ADOPTION ranks it
+    // (`FoldedCost::key`), so the alternative is that no preserving option existed to adopt. This counter
+    // separates those two, and it is the denominator-free half: if owners routinely HAVE a non-evicting
+    // option, the search is the defect; if they routinely do not, the evictions are correct and the whole
+    // line of work has been chasing a planner that is behaving properly.
+    program->note_pressure_successor_outcome(successors.empty());
     if (std::find(successors.begin(), successors.end(), eviction) == successors.end()) {
         successors.push_back(eviction);
     }
@@ -461,15 +652,22 @@ PressurePlanningSessionImpl::root_maximal_target(runtime::PlanningCandidateId ro
         choice_scratch[index] =
             candidate_options[selected_candidate].victims[index].eviction_choice;
     }
-    const std::uint32_t target_index = intern_target(selected_candidate, choice_scratch, true);
+    const std::optional<std::uint32_t> target_index =
+        intern_target(selected_candidate, choice_scratch, true, /*terminal=*/true);
+    if (!target_index) {
+        // Unreachable: this is one of the two calls `terminal_target_reserve` exists for. Distinct
+        // wording on purpose -- a reader must be able to tell "the reserve is wrong" from "the
+        // search filled the arena", which the old single message conflated.
+        throw std::logic_error("the terminal target reserve was not enough for a root-maximal target");
+    }
     qwen3_5::PressureTargetHandle handle;
     handle.session_    = this;
     handle.generation_ = generation;
-    handle.index_      = target_index;
+    handle.index_      = *target_index;
     return handle;
 }
 
-qwen3_5::PressureTargetHandle
+std::optional<qwen3_5::PressureTargetHandle>
 PressurePlanningSessionImpl::maximal_target(runtime::PlanningCandidateId id) {
     if (scratch_live) { throw std::logic_error("pressure expansion scratch is live"); }
     const auto selected = candidate_index(id);
@@ -478,11 +676,12 @@ PressurePlanningSessionImpl::maximal_target(runtime::PlanningCandidateId id) {
     for (const auto& victim : candidate_options[selected].victims) {
         choice_scratch.push_back(victim.eviction_choice);
     }
-    const auto index = intern_target(selected, choice_scratch);
+    const std::optional<std::uint32_t> index = intern_target(selected, choice_scratch);
+    if (!index) { return std::nullopt; }  // the arena is full: a search stop, not a request failure
     qwen3_5::PressureTargetHandle result;
     result.session_    = this;
     result.generation_ = generation;
-    result.index_      = index;
+    result.index_      = *index;
     return result;
 }
 
@@ -637,15 +836,16 @@ void PressurePlanningSessionImpl::choose_construction(qwen3_5::PressureConstruct
 std::optional<qwen3_5::PressureTargetHandle> PressurePlanningSessionImpl::construction_target(
     const qwen3_5::PressureConstructionCursor& cursor) {
     auto& slot = construction_slot(cursor);
-    if (!find_target(slot.candidate_index, slot.choices) &&
-        targets.size() >= candidates.size() + 1U + planning_detail::kOptionalTargetCapacity) {
-        return std::nullopt;
-    }
-    const auto index = intern_target(slot.candidate_index, slot.choices);
+    // THE PRE-CHECK IS GONE: `intern_target` applies the same bound itself and returns `nullopt` on
+    // it, so keeping a second copy here is how the two would drift -- and the copy that was here
+    // tested `candidates + 1 + kSearchTargetBudget`, i.e. the UNRESERVED maximum, which would
+    // have let the search spend the terminal calls' room.
+    const std::optional<std::uint32_t> index = intern_target(slot.candidate_index, slot.choices);
+    if (!index) { return std::nullopt; }
     qwen3_5::PressureTargetHandle result;
     result.session_    = this;
     result.generation_ = generation;
-    result.index_      = index;
+    result.index_      = *index;
     return result;
 }
 
@@ -719,7 +919,14 @@ runtime::PressureTargetGuidance PressurePlanningSessionImpl::guidance_choices(
         approximate_pressure.removed =
             planning_resource_sum(approximate_pressure.removed, decision.effect.removed);
         estimated_pressure.append(decision.transfer_requirements);
-        const std::uint32_t units = degradation_units(decision);
+        std::uint32_t units = degradation_units(decision);
+        // Evicting-and-dropping a private victim is not just one degradation unit: it loses a
+        // restorable checkpoint, so charge its value rank. This makes the search prefer to
+        // demote the highest-value victims to host and evict the cheapest when host is short.
+        if (decision.evicts_continuation) {
+            units = planning_saturating_u32(static_cast<std::uint64_t>(units) +
+                                            victim_options.value_weight);
+        }
         total_degradation =
             planning_saturating_u32(static_cast<std::uint64_t>(total_degradation) + units);
         total_dropped = planning_saturating_u32(static_cast<std::uint64_t>(total_dropped) +
@@ -1232,9 +1439,17 @@ PressurePlanningSessionImpl::commit_expansion(qwen3_5::PreparedPressureExpansion
         prepared.parent_index_ >= targets.size()) {
         throw std::logic_error("prepared pressure expansion is stale");
     }
-    const std::size_t maximum = candidates.size() + 1U + planning_detail::kOptionalTargetCapacity;
-    if (prepared_new_count > maximum - std::min(maximum, targets.size())) {
-        throw std::length_error("prepared pressure expansion exceeds the target arena");
+    // THE SEARCH LIMIT, NOT THE WHOLE ARENA. This check used `target_arena_maximum`, which INCLUDES the
+    // terminal reserve -- so an expansion commit could take the room the post-search calls depend on. That
+    // was invisible only because `expand_target`'s own `kTargetBudget` guard fires first, and
+    // `kTargetBudget` equals `kSearchTargetBudget`. With the limit corrected here, the reserve is
+    // protected by THIS bound rather than by that coincidence: an expansion cannot reach past the search
+    // limit whatever the budget is set to. The constants are additionally tied by a `static_assert` in
+    // `tests/test_materialization_budget.cpp` (a test TU, because no production TU sees both).
+    const std::size_t search_limit =
+        planning_detail::target_arena_limit(candidates.size(), /*terminal=*/false);
+    if (prepared_new_count > search_limit - std::min(search_limit, targets.size())) {
+        throw std::length_error("prepared pressure expansion exceeds the search target limit");
     }
 
     committed_children.clear();

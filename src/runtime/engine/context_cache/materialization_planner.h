@@ -9,6 +9,9 @@
 #include <array>
 #include <chrono>
 #include <cstdint>
+#include <thread>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <optional>
 #include <span>
@@ -37,6 +40,15 @@ struct MaterializationOwnerPolicy {
     std::uint32_t private_retention_weight = 0;
     bool explicit_shared_credit            = false;
 };
+
+// THE PRESSURE SEARCH'S TARGET BUDGET, at namespace scope so the ARENA'S sizing can be compile-checked
+// against it. The search stops here; the model's target arena is sized to hold this PLUS the room the
+// post-search calls need, so the reserve is only unreachable while this <= the arena's search budget.
+// The coupling spans the runtime/model boundary, which is why the guard lives in a test TU: this header
+// cannot include a model header without inverting the layering that keeps `ResourceManager`
+// model-agnostic. Namespace scope rather than a class member because the class is a template, and a
+// static member cannot be named without its template arguments.
+inline constexpr std::uint32_t kPlannerTargetBudget = 4096;
 
 template <class ModelContract, class SearchClock = std::chrono::steady_clock>
 class MaterializationPlanner {
@@ -100,6 +112,15 @@ public:
         if (candidates.empty() || root_candidate_index >= candidates.size()) {
             throw std::invalid_argument("materialization planning problem has no root candidate");
         }
+        // #6's counter is PER RUN, and the first version of it was not: it is a member of a planner that
+        // outlives a request, so it accumulated -- which is how two different requests reported the same
+        // 607. Reset here, at the only point a planning run begins, so the number means "in THIS run".
+        feasible_preserving_alternatives_ = 0;
+        preserving_alternatives_assessed_ = 0;
+        goal_probes_by_site_.fill(0);
+        assessed_targets_without_goal_    = 0;
+        assessed_targets_without_goal_infeasible_  = 0;
+        assessed_targets_without_goal_unadoptable_ = 0;
         for (std::size_t index = 0; index < candidates.size(); ++index) {
             if (candidates[index].candidate == nullptr ||
                 std::find_if(candidates.begin(), candidates.begin() + index,
@@ -109,12 +130,28 @@ public:
                 throw std::invalid_argument("materialization candidate IDs are invalid");
             }
         }
+        // Gate instrumentation (NINFER_MAT_DEBUG=1): dump the value-gate inputs on every
+        // materialization so a failed re-touch shows exactly which candidate loses to which
+        // incumbent, and by how much. Off by default; writes to stderr (serve log).
+        const bool dbg = std::getenv("NINFER_MAT_DEBUG") != nullptr;
+        const auto dbg_economic = [](std::uint64_t gain) noexcept {
+            return gain == std::numeric_limits<std::uint64_t>::max() ? 0ULL : gain / 20U;
+        };
+        const auto dbg_flush = [&] { if (dbg) { std::fflush(stderr); } };
+
         queue_.clear();
         pending_.clear();
         const std::size_t frontier_capacity = candidates.size() + 1U + kTargetBudget;
         queue_.reserve(frontier_capacity);
         pending_.reserve(frontier_capacity);
         identity_costs_.clear();
+        // PER-CANDIDATE ELECTION COSTS. Filled at THREE sites, not one: the identity loop above (the fold
+        // the SELECT-FAST path elects on), the root-maximal seed, and `assess_target` -- the last of which
+        // KEEPS THE BEST GOAL-BEARING COST rather than the last one assessed. Reported so a loss can be
+        // attributed to the key element that decided it: `reused_prompt_tokens` is element 10 of the
+        // ordering, so a higher-reuse candidate losing is the ORDINARY case whenever any of the ten terms
+        // above it differ.
+        election_best_.assign(candidates.size(), std::nullopt);
         target_ledger_.reset(candidates.size() + 1U + kTargetBudget);
 
         // The mandatory root-maximal fallback does not count as an ordinary feasible seed.
@@ -130,8 +167,20 @@ public:
             planning_saturating_add(projection_work, identity.projection_work);
             const FoldedCost cost = fold_identity(input, identity, machine_cost);
             identity_costs_.push_back(cost);
+            if (dbg) {
+                std::fprintf(stderr, "[mat-debug] IDENT cand=%zu phys=%d now=%lu total=%lu "
+                                     "prefill_tok=%lu reused_tok=%lu bytes=%lu\n",
+                             index, static_cast<int>(identity.physical_status),
+                             static_cast<unsigned long>(cost.now_ns),
+                             static_cast<unsigned long>(cost.total_ns),
+                             static_cast<unsigned long>(cost.remaining_text_prefill),
+                             static_cast<unsigned long>(cost.reused_prompt_tokens),
+                             static_cast<unsigned long>(cost.transferred_bytes));
+                dbg_flush();
+            }
             std::optional<LogicalGoal> goal;
             if (identity.physical_status == MaterializationPhysicalStatus::Feasible) {
+++goal_probes_by_site_[0];
                 goal = logical_goal(input.id, identity.source_mode,
                                     std::span<const PressureOwnerOutcome>{});
             }
@@ -144,6 +193,15 @@ public:
                 };
             }
             candidate_seeded[index] = goal.has_value();
+            // THE IDENTITY FOLD IS THE ONLY COST THIS CANDIDATE HAS UNTIL IT IS ASSESSED, and the
+            // SELECT-FAST path below elects a winner from `identity_best` without ever calling
+            // `assess_target` -- `no_pressure` returns that way. Recording it here is what makes that path
+            // report WHY its winner won; without it a `no_pressure` request emitted every row as
+            // `eligible=false, decided_by=255`, i.e. nothing, which was measured on the first smoke request
+            // after the deploy. `assess_target` replaces it with a real assessment when one happens.
+            if (goal && index < election_best_.size()) {
+                election_best_[index] = cost;
+            }
             const bool needs_pressure =
                 !goal.has_value() &&
                 (identity.physical_status == MaterializationPhysicalStatus::Feasible ||
@@ -165,7 +223,7 @@ public:
                             [](const IdentityRoot& root) { return root.expandable; });
             const bool no_allowance =
                 allowance.remaining(planning_now_ns<Clock>()) == 0 ||
-                identity_best->cost.total_ns / 20U / std::max(1U, allowance.affected_requests) == 0;
+                identity_best->cost.total_ns / 20U == 0;
             if (!needs_optional_search || no_allowance) {
                 const CandidateInput& selected = candidates[identity_best->candidate_index];
                 const auto price_split         = [&](std::span<const std::uint32_t> frontiers) {
@@ -183,6 +241,23 @@ public:
                     *selected.candidate, prompt,
                     FinalScheduleIntent{.shared_capture_frontiers = shared_frontiers});
                 if (!sealed) { return std::nullopt; }
+                if (dbg) {
+                    std::fprintf(stderr,
+                                 "[mat-debug] SELECT-FAST cand=%zu now=%lu fut=%lu total=%lu "
+                                 "prefill_tok=%lu reused_tok=%lu stop=%s\n",
+                                 static_cast<std::size_t>(identity_best->candidate_index),
+                                 static_cast<unsigned long>(identity_best->cost.now_ns),
+                                 static_cast<unsigned long>(identity_best->cost.future_loss_ns),
+                                 static_cast<unsigned long>(identity_best->cost.total_ns),
+                                 static_cast<unsigned long>(identity_best->cost.remaining_text_prefill),
+                                 static_cast<unsigned long>(identity_best->cost.reused_prompt_tokens),
+                                 needs_optional_search
+                                     ? materialization_stop_reason_name(
+                                           MaterializationStopReason::TimeBudget)
+                                     : materialization_stop_reason_name(
+                                           MaterializationStopReason::NoPressure));
+                    dbg_flush();
+                }
                 MaterializationDiagnostics diagnostics = complete_diagnostics(
                     identity_best->cost, static_cast<std::uint32_t>(candidates.size()),
                     projection_work, planning_started,
@@ -201,6 +276,8 @@ public:
                 result.publication_slot = identity_best->publication_slot;
                 result.source_mode      = identity_best->source_mode;
                 result.diagnostics      = diagnostics;
+                finalize_selection(identity_best->candidate_index, identity_best->cost,
+                                   identity_best->cost, result.diagnostics);
                 return result;
             }
         }
@@ -249,6 +326,7 @@ public:
             planning_saturating_add(projection_work, assessment.projection_work);
             std::optional<LogicalGoal> goal;
             if (assessment.physical_status == MaterializationPhysicalStatus::Feasible) {
+++goal_probes_by_site_[1];
                 goal = logical_goal(assessment.candidate, assessment.source_mode,
                                     assessment.owner_outcomes);
             }
@@ -259,13 +337,65 @@ public:
             incumbent = make_incumbent(root_maximal, root_candidate_index, assessment,
                                        std::move(assessed), cost, *goal);
             mark_target(assessment.stable_target_ordinal, kTargetDiscovered | kTargetAssessed);
+            // RECORD THE SEED, or the root is compared and can lose without being countable as a loser.
+            // This target is marked assessed above, so `assess_target` never revisits it and no other site
+            // would fill the entry: a later winner would then report `decided_by == 255` -- documented as
+            // "NO ELIGIBLE LOSER EXISTED AT ALL" -- while an eligible loser (the root) sat right there. A
+            // review found the gap in the same pass that found the fallback attribution fault.
+            if (root_candidate_index < election_best_.size()) { election_best_[root_candidate_index] = cost; }
+            if (root_candidate_index < candidates.size()) {
+            }
         }
 
         if (!identity_best) { search_started = Clock::now(); }
         const auto search_origin_ns = static_cast<std::uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(search_started.time_since_epoch())
                 .count());
-        MaterializationSearchBudget search_budget(allowance, search_origin_ns,
+        // The optional search gets a fresh allowance (full limit, restarted at the search
+        // origin) so the mandatory setup -- the root-maximal eviction assessment -- does not
+        // consume the window and starve the search of the preserving alternative (a
+        // demote-to-host). The setup's own elapsed time is still charged against the enclosing
+        // `allowance` used elsewhere; only the search's internal budget is restarted.
+        PlanningAllowance search_allowance = allowance;
+        search_allowance.started_ns = search_origin_ns;
+        // This is a CUT-OFF, not a completeness bound. What the artifacts contain, with inference
+        // labelled and denominators stated:
+        //   - the gate's own FORECAST for a construction step (`GATE DENY phase=construction
+        //     completion=…`, the `completion` argument passed to `allow_work` -- an estimate, not a
+        //     measured duration). From ONE log (`/tmp/why.log`, n=8, all `complete=0`): 7.4-30.8 ms.
+        //     Across every surviving log the same line reads 0.024-30.8 ms (n=92, p50 4.7 ms), so
+        //     "several times the flat 5 ms window" holds for that log, not for the population;
+        //   - the collapse artifacts' stop reasons read `{'no_pressure': 1, 'time_budget': 15}` with
+        //     0% prefix reuse;
+        //   - in the 400 ms arm 14 of its 16 records report `search_elapsed` ~395 ms with
+        //     `budget_exhausted: true` (req 1 made no search; req 2 stopped `queue_exhausted` at
+        //     ~150 ms), i.e. the search is stopped by this bound, not finished;
+        //   - `first_improvement_ns` is carried by 15 of serve-292073's 16 records, spanning
+        //     8.534-163.925 ms; req 16's is 95.541 ms (an earlier version said "the record that
+        //     carries it", singular -- wrong by 14 records). The later acceptance arm spans
+        //     8.227-166.211 ms, and earlier runs 18.7-23.4 ms (serve-277147, serve-277417,
+        //     serve-278329 -- the range was written as "19-23 ms", which excludes 18.740).
+        // THE MEASURED A/B (2026-09-24, prod4 4x150k; arms by instance id -- neither recorded a binary). Counts per COMPLETED turn: records the 420 s cap cancelled in flight (`finish_reason=cancelled`, `prefill=0`) carry no reuse evidence and are excluded.
+        //   * 5 ms arm 1 (serve-293952): cut after 9 of 16 turns completed (rc=124), 3 cancelled in flight. Of the 9: 9/9 root with 0 hits, 8 with search_work>0 (granted 5e6, time_budget), 1 no_pressure (granted 0).
+        //   * 5 ms arm 2 (serve-307902, 3 rounds): cut after 9 of 12 completed, 3 cancelled. Of the 9: 8/9 root with 0 hits, 1 private_endpoint (152,227 hits), 7 with search_work>0.
+        //   * combined: 17 of 18 completed turns re-prefilled from root.
+        //   * 400 ms arm (serve-292073): completed 16/16; rounds 2-3 (records 5-12) 8/8 private_endpoint with hits 152,333-154,799; overall 12 of 16 private_endpoint (152,333-157,004), 4 root (round 1), 15 of 16 with search_work>0 (exception: record 1, no_pressure, granted 0).
+        // SCOPE: at 5 ms the old capped expression and the new one are numerically identical (both 5 ms) with `allow()` byte-identical, so this pair measures THE WINDOW'S VALUE; the cap's removal is what makes 400 ms reachable (arithmetic), not separately measured.
+        // STILL TUNED: 400 ms is the only value measured PASSING. 100 ms fails the gate (`/tmp/cmp-ms100.json`: root 12/16, 614,577 hits, queue_wait_s.max 153.03 s); a 32 ms arm failed too but its artifact is byte-identical to an 800 ms arm's and tagged only `build`, so it establishes nothing.
+        // NINFER_SEARCH_MS is an operator override, not a diagnostic: it sets this bound, is the
+        // supported way to A/B it, and is deliberately not behind the harmful-control guard (see
+        // src/core/diagnostics.h, which names this and the ingress probe as its two documented
+        // exceptions). A negative value is clamped rather than rejected (`strtoull` negation lands
+        // above the clamp, so it becomes the 2000 ms ceiling) -- read it as "no limit".
+        search_allowance.limit_ns = 400'000'000;
+        if (const char* override_ms = std::getenv("NINFER_SEARCH_MS")) {
+            const auto parsed = std::strtoull(override_ms, nullptr, 10);
+            // Clamped: an unbounded planning window would spend a request's whole deadline here.
+            if (parsed > 0) {
+                search_allowance.limit_ns = std::min<std::uint64_t>(parsed, 2'000ULL) * 1'000'000ULL;
+            }
+        }
+        MaterializationSearchBudget search_budget(search_allowance, search_origin_ns,
                                                   incumbent.cost.total_ns);
         const auto initial_cost_ns = incumbent.cost.total_ns;
         std::optional<std::uint64_t> first_improvement_ns;
@@ -278,6 +408,10 @@ public:
         std::uint32_t optional_targets        = 0;
         MaterializationStopReason stop_reason = MaterializationStopReason::QueueExhausted;
         bool budget_exhausted                 = false;
+        // THE TARGET ARENA WAS FULL. Its own flag, because `budget_exhausted` already means "the
+        // search ran out of ITS budget" -- the designed stop -- and a capacity ceiling read as that
+        // is a wall reported as a healthy bounded search. See `intern_target`.
+        bool target_arena_truncated           = false;
         auto search_phase                     = MaterializationSearchPhase::Setup;
         const auto allow_work = [&](std::uint64_t operation, std::uint64_t completion,
                                     std::uint64_t gain, bool complete,
@@ -287,10 +421,24 @@ public:
                 budget_exhausted = true;
                 return false;
             }
-            if (!search_budget.allow(planning_now_ns<Clock>(), operation, completion, gain,
-                                     complete, search_work, discovery_eligible)) {
+            const bool allowed = search_budget.allow(
+                planning_now_ns<Clock>(), operation, completion, gain, complete, search_work,
+                discovery_eligible);
+            if (!allowed) {
                 stop_reason      = search_budget.stop_reason();
                 budget_exhausted = stop_reason == MaterializationStopReason::TimeBudget;
+                if (dbg) {
+                    std::fprintf(stderr,
+                                 "[mat-debug] GATE DENY phase=%s op=%lu completion=%lu gain=%lu "
+                                 "econ=%lu complete=%d stop=%s\n",
+                                 materialization_search_phase_name(search_phase),
+                                 static_cast<unsigned long>(operation),
+                                 static_cast<unsigned long>(completion),
+                                 static_cast<unsigned long>(gain),
+                                 static_cast<unsigned long>(dbg_economic(gain)), complete ? 1 : 0,
+                                 materialization_stop_reason_name(stop_reason));
+                    dbg_flush();
+                }
                 return false;
             }
             stop_reason      = MaterializationStopReason::QueueExhausted;
@@ -355,20 +503,84 @@ public:
             }
             mark_target(assessment.stable_target_ordinal, kTargetDiscovered | kTargetAssessed);
             ++targets_evaluated;
+            // Counted HERE, once, for both paths: an assessment that is physically feasible and whose cost
+            // destroys no restorable checkpoint is a plan that would have preserved one, whether or not the
+            // search adopts it. Paired with the chosen plan's own count in the diagnostics, this is what
+            // separates "the ordering let one through" from "nothing feasible preserved".
             planning_saturating_add(projection_work, assessment.projection_work);
             const FoldedCost cost =
                 fold_assessment(candidates[expected_candidate], assessment, pressure.owner_policy,
                                 pressure.checkpoint_policy, machine_cost);
             std::optional<LogicalGoal> goal;
             if (assessment.physical_status == MaterializationPhysicalStatus::Feasible) {
+++goal_probes_by_site_[2];
                 goal = logical_goal(assessment.candidate, assessment.source_mode,
                                     assessment.owner_outcomes);
+            }
+            // RECORD WHAT THIS CANDIDATE WOULD BE RANKED ON. `eligible` is deliberately the SAME condition
+            // adoption uses (`goal.has_value()`, which requires physical feasibility) -- an ineligible
+            // candidate was never compared, so calling it a loser is the defect this row exists to remove.
+            // (Removed 2026-10-02: this said "the LAST assessment for a candidate wins", which is exactly
+            // what the block below replaced. A review found the superseded line still standing above it.)
+            // THE BEST GOAL-BEARING COST FOR THIS CANDIDATE, not the last one assessed. The search
+            // assesses many targets per candidate (the seed, every expansion child, the rescue), so
+            // last-wins would let a later, worse, never-adopted target of the WINNING candidate describe the
+            // winner -- and a review found exactly that. `less` is `key()`, so this keeps the best plan the
+            // candidate actually had. Only goal-bearing assessments count: a goal is what makes a plan
+            // electable, which is the same condition `becomes_incumbent` uses, so this vector IS the
+            // eligible set.
+            if (expected_candidate < election_best_.size()) {
+                std::optional<FoldedCost>& best = election_best_[expected_candidate];
+                if (goal && (!best || cost.less(*best))) { best = cost; }
+            }
+            // COUNTED HERE, beside the goal decision: a target with no goal is one that was ASSESSED and
+            // could not be adopted -- which is what separates "the relief step was generated and rejected"
+            // from "it was never reached in the arena".
+            if (cost.restorable_evictions == 0) { ++preserving_alternatives_assessed_; }
+            if (!goal) {
+                ++assessed_targets_without_goal_;
+                // SPLIT BY WHY, BECAUSE THE TWO MEAN OPPOSITE THINGS AND THE TOTAL CANNOT TELL THEM APART.
+                // `logical_goal` is called only for a PHYSICALLY FEASIBLE assessment (above), so a target
+                // that is not feasible reaches this line with no goal and NEVER HAD A PROBE TO FAIL. Counting
+                // both populations in one number is what let "~4000 of ~4080 targets had no goal" be read as
+                // "the goal gate refused them" when the goal-probe split measured 0 refusals against 417,152
+                // probes on live QA: the cell refused nothing, and the population was infeasibility.
+                if (assessment.physical_status != MaterializationPhysicalStatus::Feasible) {
+                    ++assessed_targets_without_goal_infeasible_;
+                } else {
+                    ++assessed_targets_without_goal_unadoptable_;
+                }
             }
             if (goal) {
                 mark_target(assessment.stable_target_ordinal, kTargetFeasible);
                 candidate_seeded[expected_candidate] = true;
+                // #6's "was a preserving plan ADOPTABLE" -- and the first version of this counter got it
+                // wrong in a way its own reading exposed: it incremented on physical feasibility alone, so
+                // it reported 607 available preserving alternatives against a chosen plan that evicted one
+                // (line=23809), a combination the key ordering makes impossible if those alternatives were
+                // real. They were not: a target with no `logical_goal` can never become an incumbent (the
+                // adoption below is `goal && cost.less(...)`), so counting it claims availability that the
+                // planner could not use. Gated on `goal` now, which is the same condition adoption uses.
+                if (cost.restorable_evictions == 0) { ++feasible_preserving_alternatives_; }
             }
-            if (goal && cost.less(incumbent.cost)) {
+            const bool becomes_incumbent = goal && cost.less(incumbent.cost);
+            if (dbg) {
+                std::fprintf(stderr,
+                             "[mat-debug] ASSESS cand=%zu phys=%d now=%lu fut=%lu total=%lu "
+                             "prefill_tok=%lu reused_tok=%lu bytes=%lu incumbent_now=%lu "
+                             "->inc=%d\n",
+                             expected_candidate, static_cast<int>(assessment.physical_status),
+                             static_cast<unsigned long>(cost.now_ns),
+                             static_cast<unsigned long>(cost.future_loss_ns),
+                             static_cast<unsigned long>(cost.total_ns),
+                             static_cast<unsigned long>(cost.remaining_text_prefill),
+                             static_cast<unsigned long>(cost.reused_prompt_tokens),
+                             static_cast<unsigned long>(cost.transferred_bytes),
+                             static_cast<unsigned long>(incumbent.cost.now_ns),
+                             becomes_incumbent ? 1 : 0);
+                dbg_flush();
+            }
+            if (becomes_incumbent) {
                 if (cost.total_ns < initial_cost_ns && !first_improvement_ns) {
                     first_improvement_ns = elapsed_ns(search_started, Clock::now());
                 }
@@ -411,6 +623,7 @@ public:
                 GuidanceCost cost =
                     fold_guidance(candidates[candidate_index], guidance, pressure.owner_policy,
                                   pressure.checkpoint_policy, machine_cost);
+++goal_probes_by_site_[3];
                 cost.logical_ready = logical_goal(candidates[candidate_index].id,
                                                   guidance.source_mode, guidance.owner_outcomes)
                                          .has_value();
@@ -450,9 +663,10 @@ public:
         const auto rank_guidance = [&](std::uint32_t index, const PressureTargetGuidance& guide) {
             auto cost = fold_guidance(candidates[index], guide, pressure.owner_policy,
                                       pressure.checkpoint_policy, machine_cost);
-            cost.logical_ready =
-                logical_goal(candidates[index].id, guide.source_mode, guide.owner_outcomes)
-                    .has_value();
+            ++goal_probes_by_site_[4];
+            cost.logical_ready = logical_goal(candidates[index].id, guide.source_mode,
+                                              guide.owner_outcomes)
+                                     .has_value();
             if (!cost.logical_ready) {
                 ++cost.unsatisfied_constraints;
                 cost.normalized_residual_q20 += 1ULL << 20U;
@@ -500,14 +714,29 @@ public:
                         search_phase = MaterializationSearchPhase::Assessment;
                         if (allow_work(assessment_step_ns, assessment_step_ns, gain, false)) {
                             const auto rescue = session.maximal_target(candidates[candidate].id);
-                            const auto guide  = session.guidance(rescue);
+                            if (!rescue) {
+                                // THE TARGET ARENA IS FULL. This is a SEARCH alternative -- the
+                                // "evict everything for this candidate" rescue -- so the answer is to
+                                // stop searching, not to fail the request. It used to throw here
+                                // (`std::length_error` -> HTTP 500 + a worker recovery), which is what
+                                // made the e2e's phase 1 unreachable on every tree (2026-09-28).
+                                // Counted separately from `budget_exhausted` because the two ask
+                                // different questions: "the search ran out of its own budget" is the
+                                // designed stop, "the planner had no room for another target" is a
+                                // capacity ceiling, and conflating them is how a capacity wall reads
+                                // as a healthy bounded search.
+                                target_arena_truncated = true;
+                                stop_reason            = MaterializationStopReason::ExpansionCapacity;
+                                break;
+                            }
+                            const auto guide  = session.guidance(*rescue);
                             if (!target_marked(guide.stable_target_ordinal, kTargetAssessed)) {
                                 if (!target_marked(guide.stable_target_ordinal,
                                                    kTargetDiscovered)) {
                                     ++optional_targets;
                                 }
                                 const auto started = Clock::now();
-                                (void)assess_target(rescue, candidate, guide.stable_target_ordinal);
+                                (void)assess_target(*rescue, candidate, guide.stable_target_ordinal);
                                 observe_step(assessment_step_ns, started);
                                 ++search_work;
                             }
@@ -571,8 +800,15 @@ public:
                     session.choose_construction(*path.cursor, path.best_option);
                     const auto target = session.construction_target(*path.cursor);
                     if (!target) {
-                        stop_reason      = MaterializationStopReason::ExpansionCapacity;
-                        budget_exhausted = search_stopped = true;
+                        stop_reason = MaterializationStopReason::ExpansionCapacity;
+                        search_stopped = true;
+                        // AN ARENA CEILING, NOT A BUDGET STOP -- so `budget_exhausted` is deliberately NOT
+                        // set here. The first version set both, which also incremented
+                        // `search_budget_exhaustions` and contradicted the separation these two counters
+                        // exist to provide ("the search spent its own budget" vs "the planner had no room
+                        // for another target"). This is the path that fired in production
+                        // (`targets=4102/4102` before the throw).
+                        target_arena_truncated = true;
                         break;
                     }
                     auto chosen = rank_guidance(path.candidate_index, session.guidance(*target));
@@ -601,11 +837,13 @@ public:
                                 ? incumbent.cost.total_ns - chosen.estimated_total_ns
                                 : 0;
                         search_phase = MaterializationSearchPhase::Assessment;
+                        // The assessment confirms an already-generated option; admit it even when
+                        // the candidate is seeded so a demote is not generated and left unassessed.
                         if (!allow_work(assessment_step_ns, assessment_step_ns,
                                         chosen.recovery_complete ? target_gain : gain,
                                         chosen.recovery_complete &&
                                             chosen.unsatisfied_constraints == 0,
-                                        !candidate_seeded[path.candidate_index])) {
+                                        true)) {
                             search_stopped = search_work >= work_limit ||
                                              allowance.remaining(planning_now_ns<Clock>()) == 0;
                             path.cursor.reset();
@@ -660,8 +898,9 @@ public:
                             assess_pending && pending_.front().guidance.recovery_complete &&
                                 pending_.front().guidance.unsatisfied_constraints == 0 &&
                                 pending_.front().guidance.logical_ready,
-                            !candidate_seeded[assess_pending ? pending_.front().candidate_index
-                                                             : queue_.front().candidate_index])) {
+                            assess_pending
+                                ? true
+                                : !candidate_seeded[queue_.front().candidate_index])) {
                 if (search_work >= work_limit ||
                     allowance.remaining(planning_now_ns<Clock>()) == 0) {
                     break;
@@ -687,7 +926,16 @@ public:
                     break;
                 }
                 if (!expand_target(queue_pop())) {
-                    stop_reason      = MaterializationStopReason::ExpansionCapacity;
+                    // `expand_target` returns false for exactly two reasons and BOTH are the target
+                    // budget: `optional_targets >= kTargetBudget`, or an expansion whose canonical
+                    // count would exceed `kTargetBudget - optional_targets`. It cannot return false
+                    // on the arena ceiling -- `commit_expansion` is bounded by `target_arena_limit`,
+                    // reports that as `children.complete == false`, and the lambda handles it and
+                    // still returns true. So this was named `ExpansionCapacity` while measuring the
+                    // SEARCH BUDGET, which is the conflation the other two `ExpansionCapacity` sites
+                    // (both paired with `target_arena_truncated = true`) exist to avoid. The arena
+                    // bound keeps its own name and its own flag.
+                    stop_reason      = MaterializationStopReason::TargetBudget;
                     budget_exhausted = true;
                     break;
                 }
@@ -696,13 +944,45 @@ public:
             ++search_work;
         }
 
+        // Claim the seal window so a concurrent demote cannot bump a victim's slot generation
+        // between the final assess and the seal (which would fail the seal's revalidate and force
+        // a re-prefill). Back off briefly on contention; if we cannot claim within the budget,
+        // fall through to the re-prefill fallback below (the concurrent materialization makes the
+        // room, and our next admission restores the checkpoint).
+        struct SealWindowClaim {
+            bool             claimed = false;
+            decltype(session)& s;
+            explicit SealWindowClaim(decltype(session)& ref) noexcept : s(ref) {
+                for (std::uint32_t attempt = 0; attempt < 32U; ++attempt) {
+                    if (ref.try_claim_seal_window()) { claimed = true; break; }
+                    std::this_thread::sleep_for(std::chrono::microseconds(125));
+                }
+            }
+            // Release as soon as the seal (and its fallback) is done, before the result is
+            // constructed. Holding it through the result bookkeeping would starve concurrent
+            // materializations that are waiting to seal (the N=10 re-touch cascade).
+            void release() noexcept { if (claimed) { s.release_seal_window(); claimed = false; } }
+            ~SealWindowClaim() { release(); }
+        };
+        SealWindowClaim seal_claim(session);
+
         const std::uint64_t search_elapsed_ns = elapsed_ns(search_started, Clock::now());
         if (!incumbent.assessed) {
             AssessedPressureTarget assessed            = session.assess(incumbent.target);
             const PressureTargetAssessment& assessment = assessed.assessment();
             if (assessment.candidate != candidates[incumbent.candidate_index].id ||
                 assessment.physical_status != MaterializationPhysicalStatus::Feasible) {
-                throw std::logic_error("selected identity target lost exact feasibility");
+                // Stale before commit: a concurrent transition took the target's room. Reject
+                // without physical side effects (§12 invariant 10) and let the caller fall back
+                // to the root identity, so the request re-prefills instead of failing the batch
+                // with a 500.
+                if (dbg) {
+                    std::fprintf(stderr,
+                                 "[mat-debug] STALE identity target -> re-prefill cand=%lu\n",
+                                 static_cast<unsigned long>(incumbent.candidate_index));
+                    dbg_flush();
+                }
+                return std::nullopt;
             }
             incumbent.assessed.emplace(std::move(assessed));
         }
@@ -716,14 +996,134 @@ public:
         };
         std::vector<std::uint32_t> shared_frontiers =
             final_schedule(selected.id, selected.candidate->summary(), price_split);
-        std::optional<ResourcePlan> sealed =
-            session.seal(std::move(*incumbent.assessed), prompt,
-                         FinalScheduleIntent{.shared_capture_frontiers = shared_frontiers});
-        if (!sealed) { throw std::logic_error("selected pressure target could not be sealed"); }
+        std::optional<ResourcePlan> sealed;
+        if (seal_claim.claimed) {
+            sealed = session.seal(std::move(*incumbent.assessed), prompt,
+                                  FinalScheduleIntent{.shared_capture_frontiers = shared_frontiers});
+        } else if (dbg) {
+            std::fprintf(stderr, "[mat-debug] SEAL SKIP (claim) -> re-prefill cand=%lu\n",
+                         static_cast<unsigned long>(incumbent.candidate_index));
+            dbg_flush();
+        }
+        // THE COST THE ELECTION COMPARED, kept across the fallback below. The fallback REPLACES the sealed
+        // plan with root-maximal, whose key can be WORSE than a loser's -- the election never ranked that
+        // pair -- so attributing against it would name an element where the LOSER was better and present it
+        // as the winner's reason (`decided_by=0` reading "the #6 ruling decided" when the winner actually
+        // LOST on element 0 and was seated by a seal failure). Since `first_differing_key_element` is
+        // symmetric it cannot signal that reversal; the fix is to never compare the wrong pair. A review
+        // caught this, with 974 of 977 reversed pairs yielding the supposedly-impossible `decided_by == 10`.
+        const FoldedCost elected_cost = incumbent.cost;
+        if (!sealed) {
+            // The selected preserving target (a demote-to-host) lost its host allocation to a
+            // concurrent demote between assess and seal. Fall back to the root-maximal eviction
+            // target, which needs no host and is always sealable, so the re-touch re-prefills
+            // instead of surfacing a 500. This is the unfixed outcome, not a new one.
+            if (dbg) {
+                std::fprintf(stderr,
+                             "[mat-debug] SEAL FALLBACK to root-maximal eviction cand=%lu "
+                             "reused_tok=%lu\n",
+                             static_cast<unsigned long>(incumbent.candidate_index),
+                             static_cast<unsigned long>(incumbent.cost.reused_prompt_tokens));
+                dbg_flush();
+            }
+            const PressureTargetHandle root =
+                session.root_maximal_target(candidates[incumbent.candidate_index].id);
+            AssessedPressureTarget root_assessed = session.assess(root);
+            if (root_assessed.assessment().physical_status !=
+                MaterializationPhysicalStatus::Feasible) {
+                // The fallback is not guaranteed feasible under concurrent transitions either.
+                // Re-prefill is the intended outcome (see the comment above): a retention loss
+                // must never become a request failure.
+                if (dbg) {
+                    std::fprintf(stderr, "[mat-debug] SEAL FALLBACK infeasible -> re-prefill\n");
+                    dbg_flush();
+                }
+                return std::nullopt;
+            }
+            // THE FOLDED COST OF THE PLAN THAT IS ABOUT TO BE SEALED, taken here because `root_assessed` is
+            // moved into `seal` below. See the assignment at `incumbent.cost` further down for why it must
+            // replace the preserving plan's.
+            const FoldedCost fallback_cost =
+                fold_assessment(candidates[incumbent.candidate_index], root_assessed.assessment(),
+                                pressure.owner_policy, pressure.checkpoint_policy, machine_cost);
+            sealed = session.seal(std::move(root_assessed), prompt,
+                                  FinalScheduleIntent{.shared_capture_frontiers = shared_frontiers});
+            if (!sealed) {
+                // Reproduced under 4 concurrent sessions sharing a large prefix: the losing lane
+                // cannot claim the seal window, so neither the preserving target nor the
+                // root-maximal fallback seals. Degrade to re-prefill instead of HTTP 500.
+                if (dbg) {
+                    std::fprintf(stderr, "[mat-debug] SEAL FALLBACK claims blocked -> re-prefill\n");
+                    dbg_flush();
+                }
+                return std::nullopt;
+            }
+            incumbent.root_maximal = true;
+            // THE RECORD MUST DESCRIBE THE PLAN THAT WAS SEALED. Until 2026-10-02 `incumbent.cost` was left
+            // as the PRESERVING plan's, while the sealed plan was this evict-everything fallback -- and
+            // `make_diagnostics(incumbent.cost, ...)` runs AFTER here, so `chosen_restorable_evictions` and
+            // every `predicted_*` figure for a fallback case described a plan that was never sealed. The
+            // fallback is precisely the maximal-eviction path, so the numbers read LOW exactly where the
+            // destruction is largest: `req#201` reported `chosen_restorable_evictions=69` BESIDE
+            // `selected_maximal_fallback=true` with a lowering reuse of 54,963, and which plan owned those 69
+            // evictions could not be told from the record. A review found it against the fallback flag.
+            incumbent.cost = fallback_cost;
+            // **ONLY THE COST FIELDS WERE UPDATED HERE, AND THAT IS NOT THE WHOLE RECORD.** After a
+            // fallback, `predicted_now_ns` / `predicted_future_loss_ns` / `predicted_total_ns` /
+            // `chosen_restorable_evictions` come from `incumbent.cost` and now describe the sealed plan,
+            // while these still describe the PRESERVING one that was never sealed:
+            // `selected_degradation_units` (`incumbent.degradation_units`), `owner_outcomes` and
+            // `checkpoint_outcomes` (whose claims drive `private_claims_` / `shared_claims_` dispositions in
+            // `resource_manager`), `publication_slot` and `source_mode`. This is PRE-EXISTING, not caused by
+            // the cost assignment -- a review separated the two -- and it is left as an open item rather
+            // than half-fixed, because whether the CLAIMS need the fallback's outcomes is a separate
+            // question that the e2e's demotion and state-saturation phases would have to answer.
+        }
+        // The seal (and any fallback) is committed; release the claim so a concurrent
+        // materialization can seal immediately, before this one builds its result.
+        seal_claim.release();
 
+        if (dbg) {
+            std::fprintf(stderr,
+                         "[mat-debug] SELECT cand=%zu now=%lu fut=%lu total=%lu prefill_tok=%lu "
+                         "reused_tok=%lu stop=%s evals=%lu work=%lu\n",
+                         incumbent.candidate_index, static_cast<unsigned long>(incumbent.cost.now_ns),
+                         static_cast<unsigned long>(incumbent.cost.future_loss_ns),
+                         static_cast<unsigned long>(incumbent.cost.total_ns),
+                         static_cast<unsigned long>(incumbent.cost.remaining_text_prefill),
+                         static_cast<unsigned long>(incumbent.cost.reused_prompt_tokens),
+                         materialization_stop_reason_name(stop_reason),
+                         static_cast<unsigned long>(targets_evaluated),
+                         static_cast<unsigned long>(search_work));
+            dbg_flush();
+        }
+
+        // THE ORDER MATCHES THE SIGNATURE. It did not: `preserving_alternatives_assessed_` was added to
+        // the signature BESIDE ITS SIBLING but appended at the END here, so four same-typed-ish arguments
+        // shifted by one -- `assessed` took the goal-less count, `without_goal` took the bool, and
+        // `target_arena_truncated` took `assessed != 0` through an implicit uint64->bool conversion inside
+        // a `noexcept` function. It compiled, it deployed, and it corrupted both counters on live traffic
+        // (2026-10-01). TWO guards now: this ordering, and the invariant assertions in
+        // `test_resource_manager.cpp` -- which are what caught it, via the arena test's CONTROL arm.
         MaterializationDiagnostics diagnostics = make_diagnostics(
             incumbent.cost, targets_evaluated, projection_work, planning_started, search_elapsed_ns,
-            stop_reason, budget_exhausted, incumbent.degradation_units, incumbent.root_maximal);
+            stop_reason, budget_exhausted, incumbent.degradation_units, incumbent.root_maximal,
+            feasible_preserving_alternatives_, preserving_alternatives_assessed_,
+            assessed_targets_without_goal_, target_arena_truncated);
+        // SET HERE, NOT AS ANOTHER ARGUMENT. This parameter list is what produced the 2026-10-01
+        // transposition (four arguments shifted by one and it still compiled), so the new fields
+        // are assigned to the struct directly instead of joining a positional list.
+        diagnostics.goal_probes_by_site = goal_probes_by_site_;
+        diagnostics.targets_assessed   = targets_evaluated;
+        diagnostics.assessed_targets_without_goal_infeasible  = assessed_targets_without_goal_infeasible_;
+        diagnostics.assessed_targets_without_goal_unadoptable = assessed_targets_without_goal_unadoptable_;
+        // #6's pair is `feasible_preserving_alternatives` against `chosen_restorable_evictions` (the
+        // incumbent's own count, filled by `make_diagnostics`). Both non-zero in one record means a
+        // preserving plan was assessed feasible and a destroying one was taken anyway.
+        //
+        // IT IS NOT DECISIVE ON ITS OWN. The first half is GOAL-GATED, so a 0 cannot be told from "no
+        // preserving target was ever assessed" -- and only the second is #6's shape. Read
+        // `preserving_alternatives_assessed`, the ungated denominator set above, beside it for that.
 
         diagnostics.initial_predicted_total_ns = initial_cost_ns;
         diagnostics.first_improvement_ns       = first_improvement_ns;
@@ -737,6 +1137,14 @@ public:
         diagnostics.search_overshoot_ns        = search_elapsed_ns > search_budget.granted_ns()
                                                      ? search_elapsed_ns - search_budget.granted_ns()
                                                      : 0;
+        if (!sealed) {
+            if (dbg) {
+                std::fprintf(stderr, "[mat-debug] NO SEAL -> re-prefill cand=%lu\n",
+                             static_cast<unsigned long>(incumbent.candidate_index));
+                dbg_flush();
+            }
+            return std::nullopt;
+        }
         Result result;
         result.plan                = std::move(*sealed);
         result.candidate           = candidates[incumbent.candidate_index].id;
@@ -745,6 +1153,7 @@ public:
         result.owner_outcomes      = std::move(incumbent.owner_outcomes);
         result.checkpoint_outcomes = std::move(incumbent.checkpoint_outcomes);
         result.diagnostics         = diagnostics;
+        finalize_selection(incumbent.candidate_index, elected_cost, incumbent.cost, result.diagnostics);
         return result;
     }
 
@@ -764,48 +1173,9 @@ public:
     }
 
 private:
-    static constexpr std::uint32_t kTargetBudget = 4096;
+    // The namespace-scope constant above, kept as a short name for the uses inside this class.
+    static constexpr std::uint32_t kTargetBudget = kPlannerTargetBudget;
 
-    struct FoldedCost {
-        std::uint64_t now_ns                    = 0;
-        std::uint64_t future_loss_ns            = 0;
-        std::uint64_t total_ns                  = 0;
-        std::uint64_t lower_bound_ns            = 0;
-        std::uint64_t affected_selected_hits    = 0;
-        std::uint64_t newest_affected_hit_epoch = 0;
-        std::uint32_t owner_evictions           = 0;
-        std::uint32_t checkpoint_drops          = 0;
-        std::uint32_t copy_operations           = 0;
-        std::uint64_t transferred_bytes         = 0;
-        std::uint64_t remaining_text_prefill    = 0;
-        std::uint64_t remaining_vision_prefill  = 0;
-        std::uint32_t reused_prompt_tokens      = 0;
-        bool current_session_binding            = false;
-        std::uint32_t candidate_ordinal         = 0;
-        std::uint32_t target_ordinal            = 0;
-
-        [[nodiscard]] auto key() const noexcept {
-            return std::tuple{
-                total_ns,
-                affected_selected_hits,
-                newest_affected_hit_epoch,
-                owner_evictions,
-                checkpoint_drops,
-                copy_operations,
-                transferred_bytes,
-                remaining_text_prefill,
-                remaining_vision_prefill,
-                std::numeric_limits<std::uint32_t>::max() - reused_prompt_tokens,
-                current_session_binding ? 0U : 1U,
-                candidate_ordinal,
-                target_ordinal,
-            };
-        }
-
-        [[nodiscard]] bool less(const FoldedCost& other) const noexcept {
-            return key() < other.key();
-        }
-    };
 
     struct Incumbent {
         PressureTargetHandle target{};
@@ -1113,6 +1483,21 @@ private:
         cost.target_ordinal          = assessment.stable_target_ordinal;
         cost.checkpoint_drops        = assessment.dropped_checkpoints;
 
+        // #6: count evictions of victims that HELD a recoverable checkpoint -- the quantity the ruling
+        // names. An owner appears in `checkpoint_impacts` only when it had a checkpoint whose recovery
+        // recipe is supported, so its presence is the "restorable" half; the eviction itself supplies the
+        // other half. Victims with nothing to lose are not counted, which is what keeps this from
+        // outranking cost for throwaway evictions.
+        for (const PressureOwnerOutcome& outcome : assessment.owner_outcomes) {
+            if (outcome.disposition != VictimDisposition::Evicted) { continue; }
+            const bool had_recoverable_checkpoint = std::any_of(
+                assessment.checkpoint_impacts.begin(), assessment.checkpoint_impacts.end(),
+                [&](const PressureCheckpointRecoveryImpact& impact) {
+                    return impact.owner == outcome.owner;
+                });
+            if (had_recoverable_checkpoint) { ++cost.restorable_evictions; }
+        }
+
         for (const PressureOwnerOutcome& outcome : assessment.owner_outcomes) {
             const MaterializationOwnerPolicy* policy =
                 owner_policy_for(owner_policies, outcome.owner);
@@ -1297,6 +1682,96 @@ private:
         target_ledger_.mark(ordinal, mark);
     }
 
+    // WHERE THE WINNER'S REASON IS COMPUTED, from `incumbent.cost` and each candidate's BEST GOAL-BEARING
+    // cost -- the costs the election actually compared. It cannot be computed from the request log's
+    // candidate rows: on the search path a row holds the last assessment for its candidate (a review found
+    // this), and the root-maximal seed and the seal fallback write no row terms at all, so a row-based
+    // comparison would attribute a win to a plan that was never seated.
+    //
+    // The loser it names is the ELIGIBLE candidate with the most reuse, matching the published
+    // `best_loser_reuse`'s intent; "eligible" is carried by this vector itself, since an entry exists only
+    // for a goal-bearing assessment (the same condition `becomes_incumbent` uses).
+    // Ship the per-candidate terms WITH the winner's entry replaced by the cost it was actually seated on,
+    // then attribute. Done at the return sites because that is the only place `incumbent.cost` exists.
+    // TWO COSTS, DELIBERATELY. `elected_cost` is what the ELECTION ranked and is the only correct basis for
+    // the attribution. `seated_cost` is what was actually SEALED -- `elected_cost` unless the seal failed
+    // and the root-maximal fallback replaced it -- and is what the winner's ROW should describe, since that
+    // is the plan that ran. Passing one cost for both purposes is the fault a review found: on the fallback
+    // path the winner's row would then claim terms the election never weighed, and `decided_by` would name
+    // an element where the loser was BETTER.
+    void finalize_selection(std::uint32_t winner_index, const FoldedCost& elected_cost,
+                            const FoldedCost& seated_cost, MaterializationDiagnostics& out) const {
+        out.election.clear();
+        out.election.reserve(election_best_.size());
+        for (std::size_t index = 0; index < election_best_.size(); ++index) {
+            MaterializationDiagnostics::ElectionTerm term;
+            const FoldedCost* cost = election_best_[index] ? &*election_best_[index] : nullptr;
+            if (index == static_cast<std::size_t>(winner_index)) { cost = &seated_cost; }
+            if (cost != nullptr) {
+                // An entry exists only for a GOAL-BEARING assessment (or the winner, which was seated by
+                // one), and a goal is exactly what makes a plan electable -- so this is the eligibility
+                // bit, not a convenience.
+                term.eligible               = true;
+                term.restorable_evictions   = cost->restorable_evictions;
+                term.total_ns               = cost->total_ns;
+                term.affected_selected_hits = cost->affected_selected_hits;
+                term.owner_evictions        = cost->owner_evictions;
+                term.checkpoint_drops       = cost->checkpoint_drops;
+            }
+            // THE WINNER'S ELECTED COST, RECORDED BESIDE ITS SEATED ONE -- see `ElectionTerm`. `cost` above
+            // is `seated_cost` for the winner, so these are the only terms that may be compared against a
+            // loser's, and `seated_differs` tells a reader when the two disagree.
+            if (index == static_cast<std::size_t>(winner_index)) {
+                term.seated_differs               = !(seated_cost.key() == elected_cost.key());
+                term.elected_reuse                 = elected_cost.reused_prompt_tokens;
+                term.elected_restorable_evictions  = elected_cost.restorable_evictions;
+                term.elected_total_ns              = elected_cost.total_ns;
+                term.elected_affected_selected_hits= elected_cost.affected_selected_hits;
+                term.elected_owner_evictions       = elected_cost.owner_evictions;
+                term.elected_checkpoint_drops      = elected_cost.checkpoint_drops;
+            }
+            out.election.push_back(term);
+        }
+        attribute_selection(winner_index, elected_cost, out);
+    }
+
+    void attribute_selection(std::uint32_t winner_index, const FoldedCost& winner_cost,
+                             MaterializationDiagnostics& out) const noexcept {
+        std::uint32_t     best_loser_reuse = 0U;
+        const FoldedCost* best_loser       = nullptr;
+        for (std::size_t index = 0; index < election_best_.size(); ++index) {
+            if (index == static_cast<std::size_t>(winner_index) || !election_best_[index]) { continue; }
+            const FoldedCost& candidate = *election_best_[index];
+            // THE LOSER NAMED IS THE ONE WITH THE MOST REUSE -- the published `best_loser_reuse` notion,
+            // because a LONGER candidate is what this pair is about. The `best_loser == nullptr` arm takes
+            // the earliest eligible loser instead, so that a set of eligible losers which all reuse NOTHING
+            // still yields an attribution; without it, `decided_by == 255` conflated "no eligible loser at
+            // all" with "eligible losers existed, none reusing anything" (a review's finding 9). 255 now
+            // means the former and nothing else.
+            if (best_loser == nullptr || candidate.reused_prompt_tokens > best_loser_reuse) {
+                best_loser_reuse = candidate.reused_prompt_tokens;
+                best_loser       = &candidate;
+            }
+        }
+        out.best_eligible_loser_reuse = best_loser_reuse;
+        out.longer_lost_eligible =
+            best_loser != nullptr && best_loser_reuse > winner_cost.reused_prompt_tokens;
+        // `election_deciding_element`, NOT `first_differing_key_element`: the wrapper checks that the
+        // winner actually BEATS this loser before naming an element. The raw helper is symmetric, so on an
+        // inverted pair -- which is what a fallback cost produces, see `finalize_selection` -- it would name
+        // an element where the LOSER was better and present it as the winner's reason. With the wrapper that
+        // case is `kNotAnElectedWinner` (254): loud, and impossible to read as a finding.
+        out.longer_lost_decided_by    = best_loser != nullptr
+                                            ? election_deciding_element(winner_cost, *best_loser)
+                                            : kNoDifferingKeyElement;
+        // THE INVARIANT, and it is why `decided_by == 10` must never be read as a finding:
+        // `key()` element 10 is `max - reused_prompt_tokens`, so a cost with MORE reuse has a SMALLER key
+        // and wins on element 10. A loser that has more reuse therefore LOST on one of elements 0..9, and
+        // `first_differing_key_element` can only return 10 when the loser has LESS reuse. So
+        // (`longer_lost_eligible` && `decided_by == 10`) is IMPOSSIBLE, and a reading that shows it means
+        // the two costs are not the ones the election compared -- an instrument fault, not a defect found.
+    }
+
     [[nodiscard]] static MaterializationDiagnostics
     complete_diagnostics(const FoldedCost& cost, std::uint32_t targets_evaluated,
                          std::uint64_t projection_work, Clock::time_point planning_started,
@@ -1310,7 +1785,11 @@ private:
                      std::uint64_t projection_work, Clock::time_point planning_started,
                      std::uint64_t search_elapsed_ns, MaterializationStopReason reason,
                      bool budget_exhausted, std::uint32_t degradation_units,
-                     bool maximal_fallback) noexcept {
+                     bool maximal_fallback,
+                     std::uint64_t feasible_preserving_alternatives = 0,
+                     std::uint64_t preserving_alternatives_assessed = 0,
+                     std::uint64_t assessed_targets_without_goal = 0,
+                     bool target_arena_truncated = false) noexcept {
         return MaterializationDiagnostics{
             .predicted_now_ns           = cost.now_ns,
             .predicted_future_loss_ns   = cost.future_loss_ns,
@@ -1321,15 +1800,71 @@ private:
             .search_elapsed_ns          = search_elapsed_ns,
             .stop_reason                = reason,
             .budget_exhausted           = budget_exhausted,
+            .target_arena_truncated     = target_arena_truncated,
             .selected_degradation_units = degradation_units,
-            .selected_maximal_fallback  = maximal_fallback,
-            .initial_predicted_total_ns = cost.total_ns,
+            .selected_maximal_fallback        = maximal_fallback,
+            .feasible_preserving_alternatives = feasible_preserving_alternatives,
+            .preserving_alternatives_assessed = preserving_alternatives_assessed,
+            .chosen_restorable_evictions      = cost.restorable_evictions,
+            .assessed_targets_without_goal    = assessed_targets_without_goal,
+            .initial_predicted_total_ns       = cost.total_ns,
         };
     }
 
     std::vector<QueueEntry> queue_;
     std::vector<PendingEntry> pending_;
     std::vector<FoldedCost> identity_costs_;
+    // THE BEST GOAL-BEARING COST PER CANDIDATE, index-aligned with the `candidates` span -- the costs the
+    // election compared. `nullopt` means the candidate never had a goal-bearing assessment, i.e. it was
+    // never electable. Deliberately NOT "the last assessment" (a later, worse target of the winning
+    // candidate would then describe the winner) and not the request log's rows (which are written later,
+    // from a different fold, and not at all on two of the winner's paths).
+    std::vector<std::optional<FoldedCost>> election_best_;
+    // #6 (2026-09-27): how many targets this planning run assessed FEASIBLE whose cost evicted no
+    // restorable victim -- i.e. how many plans existed that would have preserved one. Counted in
+    // `assess_target` because BOTH paths (the seeded candidate and the search) mark feasibility there, so
+    // one site covers both; see the diagnostics field of the same name.
+    std::uint64_t feasible_preserving_alternatives_ = 0;
+    // THE DENOMINATOR THE PAIR LACKED. `feasible_preserving_alternatives` is gated on `goal`, so it reads
+    // 0 in TWO different situations: a preserving target was assessed and found goal-less, or NO preserving
+    // target was ever assessed at all. Those are different findings and only the second is #6's shape --
+    // the planner destroyed a restorable checkpoint while a demote was available -- so a counter that
+    // cannot separate them cannot exonerate the case either. This one is UNGATED: it counts every
+    // assessed target whose cost evicts no restorable checkpoint, whatever its goal status.
+    //
+    // Read the two together: `assessed == 0` means no preserving option was ever in front of the planner
+    // (the #6 shape); `assessed > 0 && feasible == 0` means preserving options existed and none was
+    // adoptable, which is a defensible outcome rather than a defect.
+    std::uint64_t preserving_alternatives_assessed_ = 0;
+    // WHERE THE ~4,000 GOAL PROBES OF AN ORDINARY PLANNING RUN COME FROM. The planner calls the goal probe
+    // from FIVE sites (below), all through one wrapper whose signature is identical at each, so the wrapper
+    // cannot tell them apart -- the tally has to be taken at the call sites. 2026-10-01, measured: 67% of
+    // plans end on `time_budget` with ~4,630 probes and 82% end on SOME budget, including plans with ONE
+    // candidate, so the question is which site repeats. Reset per run with its siblings.
+    std::array<std::uint64_t, 5> goal_probes_by_site_{};
+    static constexpr std::array<const char*, 5> kGoalProbeSiteNames{
+        "identity_target", "assessment_a", "assessment_b", "guidance_cost", "guidance_rank"};
+    // UNTESTED ON HOST, AND THAT IS THE HONEST STATE -- do not read the green suite as coverage. Measured
+    // 2026-10-01 against a build that had this counter, three mutants were run:
+    //   * the call-site TRANSPOSITION that actually shipped (arguments shifted by one) -- dies, but by the
+    //     ARENA test's control arm, not by anything specific to this counter;
+    //   * moving this increment inside `if (goal)` -- SURVIVES;
+    //   * deleting this increment outright -- SURVIVES.
+    // The deletion surviving is the informative one: `feasible_preserving_alternatives` is 0 in EVERY
+    // materialization the host fixtures produce (10 of 10 measured in the split fixture), so an
+    // `assessed >= feasible` assertion is `0 >= 0` wherever it can be placed -- the assertion was written,
+    // measured vacuous, and REMOVED rather than left looking like a guard. `feasible > 0` needs pressure AND
+    // an adopted preserving plan, and the only scenario that reaches that (`guided deep retention`) is the
+    // pre-existing baseline failure. So this counter's discriminating power -- a preserving target assessed
+    // and found GOAL-LESS, which is the case it exists for -- has no host coverage at all.
+    // Check it on live traffic: a record with `preserving_alternatives_assessed > feasible_preserving_alternatives`
+    // is the first evidence the distinction is real. If no such record ever appears, this counter adds
+    // nothing its sibling does not already say, and the #6 rule in CLAUDE.md should say so.
+    std::uint64_t assessed_targets_without_goal_    = 0;
+    // The split that makes the line above interpretable: `infeasible` never had a goal probe (so its refusal
+    // is capacity), `unadoptable` was feasible and the probe refused it (so its refusal is the goal gate).
+    std::uint64_t assessed_targets_without_goal_infeasible_   = 0;
+    std::uint64_t assessed_targets_without_goal_unadoptable_  = 0;
     BoundedTargetLedger target_ledger_;
     std::vector<CombinedImpact> impact_scratch_;
     ContextPortfolioValue portfolio_value_;

@@ -13,8 +13,11 @@ void copy_i32(const std::int32_t* source, Tensor& destination, cudaStream_t stre
         destination.data == nullptr) {
         throw std::invalid_argument("copy_i32: invalid host source or I32 destination");
     }
+    // Same contract as the sibling helper in text.cpp: async on the caller's stream (that copy is
+    // capture-recordable), then settle (eager-only).
     CUDA_CHECK(cudaMemcpyAsync(destination.data, source, destination.bytes(),
                                cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
 }
 
 } // namespace

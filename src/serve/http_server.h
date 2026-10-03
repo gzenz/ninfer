@@ -87,6 +87,7 @@ private:
     void handle_response_compact(const httplib::Request& req, httplib::Response& res);
     void handle_models(const httplib::Request& req, httplib::Response& res) const;
     void handle_model(const httplib::Request& req, httplib::Response& res) const;
+    void handle_stats(const httplib::Request& req, httplib::Response& res) const;
 
     void record_request_start(const RequestLogContext& context);
     void record_request_rejected(const RequestRejectionLogContext& context);
@@ -96,6 +97,9 @@ private:
     void record_throughput(const ThroughputReport& report);
     void run_stats_reporter();
     void stop_stats_reporter();
+    // Stops the dedicated /stats + /health listener (no-op when --stats-port
+    // is unset or the listener never started).
+    void stop_stats_listener();
 
     GenerationService* service_ = nullptr;
     ServeOptions options_;
@@ -104,11 +108,29 @@ private:
     OperationalLog operational_log_;
     JsonlRequestLog request_jsonl_;
     httplib::Server server_;
+    // Dedicated single-thread server for /stats + /health (only when
+    // --stats-port is set): liveness and stats must stay reachable while the
+    // main pool is saturated by streaming handlers spanning long prefills.
+    httplib::Server stats_server_;
+    std::thread stats_listener_;
     std::atomic<std::uint64_t> request_seq_{0};
-    std::mutex stats_mutex_;
+    mutable std::mutex stats_mutex_;
     std::condition_variable stats_cv_;
     std::thread stats_thread_;
     bool stats_stopping_ = false;
+    // THE SNAPSHOT /stats SERVES (2026-09-28). `handle_stats` used to call the engine live, which takes the
+    // EXECUTION MUTEX -- so the endpoint built to be reachable while the server is busy was the one that
+    // blocked on a prefill. Measured under an 8-agent load: a 90 s read timed out and a 240 s read returned,
+    // i.e. the reserved listener worked and the handler serialised anyway.
+    //
+    // These are published by `run_stats_reporter` on the `--log-stats-interval-ms` cadence it already keeps
+    // (it reads the engine there to compute throughput). The endpoint is therefore up to one interval stale,
+    // which is the contract the reporter already promises and the right trade for monitoring: a number that
+    // is 5 s old beats no number at all exactly when the server is loaded.
+    bool stats_snapshot_ready_ = false;
+    ninfer::RuntimeStats stats_snapshot_;
+    ninfer::MemorySummary stats_snapshot_memory_;
+    ninfer::LoadSummary stats_snapshot_load_;
 };
 
 } // namespace ninfer::serve

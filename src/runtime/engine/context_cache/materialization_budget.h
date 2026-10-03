@@ -5,10 +5,359 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <span>
 
 namespace ninfer::runtime {
+
+// THE PUBLICATION-CELL LOSS, at namespace scope for the same reason as the cost key below: a host-only test
+// can decide the case without a GPU.
+//
+// WHY THIS IS NOT "A REFUSAL COUNTER", WHICH IS WHAT THE FIRST VERSION OF IT WAS AND WHY THAT WAS WRONG.
+// The planner probes a cell-free option from FIVE call sites (`materialization_planner.h:163, 297, 471,
+// 550, 590`) -- not once per assessed target: `rank_guidance` alone runs twice per candidate in
+// `start_path` and again for every construction option and every chosen target. Counting those calls
+// therefore counts SEARCH STEPS. Measured: 108,544 of them across 24 requests on one run, and the same
+// instrument printed 97 of them on another run in which four requests achieved 99.9% turn-closure reuse.
+// A number that goes nonzero whenever retention fills the catalog -- which is the normal state under
+// eviction-to-publish -- cannot falsify a capacity raise, and as an alert it fires during healthy
+// operation. So the event is decided HERE instead, once per planning run, and it means something narrow:
+//
+//   a candidate whose EVERY goal probe failed on the publication cell -- never on any other condition --
+//   could not be adopted at all, and would have reused strictly more tokens than the plan that won.
+//
+// That is the only shape in which the catalog has actually cost reuse.
+struct PublicationCellProbe {
+    // Every probe made for this candidate, with the reason a failed one failed. `cell_only` and `other` are
+    // the two ways to fail and they are exclusive; a candidate with `goals != 0` could be adopted.
+    std::uint32_t probes    = 0;
+    std::uint32_t cell_only = 0;
+    std::uint32_t other     = 0;
+    std::uint32_t goals     = 0;
+};
+
+struct PublicationCellLoss {
+    std::uint32_t candidates         = 0;  // candidates the cell alone made unadoptable
+    std::uint32_t best_blocked_reuse = 0;  // the most tokens any of them would have reused
+    // THE AT-RISK BREAKDOWN, and it exists to settle a disagreement that reading the code did not. A review
+    // pass argued that a catalog-caused loss cannot occur at prod's shape (C=32 cells, L=4 lanes) because a
+    // cell-only failure needs no free cell AND no evictable owner, and the count of non-evictable owned cells
+    // is bounded by the lane count -- so it needs roughly `C <= 2L + Claimed`. If that is right, this
+    // instrument can never fire on prod for the reason it claims, and its only firing would be search
+    // truncation. The counter-argument is that an owner being EVICTABLE is not the same as an owner this
+    // candidate's own solution EVICTS, and a preserving (zero-eviction) candidate gets no cell from victims
+    // however many owners are evictable.
+    //
+    // `at_risk` (non-winner candidates with any cell-only failure, whatever vetoed them) against
+    // `evictable_owners` (was there a private owner record at all) decides it: if at_risk > 0 always comes
+    // with evictable_owners > 0, the review is right and the predicate must be rebuilt from catalog state. If
+    // at_risk > 0 with evictable_owners == 0 occurs, the cell really was unobtainable and the mechanism is
+    // real. NOT counted by `candidates`: a candidate can be at risk and still not count (it was vetoed).
+    std::uint32_t at_risk            = 0;
+    std::uint32_t blocked_by_goals   = 0;  // at-risk candidates a successful goal also existed for
+    std::uint32_t blocked_by_other   = 0;  // at-risk candidates that also failed on something else
+    std::uint32_t blocked_by_reuse   = 0;  // at-risk candidates that would not have out-reused the winner
+};
+
+// `reuse_of(i)` is the tokens candidate `i` would have reused. Excluded: the winner itself (its own probes
+// failing on the cell is the eviction-to-publish path, which is expected and is not a loss) and any
+// candidate that could have been adopted or that failed for a reason other than the cell.
+template <typename ReuseOf>
+[[nodiscard]] PublicationCellLoss publication_cell_loss(std::span<const PublicationCellProbe> probes,
+                                                       std::size_t candidate_count,
+                                                       std::size_t winner_index,
+                                                       std::uint32_t winner_reuse, ReuseOf&& reuse_of) {
+    PublicationCellLoss loss;
+    const std::size_t bounded = std::min(candidate_count, probes.size());
+    for (std::size_t index = 0; index < bounded; ++index) {
+        const PublicationCellProbe& probe = probes[index];
+        // `probe.probes == 0U` USED to be the first conjunct and is deleted on purpose: every tallied probe
+        // increments exactly one of `goals`/`cell_only`/`other`, so `probes == goals + cell_only + other`
+        // always holds and `cell_only > 0` already implies `probes > 0`. A mutant that removes it passed all
+        // thirteen checks (verified 2026-09-27) -- an untestable conjunct is not a defensive one, and keeping
+        // it would invite a reader to think the classification can be skipped. If a future caller counts
+        // probes WITHOUT classifying them, the fix is that caller, not a guard here.
+        if (probe.cell_only == 0U || index == winner_index) { continue; }
+        // AT RISK: the cell blocked this candidate at least once. Whether any single veto is enough to
+        // disqualify it is the next question, and the breakdown says which veto did.
+        ++loss.at_risk;
+        if (probe.goals != 0U) { ++loss.blocked_by_goals; continue; }
+        if (probe.other != 0U) { ++loss.blocked_by_other; continue; }
+        const std::uint32_t reuse = static_cast<std::uint32_t>(reuse_of(index));
+        if (reuse <= winner_reuse) { ++loss.blocked_by_reuse; continue; }
+        ++loss.candidates;
+        loss.best_blocked_reuse = std::max(loss.best_blocked_reuse, reuse);
+    }
+    return loss;
+}
+
+// THE SPLIT'S AGGREGATION, at namespace scope so a host-only test can drive it -- because the first version
+// of this was WRONG in a way no test would have caught, and it sent a fix the wrong way.
+//
+// What it did: it reported `restorable` from whichever entry matched DEEPEST, so an entry matching 28,530 with
+// no restorable checkpoint hid a second entry matching 23,353 WITH one. The field then contradicted the
+// request's own `chosen_reuse` in 94 of 309 records -- the request demonstrably resumed from a checkpoint the
+// field said did not exist -- and the "no checkpoint below the match, so capture one" conclusion was built on
+// that artifact.
+//
+// The two maxima are INDEPENDENT and that is the whole point: the deepest MATCH and the deepest RESTORABLE
+// checkpoint need not come from the same entry, and a reader must not infer one from the other.
+// WHERE A DIVERGENCE FALLS IN THE PROMPT'S OWN MESSAGE HISTORY.
+//
+// `tokens` is the match LENGTH -- the index of the first token the two renders disagreed on -- and
+// `frontiers[n]` is the token at which input message n starts. The divergence is therefore in the
+// last message whose own frontier the match reached, and `message_offset` is how far into that
+// message it got before disagreeing.
+//
+// This is PROMPT-SIDE ONLY: the stored ledger's boundaries are not retained, so it says where the
+// incoming render diverged in its own history, never where the stored one sat.
+inline constexpr std::uint8_t kNoMessageRole = 0xFF;
+
+struct DivergencePosition {
+    std::uint32_t message_index  = 0;
+    std::uint32_t message_offset = 0;  // tokens from that message's frontier to the divergence
+    // The index names the END-of-prompt boundary rather than a message: no message starts there, so
+    // there is no role to report and `message_offset` is measured from the end of the last message.
+    bool          past_last_message = false;
+    // The role of the message the divergence falls in, as a ChatRole value, or kNoMessageRole when
+    // no message starts at that index (the end boundary, or a divergence before the first frontier).
+    std::uint8_t  role = kNoMessageRole;
+};
+
+// No entry of `frontiers` at or below the divergence (a zero-length match, or a template with no
+// boundaries at all) leaves index 0 and measures the offset from the START OF THE PROMPT, which is
+// what `message_offset` is then documented as, and no role is resolved FROM THE FALLBACK INDEX.
+// Careful, because the two cases look alike and are not: if `frontiers[0]` is present and 0 -- the
+// ordinary shape, where message 0 starts at token 0 -- then a zero-length match DOES reach it and the
+// role of message 0 is reported. Only when NO frontier is reached at all (an empty span, or every
+// entry nullopt or greater than `tokens`) is the role kNoMessageRole. A divergence is only
+// attributed when it actually diverged; the caller does not pass one that did not.
+//
+// `roles` is one entry per INPUT message, which is one SHORTER than `frontiers` -- the last
+// frontier is the end of the prompt and starts no message, so an index at or past `roles.size()`
+// carries no role. That is a fact about the prompt, not a failure to measure, and it is reported as
+// kNoMessageRole rather than as a role code that would be read as "the divergence is in a system turn".
+[[nodiscard]] inline DivergencePosition
+attribute_divergence(std::span<const std::optional<std::uint32_t>> frontiers,
+                     std::span<const ChatRole> roles, std::uint32_t tokens) noexcept {
+    DivergencePosition where;
+    bool found = false;
+    for (std::size_t index = 0; index < frontiers.size(); ++index) {
+        if (!frontiers[index].has_value() || *frontiers[index] > tokens) { continue; }
+        where.message_index  = static_cast<std::uint32_t>(index);
+        where.message_offset = tokens - *frontiers[index];
+        found                = true;
+    }
+    if (!found) { where.message_offset = tokens; }
+    where.past_last_message =
+        found && static_cast<std::size_t>(where.message_index) + 1U == frontiers.size();
+    // Gated on `found` as well as the bounds: when no frontier was reached the index is a fallback of
+    // 0 and does NOT name message 0, so resolving a role from it would report "the divergence is in a
+    // system turn" for a prompt that simply has no boundaries to attribute it with.
+    if (found && !where.past_last_message &&
+        static_cast<std::size_t>(where.message_index) < roles.size()) {
+        where.role = static_cast<std::uint8_t>(roles[where.message_index]);
+    }
+    return where;
+}
+
+struct PrefixSplitSample {
+    std::uint32_t tokens      = 0;  // this entry's token-exact match
+    std::uint32_t restorable  = 0;  // this entry's deepest restorable checkpoint at or below its own match
+    bool          identity_ok = false;  // did the identity chain agree AT that match (stricter than tokens)
+    std::uint8_t  match_end   = 0;      // 0 = diverged, 1 = the stored ledger ended, 2 = the prompt ended
+    std::uint32_t stored      = 0;      // this entry's own ledger length -- the denominator `match_end` needs
+    // WHICH LEDGER THE MATCH CAME FROM. Without it a divergence window cannot be attributed: the deepest match
+    // over the whole catalog is often ANOTHER conversation's ledger (all of them share the 23k system prompt
+    // and open with similar phrasing), so its window describes why that match stopped and says nothing about
+    // why this conversation's OWN entry was refused -- which is the question. 0 = unknown, 1 = this request's
+    // own session's CURRENT CELL, 2 = any other private entry (including this conversation's superseded
+    // ledgers, which lose their session marker on replacement), 3 = a shared entry. `frontier` is that entry's
+    // own restorable point AT OR BELOW its match -- not a resume point beyond the prompt, which cannot occur.
+    std::uint8_t  source      = 0;
+    std::uint32_t frontier    = 0;
+    // WHERE the match stopped, as an index. The id windows that used to sit here were removed 2026-09-28:
+    // they answered their question (the replayed turn's structure diverging from the stored ledger) and they
+    // logged content, which an instrument should not keep doing once the question is answered.
+    std::uint32_t probe_index = 0;
+    // WHERE that divergence falls in the prompt's own message history. Carried per SAMPLE rather
+    // than read from the best one later, for the same reason `source` and `frontier` are: a
+    // shallower entry's divergence is a different divergence, and the deepest match is often
+    // another conversation's ledger, whose window describes why THAT match stopped.
+    DivergencePosition divergence;
+};
+
+struct PrefixSplitBest {
+    std::uint32_t tokens            = 0;
+    std::uint32_t restorable        = 0;
+    std::uint32_t entries           = 0;
+    // From the DEEPEST-matching entry, not an OR over entries: the question is whether the entry this request
+    // would actually have resumed from was rendered the same way, and an unrelated shallow entry's agreement
+    // says nothing about it. `identity_checked` is the denominator -- the entries whose match was non-zero, so
+    // a `false` can be told from "no entry matched anything".
+    bool          identity_ok       = false;
+    std::uint32_t identity_checked  = 0;
+    std::uint8_t  match_end         = 0;  // from the deepest-matching entry, like identity_ok
+    std::uint32_t stored            = 0;  // from the deepest-matching entry, like identity_ok
+    std::uint8_t  source            = 0;  // ...and these: a shallower entry's ledger is not this one's
+    std::uint32_t frontier          = 0;
+    std::uint32_t probe_index       = 0;  // ...and this too: a shallower entry's divergence is not this one's
+    DivergencePosition divergence;        // ...and this: it attributes THIS entry's divergence
+};
+
+[[nodiscard]] inline PrefixSplitBest best_prefix_split(std::span<const PrefixSplitSample> samples) noexcept {
+    PrefixSplitBest best;
+    for (const PrefixSplitSample& sample : samples) {
+        ++best.entries;
+        if (sample.tokens != 0) { ++best.identity_checked; }
+        if (sample.tokens > best.tokens) {
+            best.tokens      = sample.tokens;
+            best.identity_ok = sample.identity_ok;
+            best.match_end   = sample.match_end;
+            best.stored      = sample.stored;
+            best.source      = sample.source;
+            best.frontier    = sample.frontier;
+            best.probe_index = sample.probe_index;
+            best.divergence  = sample.divergence;
+        }
+        best.restorable = std::max(best.restorable, sample.restorable);
+    }
+    return best;
+}
+
+// #6: THE INCUMBENT COST KEY, at namespace scope so a host-only test can compare two of them and assert
+// the ordering directly. It was private to the planner, which is why nothing tested it -- and the ordering
+// it encodes IS the operator's ruling ("evicting a victim that holds a restorable checkpoint while the host
+// has room is a defect"): `restorable_evictions` is the FIRST element, ahead of `total_ns`, so among
+// feasible plans fewer evictions of victims that held a recoverable checkpoint wins and cost decides among
+// equals. A test asserting this on a COPY of the ordering would drift the first time either changed, so the
+// planner compares this very struct.
+struct FoldedCost {
+    std::uint64_t now_ns                    = 0;
+    std::uint64_t future_loss_ns            = 0;
+    std::uint64_t total_ns                  = 0;
+    std::uint64_t lower_bound_ns            = 0;
+    std::uint64_t affected_selected_hits    = 0;
+    std::uint64_t newest_affected_hit_epoch = 0;
+    std::uint32_t owner_evictions           = 0;
+    // #6: evictions of victims that held a RESTORABLE checkpoint -- the exact quantity the operator's
+    // ruling names, and the ONLY one that outranks cost in `key()`. Kept separate from
+    // `owner_evictions` because a victim with no checkpoint to lose costs nothing here, and from
+    // `checkpoint_drops` because that counts every drop, restorable or not: a blanket ordering on
+    // either one regressed `replacement private long anchor was not reusable` when it was tried.
+    std::uint32_t restorable_evictions      = 0;
+    std::uint32_t checkpoint_drops          = 0;
+    std::uint32_t copy_operations           = 0;
+    std::uint64_t transferred_bytes         = 0;
+    std::uint64_t remaining_text_prefill    = 0;
+    std::uint64_t remaining_vision_prefill  = 0;
+    std::uint32_t reused_prompt_tokens      = 0;
+    bool current_session_binding            = false;
+    std::uint32_t candidate_ordinal         = 0;
+    std::uint32_t target_ordinal            = 0;
+
+    [[nodiscard]] auto key() const noexcept {
+        // #6: PRESERVATION DOMINATES COST, and the ordering here is the whole of that decision.
+        //
+        // `checkpoint_drops` and `owner_evictions` used to sit FOURTH and FIFTH, behind `total_ns`, so
+        // a plan that was merely cheaper won over one that kept a restorable checkpoint: the fold
+        // prices a demote (host bytes + transfers) against an eviction (free), and cost decided before
+        // the destruction count was ever consulted. The operator's ruling is that evicting a victim
+        // holding a restorable checkpoint while the host has room is a DEFECT, not a trade, so the two
+        // counts now come first: among feasible plans, fewer dropped checkpoints wins, then fewer
+        // evictions, and only then cost.
+        //
+        // `restorable_evictions` is FIRST and everything else is where it was: the ruling names
+        // evictions of victims HOLDING A RESTORABLE CHECKPOINT, and nothing wider. An earlier version
+        // of this change promoted `checkpoint_drops` and `owner_evictions` too and regressed
+        // `replacement private long anchor was not reusable` -- preserving a checkpoint the scenario
+        // needs dropped (a non-restorable one) is not what the ruling asks for.
+        return std::tuple{
+            restorable_evictions,
+            total_ns,
+            affected_selected_hits,
+            newest_affected_hit_epoch,
+            owner_evictions,
+            checkpoint_drops,
+            copy_operations,
+            transferred_bytes,
+            remaining_text_prefill,
+            remaining_vision_prefill,
+            std::numeric_limits<std::uint32_t>::max() - reused_prompt_tokens,
+            current_session_binding ? 0U : 1U,
+            candidate_ordinal,
+            target_ordinal,
+        };
+    }
+
+    [[nodiscard]] bool less(const FoldedCost& other) const noexcept {
+        return key() < other.key();
+    }
+};
+
+// WHICH ELEMENT OF `key()` DECIDED ONE COST OVER ANOTHER: the index of the first element at which the two
+// differ, or `kNoDifferingKeyElement` when they are key-equal.
+//
+// COMPUTED OVER `key()` ITSELF, never over a hand-carried list of terms. The first version of this walked
+// six terms chosen by name and jumped from element 5 straight to element 10, so a pair differing on
+// `newest_affected_hit_epoch` (3), `copy_operations` (6), `transferred_bytes` (7), `remaining_text_prefill`
+// (8) or `remaining_vision_prefill` (9) was reported as **element 10** -- which its own legend called
+// "reuse itself decided, the real defect". That is a counter asserting the defect it exists to stop
+// asserting, and a review reproduced it. The `index_sequence` walk below cannot drift from `key()` and
+// covers EVERY element, including the two ordinal tie-breakers -- so "the winner was picked by ENUMERATION
+// ORDER" (an arbitrary tie-break, the real bug) is now distinguishable from "an unlooked-at term decided".
+//
+// THE INVARIANT THIS MAKES CHECKABLE, and it is the one to test the instrument with: a key that TIES on
+// elements 0..9 prefers MORE reuse, so **a loser with more `reused_prompt_tokens` than the winner cannot
+// have lost on element 10**. Therefore (`longer_lost_eligible` && `decided_by == 10`) is IMPOSSIBLE, and
+// seeing it means the two costs are not the ones the election compared -- an instrument fault, not a finding.
+// **IT NAMES `longer_lost_eligible`, NOT `longer_lost`** (corrected 2026-10-02): the ROW-based `longer_lost`
+// counts INELIGIBLE candidates, so it can be true for a reason that has nothing to do with this invariant,
+// and a legitimate `decided_by == 10` can sit beside it. All four copies of the claim now say the same.
+inline constexpr std::uint8_t kNoDifferingKeyElement = 255U;
+// 254 = THE "WINNER" DOES NOT BEAT THE LOSER ON `key()`. `first_differing_key_element` is symmetric, so
+// given an inverted pair it will happily name an element -- and that element is one where the LOSER was
+// better, presented as the winner's reason. That is not hypothetical: the seal fallback replaces the
+// sealed plan with root-maximal, whose key can be worse than a loser's, and the election never ranked that
+// pair. Attributing against the wrong cost therefore produced `decided_by` values that read as findings
+// (a review measured 974 of 977 such pairs yielding the supposedly-impossible `decided_by == 10`).
+// This sentinel makes the inverted comparison LOUD instead of plausible, so wherever the attribution is
+// computed from the wrong cost the record says so rather than inventing a cause.
+inline constexpr std::uint8_t kNotAnElectedWinner = 254U;
+
+[[nodiscard]] inline std::uint8_t first_differing_key_element(const FoldedCost& a,
+                                                              const FoldedCost& b) noexcept {
+    const auto ka = a.key();
+    const auto kb = b.key();
+    std::uint8_t result = kNoDifferingKeyElement;
+    bool found          = false;
+    const auto probe = [&]<std::size_t I>() {
+        if (!found && std::get<I>(ka) != std::get<I>(kb)) {
+            result = static_cast<std::uint8_t>(I);
+            found  = true;
+        }
+    };
+    // The pack must be DEDUCED from the argument -- a lambda whose only template parameters are the pack
+    // cannot be called with a `std::index_sequence` value.
+    [&]<std::size_t... Index>(std::index_sequence<Index...>) {
+        (probe.template operator()<Index>(), ...);
+    }(std::make_index_sequence<std::tuple_size_v<decltype(ka)>>{});
+    return result;
+}
+
+// THE ATTRIBUTION, WITH THE DIRECTION CHECKED -- the entry point to use, rather than
+// `first_differing_key_element` directly. It answers "which element decided the WINNER over this loser", and
+// returns `kNotAnElectedWinner` when the winner does not in fact beat the loser, because then no element can
+// honestly be named. Use it wherever a winner is compared against a candidate: `first_differing_key_element`
+// alone is symmetric and will name an element where the LOSER was better.
+[[nodiscard]] inline std::uint8_t election_deciding_element(const FoldedCost& winner,
+                                                            const FoldedCost& loser) noexcept {
+    return winner.less(loser) ? first_differing_key_element(winner, loser) : kNotAnElectedWinner;
+}
+
+
 
 template <class Clock = std::chrono::steady_clock>
 [[nodiscard]] std::uint64_t planning_now_ns() noexcept {
@@ -50,8 +399,48 @@ public:
     MaterializationSearchBudget(PlanningAllowance allowance, std::uint64_t started,
                                 std::uint64_t initial_cost) noexcept
         : allowance_(allowance), started_(started),
-          granted_(std::min(
-              {std::uint64_t{5'000'000}, economic(initial_cost), allowance.remaining(started)})) {}
+          // No flat millisecond cap on the initial window. What the artifacts support, with the
+          // denominators stated because this repo keeps paying for claims without them:
+          //
+          //  * the gate's own FORECAST for a construction step (`GATE DENY phase=construction
+          //    completion=…` -- the `completion` argument handed to `allow_work`, an estimate, not a
+          //    measured duration). The figure that motivated this change is from ONE log: `/tmp/why.log`
+          //    (n=8, all `complete=0`), 7.4-30.8 ms. Across every surviving log the same line reads
+          //    **0.024-30.8 ms (n=92, p50 4.7 ms, 71 of them `complete=1`)** -- so "several times the
+          //    flat 5 ms window" is true of that log's construction steps and NOT of the population.
+          //    The decision does not rest on it: the A/B below is the measurement;
+          //  * the collapse artifacts' stop reasons read `{'no_pressure': 1, 'time_budget': 15}` with
+          //    0% prefix reuse;
+          //  * the 5 ms arm below shows a work unit WAS admitted inside a 5 ms window, so the tempting
+          //    reading "the first step could not be admitted" is FALSE -- the window opened, one work
+          //    unit ran, and the search was cut off before finding the candidate. What remains (the
+          //    collapse) is labelled INFERENCE where it is stated.
+          //
+          // THE MEASURED A/B (2026-09-24, prod4 4x150k; arms by instance id in ~/ninfer-requests.jsonl -- neither arm recorded a binary identity). Counts are per COMPLETED turn: records the 420 s cap cancelled in flight carry `finish_reason=cancelled`, `prefill=0`, no reuse evidence, and are excluded -- an earlier version of this comment counted them as turns, which flattered the ratio and hid that a third of the "12 records" never ran.
+          //   * 5 ms arm 1 (serve-293952): cut by the 420 s cap after 9 of 16 turns completed (rc=124); 3 further turns cancelled in flight. Of the 9 completed: 9/9 root with 0 hits, 8 with `search_work>0` (`granted=5e6`, `time_budget`), 1 `no_pressure` (`granted=0`).
+          //   * 5 ms arm 2 (serve-307902, 3 rounds): cut after 9 of 12 completed, 3 cancelled. Of the 9: 8/9 root with 0 hits, 1 `private_endpoint` (152,227 hits); 7 with `search_work>0`.
+          //   * combined: 17 of 18 completed turns re-prefilled from root.
+          //   * 400 ms arm (serve-292073): completed 16/16. Rounds 2-3 (records 5-12): 8/8 `private_endpoint`, hits 152,333-154,799. Overall 12 of 16 `private_endpoint` (152,333-157,004) and 4 root (round 1, records 1-4); 15 of 16 with `search_work>0` -- the exception is record 1, `no_pressure`, `granted=0`.
+          // SCOPE: at a 5 ms allowance the old capped expression and the new one are numerically identical (both 5 ms) and `allow()` is byte-identical, so this pair measures THE WINDOW'S VALUE, not the cap removal as such. The cap's contribution is arithmetic: kept, with the allowance at 400 ms, `granted_` would still be 5 ms -- so it is what makes the measured window reachable, and its effect is not separately measured.
+          // STILL TUNED, not derived: 400 ms is the only value measured PASSING. 100 ms fails the gate (`/tmp/cmp-ms100.json`: root 12/16, 614,577 hits, `queue_wait_s.max` 153.03 s, 67% root in rounds 2+), and the no-reuse collapse is `/tmp/cmp-after.json` (`{no_pressure: 1, time_budget: 15}`, root 16/16, 0 hits -- its own `n_errors` is 0; the 22 turn errors belong to the narrowed-window arms, `cmp-ms800`/`cmp-w32`).
+          // KNOWN COST, deliberate: inside this window the per-step economic test does not run (the
+          // shortcut below precedes it), so discovery is bounded by the allowance rather than per
+          // step. In the prod4 4x150k profile that is the whole budget -- `search_granted_ns` is
+          // 4e8 on every record that searched (15 of 16; record 1 is `no_pressure`/`granted=0`), i.e.
+          // `granted_ == remaining`, because `economic(initial_cost)` is far above the allowance: the
+          // cost field (`initial_predicted_total_ns`) reads 1.239e11-8.798e12 ns across the prod4
+          // instances and `economic` is that divided by 20 -- **6.2e9-4.4e11 ns**. (An earlier version
+          // quoted the cost range as if it were the economic bound: 20x too large at the top end.)
+          // Ordinary traffic is not the prod4 profile, where `granted_ == remaining` still holds;
+          // across all records the smallest granted value on a record that actually searched
+          // (`search_work>0`) is 4,270,230 ns (`serve-820`); one record with `search_work=0` was
+          // granted 35,391 ns, and 901 records carry `granted=0` because no search was needed. No
+          // upper bound is claimed here. The test reaches the per-step guards with a 200 ms cost.
+          //
+          // The 32 ms arm did not complete (1200 s cap, 22 turn errors, 0 prefix hits) and its result
+          // file is byte-identical to an 800 ms arm's and tagged only `build`, so no arm's provenance
+          // is established and none of it is cited as evidence here.
+          granted_(std::min(economic(initial_cost), allowance.remaining(started))) {}
 
     [[nodiscard]] bool allow(std::uint64_t now, std::uint64_t next_operation_ns,
                              std::uint64_t completion_ns, std::uint64_t gain_ns,
@@ -72,8 +461,11 @@ public:
             reason_ = MaterializationStopReason::InsufficientExpectedGain;
             return false;
         }
-        // Unknown forecasts get one bounded discovery episode, not a fresh grant for every node.
-        if (!complete_prediction && (!discovery_eligible || discovery_used_)) {
+        // An incomplete (uncertain) forecast is only admitted for a discovery-eligible node. The
+        // eligibility is per-candidate (the caller passes it); cheap confirmation steps such as
+        // the assessment of an already-generated preserving alternative are admitted so a demote
+        // is not generated and then left unassessed.
+        if (!complete_prediction && !discovery_eligible) {
             reason_ = MaterializationStopReason::InsufficientExpectedGain;
             return false;
         }
@@ -112,9 +504,13 @@ public:
     }
 
 private:
+    // The gain is a per-request fact (the re-prefill a restore avoids). Dividing it by the
+    // concurrency inverts the economics: under load re-prefills queue and cost more, so the
+    // value threshold must not shrink as affected requests rise. The time allowance above is
+    // the legitimate concurrency fairness bound.
     [[nodiscard]] std::uint64_t economic(std::uint64_t gain) const noexcept {
         if (gain == std::numeric_limits<std::uint64_t>::max()) { return 0; }
-        return gain / 20U / std::max(1U, allowance_.affected_requests);
+        return gain / 20U;
     }
 
     bool boundary_limited_ = false;

@@ -6,6 +6,8 @@ add_library(ninfer_core STATIC
   gdn_replay_records.cpp
   cyclic_kv_cache.cpp
   host_kv_arena.cpp
+  pinned_host_pool.cpp
+  host_memory_budget.cpp
   paged_kv_cache.cpp
   linear_attention_state.cpp
   layout.cpp

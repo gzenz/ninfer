@@ -4,6 +4,7 @@
 #include "core/device.h"
 #include "core/layout.h"
 #include "core/nvtx.h"
+#include "models/qwen3_5/execution/vision_cpu/vision_cpu.h"
 #include "models/qwen3_5/program/vision_control.h"
 #include "ninfer/ops/add_bias.h"
 #include "ninfer/ops/gelu.h"
@@ -23,6 +24,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <thread>
 
 namespace ninfer::models::qwen3_5::execution {
 namespace {
@@ -217,14 +219,41 @@ std::size_t merger_hidden_bytes(const VisionConfig& config, std::size_t merged_t
 
 void copy_host(const void* src, Tensor& dst, cudaStream_t stream) {
     if (dst.bytes() == 0) { return; }
+    // Async on the caller's stream, then settle: the async copy is capture-recordable, the settle
+    // is eager-only, and the caller's buffer is not read after this returns.
     CUDA_CHECK(cudaMemcpyAsync(dst.data, src, dst.bytes(), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
 }
 
 } // namespace
 
-VisionContext::VisionContext(DeviceContext& ctx, const Parameters& parameters)
+VisionWorkspacePlan plan_vision_workspace_offload(const VisionConfig& config,
+                                                  std::int32_t output_hidden,
+                                                  std::uint32_t max_merged_tokens,
+                                                  std::size_t general_capacity_bytes) {
+    if (max_merged_tokens == 0 || general_capacity_bytes == 0 || output_hidden <= 0) {
+        throw std::invalid_argument("Vision offload workspace extents must be positive");
+    }
+    VisionWorkspacePlan out;
+    out.output_hidden          = output_hidden;
+    out.max_merged_tokens      = max_merged_tokens;
+    out.general_capacity_bytes = general_capacity_bytes;
+    // `--vision-cpu`: only the final embedding handoff is device-resident; the ViT scratch lives
+    // on the CPU, so the encode scratch is zero.
+    out.encode_peak_bytes      = 0;
+    out.handoff_offset_bytes =
+        align_up(general_capacity_bytes, kWorkspaceAlignment, "offload handoff offset");
+    out.handoff_capacity_bytes = output_handoff_bytes(output_hidden, max_merged_tokens);
+    out.capacity_bytes =
+        checked_add(out.handoff_offset_bytes, out.handoff_capacity_bytes, "offload workspace");
+    (void)config;
+    return out;
+}
+
+VisionContext::VisionContext(DeviceContext& ctx, const Parameters& parameters,
+                             bool use_device_parameters)
     : ctx_(ctx), config_(parameters.model.config().vision.value()),
-      parameters_(parameters.vision.value()) {}
+      parameters_(use_device_parameters ? &parameters.vision.value() : nullptr) {}
 
 std::size_t VisionContext::workspace_bytes(const VisionConfig& config,
                                            const VisionParameters& parameters, std::size_t patches,
@@ -284,6 +313,10 @@ Tensor VisionContext::bind_output(DeviceSpan backing, const VisionWorkspacePlan&
 void VisionContext::encode(const VisionItemView& item, Tensor& output, DeviceSpan backing,
                            const VisionWorkspacePlan& plan) const {
     if (item.control == nullptr) { throw std::invalid_argument("Vision item control is null"); }
+    if (parameters_ == nullptr) {
+        throw std::logic_error("VisionContext::encode requires device Vision parameters");
+    }
+    const VisionParameters& parameters = *parameters_;
     const qwen3_5::VisionItemControl& control = *item.control;
     const auto patches64                      = control.patch_count;
     const auto tokens64                       = control.merged_count;
@@ -293,7 +326,7 @@ void VisionContext::encode(const VisionItemView& item, Tensor& output, DeviceSpa
         checked_mul(patches64, dimension(config_.patch_width()), "patch elements")) {
         throw std::invalid_argument("Vision processor patch buffer has invalid shape");
     }
-    if (output.dtype != DType::BF16 || output.ne[0] != parameters_.merger_fc2.weight.n ||
+    if (output.dtype != DType::BF16 || output.ne[0] != parameters.merger_fc2.weight.n ||
         output.ne[1] != static_cast<std::int32_t>(tokens64) || output.ne[2] != 1 ||
         output.ne[3] != 1 || !output.is_contiguous() || output.data == nullptr) {
         throw std::invalid_argument("Vision output must be contiguous BF16 [H,V]");
@@ -303,7 +336,7 @@ void VisionContext::encode(const VisionItemView& item, Tensor& output, DeviceSpa
         throw std::invalid_argument("Vision output does not name the planned handoff region");
     }
     const VisionWorkspaceLayout layout = build_workspace_layout(
-        config_, parameters_, patches64, tokens64, plan.handoff_offset_bytes);
+        config_, parameters, patches64, tokens64, plan.handoff_offset_bytes);
     if (layout.bytes > plan.encode_peak_bytes || backing.bytes < plan.capacity_bytes) {
         throw std::invalid_argument("Vision workspace capacity is too small for request");
     }
@@ -326,21 +359,21 @@ void VisionContext::encode(const VisionItemView& item, Tensor& output, DeviceSpa
                                       static_cast<std::uint64_t>(patches64));
         copy_host(control.position_ids.data(), position_ids, stream);
         copy_host(item.patches.data(), patch_bf16, stream);
-        project(patch_bf16, parameters_.patch_embedding, x, layout.patch_scratch);
-        ops::add_bias(parameters_.patch_embedding_bias, x, stream);
+        project(patch_bf16, parameters.patch_embedding, x, layout.patch_scratch);
+        ops::add_bias(parameters.patch_embedding_bias, x, stream);
         // The artifact records the source table shape [rows,hidden], while Tensor's
         // contiguous matrix convention is [inner,columns]. The payload is already
         // row-major, so this is a zero-copy [hidden,rows] view, not a transpose.
         copy_host(control.position_table_indices.data(), pos_indices, stream);
         copy_host(control.position_table_weights.data(), pos_weights, stream);
-        Tensor position_table = parameters_.position_embedding.reshape(
+        Tensor position_table = parameters.position_embedding.reshape(
             {dimension(config_.hidden_size), dimension(config_.num_position_embeddings)});
         ops::vision_pos_embed_add(position_table, pos_indices, pos_weights, x, stream);
     }
-    for (std::size_t layer = 0; layer < parameters_.layers.size(); ++layer) {
+    for (std::size_t layer = 0; layer < parameters.layers.size(); ++layer) {
         nvtx::ScopedRange layer_range(nvtx::Name::VisionLayer, nvtx::Category::Vision,
                                       static_cast<std::uint64_t>(layer));
-        const auto& block = parameters_.layers[layer];
+        const auto& block = parameters.layers[layer];
         {
             nvtx::ScopedRange attention_range(nvtx::Name::VisionAttention,
                                               nvtx::Category::Attention,
@@ -408,24 +441,26 @@ void VisionContext::encode(const VisionItemView& item, Tensor& output, DeviceSpa
         nvtx::ScopedRange merge_range(nvtx::Name::VisionMerge, nvtx::Category::Vision,
                                       static_cast<std::uint64_t>(tokens64));
         Tensor normalized = layout.normalized.bind(backing);
-        ops::layer_norm(x, parameters_.merger_norm.weight, parameters_.merger_norm.bias, 1.0e-6F,
+        ops::layer_norm(x, parameters.merger_norm.weight, parameters.merger_norm.bias, 1.0e-6F,
                         normalized, stream);
         Tensor merged = normalized.view({dimension(config_.merger_width()), tokens});
         Tensor hidden = layout.merger_hidden.bind(backing);
-        project(merged, parameters_.merger_fc1, hidden, layout.merger_first_scratch);
-        ops::add_bias(parameters_.merger_fc1_bias, hidden, stream);
+        project(merged, parameters.merger_fc1, hidden, layout.merger_first_scratch);
+        ops::add_bias(parameters.merger_fc1_bias, hidden, stream);
         ops::gelu(hidden, ops::GeluMode::Exact, stream);
-        project(hidden, parameters_.merger_fc2, output, layout.merger_second_scratch);
-        ops::add_bias(parameters_.merger_fc2_bias, output, stream);
+        project(hidden, parameters.merger_fc2, output, layout.merger_second_scratch);
+        ops::add_bias(parameters.merger_fc2_bias, output, stream);
     }
 }
 
 VisionPrefillSession::VisionPrefillSession(
     DeviceContext& device, const execution::Parameters& parameters, DeviceSpan workspace,
     const VisionWorkspacePlan& workspace_plan, qwen3_5::PreparedPromptData& prompt,
-    const VisionPrefillPlan& plan, std::size_t& handoff_peak_bytes)
+    const VisionPrefillPlan& plan, std::size_t& handoff_peak_bytes,
+    const vision_cpu::CpuVisionWeights* cpu_weights)
     : device_(device), workspace_(workspace), workspace_plan_(workspace_plan), prompt_(prompt),
-      plan_(plan), handoff_peak_bytes_(handoff_peak_bytes), context_(device, parameters) {
+      plan_(plan), handoff_peak_bytes_(handoff_peak_bytes), cpu_weights_(cpu_weights),
+      context_(device, parameters, cpu_weights == nullptr) {
     if (plan_.control == nullptr || plan_.control->items.empty() || plan_.uses.empty()) {
         throw std::invalid_argument("Vision prefill plan has no suffix item spans");
     }
@@ -509,6 +544,35 @@ VisionChunk VisionPrefillSession::prepare_chunk(std::uint32_t begin, std::uint32
     }
     const qwen3_5::VisionItemControl& control = plan_.control->items[active->control_index];
     Tensor output = VisionContext::bind_output(workspace_, workspace_plan_, control.merged_count);
+
+    if (cpu_weights_ != nullptr) {
+        // `--vision-cpu`: run the ViT on the CPU with the host-resident FP32 weights and hand the
+        // final BF16 embedding to the device handoff region. The device scratch/encode is unused.
+        if (!active_item_ || *active_item_ != active->prepared_item_index) {
+            const auto& weights = *cpu_weights_;
+            const int32_t patches = static_cast<int32_t>(control.patch_count);
+            std::vector<float> visible;
+            vision_cpu::encode(weights, prompt_.media_payloads[active->prepared_item_index]
+                                            ->span()
+                                           .data(),
+                               control.position_ids.data(),
+                               control.position_table_indices.data(),
+                               control.position_table_weights.data(), patches,
+                               control.segment_length,
+                               static_cast<int>(std::thread::hardware_concurrency()),
+                               visible);
+            // Synchronous transfer so the host `visible` buffer is fully consumed before it can be
+            // freed; the device scatter in the text prefill then reads the completed handoff.
+            CUDA_CHECK(cudaMemcpy(output.data, visible.data(),
+                                  static_cast<std::size_t>(visible.size()) * 2,
+                                  cudaMemcpyHostToDevice));
+            active_item_          = active->prepared_item_index;
+            active_handoff_bytes_ = output.bytes();
+            handoff_peak_bytes_   = std::max(handoff_peak_bytes_, active_handoff_bytes_);
+            encoded_payloads_pending_release_.push_back(active->prepared_item_index);
+        }
+        return VisionChunk{static_cast<int32_t>(end - begin), &control, output};
+    }
 
     if (!active_item_ || *active_item_ != active->prepared_item_index) {
         const auto& payload = prompt_.media_payloads[active->prepared_item_index];

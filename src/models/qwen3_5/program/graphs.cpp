@@ -298,17 +298,25 @@ void ProgramImpl::prepare_graphs() {
                                         io,
                                         prefill_hidden,
                                         prefill_chunk,
-                                        proposal_head};
+                                        proposal_head,
+                                        rope_scaling_factor,
+                                        rope_scaling_original_context};
     };
 
     if (speculative_backend == SpeculativeBackend::None) {
         const auto ordinary_profiles = ordinary_graph_profiles(capacity);
         validate_graph_profiles(ordinary_profiles, capacity - 1, "ordinary");
         const std::uint32_t ordinary_batch_limit = max_concurrency;
+        // The ingress shadow must exist BEFORE capture: the batch body is captured into a graph,
+        // so a copy node only exists if the pointer was non-null when the graph was built.
+        if (std::getenv("NINFER_INGRESS_PROBE") != nullptr && !ingress_shadow) {
+            ingress_shadow.emplace(sizeof(qwen3_5::OrdinaryDecodeIngress));
+        }
         execution::OrdinaryBatchContext ordinary_state{
             execution_core(),      decoder->text_kv,
             *io.ordinary,          *ordinary_host_ingress,
-            *ordinary_host_egress, state_images->continuation_hidden_store()};
+            *ordinary_host_egress, state_images->continuation_hidden_store(),
+            ingress_shadow ? ingress_shadow->data() : nullptr};
         const GraphExecutionProfile code_warm = ordinary_profiles.front();
         prepare_representative(code_warm.min, 1);
         device.synchronize();

@@ -18,7 +18,8 @@ struct RequestCapacity {
     explicit RequestCapacity(std::size_t limit) : maximum(limit) {}
 
     std::mutex mutex;
-    std::size_t active = 0;
+    std::size_t active   = 0;
+    std::size_t max_seen = 0;  // high-water mark of active since startup
     const std::size_t maximum;
 };
 
@@ -244,7 +245,10 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     engine_options.prefill_chunk            = options_.prefill_chunk;
     engine_options.kv_cache                 = options_.kv_cache;
     engine_options.enable_vision            = options_.enable_vision;
+    engine_options.vision_cpu_offload       = options_.vision_cpu_offload;
     engine_options.use_cuda_graph           = options_.use_cuda_graph;
+    engine_options.rope_scaling_factor          = options_.rope_scaling_factor;
+    engine_options.rope_scaling_original_context = options_.rope_scaling_original_context;
     engine_options.speculative              = options_.speculative;
     engine_options.context_cache            = options_.context_cache;
     engine_options.context_cost.preset_path = options_.context_cost_presets;
@@ -267,6 +271,9 @@ GenerationService::acquire_request_lifetime(DeadlinePolicy deadline_policy) cons
                                                      "inference request queue is full"));
         }
         ++request_capacity_->active;
+        if (request_capacity_->active > request_capacity_->max_seen) {
+            request_capacity_->max_seen = request_capacity_->active;
+        }
     }
     try {
         const Clock::time_point deadline =
@@ -279,6 +286,16 @@ GenerationService::acquire_request_lifetime(DeadlinePolicy deadline_policy) cons
         --request_capacity_->active;
         throw;
     }
+}
+
+std::size_t GenerationService::in_flight() const {
+    std::lock_guard lock(request_capacity_->mutex);
+    return request_capacity_->active;
+}
+
+std::size_t GenerationService::max_in_flight() const {
+    std::lock_guard lock(request_capacity_->mutex);
+    return request_capacity_->max_seen;
 }
 
 PreparedRequest GenerationService::prepare(const GenerationRequest& request,

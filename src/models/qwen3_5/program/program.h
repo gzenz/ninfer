@@ -4,6 +4,9 @@
 #include "runtime/contract/execution.h"
 #include "runtime/contract/resources.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
+// For `runtime::DivergencePosition`, carried by `PrefixSplit` beside its probe index. Header-only,
+// and it itself includes only ninfer/types.h.
+#include "runtime/engine/context_cache/materialization_budget.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -197,6 +200,7 @@ public:
     [[nodiscard]] const PreparedContextCache& context_cache() const noexcept;
     [[nodiscard]] std::optional<PrefixShortlistKey>
     prefix_shortlist_key(std::uint32_t frontier) const noexcept;
+    [[nodiscard]] std::size_t prefix_shortlist_size() const noexcept;
     [[nodiscard]] std::optional<runtime::PrefillWork>
     shared_candidate_rebuild_work(std::uint32_t frontier) const noexcept;
 
@@ -567,7 +571,10 @@ public:
     identity_target(runtime::PlanningCandidateId candidate) const;
     [[nodiscard]] PressureTargetHandle
     root_maximal_target(runtime::PlanningCandidateId root_candidate);
-    [[nodiscard]] PressureTargetHandle maximal_target(runtime::PlanningCandidateId candidate);
+    // `nullopt` = the target arena is full. A SEARCH alternative, not a required target: the caller
+    // stops searching rather than failing the request (see `intern_target`).
+    [[nodiscard]] std::optional<PressureTargetHandle>
+    maximal_target(runtime::PlanningCandidateId candidate);
     [[nodiscard]] PressureConstructionCursor begin_construction(PressureTargetHandle target,
                                                                 bool restore = false);
     [[nodiscard]] runtime::PressureConstructionStep
@@ -592,6 +599,11 @@ public:
                                                    runtime::FinalScheduleIntent intent);
     [[nodiscard]] std::optional<CapturePressurePlan>
     seal_capture(AssessedPressureTarget&& assessed);
+    // Claim the seal window so a concurrent demote cannot bump a victim's slot generation
+    // between this session's final assess and seal. Returns false if another session already
+    // claims it; the caller must back off. release_seal_window is idempotent.
+    [[nodiscard]] bool try_claim_seal_window() noexcept;
+    void release_seal_window() noexcept;
 
 private:
     explicit PressurePlanningSession(
@@ -846,14 +858,20 @@ public:
 
     // Engine owns scheduling and logical residency policy. Program owns physical lanes, opaque
     // capabilities, model state and one immutable pending transaction at a time.
+    // `branch_anchor_frontier`: the depth at which to capture a checkpoint because this prompt matched stored
+    // content deeper than any checkpoint below it can resume from. It arrives HERE, with the plan build, so the
+    // group exists before the identity and pricing passes -- the two things a later injection misses.
     [[nodiscard]] RequestBasePlan plan_request(const PreparedPrompt& prompt,
-                                               const runtime::ResolvedExecutionOptions& options);
+                                               const runtime::ResolvedExecutionOptions& options,
+                                               std::optional<std::uint32_t> branch_anchor_frontier = std::nullopt);
     [[nodiscard]] std::vector<float> causal_score(PreparedPrompt&& prompt,
                                                   std::uint32_t first_target);
+
     [[nodiscard]] std::optional<AdmissionCandidate> inspect_admission(
         const PreparedPrompt& prompt, const RequestBasePlan& base, runtime::LaneId destination,
         const ContinuationHandle* source, const SharedPrefixHandle* shared_source,
         std::optional<runtime::CheckpointRef> checkpoint, bool must_retain_private_source);
+
     [[nodiscard]] std::optional<ResourcePlan> seal_identity(const AdmissionCandidate& candidate,
                                                             const PreparedPrompt& prompt,
                                                             runtime::FinalScheduleIntent intent);
@@ -884,7 +902,7 @@ public:
     inspect_capture(const CaptureOffer& offer, const SharedPrefixHandle* exact_shared,
                     const SharedPrefixHandle* replacement,
                     std::optional<runtime::CheckpointRef> private_replacement,
-                    bool permit_shared_publication) const;
+                    bool permit_shared_publication, const char* site) const;
     [[nodiscard]] std::vector<runtime::CheckpointRecoveryAlternativeWork>
     checkpoint_recovery_work(const ContinuationHandle& owner,
                              runtime::CheckpointRef checkpoint) const;
@@ -932,6 +950,65 @@ public:
     [[nodiscard]] ReleaseResult release_continuation(ContinuationHandle&& continuation) noexcept;
     [[nodiscard]] ReleaseResult release_shared_prefix(SharedPrefixHandle&& shared) noexcept;
     void fail_all_cleanup() noexcept;
+    void resource_census() const noexcept;
+    [[nodiscard]] std::uint64_t shared_replacements() const noexcept;
+    [[nodiscard]] std::uint64_t demotable_evictions() const noexcept;
+    [[nodiscard]] std::uint64_t evictions_with_victim_room() const noexcept;
+    [[nodiscard]] std::uint64_t evictions_demote_possible() const noexcept;
+    [[nodiscard]] std::uint64_t demotable_eviction_checks() const noexcept;
+    [[nodiscard]] std::uint64_t pressure_options() const noexcept;
+    [[nodiscard]] std::uint64_t demote_options() const noexcept;
+    // The five capture-skip reasons. An optional capture that silently does not happen is indistinguishable
+    // from one that was never needed without these.
+    [[nodiscard]] std::uint64_t capture_skips(std::uint32_t reason) const noexcept;
+    // The private catalog: requests that LOST reuse to a missing cell, and the goal-probe denominator beside
+    // it. MUTATORS are needed because both are decided in `ResourceManager`'s planning, which holds only
+    // this façade -- every other counter in this block is incremented inside ProgramImpl's own TUs.
+    [[nodiscard]] std::uint64_t note_publication_cell_loss() noexcept;
+    [[nodiscard]] std::uint64_t note_publication_cell_at_risk() noexcept;
+    void add_publication_cell_at_risk(std::uint32_t at_risk, std::uint32_t goals, std::uint32_t other,
+                                      std::uint32_t reuse) noexcept;
+    [[nodiscard]] std::uint64_t publication_cell_at_risk_runs() const noexcept;
+    [[nodiscard]] std::uint64_t publication_cell_veto_goals() const noexcept;
+    [[nodiscard]] std::uint64_t publication_cell_veto_other() const noexcept;
+    [[nodiscard]] std::uint64_t publication_cell_veto_reuse() const noexcept;
+    // Ungated goal-failure split; see the RuntimeStats comment for why the `veto_*` totals cannot answer it.
+    void add_publication_goal_blocked(std::uint64_t cell_only, std::uint64_t other) noexcept;
+    [[nodiscard]] std::uint64_t publication_goal_blocked_cell_only() const noexcept;
+    [[nodiscard]] std::uint64_t publication_goal_blocked_other() const noexcept;
+    void add_publication_cell_probes(std::uint64_t count) noexcept;
+    [[nodiscard]] std::uint64_t options_refused_no_kv() const noexcept;
+    void note_pressure_successor_outcome(bool nonevicting_available) noexcept;
+    [[nodiscard]] std::uint64_t pressure_successor_calls() const noexcept;
+    [[nodiscard]] std::uint64_t pressure_successors_with_option() const noexcept;
+    [[nodiscard]] std::uint64_t demote_option_refused_no_state_deficit() const noexcept;
+    [[nodiscard]] std::uint64_t demote_option_refused_precondition() const noexcept;
+    [[nodiscard]] std::uint64_t options_refused_active_lanes() const noexcept;
+    [[nodiscard]] std::uint64_t options_refused_evicting_current() const noexcept;
+
+    struct PrefixSplit {
+        std::uint32_t tokens      = 0;
+        std::uint32_t restorable  = 0;
+        bool          identity_ok = false;
+        std::uint8_t  match_end   = 0;  // 0 = diverged, 1 = the stored ledger ended, 2 = the prompt ended
+        std::uint32_t stored      = 0;  // THIS entry's ledger length: the denominator `match_end` needs
+        std::uint32_t probe_index = 0;  // where the match stopped; 0 unless it diverged
+        // WHICH TURN OF THE PROMPT'S OWN HISTORY the divergence falls in, and its role. `probe_index`
+        // localises the stop to a token, which is unreadable on its own: the prompt's per-message token
+        // layout is not retained anywhere a reader can consult. PROMPT-SIDE ONLY -- the stored ledger's
+        // boundaries are not kept, so this does not say where the STORED render sat.
+        runtime::DivergencePosition divergence;
+    };
+    // Takes the PROMPT, not a token span: reading the prompt's tokens requires the frontend's
+    // `PreparedPromptAccess`, and doing that in the caller forced the model-agnostic `ResourceManager` to
+    // include a qwen3_5 header -- which broke `ninfer_resource_manager_test`'s ability to compile against a
+    // fake prompt at all. The view happens here, in the model layer.
+    [[nodiscard]] PrefixSplit prefix_split(const ContinuationHandle& owner,
+                                           const PreparedPrompt& prompt) const;
+    [[nodiscard]] PrefixSplit prefix_split(const SharedPrefixHandle& owner,
+                                           const PreparedPrompt& prompt) const;
+    [[nodiscard]] std::uint64_t publication_cell_losses() const noexcept;
+    [[nodiscard]] std::uint64_t publication_cell_probes() const noexcept;
 
     [[nodiscard]] bool isolated_request_feasible(const RequestBasePlan& base) const noexcept;
     [[nodiscard]] runtime::ProgramResourceRevision resource_revision() const noexcept;

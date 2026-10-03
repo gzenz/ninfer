@@ -276,7 +276,10 @@ int main(int argc, char** argv) {
         engine_options.kv_cache           = cli.kv_cache;
         engine_options.speculative        = cli.speculative;
         engine_options.enable_vision      = cli.enable_vision;
+        engine_options.vision_cpu_offload = cli.vision_cpu_offload;
         engine_options.use_cuda_graph     = cli.use_cuda_graph;
+        engine_options.rope_scaling_factor = cli.rope_scaling_factor;
+        engine_options.rope_scaling_original_context = cli.rope_scaling_original_context;
         // One CLI invocation owns exactly one request, so retained cross-request context has no
         // consumer and must not reserve an extra Device StateImage or run terminal capture.
         engine_options.context_cache.enabled                = false;

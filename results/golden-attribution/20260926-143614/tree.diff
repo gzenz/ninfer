@@ -1,0 +1,120 @@
+diff --git a/include/ninfer/types.h b/include/ninfer/types.h
+index 32ec0097..248a0157 100644
+--- a/include/ninfer/types.h
++++ b/include/ninfer/types.h
+@@ -977,6 +977,13 @@ struct RuntimeStats {
+     std::uint64_t pressure_private_owners_evicted      = 0;
+     std::uint64_t pressure_shared_owners_degraded      = 0;
+     std::uint64_t pressure_shared_owners_evicted       = 0;
++    // A shared slot whose catalogued owner was REPLACED by a new publication (`capture.cpp`, where
++    // `replaces_shared` is set and the slot becomes `ReservedReplacement`). It had no counter at all,
++    // which meant a run where shared prefixes were replaced was indistinguishable from one where none
++    // were -- and the one assertion that would have covered replacement in the suite could not be
++    // written for want of it (`pressure_shared_owners_evicted` is the KV-pressure path only, so it
++    // reads 0/0 across a replacement).
++    std::uint64_t pressure_shared_owners_replaced      = 0;
+     std::uint64_t pressure_checkpoints_dropped         = 0;
+     std::uint64_t pressure_searches                    = 0;
+     std::uint64_t pressure_search_budget_exhaustions   = 0;
+diff --git a/src/models/qwen3_5/program/program.cpp b/src/models/qwen3_5/program/program.cpp
+index 71b8f05b..af828fb9 100644
+--- a/src/models/qwen3_5/program/program.cpp
++++ b/src/models/qwen3_5/program/program.cpp
+@@ -470,6 +470,7 @@ ReleaseResult Program::release_shared_prefix(SharedPrefixHandle&& shared) noexce
+ 
+ void Program::fail_all_cleanup() noexcept { impl_->fail_all_cleanup(); }
+ void Program::resource_census() const noexcept { impl_->resource_census(); }
++std::uint64_t Program::shared_replacements() const noexcept { return impl_->shared_replacements(); }
+ 
+ bool Program::isolated_request_feasible(const RequestBasePlan& base) const noexcept {
+     return impl_->isolated_request_feasible(base);
+diff --git a/src/models/qwen3_5/program/program.h b/src/models/qwen3_5/program/program.h
+index 9a98415c..4383d48b 100644
+--- a/src/models/qwen3_5/program/program.h
++++ b/src/models/qwen3_5/program/program.h
+@@ -939,6 +939,7 @@ public:
+     [[nodiscard]] ReleaseResult release_shared_prefix(SharedPrefixHandle&& shared) noexcept;
+     void fail_all_cleanup() noexcept;
+     void resource_census() const noexcept;
++    [[nodiscard]] std::uint64_t shared_replacements() const noexcept;
+ 
+     [[nodiscard]] bool isolated_request_feasible(const RequestBasePlan& base) const noexcept;
+     [[nodiscard]] runtime::ProgramResourceRevision resource_revision() const noexcept;
+diff --git a/src/models/qwen3_5/program/program_impl.h b/src/models/qwen3_5/program/program_impl.h
+index 0db9cc39..664e7ecb 100644
+--- a/src/models/qwen3_5/program/program_impl.h
++++ b/src/models/qwen3_5/program/program_impl.h
+@@ -567,6 +567,8 @@ public:
+     // #9 diagnostic: what the KV address spaces still hold, per address. Called by the engine's recovery
+     // path so a non-zero residual can be attributed to an owner instead of remaining an amount.
+     void resource_census() const noexcept;
++    // Shared-prefix replacements observed (see `shared_replacements_`).
++    [[nodiscard]] std::uint64_t shared_replacements() const noexcept { return shared_replacements_; }
+     [[nodiscard]] detail::PhysicalResources admission_capacity() const noexcept;
+     [[nodiscard]] bool isolated_request_feasible(const RequestBasePlan& base) const noexcept;
+ 
+@@ -896,6 +898,9 @@ private:
+     // could only ever read 0 (the branch is unreachable), and a counter that can only read zero is a
+     // claim, not an instrument.
+     std::uint64_t recycled_checkpoint_drops_             = 0;
++    // A shared catalogued slot replaced by a new capture (`prepare_active_capture`). Counted so the
++    // replacement path is observable at all; read back through `Program::shared_replacements()`.
++    std::uint64_t shared_replacements_                   = 0;
+     // #11(b): a checkpoint priced with no settled StateImage replica. Counted with its denominator, never
+     // thrown on -- see the comment at the observation site.
+     // `mutable`: the observation site is a const pricing walk, which is where the condition has to be
+diff --git a/src/models/qwen3_5/program/transactions/capture.cpp b/src/models/qwen3_5/program/transactions/capture.cpp
+index 9bec3fea..6fbb3da7 100644
+--- a/src/models/qwen3_5/program/transactions/capture.cpp
++++ b/src/models/qwen3_5/program/transactions/capture.cpp
+@@ -553,6 +553,9 @@ runtime::ContextTransactionReserveStatus ProgramImpl::reserve_active_capture_imp
+                 transaction.replaces_shared        = true;
+                 transaction.replacement_generation = shared_prefix_slots[index].generation;
+                 shared_prefix_slots[index].role    = SharedPrefixSlotRole::ReservedReplacement;
++                // Counted HERE, at the decision, because this is the only place that knows a catalogued
++                // shared owner is being displaced. Nothing else reported it -- see the field's comment.
++                ++shared_replacements_;
+             } else {
+                 for (std::uint32_t index = 0; index < shared_prefix_capacity; ++index) {
+                     if (shared_prefix_slots[index].role == SharedPrefixSlotRole::Free) {
+diff --git a/src/runtime/engine/context_cache/resource_manager.h b/src/runtime/engine/context_cache/resource_manager.h
+index 093b5ab0..85d35d86 100644
+--- a/src/runtime/engine/context_cache/resource_manager.h
++++ b/src/runtime/engine/context_cache/resource_manager.h
+@@ -1205,6 +1205,7 @@ public:
+         out.pressure_private_owners_evicted    = context_stats_.pressure_private_owners_evicted;
+         out.pressure_shared_owners_degraded    = context_stats_.pressure_shared_owners_degraded;
+         out.pressure_shared_owners_evicted     = context_stats_.pressure_shared_owners_evicted;
++        out.pressure_shared_owners_replaced    = program.shared_replacements();
+         out.pressure_checkpoints_dropped       = context_stats_.pressure_checkpoints_dropped;
+         out.pressure_searches                  = context_stats_.pressure_searches;
+         out.pressure_search_budget_exhaustions = context_stats_.pressure_search_budget_exhaustions;
+diff --git a/src/serve/stats_json.cpp b/src/serve/stats_json.cpp
+index cc5eef2b..e8faf524 100644
+--- a/src/serve/stats_json.cpp
++++ b/src/serve/stats_json.cpp
+@@ -104,6 +104,7 @@ std::string format_stats_json(const ninfer::RuntimeStats& s, const ninfer::Memor
+         {"private_owners_evicted", s.pressure_private_owners_evicted},
+         {"shared_owners_degraded", s.pressure_shared_owners_degraded},
+         {"shared_owners_evicted", s.pressure_shared_owners_evicted},
++        {"shared_owners_replaced", s.pressure_shared_owners_replaced},
+         {"checkpoints_dropped", s.pressure_checkpoints_dropped},
+         {"searches", s.pressure_searches},
+         {"search_budget_exhaustions", s.pressure_search_budget_exhaustions},
+diff --git a/tests/models/qwen3_5/test_engine_prefix_real.cpp b/tests/models/qwen3_5/test_engine_prefix_real.cpp
+index c8d353ef..cf4a10af 100644
+--- a/tests/models/qwen3_5/test_engine_prefix_real.cpp
++++ b/tests/models/qwen3_5/test_engine_prefix_real.cpp
+@@ -685,6 +685,12 @@ int exercise_shared_replacement_and_full_capacity_reuse(const char* artifact) {
+         std::cerr << "shared replacement fixture did not produce its deterministic stop token\n";
+         return 1;
+     }
++    // MEASURED, and the counter now exists to measure it. This prints the shared-replacement count the
++    // engine reports, so the question "does a replacement happen here, and does anything see it?" is
++    // answered by a run rather than by reading. The assertion is written only once a run shows it moves.
++    std::fprintf(stderr, "[scenario] shared-replacement owners_replaced=%llu (after the Bravo turn)\n",
++                 static_cast<unsigned long long>(
++                     after_replacement.pressure_shared_owners_replaced));
+     // NOT asserted, and the reason is worth more than the assertion would have been:
+     // `pressure_shared_owners_evicted` is incremented ONLY by the KV-pressure shared-victim path
+     // (`resource_manager.h:2761`, `apply_shared_action`), and it reads `0/0` across this sequence even

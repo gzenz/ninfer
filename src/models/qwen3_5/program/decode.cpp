@@ -4,6 +4,7 @@
 #include "models/qwen3_5/program/graph_execution.h"
 #include "core/nvtx.h"
 #include "core/device.h"
+#include "core/diagnostics.h"
 #include "ninfer/ops/prepare_ragged_prefix.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/scatter.h"
@@ -12,8 +13,11 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
+#include <limits>
 #include <optional>
 #include <span>
+#include <unordered_map>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -32,6 +36,11 @@ auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
         CUDA_CHECK(cudaMemcpyAsync(ordinary.ingress.data, &state.host_ingress,
                                    sizeof(qwen3_5::OrdinaryDecodeIngress), cudaMemcpyHostToDevice,
                                    state.execution.device.stream));
+        if (state.ingress_shadow != nullptr) {
+            CUDA_CHECK(cudaMemcpyAsync(state.ingress_shadow, ordinary.ingress.data,
+                                       sizeof(qwen3_5::OrdinaryDecodeIngress),
+                                       cudaMemcpyDeviceToDevice, state.execution.device.stream));
+        }
 
         TextContext card(state.execution.device, state.execution.parameters, state.execution.work,
                          {}, state.execution.linear_attention, state.execution.io,
@@ -47,9 +56,10 @@ auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
         Tensor hidden             = ordinary.hidden.slice(1, 0, batch_size);
         Tensor logits             = ordinary.logits.slice(1, 0, batch_size);
         Tensor sampled            = ordinary.sampled_tokens.slice(0, 0, batch_size);
+        Tensor valid_columns      = ordinary.valid_columns.slice(0, 0, batch_size);
 
-        card.ordinary_decode_batch(tokens, cache_positions, rope_positions, kv_rows, state_sources,
-                                   state_destinations, envelope, hidden, logits);
+        card.ordinary_decode_batch(tokens, cache_positions, rope_positions, valid_columns, kv_rows,
+                                   state_sources, state_destinations, envelope, hidden, logits);
         ops::scatter(hidden, state_destinations, state.continuation_hidden_store,
                      state.execution.device.stream);
         ops::sample(logits, sampled,
@@ -83,6 +93,23 @@ void ordinary_decode_batch(OrdinaryBatchContext& state, std::int32_t batch_size,
 namespace ninfer::models::qwen3_5::detail {
 
 namespace {
+
+// Host-side mirror of ops::scale_positions_yarn (src/ops/kernel/position.cuh). Applied to the
+// spec-decode target and ordinary-decode host RoPE positions so the target model sees YaRN-scaled
+// positions while the draft continues on unscaled logical positions (which it must, per the draft's
+// own position-encoding invariants).
+[[nodiscard]] std::int32_t yarn_scale_position(std::int32_t position, std::uint32_t original_context,
+                                               float factor) noexcept {
+    if (factor == 1.0F ||
+        position <= static_cast<std::int32_t>(original_context)) {
+        return position;
+    }
+    const float scaled = static_cast<float>(original_context) +
+                         (static_cast<float>(position - static_cast<std::int32_t>(original_context))) /
+                             factor +
+                         0.5F;
+    return static_cast<std::int32_t>(scaled);
+}
 
 DecodeGraphProfile& select_graph_profile(DecodeGraphFamily& family, std::uint32_t batch_size,
                                          std::uint32_t frontier, const char* label);
@@ -245,7 +272,9 @@ void ProgramImpl::enqueue_dflash_context_append(std::span<const std::uint32_t> l
 
     execution::DFlashAppendContext state{{device, parameters, work, state_images->linear(),
                                           replay_records ? &*replay_records : nullptr, io,
-                                          prefill_hidden, prefill_chunk, proposal_head},
+                                          prefill_hidden, prefill_chunk, proposal_head,
+                                          rope_scaling_factor,
+                                          rope_scaling_original_context},
                                          *dflash};
     mark_workspace_usage(workspace_plan.dflash_context);
     execution::dflash_append_context(state, features, positions, device_counts,
@@ -298,6 +327,150 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
         maximum_frontier = std::max(maximum_frontier, sequence.execution_frontier);
     }
 
+    // See the note in prefill.cpp: N1 is not fixed by waiting on the compute side.
+    // KV content fingerprint (NINFER_KV_PROBE=1). Samples the first 4 KB of a physical page per plane
+    // and prints a digest of those bytes.
+    //
+    // EXTENDED (2026-09-24): not the frontier page only. The canary sits INSIDE the private document,
+    // thousands of tokens before the frontier, so sampling only `pages-1` could never cover it -- which
+    // is why the first version's "no cross-lane page sharing" was a bounded negative about one page per
+    // lane, not about the region the evidence points at. It now samples at three offsets through the
+    // lane's mapped range (1/3, 2/3, last) and prints the logical index beside the physical page.
+    // Reading rule, pre-committed: a digest shared by two lanes at *different* logical positions is
+    // shared bytes; a shared page at the *same* position is the shared prefix and legitimate.
+    //
+    // `sum`/`peak` are gone deliberately: they decoded an NVFP4 KV buffer as float words and printed
+    // `-nan` / 3.3e38, values that invite a reader to believe the probe measured magnitudes it did not.
+    // Page size in tokens for the label above, and the shared/private split for the region digests: a
+    // page holds kKvPageTokens columns, and the boundary is where this lane's reused prefix ends, so
+    // "private" means the region that is this lane's own document.
+    constexpr std::uint32_t kKvPageTokens = 64U;
+    // Where "shared" ends and this lane's own document begins, in tokens, supplied by the experiment
+    // (`NINFER_KV_SHARED_TOKENS`, e.g. the harness's shared system block) rather than inferred from the
+    // engine: the region split is the question being asked, so it must not come from the code under
+    // test. 0 means "no split known" and every page counts as private.
+    const auto kv_shared_tokens = [] {
+        const char* value = std::getenv("NINFER_KV_SHARED_TOKENS");
+        return value != nullptr ? static_cast<std::uint32_t>(std::strtoul(value, nullptr, 10)) : 0U;
+    }();
+    const auto head_is_zero = [](const char* hex) {
+        for (const char* p = hex; *p != '\0'; ++p) {
+            if (*p != '0') { return false; }
+        }
+        return true;
+    };
+    if (std::getenv("NINFER_KV_PROBE") != nullptr) {
+        const bool verbose_pages = std::strcmp(std::getenv("NINFER_KV_PROBE"), "pages") == 0;
+        const std::uint32_t shared_page_boundary = kv_shared_tokens / kKvPageTokens;
+        const DeviceKVPagePool& pool = text_kv_pages->physical_pool();
+        for (std::size_t row = 0; row < lanes.size(); ++row) {
+            const SequenceState& state = active_sequence(lanes[row]);
+            if (!state.kv) { continue; }
+            const std::uint32_t pages = text_kv_addresses->mapped_pages(state.kv->text);
+            if (pages == 0) { continue; }
+            // `NINFER_KV_PROBE=full` digests EVERY mapped page of this lane's range once, at its first
+            // decode step -- the 3-offset mode covers 3 of ~950 pages per lane, which bounds what its
+            // "no cross-lane sharing" negative can claim. Full coverage is affordable exactly once per
+            // lane (~950 x 4 KB x planes), so it is gated on `execution_frontier ==
+            // admitted_prompt_tokens` (the first decode step) rather than run every step.
+            const char* const kv_mode = std::getenv("NINFER_KV_PROBE");
+            const bool full_mode      = kv_mode != nullptr && std::strcmp(kv_mode, "full") == 0;
+            if (full_mode && state.execution_frontier != state.admitted_prompt_tokens) { continue; }
+            std::vector<std::uint32_t> offsets;
+            if (full_mode) {
+                offsets.resize(pages);
+                for (std::uint32_t logical = 0; logical < pages; ++logical) { offsets[logical] = logical; }
+            } else {
+                offsets = {pages / 3U, (2U * pages) / 3U, pages - 1U};
+            }
+            // WHAT THE ROW READS, as one digest per region. A row's attention window covers its whole
+            // prefix, so hashing it page by page says little; what matters is whether lane i's own
+            // PRIVATE region reads the same bytes as lane j's -- which is the cross-session question
+            // asked of what the kernel actually consumes, not of the bindings. Per page the sample is
+            // also LABELLED: `expect_written` says whether that page's columns fall inside this lane's
+            // frontier. Without that label a zero is ambiguous (unwritten vs mis-addressed), which is
+            // exactly how an earlier version of this probe produced a negative that had to be withdrawn.
+            const std::uint32_t written_pages =
+                (state.execution_frontier + kKvPageTokens - 1U) / kKvPageTokens;
+            std::uint64_t shared_digest  = 1469598103934665603ULL;
+            std::uint64_t private_digest = 1469598103934665603ULL;
+            std::uint32_t zero_expected = 0, zero_unexpected = 0, sampled = 0;
+            for (const std::uint32_t logical : offsets) {
+                const std::int32_t phys =
+                    text_kv_addresses->physical_page_index(state.kv->text, logical);
+                if (phys < 0) { continue; }
+                std::uint64_t digest = 1469598103934665603ULL;
+                for (std::size_t plane_index = 0; plane_index < pool.plane_count(); ++plane_index) {
+                    const Tensor& plane = pool.plane(plane_index);
+                    if (plane.data == nullptr || plane.nb[3] <= 0) { continue; }
+                    const auto* base = static_cast<const unsigned char*>(plane.data) +
+                                       static_cast<std::size_t>(phys) * plane.nb[3];
+                    // The WHOLE page stride, not its first 4 KB. The 4 KB version hashed a region
+                    // whose bytes did not vary with the page's content: 597 distinct pages came back
+                    // with one identical digest, which turned "no cross-lane sharing" into a
+                    // statement about the probe rather than about the KV (2026-09-25 00:35).
+                    const std::size_t bytes = static_cast<std::size_t>(plane.nb[3]);
+                    std::vector<unsigned char> sample(bytes, 0);
+                    CUDA_CHECK(cudaMemcpyAsync(sample.data(), base, bytes, cudaMemcpyDeviceToHost,
+                                               device.stream));
+                    device.synchronize();
+                    for (std::size_t i = 0; i < sample.size(); ++i) {
+                        digest ^= sample[i];
+                        digest *= 1099511628211ULL;
+                    }
+                }
+                // The first plane's first bytes, printed beside the digest. This is the positive
+                // control the probe has never had: several hundred of a lane's pages hashed
+                // identically, which means the bytes it reads are identical -- most plausibly zeros --
+                // and a digest alone cannot say whether the probe is addressing a region that carries
+                // content at all. With the bytes visible, "all zero" and "mis-addressed" are
+                // distinguishable, and a page that must differ (the shared prefix vs a private page)
+                // can be checked by eye before any negative is believed.
+                unsigned char preview[16] = {};
+                std::size_t preview_bytes   = 0;
+                for (std::size_t plane_index = 0; plane_index < pool.plane_count() && preview_bytes == 0;
+                     ++plane_index) {
+                    const Tensor& plane = pool.plane(plane_index);
+                    if (plane.data == nullptr || plane.nb[3] <= 0) { continue; }
+                    const auto* base = static_cast<const unsigned char*>(plane.data) +
+                                       static_cast<std::size_t>(phys) * plane.nb[3];
+                    CUDA_CHECK(cudaMemcpyAsync(preview, base, sizeof(preview), cudaMemcpyDeviceToHost,
+                                               device.stream));
+                    device.synchronize();
+                    preview_bytes = sizeof(preview);
+                }
+                char hex[sizeof(preview) * 2 + 1] = {};
+                for (std::size_t i = 0; i < sizeof(preview); ++i) {
+                    std::snprintf(hex + i * 2, 3, "%02x", preview[i]);
+                }
+                const bool expect_written = logical < written_pages;
+                const bool all_zero       = (head_is_zero(hex));
+                if (all_zero) { (expect_written ? zero_unexpected : zero_expected)++; }
+                ++sampled;
+                const bool shared_region = logical < shared_page_boundary;
+                std::uint64_t& acc       = shared_region ? shared_digest : private_digest;
+                acc ^= digest;
+                acc *= 1099511628211ULL;
+                if (verbose_pages) {
+                    std::fprintf(stderr,
+                                 "[mat-debug] KV-FP lane=%u frontier=%u logical=%u page=%u digest=%llx "
+                                 "head=%s expect_written=%d\n",
+                                 lanes[row], state.execution_frontier, logical,
+                                 static_cast<unsigned>(phys),
+                                 static_cast<unsigned long long>(digest), hex,
+                                 expect_written ? 1 : 0);
+                }
+            }
+            std::fprintf(stderr,
+                         "[mat-debug] READ-SUMMARY lane=%u frontier=%u sampled=%u zero_expected=%u "
+                         "zero_unexpected=%u shared_digest=%llx private_digest=%llx\n",
+                         lanes[row], state.execution_frontier, sampled, zero_expected, zero_unexpected,
+                         static_cast<unsigned long long>(shared_digest),
+                         static_cast<unsigned long long>(private_digest));
+        }
+        std::fflush(stderr);
+    }
+
     const auto start = Clock::now();
     try {
         std::optional<nvtx::ScopedRange> submit_range;
@@ -321,25 +494,333 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             ordinary_host_ingress->cache_positions[row] =
                 checked_i32(frontier, "ordinary batch position");
             ordinary_host_ingress->rope_positions[row] =
-                checked_i32(frontier, "ordinary batch RoPE position") + sequence.rope_delta;
+                yarn_scale_position(
+                    checked_i32(frontier, "ordinary batch RoPE position") + sequence.rope_delta,
+                    rope_scaling_original_context, rope_scaling_factor);
             ordinary_host_ingress->text_kv_table_rows[row] =
                 text_kv_addresses->bound_row(sequence.kv->text);
             const StateImageSelectors selectors                 = state_selectors(sequence);
             ordinary_host_ingress->state_source_slots[row]      = selectors.source;
             ordinary_host_ingress->state_destination_slots[row] = selectors.destination;
+            // Visible keys for THIS row. HONEST SCOPE (third review): at width 1 this is INERT --
+            // the SmallT kernel derives each row's key window from its own `positions` entry
+            // (`small_t_k8v4.cuh`, `window = positions[TokenTile-1] + 1`), and the mask only bounds
+            // output columns via `absolute_column >= valid_columns[batch]`, which is never true for
+            // `frontier + 1`. The earlier justification here ("without a per-row bound a row attends
+            // past its own context") was contradicted by the kernel source and by this plan's own
+            // cleared-table row. Kept as a guard for width > 1 and as the binding `NINFER_MASK_PROBE`
+            // toggles -- whose "decisive" 11:07 reading measured nothing.
+            // NINFER_MASK_PROBE=1 was added as a positive control ("bound each row to ONE key").
+            // It is NOT one: at width 1 the value reaches the kernel only as
+            // `absolute_column >= valid_columns[batch]` with token 0 and column_begin 0, and the
+            // producer clamps valid_tokens to TokenTile = 1, so 1 is bit-identical to frontier + 1
+            // (fifth review, verified against all four kernel consumers). It is meaningful only
+            // for width > 1, to which it is not wired, so it is inert as wired -- and the
+            // "decisive control" reading once taken from it measured nothing.
+            ordinary_host_ingress->valid_columns[row] =
+                diagnostic_control_enabled("NINFER_MASK_PROBE")
+                    ? 1
+                    : checked_i32(frontier + 1U, "ordinary batch visible keys");
             ordinary_host_ingress->sampling[row]                = request.sampling_host;
             ensure_sequence_kv_mapped(sequence, frontier + 1, 0);
+            // Slot provenance (NINFER_SLOT_PROBE=1): record this lane as the writer of its
+            // destination slot, and shout if it READS a slot a *different* lane wrote last. The
+            // proven symptom is a victim emitting the canary of the request admitted just before
+            // it, so a read of another lane's slot is exactly the aliasing to catch.
+            // Ledger provenance (NINFER_LEDGER_PROBE=1): what the model is actually fed as this
+            // row's input token, and whether the ledger behind it is this sequence's own prompt.
+            // Every binding is verified; the ledger's *contents* were never checked, and the
+            // symptom is a victim continuing the request admitted immediately before it.
+            if (std::getenv("NINFER_LEDGER_PROBE") != nullptr) {
+                const std::uint32_t ledger_size =
+                    static_cast<std::uint32_t>(sequence.ledger.size());
+                std::uint64_t prefix_hash = 1469598103934665603ULL;
+                const std::size_t prefix = std::min<std::size_t>(sequence.ledger.size(), 64U);
+                for (std::size_t index = 0; index < prefix; ++index) {
+                    prefix_hash ^= static_cast<std::uint64_t>(sequence.ledger[index]);
+                    prefix_hash *= 1099511628211ULL;
+                }
+                const bool first_step =
+                    sequence.execution_frontier + 2U >= sequence.admitted_prompt_tokens;
+                // TAIL hash: the 64 entries ending at `admitted_prompt_tokens` are this lane's OWN
+                // document, while the first 64 (`prefix64`) are the shared system prefix and identical
+                // for every lane by construction -- which is why a prefix-only hash could never
+                // discriminate anything. `tail_mismatch` compares those entries with the same range of
+                // the request's own prompt vector: the missing half of "the ledger's contents were
+                // never checked" (only its length was).
+                std::uint64_t tail_hash     = 1469598103934665603ULL;
+                std::uint32_t tail_mismatch = 0;
+                std::uint32_t tail_checked  = 0;
+                // `tail_compared` (not `tail_checked`) is the denominator a reader needs. In the one
+                // run measured, the request's `prefill` record had already been cleared by decode time
+                // (`has_prompt=0`), so `prompt_ids` was null and nothing was compared -- while
+                // `tail_checked=64 tail_mismatch=0` reads like "64 compared, 0 mismatches", the
+                // opposite of the truth. The reset is conditional, not universal: prefill.cpp resets
+                // the record unless a prompt-frontier capture is in flight, and commit.cpp resets it
+                // on a terminal decision -- so the comparison is live in some configurations and not
+                // others, which is exactly why the denominator is printed rather than assumed.
+                // Observed in one run whose log did not survive; treat it as a reading until a run
+                // with NINFER_LEDGER_PROBE=1 is captured whole.
+                std::uint32_t tail_compared = 0;
+                const std::uint32_t tail    = std::min<std::uint32_t>(64U, sequence.admitted_prompt_tokens);
+                const std::vector<TokenId>* prompt_ids = nullptr;
+                if (requests[sequence.lane].prefill) {
+                    prompt_ids = &requests[sequence.lane].prefill->prompt.token_ids;
+                }
+                for (std::uint32_t i = 0; i < tail; ++i) {
+                    const std::size_t index = static_cast<std::size_t>(sequence.admitted_prompt_tokens - 1U - i);
+                    if (index >= sequence.ledger.size()) { break; }
+                    const TokenId entry = sequence.ledger[index];
+                    tail_hash ^= static_cast<std::uint64_t>(entry);
+                    tail_hash *= 1099511628211ULL;
+                    ++tail_checked;
+                    if (prompt_ids != nullptr && index < prompt_ids->size()) {
+                        ++tail_compared;
+                        if ((*prompt_ids)[index] != entry) { ++tail_mismatch; }
+                    }
+                }
+                std::fprintf(stderr,
+                             "[mat-debug] LEDGER-FP lane=%u frontier=%u ledger=%u admitted=%u "
+                             "input_token=%d prefix64=%llx first_step=%d batch=%zu "
+                             "tail64=%llx tail_checked=%u tail_compared=%u tail_mismatch=%u "
+                             "has_prompt=%d\n",
+                             lanes[row], frontier, ledger_size, sequence.admitted_prompt_tokens,
+                             static_cast<int>(ordinary_host_ingress->tokens[row]),
+                             static_cast<unsigned long long>(prefix_hash), first_step ? 1 : 0,
+                             lanes.size(), static_cast<unsigned long long>(tail_hash), tail_checked,
+                             tail_compared, tail_mismatch, prompt_ids != nullptr ? 1 : 0);
+                std::fflush(stderr);
+            }
+            if (std::getenv("NINFER_SLOT_PROBE") != nullptr) {
+                ++step_counter;
+                const std::int32_t source = ordinary_host_ingress->state_source_slots[row];
+                const std::int32_t destination =
+                    ordinary_host_ingress->state_destination_slots[row];
+                const auto last = slot_last_writer.find(source);
+                if (last != slot_last_writer.end() && last->second.first != lanes[row]) {
+                    std::fprintf(stderr,
+                                 "[mat-debug] SLOT-READ-FOREIGN lane=%u slot=%d written_by_lane=%u "
+                                 "at_step=%llu now_step=%llu frontier=%u\n",
+                                 lanes[row], source, last->second.first,
+                                 static_cast<unsigned long long>(last->second.second),
+                                 static_cast<unsigned long long>(step_counter), frontier);
+                    std::fflush(stderr);
+                }
+                if (destination >= 0) {
+                    slot_last_writer[destination] = {lanes[row], step_counter};
+                }
+            }
+        }
+        // Within-batch state-slot uniqueness (NINFER_MAT_DEBUG=1). The cross-session canary
+        // isolates the leak to the state/hidden path (a row bounded to ONE attention key still
+        // reproduced another row's canary), so two rows of one batch resolving to the same
+        // StateImage slot is the signature to catch -- the between-steps check never sees it.
+        if (std::getenv("NINFER_MAT_DEBUG") != nullptr) {
+            const auto slot_of = [&](const SequenceState& seq, bool destination) -> std::int32_t {
+                const StateImageHandle& handle =
+                    destination ? seq.state.write : seq.state.read;
+                if (!state_store->valid(handle) ||
+                    state_store->residency(handle) == StateReplicaResidency::HostOnly) {
+                    return -1;
+                }
+                return state_store->physical_slot(handle);
+            };
+            for (std::size_t row = 0; row < lanes.size(); ++row) {
+                const SequenceState& mine = active_sequence(lanes[row]);
+                std::fprintf(stderr,
+                             "[mat-debug] DECODE-ROW row=%zu lane=%u frontier=%u src_slot=%d "
+                             "dst_slot=%d batch=%zu\n",
+                             row, lanes[row], mine.execution_frontier,
+                             slot_of(mine, false), slot_of(mine, true), lanes.size());
+                for (std::size_t other = row + 1; other < lanes.size(); ++other) {
+                    const SequenceState& theirs = active_sequence(lanes[other]);
+                    for (bool dst : {false, true}) {
+                        const std::int32_t a = slot_of(mine, dst);
+                        const std::int32_t b = slot_of(theirs, dst);
+                        if (a >= 0 && a == b) {
+                            std::fprintf(stderr,
+                                         "[mat-debug] SLOT-SHARE-IN-BATCH lane=%u other_lane=%u "
+                                         "slot=%d role=%s batch=%zu\n",
+                                         lanes[row], lanes[other], a, dst ? "write" : "read",
+                                         lanes.size());
+                        }
+                    }
+            // Physical KV page exclusivity inside one decode batch. Bindings (rows, slots) are
+            // exclusive, so the last place two lanes can meet is the physical page behind a
+            // logical column. A page mapped by two lanes is only legitimate where their *tokens*
+            // agree (a read-only shared prefix); where the tokens differ the page cannot hold
+            // both sequences, and one lane decodes with the other's content.
+            {
+                constexpr std::uint32_t kColumnsPerPage = 64;
+                std::unordered_map<std::int32_t,
+                                   std::vector<std::pair<std::uint32_t, std::uint32_t>>>
+                    by_physical;
+                for (std::size_t row = 0; row < lanes.size(); ++row) {
+                    const SequenceState& state = active_sequence(lanes[row]);
+                    if (!state.kv) { continue; }
+                    const std::uint32_t pages = text_kv_addresses->mapped_pages(state.kv->text);
+                    for (std::uint32_t page = 0; page < pages; ++page) {
+                        const std::int32_t physical =
+                            text_kv_addresses->physical_page_index(state.kv->text, page);
+                        if (physical < 0) { continue; }
+                        by_physical[physical].emplace_back(lanes[row], page);
+                    }
+                }
+                std::uint32_t reported = 0;
+                for (const auto& [physical, owners] : by_physical) {
+                    if (owners.size() < 2 || reported >= 8) { continue; }
+                    for (std::size_t i = 0; i < owners.size(); ++i) {
+                        for (std::size_t j = i + 1; j < owners.size(); ++j) {
+                            const SequenceState& left  = active_sequence(owners[i].first);
+                            const SequenceState& right = active_sequence(owners[j].first);
+                            const std::uint32_t left_begin  = owners[i].second * kColumnsPerPage;
+                            const std::uint32_t right_begin = owners[j].second * kColumnsPerPage;
+                            const std::uint32_t begin = std::max(left_begin, right_begin);
+                            const std::uint32_t end =
+                                std::min(left_begin + kColumnsPerPage, right_begin + kColumnsPerPage);
+                            for (std::uint32_t column = begin; column < end; ++column) {
+                                const std::uint32_t left_column  = column - left_begin;
+                                const std::uint32_t right_column = column - right_begin;
+                                if (left_column >= left.ledger.size() ||
+                                    right_column >= right.ledger.size()) {
+                                    break;
+                                }
+                                if (left.ledger[left_column] == right.ledger[right_column]) {
+                                    continue;
+                                }
+                                std::fprintf(
+                                    stderr,
+                                    "[mat-debug] PAGE-ALIAS-MISMATCH phys=%d lane=%u page=%u "
+                                    "column=%u token=%d other_lane=%u other_column=%u token=%d "
+                                    "batch=%zu\n",
+                                    physical, owners[i].first, owners[i].second, left_column,
+                                    static_cast<int>(left.ledger[left_column]), owners[j].first,
+                                    right_column, static_cast<int>(right.ledger[right_column]),
+                                    lanes.size());
+                                ++reported;
+                                break;
+                            }
+                            if (reported >= 8) { break; }
+                        }
+                    }
+                }
+                std::fflush(stderr);
+            }
+                }
+            }
+            // Device block table vs host bookkeeping. Everything host-side is verified clean, so
+            // the last link is the published Device row the kernels actually read: if it names a
+            // page other than the address's own, a lane reads another sequence's KV.
+            for (std::size_t row = 0; row < lanes.size(); ++row) {
+                const SequenceState& state = active_sequence(lanes[row]);
+                if (!state.kv) { continue; }
+                const std::uint32_t pages = text_kv_addresses->mapped_pages(state.kv->text);
+                if (pages == 0) { continue; }
+                const Tensor table = text_kv_addresses->execution_table(state.kv->text);
+                std::vector<std::int32_t> host_table(pages, -1);
+                CUDA_CHECK(cudaMemcpyAsync(host_table.data(), table.data,
+                                           host_table.size() * sizeof(std::int32_t),
+                                           cudaMemcpyDeviceToHost, device.stream));
+                device.synchronize();
+                std::uint32_t mismatches = 0;
+                for (std::uint32_t page = 0; page < pages; ++page) {
+                    const std::int32_t expected =
+                        text_kv_addresses->physical_page_index(state.kv->text, page);
+                    if (host_table[page] == expected) { continue; }
+                    if (mismatches < 4) {
+                        std::fprintf(stderr,
+                                     "[mat-debug] TABLE-MISMATCH lane=%u page=%u device=%d "
+                                     "host=%d batch=%zu\n",
+                                     lanes[row], page, host_table[page], expected, lanes.size());
+                    }
+                    ++mismatches;
+                }
+                if (mismatches != 0) {
+                    std::fprintf(stderr,
+                                 "[mat-debug] TABLE-MISMATCH-COUNT lane=%u mismatches=%u of %u "
+                                 "pages\n",
+                                 lanes[row], mismatches, pages);
+                }
+            }
+            // Writable-page exclusivity. A lane's own pages may be shared only as read-only
+            // aliases of a shared prefix; a page that another *active* address still references
+            // while this lane writes it is a page two sequences write, which is the one way a
+            // lane can read content its own tokens do not describe.
+            for (std::size_t row = 0; row < lanes.size(); ++row) {
+                const SequenceState& state = active_sequence(lanes[row]);
+                if (!state.kv) { continue; }
+                const std::uint32_t pages = text_kv_addresses->mapped_pages(state.kv->text);
+                std::uint32_t shared_writable = 0;
+                std::uint32_t seen            = 0;
+                for (std::uint32_t page = 0; page < pages; ++page) {
+                    const LogicalKVPageHandle logical =
+                        text_kv_addresses->logical_page(state.kv->text, page);
+                    if (!text_kv_pages->valid(logical)) { continue; }
+                    const std::uint32_t active_refs = text_kv_pages->active_address_references(logical);
+                    if (active_refs <= 1) { continue; }
+                    if (text_kv_pages->writer_references(logical) == 0) { continue; }
+                    ++shared_writable;
+                    if (seen < 4) {
+                        std::fprintf(stderr,
+                                     "[mat-debug] PAGE-SHARED-WRITER lane=%u page=%u refs=%u "
+                                     "writers=%u protected_cols=%u batch=%zu\n",
+                                     lanes[row], page, active_refs,
+                                     static_cast<unsigned>(text_kv_pages->writer_references(logical)),
+                                     text_kv_pages->protected_columns(logical), lanes.size());
+                        ++seen;
+                    }
+                }
+                // Pages this lane WRITES that are also referenced by a NON-ACTIVE owner (a
+                // catalogued checkpoint of some other, possibly released, request). The earlier
+                // exclusivity audit counted only active references, so a checkpoint's pages were
+                // invisible to it -- and writing them silently changes that checkpoint's content.
+                std::uint32_t checkpoint_writable = 0;
+                std::uint32_t shown                = 0;
+                for (std::uint32_t page = 0; page < pages; ++page) {
+                    const LogicalKVPageHandle logical =
+                        text_kv_addresses->logical_page(state.kv->text, page);
+                    if (!text_kv_pages->valid(logical)) { continue; }
+                    if (text_kv_pages->writer_references(logical) == 0) { continue; }
+                    const std::uint32_t total  = text_kv_pages->address_references(logical);
+                    const std::uint32_t active = text_kv_pages->active_address_references(logical);
+                    if (total <= active) { continue; }
+                    ++checkpoint_writable;
+                    if (shown < 4) {
+                        std::fprintf(stderr,
+                                     "[mat-debug] PAGE-CHECKPOINT-SHARED lane=%u page=%u refs=%u "
+                                     "active=%u protected_cols=%u batch=%zu\n",
+                                     lanes[row], page, total, active,
+                                     text_kv_pages->protected_columns(logical), lanes.size());
+                        ++shown;
+                    }
+                }
+                if (checkpoint_writable != 0) {
+                    std::fprintf(stderr,
+                                 "[mat-debug] PAGE-CHECKPOINT-SHARED-COUNT lane=%u pages=%u of %u\n",
+                                 lanes[row], checkpoint_writable, pages);
+                }
+                if (shared_writable != 0) {
+                    std::fprintf(stderr,
+                                 "[mat-debug] PAGE-SHARED-WRITER-COUNT lane=%u pages=%u of %u\n",
+                                 lanes[row], shared_writable, pages);
+                }
+            }
+            std::fflush(stderr);
         }
 
+        if (std::getenv("NINFER_INGRESS_PROBE") != nullptr && !ingress_shadow) {
+            ingress_shadow.emplace(sizeof(qwen3_5::OrdinaryDecodeIngress));
+        }
         execution::OrdinaryBatchContext schedule_state{
             {device, parameters, work, state_images->linear(),
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-             proposal_head},
+             proposal_head, rope_scaling_factor, rope_scaling_original_context},
             decoder->text_kv,
             *io.ordinary,
             *ordinary_host_ingress,
             *ordinary_host_egress,
-            state_images->continuation_hidden_store()};
+            state_images->continuation_hidden_store(),
+            ingress_shadow ? ingress_shadow->data() : nullptr};
 
         mark_workspace_usage(workspace_plan.ordinary_round);
         execution::ordinary_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
@@ -353,7 +834,251 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
         }
         timing.end_wait();
 
+        // Per-row sampling gather audit (NINFER_SAMPLE_PROBE=1). Every other per-row surface of
+        // this batch has been audited and cleared (ingress row->lane mapping, KV table rows,
+        // state slots, the attention mask), so the last unverified per-row step is the gather
+        // that turns the batch logits into each row's committed token. This copies the batch
+        // logits back once and compares each row's argmax with the token the engine committed
+        // for that row: a row whose committed token is another row's argmax means the gather
+        // (or its stride) is wrong, which at temperature 0 reproduces another session verbatim.
+        if (std::getenv("NINFER_SAMPLE_PROBE") != nullptr) {
+            // Reuse-equivalence trace: the token each row commits, with the row's own frontier.
+            // At temperature 0 the first token of a turn is a function of the prompt alone, so a
+            // run with prefix reuse disabled and a run with it enabled must produce the same
+            // token trace for the same turn. A difference is a *provable* statement that the
+            // reuse path is not content-equivalent, independent of any hypothesis about why.
+            for (std::size_t row = 0; row < lanes.size(); ++row) {
+                std::fprintf(stderr,
+                             "[mat-debug] SAMPLE-TRACE lane=%u owner=%llx frontier=%u token=%d\n",
+                             lanes[row],
+                             static_cast<unsigned long long>(
+                                 active_sequence(lanes[row]).session_key_hash),
+                             active_sequence(lanes[row]).execution_frontier,
+                             ordinary_host_egress->sampled_tokens[row]);
+            }
+            std::fflush(stderr);
+        }
+        if (std::getenv("NINFER_SAMPLE_PROBE") != nullptr) {
+            const std::int32_t vocab = static_cast<std::int32_t>(
+                parameters.model.resources().public_token_count);
+            // ops::sample's contract is "contiguous BF16 [physical_rows,B]"; ne[0] is the fast
+            // axis and ne[0] itself is padded above the token domain, so a row's vocabulary
+            // starts at row*ne[0] (using the padded width, not the token domain).
+            const std::int32_t rows = io.ordinary->logits.ne[0];
+            std::vector<std::uint16_t> host_logits(
+                static_cast<std::size_t>(rows) * lanes.size(), 0);
+            CUDA_CHECK(cudaMemcpyAsync(host_logits.data(), io.ordinary->logits.data,
+                                       host_logits.size() * sizeof(std::uint16_t),
+                                       cudaMemcpyDeviceToHost, device.stream));
+            device.synchronize();
+            std::fprintf(stderr,
+                         "[mat-debug] SAMPLE-LAYOUT ne0=%d ne1=%d batch=%zu vocab=%d\n", rows,
+                         static_cast<std::int32_t>(io.ordinary->logits.ne[1]), lanes.size(), vocab);
+            const auto to_float = [](std::uint16_t bits) {
+                const std::uint32_t wide = static_cast<std::uint32_t>(bits) << 16U;
+                float value              = 0.0F;
+                std::memcpy(&value, &wide, sizeof(value));
+                return value;
+            };
+            std::vector<std::int32_t> row_argmax(lanes.size(), -1);
+            for (std::size_t row = 0; row < lanes.size(); ++row) {
+                const std::uint16_t* column = host_logits.data() + row * rows;
+                float best                  = -std::numeric_limits<float>::infinity();
+                for (std::int32_t token = 0; token < vocab; ++token) {
+                    const float value = to_float(column[token]);
+                    if (value > best) {
+                        best            = value;
+                        row_argmax[row] = token;
+                    }
+                }
+            }
+            for (std::size_t row = 0; row < lanes.size(); ++row) {
+                const std::int32_t committed = ordinary_host_egress->sampled_tokens[row];
+                std::int32_t borrowed        = -1;
+                for (std::size_t other = 0; other < lanes.size(); ++other) {
+                    if (other != row && row_argmax[other] == committed) {
+                        borrowed = static_cast<std::int32_t>(other);
+                    }
+                }
+                const ops::SamplingConfig& config = ordinary_host_ingress->sampling[row];
+                // Full-row fingerprint of the (fully written) logits plus the top-3: at
+                // temperature 0 the committed token is the argmax, so this row's distribution is
+                // exactly what decides the next token. Comparing it concurrent vs serialized for
+                // the same prompt and step is a clean divergence oracle -- no stale-byte caveat,
+                // because the logits are rewritten from scratch every step.
+                std::uint64_t row_hash = 1469598103934665603ULL;
+                std::int32_t top[3]    = {-1, -1, -1};
+                float top_value[3]     = {-std::numeric_limits<float>::infinity(),
+                                          -std::numeric_limits<float>::infinity(),
+                                          -std::numeric_limits<float>::infinity()};
+                {
+                    const std::uint16_t* column = host_logits.data() + row * rows;
+                    for (std::int32_t token = 0; token < rows; ++token) {
+                        row_hash ^= column[token];
+                        row_hash *= 1099511628211ULL;
+                        if (token >= vocab) { continue; }
+                        const float value = to_float(column[token]);
+                        for (int slot = 0; slot < 3; ++slot) {
+                            if (value > top_value[slot]) {
+                                for (int move = 2; move > slot; --move) {
+                                    top_value[move] = top_value[move - 1];
+                                    top[move]      = top[move - 1];
+                                }
+                                top_value[slot] = value;
+                                top[slot]       = token;
+                                break;
+                            }
+                        }
+                    }
+                }
+                std::fprintf(stderr,
+                             "[mat-debug] SAMPLE-ROW row=%zu lane=%u committed=%d own_argmax=%d "
+                             "borrowed_from_row=%d temp=%g top_k=%d top_p=%g batch=%zu\n",
+                             row, lanes[row], committed, row_argmax[row], borrowed,
+                             static_cast<double>(config.temperature), config.top_k,
+                             static_cast<double>(config.top_p), lanes.size());
+                std::fprintf(stderr,
+                             "[mat-debug] SAMPLE-TOP row=%zu lane=%u frontier=%u hash=%llx "
+                             "top=%d:%g %d:%g %d:%g\n",
+                             row, lanes[row], active_sequence(lanes[row]).execution_frontier,
+                             static_cast<unsigned long long>(row_hash), top[0],
+                             static_cast<double>(top_value[0]), top[1],
+                             static_cast<double>(top_value[1]), top[2],
+                             static_cast<double>(top_value[2]));
+            }
+            std::fflush(stderr);
+        }
+
+        // Device-vs-host ingress comparison (NINFER_INGRESS_PROBE=1). The step's ingress is one
+        // cudaMemcpyAsync of the whole host struct, and that copy lives *inside* the captured
+        // decode graph -- so the device reads the host image at replay time while the host is free
+        // to rewrite it for the next step. A device copy that disagrees with the host image means a
+        // row was fed another step's (and possibly another lane's) tokens, slots and positions,
+        // which no host-side print can see.
+        if (std::getenv("NINFER_INGRESS_PROBE") != nullptr && ingress_shadow) {
+            qwen3_5::OrdinaryDecodeIngress device_ingress{};
+            CUDA_CHECK(cudaMemcpyAsync(&device_ingress, ingress_shadow->data(),
+                                       sizeof(device_ingress), cudaMemcpyDeviceToHost,
+                                       device.stream));
+            device.synchronize();
+            for (std::size_t row = 0; row < lanes.size(); ++row) {
+                const std::int32_t host_token  = ordinary_host_ingress->tokens[row];
+                const std::int32_t host_row    = ordinary_host_ingress->text_kv_table_rows[row];
+                const std::int32_t host_source = ordinary_host_ingress->state_source_slots[row];
+                // Positions too -- and their absence was a real gap in every "the ingress is verified"
+                // claim made before 2026-09-25. `cache_positions[row]` and `rope_positions[row]` decide
+                // WHERE the row reads in the KV (the attention window is derived from the position, not
+                // from the token), so a stale or mis-filled position makes a row read another lane's
+                // columns while tokens, KV rows and state slots all still agree -- which is exactly the
+                // observed signature: own tokens, foreign content.
+                const std::int32_t host_cache_pos = ordinary_host_ingress->cache_positions[row];
+                const std::int32_t host_rope_pos  = ordinary_host_ingress->rope_positions[row];
+                const std::int32_t dev_token   = device_ingress.tokens[row];
+                const std::int32_t dev_row     = device_ingress.text_kv_table_rows[row];
+                const std::int32_t dev_source  = device_ingress.state_source_slots[row];
+                const std::int32_t dev_cache_pos = device_ingress.cache_positions[row];
+                const std::int32_t dev_rope_pos  = device_ingress.rope_positions[row];
+                const bool agree = host_token == dev_token && host_row == dev_row &&
+                                   host_source == dev_source;
+                // Kept separate from `agree` so a position mismatch is visible even when the three
+                // original fields match -- which is the case this probe was blind to.
+                const bool pos_agree = (host_cache_pos == dev_cache_pos && host_rope_pos == dev_rope_pos);
+                std::fprintf(stderr,
+                             "[mat-debug] INGRESS-FP lane=%u agree=%d pos_agree=%d "
+                             "host(tok=%d row=%d src=%d cpos=%d rpos=%d) "
+                             "device(tok=%d row=%d src=%d cpos=%d rpos=%d)\n",
+                             lanes[row], agree ? 1 : 0, pos_agree ? 1 : 0, host_token, host_row,
+                             host_source, host_cache_pos, host_rope_pos, dev_token, dev_row,
+                             dev_source, dev_cache_pos, dev_rope_pos);
+            }
+            std::fflush(stderr);
+        }
+
         const double seconds = std::chrono::duration<double>(Clock::now() - start).count();
+        // State-write integrity (NINFER_STATE_PROBE=1). The serialized control run is clean while
+        // the concurrent one corrupts a lane's own second step, so the suspicion is what a
+        // multi-row decode step writes into the per-row linear-attention destination slot. Print
+        // a checksum per row per layer region; the same step in the serialized run must produce
+        // the same checksums for the same lane.
+        if (std::getenv("NINFER_STATE_PROBE") != nullptr) {
+            LinearAttentionStatePool& pool = state_images->linear();
+            for (std::size_t row = 0; row < lanes.size(); ++row) {
+                const SequenceState& state = active_sequence(lanes[row]);
+                const StateImageSelectors selectors = state_selectors(state);
+                if (selectors.destination < 0) { continue; }
+                std::uint64_t conv_digest = 1469598103934665603ULL;
+                std::uint64_t rec_digest  = 1469598103934665603ULL;
+
+                std::uint64_t rec_tail = 0;
+                double rec_value_sum = 0.0, rec_value_peak = 0.0;
+                for (std::uint32_t layer = 0; layer < pool.layer_count(); ++layer) {
+                    // Oracle fix: the conv window is written at column `pos % 3`, so hashing its
+                    // first bytes samples uninitialized/stale memory and makes ANY two runs differ
+                    // -- which is what made the determinism test flap (identical pairs, then 170
+                    // differing). Digest only the recurrent matrix, which the kernel writes in
+                    // full every step, and sample its LAST bytes so the offset cannot sit in an
+                    // untouched tail.
+                    const Tensor rec = pool.recurrent_slot(layer, selectors.destination);
+                    const std::size_t rec_rows = std::min<std::size_t>(
+                        static_cast<std::size_t>(rec.bytes()), static_cast<std::size_t>(4096));
+                    const std::size_t rec_offset =
+                        static_cast<std::size_t>(rec.bytes()) - rec_rows;
+                    std::vector<unsigned char> buffer(rec_rows, 0);
+                    CUDA_CHECK(cudaMemcpyAsync(buffer.data(),
+                                               static_cast<const unsigned char*>(rec.data) +
+                                                   rec_offset,
+                                               rec_rows, cudaMemcpyDeviceToHost, device.stream));
+                    device.synchronize();
+                    // Magnitude, not a digest: an FNV over raw bytes is all-or-nothing, so it
+                    // cannot tell "the same state to within float rounding" from "a different
+                    // state". Reduction order depends on batch composition (split counts), which
+                    // varies with timing, so bit-level differences across runs are expected and
+                    // meaningless; a relative magnitude difference is not.
+                    // The recurrent matrix is FP32 (`validate_state_tensor(recurrent_[layer],
+                    // DType::FP32, ...)`), not BF16 -- decoding it as bf16 produced the 1e38/NaN
+                    // garbage the first version of this print reported.
+                    double rec_sum = 0.0;
+                    float rec_peak = 0.0F;
+                    if (buffer.size() % sizeof(float) == 0) {
+                        for (std::size_t index = 0; index + sizeof(float) <= buffer.size();
+                             index += sizeof(float)) {
+                            float value = 0.0F;
+                            std::memcpy(&value, buffer.data() + index, sizeof(value));
+                            rec_sum += static_cast<double>(value);
+                            rec_peak = std::max(rec_peak, std::abs(value));
+                        }
+                    }
+                    // A tail digest as well, for a *cross-lane* question the magnitudes cannot answer:
+                    // a hash is all-or-nothing, which is wrong for a cross-run comparison (batch
+                    // composition changes the low bits), but exactly right for "do two lanes hold the
+                    // same bytes?" -- two lanes' states differ legitimately, so a collision between
+                    // them is shared content, and a collision is what this prints.
+                    std::uint64_t tail_digest = 1469598103934665603ULL;
+                    for (std::size_t index = 0; index < buffer.size(); ++index) {
+                        tail_digest ^= buffer[index];
+                        tail_digest *= 1099511628211ULL;
+                    }
+                    rec_digest = 0;
+                    rec_value_sum = rec_sum;
+                    rec_value_peak = static_cast<double>(rec_peak);
+                    rec_tail       = tail_digest;
+                    conv_digest = 0;
+                }
+                std::fprintf(stderr,
+                             "[mat-debug] STATE-SLOT lane=%u frontier=%u src=%d dst=%d "
+                             "conv=%llx rec=%llx\n",
+                             lanes[row], state.execution_frontier, selectors.source,
+                             selectors.destination,
+                             static_cast<unsigned long long>(conv_digest),
+                             static_cast<unsigned long long>(rec_digest));
+                std::fprintf(stderr,
+                             "[mat-debug] STATE-MAG lane=%u frontier=%u sum=%.6f peak=%.6f "
+                             "rec_tail=%llx\n",
+                             lanes[row], state.execution_frontier, rec_value_sum, rec_value_peak,
+                             static_cast<unsigned long long>(rec_tail));
+            }
+            std::fflush(stderr);
+        }
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             SequenceState& sequence    = active_sequence(lanes[row]);
             RequestControl& request    = requests[lanes[row]];
@@ -476,7 +1201,9 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             for (std::uint32_t j = 0; j < width; ++j) {
                 const std::uint32_t position = frontier + std::min(j, extent);
                 mtp_host_ingress->target_rope_positions[row * width + j] =
-                    checked_i32(position, "MTP batch RoPE position") + sequence.rope_delta;
+                    yarn_scale_position(
+                        checked_i32(position, "MTP batch RoPE position") + sequence.rope_delta,
+                        rope_scaling_original_context, rope_scaling_factor);
             }
             mtp_host_ingress->text_kv_table_rows[row] =
                 text_kv_addresses->bound_row(sequence.kv->text);
@@ -493,7 +1220,9 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
 
         execution::MtpBatchContext schedule_state{{device, parameters, work, state_images->linear(),
                                                    replay_records ? &*replay_records : nullptr, io,
-                                                   prefill_hidden, prefill_chunk, proposal_head},
+                                                   prefill_hidden, prefill_chunk, proposal_head,
+                                                   rope_scaling_factor,
+                                                   rope_scaling_original_context},
                                                   decoder->text_kv,
                                                   *decoder->mtp_cache(),
                                                   *io.mtp_decode,
@@ -670,7 +1399,9 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             for (std::uint32_t column = 0; column < width; ++column) {
                 const std::uint32_t position = frontier + std::min(column, extent);
                 dflash_host_ingress->target_rope_positions[row * width + column] =
-                    checked_i32(position, "DFlash target RoPE position") + sequence.rope_delta;
+                    yarn_scale_position(
+                        checked_i32(position, "DFlash target RoPE position") + sequence.rope_delta,
+                        rope_scaling_original_context, rope_scaling_factor);
             }
             dflash_host_ingress->text_kv_table_rows[row] =
                 text_kv_addresses->bound_row(sequence.kv->text);
@@ -688,7 +1419,7 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         execution::DFlashBatchContext schedule_state{
             {device, parameters, work, state_images->linear(),
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-             proposal_head},
+             proposal_head, rope_scaling_factor, rope_scaling_original_context},
             decoder->text_kv,
             *dflash,
             *io.dflash_decode,
@@ -776,6 +1507,12 @@ runtime::BatchedGeneratedRound
 ProgramImpl::decode_raw(std::span<const std::uint32_t> lanes,
                         std::span<const runtime::RoundBudget> budgets,
                         runtime::ExecutionTiming* failed_timing) {
+    // Entry-point trace (NINFER_MAT_DEBUG=1): which decode routine actually serves a round.
+    if (std::getenv("NINFER_MAT_DEBUG") != nullptr) {
+        std::fprintf(stderr, "[mat-debug] DECODE-RAW lanes=%zu backend=%d\n", lanes.size(),
+                     static_cast<int>(speculative_backend));
+        std::fflush(stderr);
+    }
     if (speculative_backend == SpeculativeBackend::None) {
         return decode_ordinary_batch(lanes, budgets, failed_timing);
     }

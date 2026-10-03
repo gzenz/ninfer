@@ -25,6 +25,16 @@ public:
 
     [[nodiscard]] std::size_t size() const noexcept { return token_types_.size(); }
 
+    [[nodiscard]] const std::vector<std::uint8_t>& token_types() const noexcept {
+        return token_types_;
+    }
+    [[nodiscard]] const std::vector<std::int32_t>& positions(std::size_t axis) const noexcept {
+        return positions_[axis];
+    }
+    [[nodiscard]] const std::vector<std::uint32_t>& rewrite_frontiers() const noexcept {
+        return rewrite_execution_frontiers_;
+    }
+
     [[nodiscard]] bool matches(const PreparedPromptData& prompt, std::size_t count) const;
     [[nodiscard]] bool equals(const ResidentPrefixIdentity& other) const;
     [[nodiscard]] bool prefix_equals(const ResidentPrefixIdentity& other, std::size_t count) const;

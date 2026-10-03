@@ -1,0 +1,9 @@
+binary=build/apps/ninfer-serve
+binary_sha256=614eff1d6b8c880e5f2d45c3f3a9787c1cd388af89670f7548ed26337daa878e
+running_exe_sha256=614eff1d6b8c880e5f2d45c3f3a9787c1cd388af89670f7548ed26337daa878e
+artifact_sha256=683f5086a0e24e9b7c5caad256d373e13eff4e0491564f5b8c2acde33e52a11e
+git_head=4ef5213c4da2a04adb27f7c4426585d84fd8012a
+config: --host-state-slots 16 --device-state-slots 4 --host-kv-mib 30720 --max-concurrency 4 (from ~/.config/ninfer.conf)
+load: tools/load/prod-load.py --sessions 16 --rounds 3 --tokens 120000 (prod, :8080)
+observed: capacity 16->17->18, one slot per firing, attempts=2 grew=2 refused=0
+not observed: that a demote was chosen where an eviction would have been -- this workload had ZERO evictions (checks=0), so there was nothing to convert.

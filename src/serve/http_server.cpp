@@ -4,6 +4,7 @@
 #include "serve/http_transport.h"
 #include "serve/openai_common.h"
 #include "serve/request_log.h"
+#include "serve/stats_json.h"
 
 #include <nlohmann/json.hpp>
 
@@ -89,6 +90,8 @@ bool report_has_activity(const ThroughputReport& report) {
            report.current.partial_tail_cow_pages != report.previous.partial_tail_cow_pages ||
            report.current.pressure_private_owners_degraded !=
                report.previous.pressure_private_owners_degraded ||
+           report.current.pressure_private_owners_demoted !=
+               report.previous.pressure_private_owners_demoted ||
            report.current.pressure_private_owners_evicted !=
                report.previous.pressure_private_owners_evicted ||
            report.current.pressure_shared_owners_degraded !=
@@ -102,6 +105,10 @@ bool report_has_activity(const ThroughputReport& report) {
                report.previous.pressure_search_budget_exhaustions ||
            report.current.pressure_maximal_fallback_selections !=
                report.previous.pressure_maximal_fallback_selections ||
+           // A capacity ceiling must reach the record too, or a truncated search is only visible in
+           // /stats and the per-request story cannot say why the plan was short.
+           report.current.pressure_target_arena_truncations !=
+               report.previous.pressure_target_arena_truncations ||
            report.current.historical_fork_hits != report.previous.historical_fork_hits ||
            report.current.device_state_occupied_slots !=
                report.previous.device_state_occupied_slots ||
@@ -217,13 +224,20 @@ HttpServer::HttpServer(ServeOptions options, std::shared_ptr<spdlog::logger> log
     : options_(std::move(options)), openai_responses_store_(options_.response_store_max_records,
                                                             options_.response_store_max_bytes),
       operational_log_(logger),
-      request_jsonl_(options_.request_log_jsonl, options_.artifact_path, std::move(logger)) {
+      request_jsonl_(options_.request_log_jsonl, options_.artifact_path, std::move(logger),
+                     options_.request_log_max_mib, options_.request_log_keep) {
     const std::size_t queued_requests =
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests;
     const std::size_t worker_count = queued_requests + 1;
     server_.new_task_queue         = [queued_requests, worker_count] {
         return new httplib::ThreadPool(worker_count, worker_count, queued_requests);
     };
+    if (options_.stats_port != 0) {
+        // One worker is ample: /stats + /health are cheap reads polled at most
+        // every few seconds, and the point of the dedicated server is that they
+        // never queue behind the streaming handlers on the main pool.
+        stats_server_.new_task_queue = [] { return new httplib::ThreadPool(1, 1, 64); };
+    }
     server_.set_socket_options(configure_http_server_socket);
     server_.set_payload_max_length(options_.max_request_bytes);
     register_routes();
@@ -302,6 +316,21 @@ void HttpServer::run_stats_reporter() {
         }
 
         const ninfer::RuntimeStats current = service_->runtime_stats();
+        // PUBLISH WHAT /stats SERVES, and READ OUTSIDE THE LOCK. The first version called `memory_summary()`
+        // *while holding* `stats_mutex_` -- and `memory_summary` takes the engine's EXECUTION mutex, so the
+        // reporter blocked on a prefill with the snapshot lock held while `handle_stats` queued behind it:
+        // the blocking had been moved, not removed. Gathering first and locking only to assign is what makes
+        // the lock uncontended. (`runtime_stats()` alone never took the execution mutex; `memory_summary`
+        // always did, and E's original comment claimed otherwise.)
+        const ninfer::MemorySummary memory = service_->memory_summary();
+        const ninfer::LoadSummary load     = service_->load_summary();
+        {
+            std::lock_guard snapshot_lock(stats_mutex_);
+            stats_snapshot_        = current;
+            stats_snapshot_memory_ = memory;
+            stats_snapshot_load_   = load;
+            stats_snapshot_ready_  = true;
+        }
         const Clock::time_point now        = Clock::now();
         const ThroughputReport report      = make_throughput_report(
             previous, current, std::chrono::duration<double>(now - previous_time).count());
@@ -352,7 +381,8 @@ void HttpServer::register_routes() {
 
     server_.set_pre_routing_handler([this](const httplib::Request& req, httplib::Response& res) {
         ensure_openai_request_id(req, res);
-        if (options_.api_key.empty() || req.path == "/health" || req.method == "OPTIONS") {
+        if (options_.api_key.empty() || req.path == "/health" || req.path == "/stats" ||
+            req.method == "OPTIONS") {
             return httplib::Server::HandlerResponse::Unhandled;
         }
         // Accept both the OpenAI-style bearer token and the Anthropic-style
@@ -431,6 +461,23 @@ void HttpServer::register_routes() {
         res.set_content(nlohmann::json{{"status", available ? "ok" : "unavailable"}}.dump(),
                         "application/json");
     });
+    server_.Get("/stats", [this](const httplib::Request& req, httplib::Response& res) {
+        handle_stats(req, res);
+    });
+    if (options_.stats_port != 0) {
+        // The main server keeps /stats + /health for backward compatibility;
+        // the dedicated server mirrors them so pollers (sentinel, dashboard)
+        // can use a port that is never saturated by streaming handlers.
+        stats_server_.Get("/health", [this](const httplib::Request&, httplib::Response& res) {
+            const bool available = service_ != nullptr && service_->is_available();
+            res.status           = available ? 200 : 503;
+            res.set_content(nlohmann::json{{"status", available ? "ok" : "unavailable"}}.dump(),
+                            "application/json");
+        });
+        stats_server_.Get("/stats", [this](const httplib::Request& req, httplib::Response& res) {
+            handle_stats(req, res);
+        });
+    }
     server_.Get("/v1/models", [this](const httplib::Request& req, httplib::Response& res) {
         handle_models(req, res);
     });
@@ -482,6 +529,39 @@ void HttpServer::handle_models(const httplib::Request&, httplib::Response& res) 
                     "application/json");
 }
 
+void HttpServer::handle_stats(const httplib::Request&, httplib::Response& res) const {
+    if (service_ == nullptr) {
+        res.status = 503;
+        res.set_content(nlohmann::json{{"status", "unavailable"}}.dump(), "application/json");
+        return;
+    }
+    // SERVE THE SNAPSHOT, NOT A LIVE READ. A live read takes the engine's EXECUTION mutex, so this endpoint
+    // blocked behind whatever prefill was in flight -- the opposite of what a reserved listener is for.
+    ninfer::RuntimeStats stats;
+    ninfer::MemorySummary memory;
+    ninfer::LoadSummary load;
+    bool have_snapshot = false;
+    {
+        std::lock_guard snapshot_lock(stats_mutex_);
+        have_snapshot = stats_snapshot_ready_;
+        if (have_snapshot) {
+            stats  = stats_snapshot_;
+            memory = stats_snapshot_memory_;
+            load   = stats_snapshot_load_;
+        }
+    }
+    if (!have_snapshot) {
+        // Before the reporter's first tick there is nothing cached; a live read is the only answer, and it is
+        // bounded by the first interval rather than by the load.
+        stats  = service_->runtime_stats();
+        memory = service_->memory_summary();
+        load   = service_->load_summary();
+    }
+    res.set_content(format_stats_json(stats, memory, load, options_.context_cache,
+                                      service_->in_flight(), service_->max_in_flight()),
+                    "application/json");
+}
+
 void HttpServer::handle_model(const httplib::Request& req, httplib::Response& res) const {
     const std::string id = req.matches.size() > 1 ? req.matches[1].str() : std::string();
     if (id != public_model_id_) {
@@ -497,7 +577,13 @@ void HttpServer::handle_model(const httplib::Request& req, httplib::Response& re
                     "application/json");
 }
 
-bool HttpServer::bind() { return server_.bind_to_port(options_.host, options_.port); }
+bool HttpServer::bind() {
+    if (!server_.bind_to_port(options_.host, options_.port)) { return false; }
+    if (options_.stats_port != 0 && !stats_server_.bind_to_port(options_.host, options_.stats_port)) {
+        return false;
+    }
+    return true;
+}
 
 void HttpServer::attach(GenerationService& service) {
     if (service_ != nullptr) {
@@ -520,16 +606,33 @@ bool HttpServer::listen() {
         stats_stopping_ = false;
         stats_thread_   = std::thread([this] { run_stats_reporter(); });
     }
+    // Start the dedicated listener BEFORE the main accept loop: listen_after_bind
+    // blocks, so anything that must outlive it has to be running already.
+    if (options_.stats_port != 0) {
+        stats_listener_ = std::thread([this] { stats_server_.listen_after_bind(); });
+    }
     try {
         const bool result = server_.listen_after_bind();
+        stop_stats_listener();
         stop_stats_reporter();
         return result;
     } catch (...) {
+        stop_stats_listener();
         stop_stats_reporter();
         throw;
     }
 }
 
-void HttpServer::stop() { server_.stop(); }
+void HttpServer::stop_stats_listener() {
+    if (stats_listener_.joinable()) {
+        stats_server_.stop();
+        stats_listener_.join();
+    }
+}
+
+void HttpServer::stop() {
+    stop_stats_listener();
+    server_.stop();
+}
 
 } // namespace ninfer::serve

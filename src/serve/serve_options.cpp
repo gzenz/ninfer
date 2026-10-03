@@ -76,13 +76,14 @@ std::string serve_usage_text(const char* argv0) {
            "[--device-state-slots N] [--host-state-slots N] [--host-kv-mib N] "
            "[--max-private-continuations N] [--max-shared-prefixes N] "
            "[--max-long-anchors-per-continuation N] "
-           "[--request-log-jsonl FILE] "
+           "[--request-log-jsonl FILE] [--request-log-max-mib N] [--request-log-keep N] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
            "[--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--spec mtp|dflash|dflash2 --draft-tokens N] "
+           "[--rope-scaling-factor F] [--rope-scaling-original-context N] "
            "[--default-max-tokens N] [--default-thinking-budget N] "
-           "[--vision] [--no-cuda-graph] [--no-prefix-reuse] "
+           "[--vision] [--vision-cpu] [--no-cuda-graph] [--no-prefix-reuse] "
            "[--chat-template FILE] [--lm-head-draft] [--no-thinking] [--preserve-thinking] "
-           "[--cors] "
+           "[--tolerant-tool-calls] [--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
            "[--frequency-penalty F] [--seed N] [--greedy]\n"
            "       [--log-level trace|debug|info|warning|error|critical|off]\n"
@@ -95,15 +96,21 @@ std::string serve_usage_text(const char* argv0) {
            "       --media-live-mib defaults to 2048 and bounds all live BF16 patch payloads\n"
            "       --media-preprocess-threads defaults to 0 (auto, at most 16 workers)\n"
            "       --request-log-jsonl appends full-precision server/request records\n"
+           "       --request-log-max-mib rotates the JSONL log at N MiB (0 = unbounded);\n"
+           "       --request-log-keep retains N rotated files (default 4), oldest dropped\n"
            "       --model-id overrides the artifact metadata.name reported by the server\n"
            "       Responses state is process-local and bounded to 1024 records / 256 MiB by "
            "default\n"
            "       --log-stats-interval-ms defaults to 5000; 0 disables periodic throughput logs\n"
            "       --vision enables media and loads the fixed Vision GPU allocations\n"
+           "       --vision-cpu enables the same with the ViT encoder on CPU (saves VRAM; slower)\n"
            "       --kv-capacity auto leaves " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            " MiB of sizing headroom\n"
            "       --no-prefix-reuse disables compatible-prefix caching (enabled by default)\n"
+           "       --tolerant-tool-calls recovers complete Qwen calls with malformed wrapper/suffix output\n"
+           "       and keeps a final tool call cut by the output budget, plus a complete call whose name is\n"
+           "       not in the declared tools\n"
            "       context cache defaults: device-state=max-concurrency, private=2x concurrency, "
            "shared=max(max-concurrency,4), anchors=2; Host state=8 slots, Host KV=8192 MiB\n"
            "       --device-state-slots is extra checkpoint capacity beyond active lanes; "
@@ -113,7 +120,10 @@ std::string serve_usage_text(const char* argv0) {
            "       --preserve-thinking retains closed-turn assistant reasoning in later prompts\n"
            "       sampler defaults come from the loaded model and resolved thinking mode; "
            "server flags and request fields override individual values.\n"
-           "       --greedy forces temperature 0 (exact argmax).\n";
+           "       --greedy forces temperature 0 (exact argmax).\n"
+           "       --rope-scaling-factor applies YaRN position scaling (1.0 = disabled); "
+           "extends effective context by the factor.\n"
+           "       --rope-scaling-original-context is the YaRN ramp threshold (default 262144).\n";
 }
 
 ServeOptions parse_serve_options(int argc, char** argv) {
@@ -132,6 +142,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     bool default_max_tokens_explicit = false;
     bool kv_capacity_explicit        = false;
     bool context_capacity_explicit   = false;
+    // SEPARATE FROM `context_capacity_explicit`, which --host-state-slots also sets: only this one means
+    // "the operator chose a host-cache budget", and only that may change what --host-kv-mib means.
+    bool host_kv_budget_explicit     = false;
     if (argc >= 2 && (std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h")) {
         options.help_requested = true;
         return options;
@@ -148,6 +161,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.host = require_value("--host");
         } else if (arg == "--port") {
             options.port = parse_nonnegative_int(require_value("--port"), "port");
+        } else if (arg == "--stats-port") {
+            options.stats_port = parse_nonnegative_int(require_value("--stats-port"), "stats-port");
         } else if (arg == "--api-key") {
             options.api_key = require_value("--api-key");
         } else if (arg == "--model-id") {
@@ -181,6 +196,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--log-stats-interval-ms") {
             options.log_stats_interval_ms = static_cast<std::uint32_t>(parse_nonnegative_int(
                 require_value("--log-stats-interval-ms"), "log-stats-interval-ms"));
+        } else if (arg == "--device") {
+            options.device = parse_nonnegative_int(require_value("--device"), "device");
         } else if (arg == "--max-request-mib") {
             const std::uint64_t mib =
                 parse_u64(require_value("--max-request-mib"), "max-request-mib");
@@ -224,15 +241,34 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             }
             options.context_cache.host_kv_capacity_bytes = static_cast<std::size_t>(mib << 20);
             context_capacity_explicit                    = true;
+            host_kv_budget_explicit                      = true;
+        } else if (arg == "--host-ram-reserve-mib") {
+            const std::uint64_t mib = parse_u64(require_value("--host-ram-reserve-mib"), "host-ram-reserve-mib");
+            if (mib > std::numeric_limits<std::size_t>::max() / (1ULL << 20)) {
+                throw std::invalid_argument("--host-ram-reserve-mib is out of range");
+            }
+            options.context_cache.host_pinned_reserve_bytes = static_cast<std::size_t>(mib << 20);
+        } else if (arg == "--host-pinned-max-mib") {
+            // 0 keeps its natural meaning: no fixed ceiling.
+            const std::uint64_t mib = parse_u64(require_value("--host-pinned-max-mib"), "host-pinned-max-mib");
+            if (mib > std::numeric_limits<std::size_t>::max() / (1ULL << 20)) {
+                throw std::invalid_argument("--host-pinned-max-mib is out of range");
+            }
+            options.context_cache.host_pinned_max_bytes = static_cast<std::size_t>(mib << 20);
+        } else if (arg == "--host-chunk-mib") {
+            const std::uint64_t mib = parse_u64(require_value("--host-chunk-mib"), "host-chunk-mib");
+            if (mib == 0U || mib > std::numeric_limits<std::size_t>::max() / (1ULL << 20)) {
+                throw std::invalid_argument("--host-chunk-mib must be a positive, in-range value");
+            }
+            options.context_cache.host_pinned_chunk_bytes = static_cast<std::size_t>(mib << 20);
         } else if (arg == "--max-private-continuations") {
             options.context_cache.max_private_continuations =
                 static_cast<std::uint32_t>(parse_nonnegative_int(
                     require_value("--max-private-continuations"), "max-private-continuations"));
             context_capacity_explicit = true;
         } else if (arg == "--max-shared-prefixes") {
-            options.context_cache.max_shared_prefixes =
-                static_cast<std::uint32_t>(parse_nonnegative_int(
-                    require_value("--max-shared-prefixes"), "max-shared-prefixes"));
+            options.context_cache.max_shared_prefixes = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--max-shared-prefixes"), "max-shared-prefixes"));
             context_capacity_explicit = true;
         } else if (arg == "--max-long-anchors-per-continuation") {
             options.context_cache.max_long_anchors_per_continuation = static_cast<std::uint32_t>(
@@ -244,6 +280,15 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             if (options.request_log_jsonl.empty()) {
                 throw std::invalid_argument("--request-log-jsonl must not be empty");
             }
+        } else if (arg == "--request-log-max-mib") {
+            // 0 disables rotation (unbounded); positive caps the active file size.
+            options.request_log_max_mib =
+                static_cast<std::uint32_t>(parse_nonnegative_int(require_value("--request-log-max-mib"),
+                                                                 "request-log-max-mib"));
+        } else if (arg == "--request-log-keep") {
+            options.request_log_keep =
+                static_cast<std::uint32_t>(parse_nonnegative_int(require_value("--request-log-keep"),
+                                                                 "request-log-keep"));
         } else if (arg == "--response-store-max-records") {
             const int records = parse_nonnegative_int(require_value("--response-store-max-records"),
                                                       "response-store-max-records");
@@ -258,8 +303,6 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 throw std::invalid_argument("--response-store-max-mib is out of range");
             }
             options.response_store_max_bytes = static_cast<std::size_t>(mib << 20);
-        } else if (arg == "--device") {
-            options.device = parse_nonnegative_int(require_value("--device"), "device");
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_dtype(require_value("--kv-dtype"));
         } else if (arg == "--spec") {
@@ -268,19 +311,28 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--draft-tokens") {
             options.speculative.draft_tokens = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--draft-tokens"), "draft-tokens"));
+        } else if (arg == "--rope-scaling-factor") {
+            options.rope_scaling_factor =
+                parse_float_in(require_value("--rope-scaling-factor"), "rope-scaling-factor", 1.0f, 32.0f);
+        } else if (arg == "--rope-scaling-original-context") {
+            options.rope_scaling_original_context =
+                static_cast<std::uint32_t>(parse_u64(require_value("--rope-scaling-original-context"), "rope-scaling-original-context"));
         } else if (arg == "--default-max-tokens") {
-            options.default_max_tokens =
-                parse_nonnegative_int(require_value("--default-max-tokens"), "default-max-tokens");
-            default_max_tokens_explicit = true;
+            options.default_max_tokens = static_cast<std::uint32_t>(parse_nonnegative_int(require_value("--default-max-tokens"), "default-max-tokens"));
         } else if (arg == "--default-thinking-budget") {
             const std::uint64_t budget =
-                parse_u64(require_value("--default-thinking-budget"), "default-thinking-budget");
-            if (budget == 0 || budget > std::numeric_limits<std::uint32_t>::max()) {
-                throw std::invalid_argument("--default-thinking-budget is out of range");
+                parse_nonnegative_int(require_value("--default-thinking-budget"), "default-thinking-budget");
+            // REJECTED AT ZERO, deliberately: 0 is not a smaller cap, it is "cap thinking at nothing",
+            // which silently disables the bound the caller asked for. The option is a POSITIVE budget.
+            if (budget == 0) {
+                throw std::invalid_argument("--default-thinking-budget must be greater than 0");
             }
             options.default_thinking_budget = static_cast<std::uint32_t>(budget);
         } else if (arg == "--vision") {
             options.enable_vision = true;
+        } else if (arg == "--vision-cpu") {
+            options.enable_vision      = true;
+            options.vision_cpu_offload = true;
         } else if (arg == "--no-cuda-graph") {
             options.use_cuda_graph = false;
         } else if (arg == "--no-prefix-reuse") {
@@ -293,6 +345,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.enable_thinking = false;
         } else if (arg == "--preserve-thinking") {
             options.preserve_thinking = true;
+        } else if (arg == "--tolerant-tool-calls") {
+            options.tolerant_tool_calls = true;
         } else if (arg == "--cors") {
             options.enable_cors = true;
         } else if (arg == "--temperature") {
@@ -326,6 +380,27 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     }
     if (!kv_capacity_explicit) {
         options.kv_capacity = KvCapacityPolicy::explicit_capacity(options.max_context);
+    }
+    // `--host-kv-mib` IS THE HOST-CACHE BUDGET, NOT THE KV ARENA'S PRIVATE SPAN (2026-09-28). The operator's
+    // rationale: "via host-kv-mib i want to specify how much host memory is used by ninfer for cacheing
+    // purposes". It used to size ONLY the arena's span, so the arena carved the whole budget at startup and
+    // the state axis could not grow into it -- measured: 60/60 state slots with 1,254 growth refusals while
+    // host KV sat at 8.6 GiB of its 30 GiB span, and forced evictions of restorable victims as the result.
+    //
+    // Now the flag is the CEILING FOR ALL HOST CACHING (the pool's max), and the arena starts at a QUARTER of
+    // it and grows on demand into the same pile the state slots draw on. The quarter is a STARTING SPLIT, not
+    // a partition: the arena's growth path takes more when KV needs it, and a failed growth there returns
+    // `nullopt` and falls back rather than throwing, so it cannot over-promise the way the state path did.
+    // GATED ON THE FLAG BEING GIVEN, not on the value being non-zero: `host_kv_capacity_bytes` has a DEFAULT
+    // (`kDefaultHostKvCapacityBytes`), so an unflagged server would otherwise silently acquire a pinned
+    // ceiling it never had -- and it did, until `ninfer_serve_options_test` caught it. Only an explicit
+    // `--host-kv-mib` changes what the flag means.
+    if (host_kv_budget_explicit) {
+        const std::size_t budget = options.context_cache.host_kv_capacity_bytes;
+        if (options.context_cache.host_pinned_max_bytes == 0) {
+            options.context_cache.host_pinned_max_bytes = budget;
+        }
+        options.context_cache.host_kv_capacity_bytes = budget / 4;
     }
     if (!options.allow_prefix_reuse) {
         if (context_capacity_explicit) {

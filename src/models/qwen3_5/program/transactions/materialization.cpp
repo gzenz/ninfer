@@ -1,4 +1,5 @@
 #include "models/qwen3_5/program/program_impl.h"
+#include "core/diagnostics.h"
 #include "models/qwen3_5/program/context_work.h"
 #include "models/qwen3_5/program/context.h"
 
@@ -344,11 +345,18 @@ ProgramImpl::reserve_materialization(AdmissionCandidate&& plan, PreparedPromptDa
             if (!workspace_plan.vision) {
                 throw std::logic_error("Vision prefill has no startup workspace plan");
             }
+            // `--vision-cpu`: the session takes the model's host-resident FP32 Vision weights
+            // (stable for the model's lifetime). A non-null pointer selects the CPU encoder;
+            // null (the device default) runs the device Vision parameters.
+            const vision_cpu::CpuVisionWeights* cpu_vision_ptr =
+                parameters.model.cpu_vision().has_value()
+                    ? &parameters.model.cpu_vision().value()
+                    : nullptr;
             request.prefill->vision = std::make_unique<execution::VisionPrefillSession>(
                 device, parameters,
                 DeviceSpan{workspace_storage.base(), workspace_storage.capacity()},
                 *workspace_plan.vision, request.prefill->prompt, *request.prefill->vision_plan,
-                vision_handoff_peak_bytes);
+                vision_handoff_peak_bytes, cpu_vision_ptr);
         }
         request.prefill->elapsed_seconds =
             std::chrono::duration<double>(Clock::now() - host_started).count();
@@ -410,19 +418,27 @@ void ProgramImpl::release_materialization_staging(
     transaction.backend_activation.reset();
     transaction.text_activation.reset();
     if (transaction.root_backend_address && backend_kv_addresses) {
-        (void)backend_kv_addresses->release(*transaction.root_backend_address);
+        if (!backend_kv_addresses->release(*transaction.root_backend_address)) {
+            note_nonstrict_release_refusal("staging-root-backend");
+        }
         transaction.root_backend_address.reset();
     }
     if (transaction.root_text_address && text_kv_addresses) {
-        (void)text_kv_addresses->release(*transaction.root_text_address);
+        if (!text_kv_addresses->release(*transaction.root_text_address)) {
+            note_nonstrict_release_refusal("staging-root-text");
+        }
         transaction.root_text_address.reset();
     }
     if (transaction.state_fork_destination) {
-        if (state_store) { (void)state_store->release(*transaction.state_fork_destination); }
+        if (state_store && !state_store->release(*transaction.state_fork_destination)) {
+            note_nonstrict_release_refusal("staging-fork-destination");
+        }
         transaction.state_fork_destination.reset();
     }
     for (std::size_t index = 0; index < transaction.reserved_state_count; ++index) {
-        if (state_store) { (void)state_store->release(transaction.reserved_states[index]); }
+        if (state_store && !state_store->release(transaction.reserved_states[index])) {
+            note_nonstrict_release_refusal("staging-reserved-state");
+        }
         transaction.reserved_states[index] = {};
     }
     transaction.reserved_state_count = 0;
@@ -594,8 +610,67 @@ void ProgramImpl::prepare_consumed_source(MaterializationTransaction& transactio
     if (host_kv_extents) { (void)host_kv_extents->release_unreferenced(); }
     refresh_state_views(source);
 
+    // Fault injection (NINFER_INJECT_THROW=mat-consume, harmful-controls build). This point is chosen
+    // deliberately: the source has just been destructively truncated and released, the views refreshed,
+    // and the host extents dropped -- everything `checked_resource_difference` reads -- while the
+    // materialization staging still holds its reservations. Throwing here unwinds through the engine's
+    // failure path, which runs `recover_from_oom_locked` -> `fail_all_cleanup` with that state in
+    // flight: the exact situation the 2026-09-25 recovery was in when it left occupancy owned by
+    // nothing (#9). Nothing here is production behaviour; the guard makes it unreachable unless the
+    // build enables harmful controls.
+    //
+    // Injection is what is left because the conditions are not sufficient: three load attempts and five
+    // constructed real-engine scenarios produced no occurrence, so the failure has to be created.
+    // `std::bad_alloc` deliberately: the engine catches that as the *recoverable* error and routes it
+    // through `recover_from_oom_locked` -> `WORKER RECOVER`, which is the path the incident's underflow
+    // took. A `std::runtime_error` is not recoverable and takes the fatal `fail_all_locked` instead --
+    // which is worth knowing too, and is what the first run of this injection demonstrated: the fail-all
+    // path from this state is clean (0 skipped, 0 refused, all-zero residual, 3 continuations released).
+    if (ninfer::harmful_inject_throw("mat-consume")) {
+        throw std::bad_alloc();
+    }
+
     const detail::PhysicalResources after   = owner_exclusive_resources(source);
     const detail::PhysicalResources removed = checked_resource_difference(before, after);
+    // NAME THE MECHANISM BEFORE THE THROW, because two OPPOSITE fixes follow from two candidates and the
+    // message cannot tell them apart. `details.demand.final_removed` is `owner_exclusive_resources(source)`
+    // sampled at PLAN TIME (`request_plan.cpp:1013-1014`), while `before`/`after` are sampled HERE -- so the
+    // check is only sound while the source's exclusive counts are unchanged in between. The candidates:
+    //   (a) the source legitimately GAINED exclusivity (a lane sharing it was released between plan and
+    //       execution), so `before` exceeds the plan's snapshot and the delta is CORRECT -- the assertion is
+    //       comparing two instants, and relaxing it is the fix;
+    //   (b) the removal OVER-COUNTS (pages attributed to this source that it does not exclusively own), which
+    //       is a real accounting fault and the opposite fix.
+    // `before` beside `planned` separates them: (a) shows before > planned with before - after == the excess;
+    // (b) shows before <= planned while the delta still exceeds it. Printed UNCAPPED and unconditionally on
+    // the skew, since this event is rare by nature -- a capped print would hide the very occurrences the
+    // instrument exists for.
+    if (removed.device.main_kv_pages > details.demand.final_removed.device.main_kv_pages ||
+        removed.device.backend_kv_pages > details.demand.final_removed.device.backend_kv_pages ||
+        removed.device.state_slots > details.demand.final_removed.device.state_slots ||
+        removed.host.kv_bytes > details.demand.final_removed.host.kv_bytes ||
+        removed.host.state_slots > details.demand.final_removed.host.state_slots) {
+        std::fprintf(
+            stderr,
+            "[engine] mat-remove skew: planned main_kv=%u backend_kv=%u dev_slots=%u host_slots=%u "
+            "host_kv=%zu | before main_kv=%u backend_kv=%u dev_slots=%u host_slots=%u host_kv=%zu "
+            "| after main_kv=%u backend_kv=%u dev_slots=%u host_slots=%u host_kv=%zu "
+            "| removed main_kv=%u backend_kv=%u dev_slots=%u host_slots=%u host_kv=%zu "
+            "| source_index=%u reuse=%d\n",
+            details.demand.final_removed.device.main_kv_pages,
+            details.demand.final_removed.device.backend_kv_pages,
+            details.demand.final_removed.device.state_slots,
+            details.demand.final_removed.host.state_slots,
+            details.demand.final_removed.host.kv_bytes,
+            before.device.main_kv_pages, before.device.backend_kv_pages, before.device.state_slots,
+            before.host.state_slots, before.host.kv_bytes,
+            after.device.main_kv_pages, after.device.backend_kv_pages, after.device.state_slots,
+            after.host.state_slots, after.host.kv_bytes,
+            removed.device.main_kv_pages, removed.device.backend_kv_pages, removed.device.state_slots,
+            removed.host.state_slots, removed.host.kv_bytes,
+            transaction.source_index, static_cast<int>(details.reuse));
+        std::fflush(stderr);
+    }
     (void)checked_resource_difference(details.demand.final_removed, removed);
 }
 
@@ -643,6 +718,139 @@ void ProgramImpl::prepare_materialization(MaterializationTransaction& transactio
             source_state != nullptr
                 ? selected_state(*source_state, details.reuse, details.selected_checkpoint)
                 : shared_state->state;
+        // Durable pairing (W1-B, plan form): the entry advertises a state, and that state carries a
+        // content epoch which changes whenever its content does. Comparing the epoch recorded when
+        // the checkpoint was installed against the live one detects a state whose content moved
+        // underneath its owner record -- the "wrong bytes behind valid bookkeeping" class this
+        // repository has twice paid for (the recycled rewrite checkpoint, and the shared entry whose
+        // state did not correspond to its advertised frontier).
+        //
+        // Counted with its denominator in every build, and NOT enforced: a mismatch has never been
+        // observed, and a throw on this path kills the worker -- which is the lesson of the wedge
+        // (2026-09-25), where an accurate detector was itself the outage. The recorded epoch is
+        // matched by *handle*, so an endpoint state or a state with no checkpoint record counts as
+        // unrecorded rather than as agreement.
+        {
+            std::uint64_t recorded_epoch = 0;
+            bool recorded                = false;
+            if (shared_state != nullptr) {
+                recorded_epoch = shared_state->state_epoch;
+                recorded       = recorded_epoch != 0;
+            } else if (source_state != nullptr) {
+                if (source_state->rewrite_state && *source_state->rewrite_state == state) {
+                    recorded_epoch = source_state->rewrite_checkpoint.state_epoch;
+                    recorded       = recorded_epoch != 0;
+                } else {
+                    for (const LongAnchorCheckpoint& anchor : source_state->long_anchors) {
+                        if (anchor.state == state) {
+                            recorded_epoch = anchor.state_epoch;
+                            recorded       = recorded_epoch != 0;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (recorded) {
+                ++state_epoch_checks_;
+                const std::uint64_t live_epoch = state_store->content_epoch(state);
+                if (live_epoch != recorded_epoch) { ++state_epoch_mismatches_; }
+                if (state_epoch_checks_ == 1ULL || state_epoch_checks_ % 512ULL == 0ULL ||
+                    live_epoch != recorded_epoch) {
+                    std::fprintf(stderr,
+                                 "[materialization] state-epoch lane=%u recorded=%llu live=%llu "
+                                 "mismatches=%llu/%llu unrecorded=%llu reuse=%d\n",
+                                 lane, static_cast<unsigned long long>(recorded_epoch),
+                                 static_cast<unsigned long long>(live_epoch),
+                                 static_cast<unsigned long long>(state_epoch_mismatches_),
+                                 static_cast<unsigned long long>(state_epoch_checks_),
+                                 static_cast<unsigned long long>(state_epoch_unrecorded_),
+                                 static_cast<int>(details.reuse));
+                    std::fflush(stderr);
+                }
+            } else {
+                ++state_epoch_unrecorded_;
+            }
+        }
+        // Owner binding (W1.2): a *private* checkpoint may only be adopted by the session that
+        // produced it. A shared entry is cross-session by design, so only the private side is
+        // checked. Both sides are FNV-1a over the session key (0 = keyless request).
+        if (source_state != nullptr) {
+            const std::uint64_t source_owner = source_state->session_key_hash;
+            const std::uint64_t consumer_owner =
+                requests[lane].prefill ? requests[lane].prefill->prompt.context_cache.session_key
+                                             ? [&] {
+                                                   std::uint64_t owner = 1469598103934665603ULL;
+                                                   for (const char byte :
+                                                        requests[lane]
+                                                            .prefill->prompt.context_cache.session_key
+                                                            ->view()) {
+                                                       owner ^= static_cast<std::uint8_t>(byte);
+                                                       owner *= 1099511628211ULL;
+                                                   }
+                                                   return owner == 0 ? 1ULL : owner;
+                                               }()
+                                             : 0ULL
+                                       : 0ULL;
+            // Detector, not a fix, and CORRECTED 2026-09-26 -- the two sentences this replaced
+            // ("should be impossible by construction", "must be rejected, not merely logged") were
+            // wrong about the design. Cross-session reuse is deliberate and safe: the candidate
+            // inspection forces `retain = true` when the sessions differ
+            // (`resource_manager.h:420-423`), so the adopter forks the source's endpoint and the other
+            // session keeps its state -- the lifetime coupling that flag exists to prevent. What is
+            // ruled out is not the adoption but the serving of FOREIGN content, and that is ruled out
+            // elsewhere: `prefix_matches(prompt, source->ledger, …)` requires the requester's own
+            // prompt tokens to equal the source's ledger prefix (`request_plan.cpp:582-636`).
+            // So this counts an event that is expected, and is worth having only as the denominator
+            // that says whether the path is reached at all. The print stays gated so a served run does
+            // not pay for it.
+            if (source_owner != 0 && consumer_owner != 0 && source_owner != consumer_owner) {
+                ++cross_session_adoptions_;
+                if (cross_session_adoptions_ <= 8ULL) {
+                    std::fprintf(stderr,
+                                 "[materialization] CROSS-SESSION-ADOPT lane=%u source_owner=%llx "
+                                 "consumer_owner=%llx count=%llu reuse=%d\n",
+                                 lane, static_cast<unsigned long long>(source_owner),
+                                 static_cast<unsigned long long>(consumer_owner),
+                                 static_cast<unsigned long long>(cross_session_adoptions_),
+                                 static_cast<int>(details.reuse));
+                    std::fflush(stderr);
+                }
+            }
+            if (std::getenv("NINFER_MAT_DEBUG") != nullptr && source_owner != 0 &&
+                consumer_owner != 0 && source_owner != consumer_owner) {
+                std::fprintf(stderr,
+                             "[mat-debug] SESSION-ADOPT-CROSS lane=%u source_owner=%llx "
+                             "consumer_owner=%llx reuse=%d frontier=%u\n",
+                             lane, static_cast<unsigned long long>(source_owner),
+                             static_cast<unsigned long long>(consumer_owner),
+                             static_cast<int>(details.reuse), details.reuse_base);
+                std::fflush(stderr);
+            }
+        }
+        // Adoption audit (NINFER_MAT_DEBUG=1): what a lane adopts. Single-lane decode rules
+        // out intra-batch mixing, so cross-session content must enter through adoption.
+        if (std::getenv("NINFER_MAT_DEBUG") != nullptr) {
+            const std::int32_t slot =
+                state_store->residency(state) == StateReplicaResidency::HostOnly
+                    ? -1
+                    : state_store->physical_slot(state);
+            std::fprintf(stderr,
+                         "[mat-debug] ADOPT source=%s src_frontier=%u shared_frontier=%u "
+                         "state_slot=%d state_epoch=%llu\n",
+                         source_state != nullptr ? "private" : "shared",
+                         // The source's OWN frontier, whichever kind it is. This printed a literal 0U
+                         // for every shared adoption, because `source_state` is null there by
+                         // construction -- and that 0 read as "the state being forked has frontier 0",
+                         // i.e. as evidence of exactly the mismatch it was being used to hunt. It is
+                         // the same class of artifact as the `dst_tail_committed=0` print found the day
+                         // before; a default is not a measurement.
+                         source_state != nullptr
+                             ? source_state->execution_frontier
+                             : (shared_state != nullptr ? shared_state->frontier : 0U),
+                         shared_state != nullptr ? shared_state->frontier : 0U, slot,
+                         static_cast<unsigned long long>(state_store->content_epoch(state)));
+            std::fflush(stderr);
+        }
         const StateReplicaResidency residency = state_store->residency(state);
         // Source existence is a StateImageStore fact. Owner-exclusive resources may be zero for a
         // valid allocation aliased by private and shared checkpoints.
@@ -820,21 +1028,70 @@ void ProgramImpl::prepare_materialization(MaterializationTransaction& transactio
                 const HostKVPageReplica replica = pages.host_replica(logical);
                 const DeviceKVPageHandle destination =
                     pages.reserve_device_replica(logical, reservation);
+                // Fault injection (NINFER_INJECT_THROW=mat-reserve-replica): the ONLY placement that
+                // reproduces the #9 leak is HERE -- between taking the replica and recording it. The
+                // existing abort (`abort_materialization_transfers`, materialization.cpp:1464) walks
+                // `text_restores`/`backend_restores` and calls `abort_device_replica` for each, so a
+                // RECORDED replica is cleaned up; a replica pinned but not yet recorded is invisible to
+                // it, and the recovery then leaves the address occupied with its pages resident
+                // (117 device pages, 8.45 MB host KV, `REFUSED (kv-text)`).
+                //
+                // This site spent a while on the far side of the recording, and a run placed there reads
+                // `residual ... all zero` -- not because anything was fixed, but because the fault had
+                // been moved past the point where the damage happens. The one-variable rule applies to
+                // fault sites too, and that is the mistake this comment exists to prevent repeating.
+                // Evidence: results/n9-evidence/. Only `20260926-130452` carries a `tree.diff`, so it is
+                // the one run whose source record shows this site where it is; three directories predate
+                // the diff-saving (`125144`, `125427`, `125703`). `125703` reads the same deciding lines as
+                // `130452` and is counted as a second gap-placement run, but its placement is INFERRED from
+                // that output; `125144` and `125427` read a zero residual, and their placement is inferred
+                // too. Read those three as a contrast, not as provenance.
+                if (ninfer::harmful_inject_throw("mat-reserve-replica")) { throw std::bad_alloc(); }
                 restores.push_back(MaterializationTransaction::KVRestorePage{
                     .logical     = logical,
                     .extent      = replica.extent,
                     .extent_page = replica.page_offset,
                 });
                 destinations.push_back(destination);
+
             }
         };
     DeviceKVPageReservation& text_restore_reservation =
         text_prefix_fork ? *transaction.text_source_restore_reservation
                          : text_kv_addresses->page_reservation(*transaction.text_activation);
+    // #9 probe (NINFER_CAPTURE_PROBE): does the recording exceed the capacity the construction-time
+    // reserve gave it (`materialization.cpp:93-103`, which runs only when the transaction has a source
+    // KV)? It cannot: with a source, `mapped` is bounded by that address's mapped pages (the lambda
+    // throws otherwise), and without one `text_address` is a fresh root whose `page_count` is 0, so
+    // nothing is recorded. The probe watches for a change that breaks that, which is the property the
+    // removed pre-reserve was mistakenly believed to be protecting.
+    // `cap_before < size_after` would mean growth happened, i.e. the recording allocated and could have
+    // thrown. It reads `would_have_grown=0` on every path measured, which is what retired the pre-reserve
+    // that used to follow it. Kept because it measures a real property of the call, and would catch a
+    // future change that lets the recording exceed the capacity reserved for it.
+    const std::size_t text_restores_cap_before = transaction.text_restores.capacity();
+    const std::size_t text_dest_cap_before     = transaction.text_restore_destinations.capacity();
     prepare_kv_restores(*text_kv_addresses, *text_kv_pages, text_address,
-                        transaction.text_activation_frontier, text_prefix_fork,
-                        text_restore_reservation, transaction.text_restores,
-                        transaction.text_restore_destinations);
+                        transaction.text_activation_frontier, text_prefix_fork, text_restore_reservation,
+                        transaction.text_restores, transaction.text_restore_destinations);
+    if (std::getenv("NINFER_CAPTURE_PROBE") != nullptr) {
+        // `cap_before` is what this call started with. `cap_before=0` together with `size=0` means the
+        // call recorded nothing (the no-source root case), not that a recording had to grow; every
+        // measured call reads `would_have_grown=0`.
+        const std::size_t grew =
+            (text_restores_cap_before < transaction.text_restores.size() ||
+             text_dest_cap_before < transaction.text_restore_destinations.size())
+                ? 1U
+                : 0U;
+        std::fprintf(stderr,
+                     "[kv-restore] would_have_grown=%zu restores: cap_before=%zu cap_now=%zu size=%zu | "
+                     "destinations: cap_before=%zu cap_now=%zu size=%zu\n",
+                     grew, text_restores_cap_before, transaction.text_restores.capacity(),
+                     transaction.text_restores.size(), text_dest_cap_before,
+                     transaction.text_restore_destinations.capacity(),
+                     transaction.text_restore_destinations.size());
+        std::fflush(stderr);
+    }
     if (backend_address) {
         DeviceKVPageReservation& backend_restore_reservation =
             backend_prefix_fork
@@ -1610,7 +1867,8 @@ void ProgramImpl::publish_pressure_work(MaterializationTransaction::PressureWork
             if (change.transfer) {
                 state_store->publish_transfer(std::move(*change.transfer), false);
                 change.transfer.reset();
-                work.mutation_published = true;
+                work.mutation_published      = true;
+                work.state_transfer_published = true;
             } else if (!change.host_released) {
                 if (pressure_state_drops_host(action)
                         ? !state_store->drop_host_replica(*source)
@@ -1653,6 +1911,7 @@ void ProgramImpl::publish_pressure_work(MaterializationTransaction::PressureWork
             if (work.option.main_kv_changes[index].kind ==
                 qwen3_5::detail::PressureKVDecisionKind::DemoteToHost) {
                 work.spill_pages += work.main_kv_changes[index].pages.size();
+                work.kv_demoted_to_host = true;
             }
         }
         if (!work.option.backend_kv_changes.empty()) {
@@ -1663,6 +1922,7 @@ void ProgramImpl::publish_pressure_work(MaterializationTransaction::PressureWork
                 if (work.option.backend_kv_changes[index].kind ==
                     qwen3_5::detail::PressureKVDecisionKind::DemoteToHost) {
                     work.spill_pages += work.backend_kv_changes[index].pages.size();
+                    work.kv_demoted_to_host = true;
                 }
             }
         }
@@ -1736,6 +1996,21 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
             transaction.operations.pressure_spill_pages += work.spill_pages;
         }
         work.spill_pages = 0;
+        // The KV axis of a demote, attributed per owner. Private only: the shared axis already has its
+        // own eviction counter and the policy treats the two differently.
+        if (work.kv_demoted_to_host && !work.shared_owner) {
+            if (transaction.operations.pressure_private_owners_demoted_kv <
+                std::numeric_limits<std::uint64_t>::max()) {
+                ++transaction.operations.pressure_private_owners_demoted_kv;
+            }
+            if (!work.state_transfer_published &&
+                transaction.operations.pressure_private_owners_demoted_kv_only <
+                    std::numeric_limits<std::uint64_t>::max()) {
+                ++transaction.operations.pressure_private_owners_demoted_kv_only;
+            }
+        }
+        work.kv_demoted_to_host       = false;
+        work.state_transfer_published = false;
     };
     const auto retain_private_result = [&](auto& result, const SequenceState& state) {
         if (!result.final_summary) {
@@ -1750,6 +2025,8 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
         populate_continuation_summary(state, *result.final_summary);
     };
     const auto evict_private_result = [&](MaterializationVictimResult& result) {
+        // The #6 measurement lives at the CALL SITE (see `evict_private_result`'s caller), because this
+        // lambda runs after the victim's state has been released and there is nothing left to read.
         result.disposition        = runtime::VictimDisposition::Evicted;
         result.pressure_committed = true;
         result.final_summary.reset();
@@ -1889,6 +2166,148 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
         for (std::size_t position = 0; position < transaction.victim_count; ++position) {
             MaterializationTransaction::PressureWork& work = transaction.pressure[position];
             if (work.option.evicts_continuation) {
+                // #6's attribution, MEASURED HERE because this is the last moment the victim's state is
+                // still populated: `release_materialization_victim` clears it. The first version of this
+                // print read `result.final_summary`, which is emplaced empty and filled only on the RETAIN
+                // path -- so it reported `frontier=0 refs=0` for every eviction and told a reader nothing.
+                // These fields come from the state itself and are the ones a demote-first policy weighs:
+                // how much work the victim represents, and which restorable checkpoints it holds.
+                //
+                // WHAT THIS MEASURES, since a counter read for more than it measures is a false result
+                // (noted by the review of `5aff7b3c`, and it is right): the check runs at the DECISION
+                // point, before `release_materialization_victim` runs, so (a) `usage` still includes the
+                // victim's OWN host pages, which a demote would free and which are not yet free here, and
+                // **(c), added 2026-09-26: `demotable` reads `admission_capacity()`, which is LIVE, so
+                // after `ensure_host_state_headroom` pre-grows the pool (§3 item 6) an eviction taken
+                // while that new slot is free reads `demotable=1` whether or not a demote was ever
+                // offered. The 8-line `demotable=0 restorable=1` shape therefore CANNOT be used as the
+                // pre-grow's success criterion: the pre-grow changes this counter's denominator. Measure
+                // demotes instead -- `private_owners_demoted`, or the state D2H count rising.**
+                // (b) an eviction that subsequently throws is counted anyway. `demotable` is therefore
+                // "the host tier had room at the moment of the decision", not "this victim would have fit
+                // after demotion" -- and neither the planner's degradation-unit weighting nor the
+                // victim's value is modelled by it. It is the denominator evidence for #6, not a verdict
+                // on the policy.
+                {
+                    const SequenceState& victim = continuation_states[work.continuation_index];
+                    const PhysicalUsageSnapshot usage    = physical_usage();
+                    const detail::PhysicalResources room = admission_capacity();
+                    const bool demotable = usage.host_state_slots < room.host.state_slots &&
+                                           usage.host_kv_bytes < room.host.kv_bytes;
+                    // The ELIGIBILITY half, which `demotable` does not express: could this victim have been
+                    // demoted at all? Demotion needs a RESTORABLE state image -- the same predicate #11(b)
+                    // uses (`state_store->complete`, which requires immutable + a settled replica + a
+                    // non-zero epoch). Printed beside `demotable` because the two answer different
+                    // questions and a reader who sees only the first concludes the engine wasted free host
+                    // capacity: `demotable=1 restorable=0` means eviction was the ONLY option here, and
+                    // `demotable=1 restorable=1` is the case that would need the demote-vs-evict weighting
+                    // examined. Neither is a verdict on the policy -- the planner's cost model is not
+                    // modelled by either flag.
+                    // `session=` and `cont=` exist so this line can be JOINED to a served request rather
+                    // than compared with one by magnitude: the 18:13 evictions (frontiers 69k-76k,
+                    // demotable=1) and a user's report that two requests reused only the 23.7k shared
+                    // prefix while re-prefilling 43k are plausibly the same phenomenon, and nothing tied
+                    // them together. `session_key_hash` is what the engine sets on a continuation at
+                    // prefill (`prefill.cpp:256`, from the request's owner). CAVEAT: the serve-side
+                    // request log records no matching field yet, so this is the engine HALF of the join --
+                    // the other half has to be added before the two logs can actually be matched.
+                    const bool state_restorable =
+                        victim.rewrite_state.has_value() && state_store->complete(*victim.rewrite_state);
+                    // THIS victim's own tier occupancy. `demotable` above is a pool comparison taken
+                    // BEFORE `release_materialization_victim`, so it counts the victim's own slot and pages
+                    // as free room: `demotable=1` on a victim that itself holds a host slot is weaker
+                    // evidence than it reads. These numbers say whether that was the case, instead of
+                    // leaving it to be inferred from a pool total.
+                    std::uint32_t victim_host_slots   = 0;
+                    std::uint32_t victim_device_slots = 0;
+                    const auto tally_slots = [&](StateImageHandle handle) {
+                        if (!state_store->valid(handle)) { return; }
+                        if (state_store->holds_host_slot(handle)) { ++victim_host_slots; }
+                        if (state_store->holds_device_slot(handle)) { ++victim_device_slots; }
+                    };
+                    tally_slots(victim.state.write);
+                    if (!victim.state.read_has_external_owner()) { tally_slots(victim.state.read); }
+                    if (victim.rewrite_state) { tally_slots(*victim.rewrite_state); }
+                    for (const auto& anchor_state : victim.long_anchors) { tally_slots(anchor_state.state); }
+                    // PER-VICTIM ROOM (#6, 2026-09-27). `demotable` above is a POOL comparison with `<`, so
+                    // it reports room that THIS victim's own footprint may not fit -- the comment above
+                    // already flagged that ("`demotable=1` on a victim that itself holds a host slot is
+                    // weaker evidence than it reads"). The three post-fix evictions on prod were all
+                    // `demotable=1 restorable=1` at `host_state_slots=17/18` with host KV 94% full, i.e. the
+                    // flag claimed room while the victim held slots and the KV axis was nearly exhausted.
+                    //
+                    // So the state-slot half is asked the per-victim question. `demotable` KEEPS its
+                    // documented meaning -- it is the monitor's alert token and changing what it counts
+                    // would silently move the semantics of every past reading -- and this is reported
+                    // beside it.
+                    //
+                    // The KV half stays pool-level ON PURPOSE, and the reason is stated rather than
+                    // implied: no per-sequence host-KV byte figure is reachable at this site (the tally
+                    // below covers state slots only), so a per-victim KV test would have to be invented,
+                    // and an invented number is worse than a labelled pool one.
+                    // WOULD A DEMOTE OF THIS VICTIM HAVE BEEN CONSTRUCTIBLE? The pool-level `demotable`
+                    // above cannot say -- it compares pool totals, so it reports room a victim's own
+                    // footprint may not fit, and it says nothing about the state's eligibility. This asks
+                    // the demote path's own seven preconditions (state_store::can_demote_to_host), which is
+                    // what separates "the plan evicted something it could have preserved" from "no demote
+                    // was possible". Non-mutating: it takes no host slot.
+                    const bool demote_possible =
+                        state_store->can_demote_to_host(victim.state.write);
+                    // WHICH PRECONDITION failed, because the boolean could not say. Prod showed a victim with
+                    // `victim_room=1` -- its own slots fitted and there was room -- evicted with
+                    // `demote_possible=0` in five of eight cases of one burst, and no fix can be aimed at that
+                    // without knowing whether the demote path was refused or simply never offered.
+                    const auto demote_refusal = state_store->demote_refusal(victim.state.write);
+                    const bool victim_room =
+                        usage.host_state_slots + victim_host_slots <= room.host.state_slots &&
+                        usage.host_kv_bytes < room.host.kv_bytes;
+                    // COMPARABILITY BREAK, 2026-09-28: the `host_kv=` DENOMINATOR below is
+                    // `admission_capacity().host.kv_bytes`, and that changed from the configured
+                    // `--host-kv-mib` (30 GiB) to the KV arena's initial span, a QUARTER of it (7.5 GiB),
+                    // when the flag became the shared host-cache ceiling. `demotable`'s KV half is
+                    // `usage.host_kv_bytes < room.host.kv_bytes`, so `demotable` readings taken after that
+                    // change are NOT comparable with earlier ones -- the bar moved down by 4x. Compare
+                    // against the denominator printed on the line itself, never across the change.
+                    if (demotable) { ++demotable_evictions_; }
+                    if (victim_room && state_restorable) { ++evictions_with_victim_room_; }
+                    // **THE #6 POPULATION, EXACTLY.** `victim_room` says the victim's OWN slots fitted;
+                    // `demote_possible` says the store's demote preconditions were all met
+                    // (`demote_refusal == None`). Together they are "a demote was fully available and the
+                    // victim was evicted anyway" -- the operator's ruling, countable. The two halves are
+                    // already reported (`evictions_with_victim_room`, and `demote_possible` on the printed
+                    // line) but their CONJUNCTION was not, and the print is rate-limited to the first 8 then
+                    // every 512th: measured 2026-10-02, 57 evictions produced 8 lines, and 7 of those 8 were
+                    // `already-on-host` -- a refusal that is CORRECT, so the printed sample overstated the
+                    // defect by 7x. This counter cannot be sampled away.
+                    if (victim_room && demote_possible) { ++evictions_demote_possible_; }
+                    ++demotable_eviction_checks_;
+                    if (demotable_eviction_checks_ <= 8ULL ||
+                        demotable_eviction_checks_ % 512ULL == 0ULL) {
+                        std::fprintf(stderr,
+                                     "[engine] private victim evicted: demotable=%d restorable=%d "
+                                     "session=%016llx cont=%u frontier=%u endpoint=%d rewrite=%d "
+                                     "anchors=%zu victim_host_slots=%u victim_dev_slots=%u host_state_slots=%u/%llu host_kv=%zu/%llu "
+                                     "victim_room=%d demote_possible=%d demote_refusal=%s "
+                                     "checked=%llu demotable_total=%llu\n",
+                                     static_cast<int>(demotable),
+                                     static_cast<int>(state_restorable),
+                                     static_cast<unsigned long long>(victim.session_key_hash),
+                                     work.continuation_index, victim.execution_frontier,
+                                     static_cast<int>(victim.endpoint_valid),
+                                     static_cast<int>(victim.rewrite_checkpoint.valid),
+                                     victim.long_anchors.size(), victim_host_slots, victim_device_slots,
+                                     usage.host_state_slots,
+                                     static_cast<unsigned long long>(room.host.state_slots),
+                                     usage.host_kv_bytes,
+                                     static_cast<unsigned long long>(room.host.kv_bytes),
+                                     static_cast<int>(victim_room),
+                                     static_cast<int>(demote_possible),
+                                     StateImageStore::demote_refusal_name(demote_refusal),
+                                     static_cast<unsigned long long>(demotable_eviction_checks_),
+                                     static_cast<unsigned long long>(demotable_evictions_));
+                        std::fflush(stderr);
+                    }
+                }
                 const PhysicalReleaseResult released =
                     release_materialization_victim(transaction, position);
                 if (released.status != runtime::ConsumeStatus::Consumed ||

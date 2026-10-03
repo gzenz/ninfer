@@ -42,6 +42,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <set>
 #include <initializer_list>
 #include <limits>
 #include <stdexcept>
@@ -62,8 +63,15 @@ void copy_i32(const std::int32_t* source, Tensor& destination, cudaStream_t stre
         destination.data == nullptr) {
         throw std::invalid_argument("copy_i32: invalid host source or I32 destination");
     }
+    // Async on the caller's stream, then settle it: a synchronous pageable H2D copy is ordered
+    // only on the legacy default stream (this stream is non-blocking) and may return before its
+    // DMA completes, and inside a capture it is not recorded at all. Here the *async copy* is
+    // capture-recordable and the *settle* is eager-only -- so this site keeps ordering and still
+    // guarantees the source is not read after return, and it must not be called from a captured
+    // body.
     CUDA_CHECK(cudaMemcpyAsync(destination.data, source, destination.bytes(),
                                cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
 }
 
 void require_tensor_shape(const Tensor& t, DType dtype, std::initializer_list<std::int32_t> shape,
@@ -622,6 +630,10 @@ void TextContext::mtp_forward_batch(const Tensor& ids, const Tensor& hidden,
     if (rope_positions == nullptr) {
         generated_rope_positions = work_.alloc(DType::I32, {T});
         ops::offset_i32_positions(positions, io_.rope_delta, generated_rope_positions, ctx_.stream);
+        if (rope_scaling_factor_ != 1.0F) {
+            ops::scale_positions_yarn(generated_rope_positions, rope_scaling_original_context_,
+                                     rope_scaling_factor_, generated_rope_positions, ctx_.stream);
+        }
         rope_positions = &generated_rope_positions;
     } else if (rope_positions->dtype != DType::I32 || rope_positions->ne[0] != T ||
                (rope_positions->ne[1] != 1 && rope_positions->ne[1] != 3) ||
@@ -656,6 +668,10 @@ void TextContext::mtp_forward_ar_step(const Tensor& token, const Tensor& previou
     auto position_scope  = work_.scope();
     Tensor rope_position = work_.alloc(DType::I32, {1});
     ops::offset_i32_positions(position, io_.rope_delta, rope_position, ctx_.stream);
+    if (rope_scaling_factor_ != 1.0F) {
+        ops::scale_positions_yarn(rope_position, rope_scaling_original_context_,
+                                  rope_scaling_factor_, rope_position, ctx_.stream);
+    }
     mtp_forward_core(token, previous_hidden, position, rope_position, envelope, mtp_hidden,
                      nullptr);
     auto logits_scope = work_.scope();
@@ -663,7 +679,8 @@ void TextContext::mtp_forward_ar_step(const Tensor& token, const Tensor& previou
 }
 
 void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_positions,
-                                        const Tensor& rope_positions, const Tensor& kv_table_rows,
+                                        const Tensor& rope_positions, const Tensor& valid_columns,
+                                        const Tensor& kv_table_rows,
                                         const Tensor& linear_state_source_slots,
                                         const Tensor& linear_state_destination_slots,
                                         ops::CausalAttentionExecutionEnvelope envelope,
@@ -675,6 +692,8 @@ void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_p
     require_tensor_shape(ids, DType::I32, {batch}, "ordinary decode ids");
     require_tensor_shape(cache_positions, DType::I32, {batch}, "ordinary decode cache positions");
     require_tensor_shape(rope_positions, DType::I32, {batch}, "ordinary decode RoPE positions");
+    require_tensor_shape(valid_columns, DType::I32, {batch},
+                         "ordinary decode valid columns");
     require_tensor_shape(kv_table_rows, DType::I32, {batch}, "ordinary decode KV rows");
     require_tensor_shape(linear_state_source_slots, DType::I32, {batch},
                          "ordinary decode Linear Attention source slots");
@@ -688,6 +707,10 @@ void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_p
     cudaStream_t stream = ctx_.stream;
     work_.reset();
     {
+        // Bind the per-row visible-key bound. HONEST SCOPE: inert at width 1 (the SmallT kernel takes
+        // each row's window from its own position; the mask only bounds output columns), so this
+        // cannot alter the served path -- see the retraction at the fill site in decode.cpp.
+        ScopedValue<const Tensor*> valid_binding(active_valid_columns_, &valid_columns);
         ScopedPositions cache_binding(active_cache_positions_, cache_positions);
         ScopedPositions rope_binding(active_rope_positions_, rope_positions);
         ScopedEnvelope envelope_binding(active_causal_attention_envelope_, envelope);
@@ -1077,6 +1100,35 @@ void TextContext::mlp_tail(const BlockParameters& weights, Tensor& x, Phase,
 template <class Tap>
 void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
     const bool prefill = ph == Phase::Prefill;
+    // Per-layer fingerprinting needs to be alignable *across runs*, and a batch column index is
+    // not: the same session sits in a different column when the batch composition differs. The
+    // cache position of a column is the session identity (each turn's first decode step reports
+    // its own prompt length) so it is what the probe carries.
+    std::vector<std::int32_t> probe_positions;
+    std::vector<std::int32_t> probe_sources;
+    const bool layer_probe = std::getenv("NINFER_LAYER_PROBE") != nullptr;
+    const bool read_probe  = std::getenv("NINFER_READ_PROBE") != nullptr;
+    if (layer_probe || read_probe) {
+        const Tensor& positions =
+            active_cache_positions_ != nullptr ? *active_cache_positions_ : io_.pos;
+        probe_positions.assign(static_cast<std::size_t>(x.ne[1]), -1);
+        if (positions.data != nullptr &&
+            static_cast<std::size_t>(positions.numel()) >= probe_positions.size()) {
+            CUDA_CHECK(cudaMemcpyAsync(probe_positions.data(), positions.data,
+                                       probe_positions.size() * sizeof(std::int32_t),
+                                       cudaMemcpyDeviceToHost, ctx_.stream));
+            CUDA_CHECK(cudaStreamSynchronize(ctx_.stream));
+        }
+        if (read_probe && active_linear_state_source_slots_ != nullptr &&
+            active_linear_state_source_slots_->data != nullptr) {
+            probe_sources.assign(static_cast<std::size_t>(x.ne[1]), -1);
+            CUDA_CHECK(cudaMemcpyAsync(probe_sources.data(),
+                                       active_linear_state_source_slots_->data,
+                                       probe_sources.size() * sizeof(std::int32_t),
+                                       cudaMemcpyDeviceToHost, ctx_.stream));
+            CUDA_CHECK(cudaStreamSynchronize(ctx_.stream));
+        }
+    }
     for (std::size_t layer = 0; layer < parameters_.text.layers.size(); ++layer) {
         const auto& block  = parameters_.text.layers[layer];
         const bool full    = config_.layer_types[layer] == MixerKind::FullAttention;
@@ -1107,6 +1159,158 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
             }
             if constexpr (Tap::enabled) {
                 tap.capture_layer(static_cast<int>(layer), x, ctx_.stream);
+            }
+            // Per-layer residual fingerprint (NINFER_LAYER_PROBE=1). The ordinary decode's logits
+            // row is a fully-written tensor, and the first argmax divergence of a corrupted turn
+            // lands a few steps in with the first token still correct -- so the corruption is an
+            // event at a known step, not a per-step contamination. `x` is the residual stream
+            // after this layer and is rewritten every step, so a checksum per column is a clean
+            // oracle; diffing it against the serialized run names the first layer that diverges.
+            // Read-side probe (NINFER_READ_PROBE=1): what the row actually reads as its linear
+            // state at this step -- the conv window and recurrent matrix of the slot the row's
+            // selector names. Bindings were audited and are distinct; their *contents* were never
+            // compared across runs, and the concurrent case diverges at layer 0 on the very first
+            // decode step, whose input is whatever the prefill left in these slots.
+            //
+            // REQUIRES --no-cuda-graph: it synchronizes the stream, which inside a stream capture
+            // returns cudaErrorStreamCaptureUnsupported and fails prepare_graphs at startup
+            // (loudly, not silently). NINFER_LAYER_PROBE below takes the same D2H + synchronize
+            // and carries the same requirement. Every probe measurement in this investigation is
+            // therefore an eager-path measurement.
+            // The pool is indexed by the COMPACT (GDN) layer index, not the text layer index --
+            // passing the text index reads the wrong pool layer, and past the pool's size the
+            // range-checked accessor throws. A throw here is fatal: it kills the worker, fails
+            // warmup, and leaves the swap with no test server (and prod down).
+            bool continue_probe = true;
+            if (read_probe && !prefill && !full) try {
+                const std::uint32_t compact_layer = static_cast<std::uint32_t>(compact);
+                if (compact_layer >= state_.layer_count()) { continue_probe = false; }
+                for (std::int32_t column = 0; column < x.ne[1] && column < 8 && continue_probe;
+                     ++column) {
+                    const std::int32_t slot = probe_sources.empty()
+                                                  ? -1
+                                                  : probe_sources[static_cast<std::size_t>(column)];
+                    if (slot < 0 || slot >= state_.slot_count()) { continue; }
+                    for (const auto& region : {std::pair<const char*, Tensor>{
+                             "conv", state_.conv_slot(compact_layer, slot)},
+                         std::pair<const char*, Tensor>{
+                             "rec", state_.recurrent_slot(compact_layer, slot)}}) {
+                        const std::size_t bytes =
+                            std::min<std::size_t>(static_cast<std::size_t>(region.second.bytes()),
+                                                  static_cast<std::size_t>(4096));
+                        std::vector<unsigned char> sample(bytes, 0);
+                        CUDA_CHECK(cudaMemcpyAsync(sample.data(), region.second.data, bytes,
+                                                   cudaMemcpyDeviceToHost, ctx_.stream));
+                        CUDA_CHECK(cudaStreamSynchronize(ctx_.stream));
+                        double sum = 0.0;
+                        float peak = 0.0F;
+                        for (std::size_t index = 0; index + 1 < sample.size(); index += 2) {
+                            std::uint16_t bits = 0;
+                            std::memcpy(&bits, sample.data() + index, sizeof(bits));
+                            const std::uint32_t wide = static_cast<std::uint32_t>(bits) << 16U;
+                            float value              = 0.0F;
+                            std::memcpy(&value, &wide, sizeof(value));
+                            sum += static_cast<double>(value);
+                            peak = std::max(peak, std::abs(value));
+                        }
+                        const std::int32_t probe_position =
+                            column < static_cast<std::int32_t>(probe_positions.size())
+                                ? probe_positions[static_cast<std::size_t>(column)]
+                                : -1;
+                        // Arguments must match the conversions in order: layer(%zu) compact(%u)
+                        // column(%d) pos(%d) slot(%d) region(%s) sum(%f) peak(%f). The previous
+                        // version had two extra arguments, so %s consumed an int as a pointer --
+                        // in the probe whose earlier crash already cost a 14-minute outage.
+                        std::fprintf(stderr,
+                                     "[mat-debug] READ-FP layer=%zu compact=%u column=%d pos=%d "
+                                     "slot=%d region=%s sum=%.6f peak=%.6f\n",
+                                     layer, static_cast<unsigned>(compact_layer), column,
+                                     probe_position, slot, region.first, sum,
+                                     static_cast<double>(peak));
+                    }
+                }
+                std::fflush(stderr);
+            } catch (const std::exception& error) {
+                std::fprintf(stderr, "[mat-debug] READ-FP-SKIP layer=%zu reason=%s\n", layer,
+                             error.what());
+                std::fflush(stderr);
+            }
+            // Control, printed rather than assumed: for each layer, how many distinct residual
+            // digests the rows of THIS step produced. If that count is 1 while the rows hold different
+            // tokens, the rows are reading one buffer -- the shared-scratch hypothesis. If it equals
+            // the row count, the probe can see content and the surface is clean for this step. An
+            // instrument that cannot show it distinguishes two rows is not allowed to report "clean".
+            std::vector<std::uint64_t> layer_digests;
+            if (layer_probe) {
+                constexpr std::size_t kSample = 4096U;
+                // A decode step has a single column (the row's own position); a wide step is a
+                // prefill chunk whose every column would explode the log, so sample only its last
+                // column there -- which is the position the next step reads from.
+                const std::int32_t column_first = x.ne[1] > 8 ? x.ne[1] - 1 : 0;
+                for (std::int32_t column = column_first; column < x.ne[1]; ++column) {
+                    const Tensor slice = x.slice(1, column, 1);
+                    const std::size_t bytes =
+                        std::min<std::size_t>(static_cast<std::size_t>(slice.bytes()), kSample);
+                    std::vector<unsigned char> sample(bytes, 0);
+                    CUDA_CHECK(cudaMemcpyAsync(sample.data(), slice.data, bytes,
+                                               cudaMemcpyDeviceToHost, ctx_.stream));
+                    CUDA_CHECK(cudaStreamSynchronize(ctx_.stream));
+                    // Magnitude, not a hash: the residual differs between runs in the low bits
+                    // whenever the batch composition changes (split counts / reduction order),
+                    // and a hash cannot tell that benign noise from real divergence. A coarse
+                    // sum and peak separate them by orders of magnitude.
+                    if (sample.size() % sizeof(std::uint16_t) != 0) { continue; }
+                    double sum      = 0.0;
+                    float peak      = 0.0F;
+                    std::size_t elements = sample.size() / sizeof(std::uint16_t);
+                    for (std::size_t index = 0; index < elements; ++index) {
+                        std::uint16_t bits = 0;
+                        std::memcpy(&bits, sample.data() + index * sizeof(std::uint16_t),
+                                    sizeof(bits));
+                        const std::uint32_t wide = static_cast<std::uint32_t>(bits) << 16U;
+                        float value              = 0.0F;
+                        std::memcpy(&value, &wide, sizeof(value));
+                        sum += static_cast<double>(value);
+                        peak = std::max(peak, std::abs(value));
+                    }
+                    // A digest as well as the magnitudes, because the question here is CONTENT and
+                    // magnitudes cannot answer it: two rows carrying the same foreign bytes and two
+                    // rows merely differing in their low bits look identical as sums/peaks. A digest
+                    // is all-or-nothing -- wrong for a cross-RUN comparison (batch composition changes
+                    // the low bits) and exactly right for a cross-ROW one: two rows of one step hold
+                    // different tokens, so equal digests mean the rows are reading the same bytes.
+                    std::uint64_t digest = 1469598103934665603ULL;
+                    for (std::size_t i = 0; i < sample.size(); ++i) {
+                        digest ^= sample[i];
+                        digest *= 1099511628211ULL;
+                    }
+                    layer_digests.push_back(digest);
+                    std::fprintf(stderr,
+                                 "[mat-debug] LAYER-FP layer=%zu column=%d pos=%d phase=%s "
+                                 "sum=%.6f peak=%.6f digest=%llx\n",
+                                 layer, column,
+                                 column < static_cast<std::int32_t>(probe_positions.size())
+                                     ? probe_positions[static_cast<std::size_t>(column)]
+                                     : -1,
+                                 prefill ? "prefill" : "verify", sum,
+                                 static_cast<double>(peak),
+                                 static_cast<unsigned long long>(digest));
+                }
+                std::fflush(stderr);
+            }
+            // The control must be evaluated AFTER the sampling loop: placed before it (the first
+            // attempt) the vector was always empty and the line never printed, so the run looked like
+            // "no result" rather than "instrument dead".
+            if (layer_probe && !layer_digests.empty()) {
+                const std::size_t distinct =
+                    std::set<std::uint64_t>(layer_digests.begin(), layer_digests.end()).size();
+                std::fprintf(stderr,
+                             "[mat-debug] LAYER-CONTROL layer=%zu rows=%zu distinct_digests=%zu%s\n",
+                             layer, layer_digests.size(), distinct,
+                             distinct == 1 && layer_digests.size() > 1
+                                 ? "  <-- ALL ROWS READ THE SAME BYTES" : "");
+                std::fflush(stderr);
+                layer_digests.clear();
             }
         } catch (const std::exception& error) {
             throw std::runtime_error("text/layers/" + std::to_string(layer) +
@@ -1179,6 +1383,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
     for (; t0 < T;) {
         int len = std::min(chunk, T - t0);
         if (split_rel > 0 && t0 < split_rel && t0 + len > split_rel) { len = split_rel - t0; }
+        CUDA_CHECK(cudaStreamSynchronize(s));
         work_.reset();
 
         VisionChunk vision_chunk;
@@ -1212,7 +1417,10 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                 }
             }
 
-            const std::int32_t rope_axes = multimodal != nullptr ? 3 : (rope_delta_ != 0 ? 1 : 0);
+            const std::int32_t rope_axes =
+                multimodal != nullptr ? 3
+                                      : ((rope_delta_ != 0 || rope_scaling_factor_ != 1.0F) ? 1
+                                                  : 0);
             const auto roots             = workspace::text_prefill_roots(
                 work_, config_, len, rope_axes,
                 static_cast<std::int32_t>(local_scatter_indices.size()));
@@ -1235,9 +1443,13 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                                 rope_positions_host.data() + static_cast<std::size_t>(axis) * len);
                 }
                 copy_i32(rope_positions_host.data(), rope_positions, s);
-            } else if (rope_delta_ != 0) {
+            } else if (rope_delta_ != 0 || rope_scaling_factor_ != 1.0F) {
                 rope_positions = roots.rope_positions;
                 ops::offset_i32_positions(positions, io_.rope_delta, rope_positions, s);
+            }
+            if (rope_scaling_factor_ != 1.0F) {
+                ops::scale_positions_yarn(rope_positions, rope_scaling_original_context_,
+                                         rope_scaling_factor_, rope_positions, s);
             }
             ScopedPositions scoped_cache(active_cache_positions_, positions);
             ScopedPositions scoped_rope(active_rope_positions_, rope_positions);
@@ -1273,7 +1485,19 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                 // the sampler RNG is keyed by it (prefill purpose keeps it distinct from the first
                 // decode step, which reuses the same io_.pos).
                 ops::set_i32_scalar(io_.pos, base_i + T, s);
-                ops::set_i32_scalar(io_.rope_pos, base_i + T + rope_delta_, s);
+                {
+                    std::int32_t bonus_rope = base_i + T + rope_delta_;
+                    if (rope_scaling_factor_ != 1.0F &&
+                        bonus_rope > static_cast<std::int32_t>(rope_scaling_original_context_)) {
+                        bonus_rope = static_cast<std::int32_t>(
+                            static_cast<float>(rope_scaling_original_context_) +
+                            (static_cast<float>(bonus_rope -
+                                                static_cast<std::int32_t>(rope_scaling_original_context_)) /
+                             rope_scaling_factor_) +
+                            0.5F);
+                    }
+                    ops::set_i32_scalar(io_.rope_pos, bonus_rope, s);
+                }
                 if (sampling_config_ != nullptr) {
                     ops::sample(logits, io_.token,
                                 dimension(parameters_.model.resources().public_token_count),

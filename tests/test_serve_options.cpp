@@ -133,6 +133,13 @@ int main() {
                           dflash_vision.speculative.backend == ninfer::SpeculativeBackend::DFlash &&
                           dflash_vision.speculative.draft_tokens == 15,
                       "serve options did not preserve combined DFlash and Vision features");
+    const ServeOptions vision_cpu =
+        parse({"ninfer-serve", "model.ninfer", "--vision-cpu"});
+    failures += check(vision_cpu.enable_vision && vision_cpu.vision_cpu_offload,
+                      "serve --vision-cpu did not enable Vision + CPU offload");
+    failures +=
+        check(serve_usage_text("ninfer-serve").find("--vision-cpu") != std::string::npos,
+              "serve help omits --vision-cpu");
 
     bool implicit_backend_rejected = false;
     try {
@@ -199,7 +206,11 @@ int main() {
     failures += check(context_cache.context_cache.enabled &&
                           context_cache.context_cache.device_state_slots == 3 &&
                           context_cache.context_cache.host_state_slots == 5 &&
-                          context_cache.context_cache.host_kv_capacity_bytes == (64ULL << 20) &&
+                          // `--host-kv-mib` IS THE SHARED CACHE CEILING, and the KV arena starts at a quarter
+                          // of it (2026-09-28). Before that it sized the arena alone, and this assertion
+                          // encoded the old meaning -- which is how the semantics change broke this test.
+                          context_cache.context_cache.host_pinned_max_bytes == (64ULL << 20) &&
+                          context_cache.context_cache.host_kv_capacity_bytes == (16ULL << 20) &&
                           context_cache.context_cache.max_private_continuations == 9 &&
                           context_cache.context_cache.max_shared_prefixes == 4 &&
                           context_cache.context_cache.max_long_anchors_per_continuation == 2,
@@ -347,6 +358,20 @@ int main() {
     }
     failures += check(!secret_present, "startup argv retained the API key");
     failures += check(redaction_present, "startup argv omitted the API-key redaction marker");
+
+    const ServeOptions rotated = parse({"ninfer-serve", "model.ninfer", "--request-log-jsonl",
+                                         "requests.jsonl", "--request-log-max-mib", "16",
+                                         "--request-log-keep", "8"});
+    failures += check(rotated.request_log_max_mib == 16,
+                      "--request-log-max-mib did not set the rotation size");
+    failures += check(rotated.request_log_keep == 8,
+                      "--request-log-keep did not set the retained file count");
+    failures +=
+        check(serve_usage_text("ninfer-serve").find("--request-log-max-mib") != std::string::npos,
+              "serve help omits --request-log-max-mib");
+    failures +=
+        check(serve_usage_text("ninfer-serve").find("--request-log-keep") != std::string::npos,
+              "serve help omits --request-log-keep");
 
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;

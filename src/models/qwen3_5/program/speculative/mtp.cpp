@@ -4,9 +4,12 @@
 #include "models/qwen3_5/program/context.h"
 #include "core/nvtx.h"
 #include "ninfer/ops/mtp_round.h"
+#include "ninfer/ops/position.h"
 #include "ninfer/ops/scatter.h"
 #include "ninfer/ops/scalar.h"
 #include <cuda_runtime.h>
+
+#include <algorithm>
 #include <stdexcept>
 
 namespace ninfer::models::qwen3_5::execution {
@@ -34,9 +37,12 @@ void mtp_bridge_and_propose(PrefillContext& state, const Tensor& next_token,
     Tensor logits             = state.execution.io.logits.slice(1, 0, 1);
     Tensor draft0             = state.execution.io.mtp->draft_tokens.slice(0, 0, 1);
     Tensor rope_position_view = state.execution.work.alloc(DType::I32, {1, 3});
+    // Async + settle: the span's callers pass a block-local std::array, and the copy must stay
+    // ordered on the non-blocking compute stream.
     CUDA_CHECK(cudaMemcpyAsync(rope_position_view.data, rope_position.data(),
                                rope_position.size_bytes(), cudaMemcpyHostToDevice,
                                state.execution.device.stream));
+    CUDA_CHECK(cudaStreamSynchronize(state.execution.device.stream));
     const auto bridge_visible = static_cast<std::uint32_t>(position + 1);
     const ops::CausalAttentionExecutionEnvelope bridge_envelope{bridge_visible, bridge_visible};
     card.mtp_forward_batch(next_token, previous_hidden, position_view, bridge_envelope, mtp_hidden,
@@ -156,6 +162,17 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
                                         ar_positions, ar_rope_positions, ar_valid_columns,
                                         static_cast<std::int32_t>(state.text_cache.max_context()),
                                         state.execution.device.stream);
+            if (state.execution.rope_scaling_factor != 1.0F) {
+                const std::int32_t ar_steps = std::max(static_cast<std::int32_t>(k) - 1, 1);
+                for (std::int32_t s = 0; s < ar_steps; ++s) {
+                    Tensor ar_rope_slice =
+                        ar_rope_positions.slice(1, s, 1).view({batch_size});
+                    ops::scale_positions_yarn(ar_rope_slice,
+                                              state.execution.rope_scaling_original_context,
+                                              state.execution.rope_scaling_factor, ar_rope_slice,
+                                              state.execution.device.stream);
+                }
+            }
             card.mtp_forward_decode_batch(alignment_ids, target_hidden, target_positions,
                                           target_rope, licensed_counts, mtp_rows, envelopes.batch,
                                           alignment_hidden);

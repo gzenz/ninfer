@@ -413,7 +413,9 @@ PreparedContextCache prepare_context_cache(
     std::span<const VisionItem> vision_items, std::optional<std::size_t> engine_tool_marker_index,
     std::optional<std::uint32_t> leading_boundary, std::uint32_t full_prompt_frontier) {
     if (hints.markers.size() > kMaximumExplicitPromptCacheMarkers) {
-        throw std::invalid_argument("PromptInput supports at most four explicit cache markers");
+        throw std::invalid_argument("PromptInput supports at most " +
+                                    std::to_string(kMaximumExplicitPromptCacheMarkers) +
+                                    " explicit cache markers");
     }
     if (cache_boundaries.size() != rendered_markers.size()) {
         throw std::logic_error("rendered cache marker count changed during preparation");
@@ -538,9 +540,19 @@ PreparedContextCache prepare_context_cache(
                             SharedCandidateEvidence::EngineStructural,
                             *message_boundaries[*leading_boundary], engine_order++);
         }
-        add_opportunity(PromptCacheMarkerKind::SharedStablePrefix,
-                        SharedCandidateEvidence::EngineObserved, full_prompt_frontier,
-                        engine_order);
+        // NOT the full prompt. This line published the session's whole prompt -- its private document
+        // and tail included -- as a SHARED stable prefix, i.e. as something other sessions may fork
+        // from, with only `EngineObserved` evidence behind it. A per-session prompt tail is not a
+        // stable prefix: it is exactly what private checkpoints are for. The two structural
+        // boundaries above (the tool marker and the leading instruction boundary) stay, because those
+        // are shared by construction rather than by observation. This is candidate fix (a) from
+        // 2026-09-24's root-cause analysis, never tried until now; D2's symptom is a lane continuing
+        // with another session's private content, and this is the only place a private tail is
+        // offered as shared.
+        //
+        // The frontier is still used for the *identity* of the prompt; it is simply no longer offered
+        // as a shared-prefix opportunity.
+        (void)full_prompt_frontier;
     }
     return out;
 }
@@ -588,6 +600,15 @@ public:
             media_cache = std::make_shared<fi::MediaPreprocessCache>(
                 options.media_cache_bytes, options.media_live_bytes,
                 options.media_preprocess_threads, static_cast<std::size_t>(minimum_live));
+        }
+        if (options.vision_cpu_offload) {
+            // CPU encode is quadratic in patch count; clamp the image pixel budget to the
+            // offload cap. Clamping into [image_min_pixels, image_max_pixels] guarantees an
+            // offload cap that is itself out of bounds falls back to the processor bound
+            // rather than rejecting or upscaling images.
+            processor.image_max_pixels =
+                std::clamp(kCpuOffloadImageMaximumPixels, processor.image_min_pixels,
+                           processor.image_max_pixels);
         }
         if (!tokenizer || resources.public_token_count != tokenizer->vocab_size()) {
             throw std::invalid_argument(
@@ -719,7 +740,9 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     const PromptOptions options   = input.options;
     ContextCacheHints cache_hints = std::move(input.context_cache);
     if (cache_hints.markers.size() > kMaximumExplicitPromptCacheMarkers) {
-        throw std::invalid_argument("PromptInput supports at most four explicit cache markers");
+        throw std::invalid_argument("PromptInput supports at most " +
+                                    std::to_string(kMaximumExplicitPromptCacheMarkers) +
+                                    " explicit cache markers");
     }
     std::vector<ChatRole> message_roles;
     message_roles.reserve(input.messages.size());
@@ -790,8 +813,12 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         result.identity.rewrite_checkpoint = processed.rewrite_checkpoint;
         result.identity.rewrite_execution_frontiers =
             std::move(processed.rewrite_execution_frontiers);
+        result.identity.message_roles = std::move(processed.message_roles);
         message_boundaries = std::move(processed.message_boundaries);
-        cache_boundaries   = std::move(processed.cache_boundaries);
+        // Copied rather than moved: `prepare_context_cache` below still needs the boundaries, and
+        // this vector is one entry per message.
+        result.identity.message_frontiers = message_boundaries;
+        cache_boundaries                  = std::move(processed.cache_boundaries);
     } else {
         const fi::RenderedChat rendered = impl_->chat_template.render(
             messages, render_options(options, rendered_markers), control);
@@ -809,8 +836,10 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         result.identity.rewrite_checkpoint = encoded.rewrite_checkpoint;
         result.identity.rewrite_execution_frontiers =
             std::move(encoded.rewrite_execution_frontiers);
+        result.identity.message_roles = std::move(encoded.message_roles);
         message_boundaries = std::move(encoded.message_boundaries);
-        cache_boundaries   = std::move(encoded.cache_boundaries);
+        result.identity.message_frontiers = message_boundaries; // copied: still needed below
+        cache_boundaries                  = std::move(encoded.cache_boundaries);
         assign_text_positions(result);
     }
     (void)checked_token_count(result.token_ids.size());

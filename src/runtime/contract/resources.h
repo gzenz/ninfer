@@ -87,6 +87,12 @@ struct ContextOperationCounts {
     std::uint64_t pressure_spill_pages   = 0;
     std::uint64_t partial_tail_cow_pages = 0;
     std::uint64_t historical_fork_hits   = 0;
+    // Demote attribution, per private owner: the KV half (pages moved device -> host) and the subset
+    // where no state transfer was published in the same action. Both are needed because state
+    // residency is the only axis `CheckpointSummary` carries, so a KV-only demotion is otherwise
+    // invisible in /stats.
+    std::uint64_t pressure_private_owners_demoted_kv      = 0;
+    std::uint64_t pressure_private_owners_demoted_kv_only = 0;
 };
 
 enum class Readiness : std::uint8_t {

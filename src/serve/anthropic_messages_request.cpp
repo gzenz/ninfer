@@ -970,8 +970,14 @@ void apply_anthropic_prompt_cache_policy(const Json& body, GenerationRequest& re
             explicit_boundaries.push_back(&turn.cache_boundary_after);
         }
     }
+    // RECORDED BEFORE THE CAP IS ENFORCED, so the log carries what the client SENT even for a request that
+    // is about to be rejected for sending too many.
+    request.explicit_cache_marker_count = explicit_boundaries.size();
     if (explicit_boundaries.size() > kMaximumExplicitPromptCacheMarkers) {
-        bad_request("at most four block-level cache_control breakpoints are supported per request",
+        // DERIVED FROM THE CONSTANT, not spelled out: the text said "four" while the cap was 4, and a
+        // hardcoded word is exactly what would keep saying four after the cap moved (it did, 2026-10-01).
+        bad_request("at most " + std::to_string(kMaximumExplicitPromptCacheMarkers) +
+                        " block-level cache_control breakpoints are supported per request",
                     "cache_control", "too_many_cache_breakpoints");
     }
 
@@ -1005,8 +1011,9 @@ void apply_anthropic_prompt_cache_policy(const Json& body, GenerationRequest& re
         return;
     }
     if (explicit_boundaries.size() == kMaximumExplicitPromptCacheMarkers) {
-        bad_request("request-level cache_control needs a fifth distinct cache write after four "
-                    "block-level breakpoints",
+        bad_request("request-level cache_control needs one more distinct cache write than the " +
+                        std::to_string(kMaximumExplicitPromptCacheMarkers) +
+                        " block-level breakpoints already used",
                     "cache_control", "too_many_cache_breakpoints");
     }
     *automatic_target =
@@ -1043,6 +1050,29 @@ void parse_common_prompt(const Json& body, GenerationRequest& request, ParsePurp
 
 } // namespace
 
+namespace {
+
+// FNV-1a, the same constants the derived session key uses, so the two are comparable in the log.
+[[nodiscard]] std::optional<std::string> hash_client_session_id(const Json& body) {
+    if (!body.contains("metadata") || !body.at("metadata").is_object()) { return std::nullopt; }
+    const Json& metadata = body.at("metadata");
+    if (!metadata.contains("user_id") || !metadata.at("user_id").is_string()) { return std::nullopt; }
+    const std::string id = metadata.at("user_id").get<std::string>();
+    if (id.empty()) { return std::nullopt; }
+    std::uint64_t hash = 1469598103934665603ULL;
+    for (const unsigned char byte : id) {
+        hash ^= static_cast<std::uint64_t>(byte);
+        hash *= 1099511628211ULL;
+    }
+    char out[32];
+    const int written = std::snprintf(out, sizeof(out), "client-%016llx",
+                                      static_cast<unsigned long long>(hash));
+    if (written <= 0 || static_cast<std::size_t>(written) >= sizeof(out)) { return std::nullopt; }
+    return std::string(out, static_cast<std::size_t>(written));
+}
+
+}  // namespace
+
 AnthropicMessagesRequest parse_anthropic_messages_request(const Json& body,
                                                           const RequestLimits& limits) {
     require_object(body);
@@ -1068,6 +1098,7 @@ AnthropicMessagesRequest parse_anthropic_messages_request(const Json& body,
     parse_common_prompt(body, result.generation, ParsePurpose::Messages,
                         result.generation.max_tokens);
     parse_generation_fields(body, result.generation);
+    result.metadata_session_hash = hash_client_session_id(body);
     return result;
 }
 

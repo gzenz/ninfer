@@ -3,6 +3,7 @@
 // Small fixed-capacity request execution for every backend.
 
 #include "core/device.h"
+#include "core/diagnostics.h"
 #include "core/nvtx.h"
 #include "ninfer/types.h"
 #include "runtime/contract/execution.h"
@@ -11,6 +12,7 @@
 #include "runtime/engine/context_cache/resource_manager.h"
 #include "runtime/engine/scheduler.h"
 #include "runtime/engine/generation_budget.h"
+#include "runtime/engine/idle_block_grace.h"
 
 #include <algorithm>
 #include <array>
@@ -19,6 +21,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <deque>
 #include <exception>
 #include <future>
@@ -410,6 +413,10 @@ private:
                                                current_decode_contains(exposure.lane));
         }
         worker_accounted_elapsed_ns_ += timing.elapsed_ns();
+        // The freeze is NOT here -- see `record_committed_output`. This function runs BEFORE the commit
+        // that sets `first_token` (`program_call.finish` in `commit_pending` precedes
+        // `record_committed_output`), so the loop that lived here
+        // could only ever fire a round late.
     }
 
     void finish_program_call(const HostPhaseMeasurement& measurement,
@@ -529,14 +536,13 @@ private:
             snapshot.waiting_requests = static_cast<std::uint32_t>(pending_.size());
         }
         snapshot.prefilling_requests = 0;
-        if (const auto lane = scheduler_.prefill_lane();
-            lane && slots_[*lane] != nullptr && !slots_[*lane]->capture_pending) {
-            snapshot.prefilling_requests = 1;
-        }
         snapshot.materializing_requests = materializing_.has_value() ? 1U : 0U;
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             if (slots_[lane] == nullptr) { continue; }
             ++snapshot.running_requests;
+            if (slots_[lane]->is_prefilling() && !slots_[lane]->capture_pending) {
+                ++snapshot.prefilling_requests;
+            }
             if (slots_[lane]->is_decode_ready()) { ++snapshot.decode_ready_requests; }
             if (slots_[lane]->capture_pending) { ++snapshot.capture_pending_requests; }
             if (slots_[lane]->terminal_reason) { ++snapshot.terminal_pending_requests; }
@@ -673,6 +679,13 @@ private:
         BackfillClass backfill_class   = BackfillClass::None;
         std::uint64_t protection_epoch = 0;
         Clock::time_point started;
+        // Process-wide transfer totals as they stood BEFORE this request's materialization
+        // reserve.  The reserve is itself transfer-producing (it demotes victims to make
+        // room) and so is the restore that follows it, so the baseline has to be taken here
+        // rather than at adoption -- adoption is on the far side of every transfer the
+        // request's admission causes.  The difference is attributed to the request for the
+        // same reason `proc` is: it is time this request waited for.
+        ContextTransferTotals transfer_baseline;
     };
 
     [[nodiscard]] std::optional<GenerationTimingObservation>
@@ -683,7 +696,32 @@ private:
             request->observation.phase_timings || request->observation.live_timings;
         const bool need_now         = !request->first_token || observe_wall;
         const Clock::time_point now = need_now ? Clock::now() : Clock::time_point{};
-        if (!request->first_token) { request->first_token = now; }
+        if (!request->first_token) {
+            request->first_token = now;
+            // FREEZE THE FIRST-TOKEN WINDOW HERE, and the placement is the whole correctness argument.
+            // The first version froze in `finish_program_call`, on the premise that the commit happens
+            // inside the program call -- the code says otherwise. `program_call.finish()` runs BEFORE this
+            // function on both commit paths, so a freeze inside `finish_program_call` could never fire in the
+            // round that produced the token; it fired at the NEXT program call of any kind that had the
+            // request exposed, absorbing that round's remaining commit phase and possibly a whole
+            // `advance_prefill` of an unrelated lane. MEASURED over-inclusion was TENS OF MILLISECONDS, not
+            // seconds (worst -28.0/-20.1/-23.4/-48.9 ms across the four old-placement instances); an
+            // earlier version of this comment said "seconds", which overstated it.
+            // Here the round's `device_wait_ns` is already accumulated and nothing between adds any, so the
+            // window is complete FOR DEVICE WAIT at exactly the right moment. Cite FUNCTIONS, not line
+            // numbers: every citation in the first version was wrong within the hour, because the edits that
+            // added them moved the lines they named.
+            // BIAS, measured and one-sided: this sits INSIDE the CommitOutput `EnginePhaseScope`, and that
+            // phase's own host time reaches the request only at `phase.finish()`. So the
+            // round's commit host time BEFORE `now` is inside the ttft wall but NOT inside
+            // `ttft_host_exposed`, which means it lands in `unaccounted`. The bias can only INFLATE
+            // `unaccounted`, never make it negative, and its size is unmeasured (milliseconds).
+            // It also covers both call sites by construction, and it fixes a case the old placement could
+            // not: a request whose FIRST commit is terminal is removed by `remove_completed_slot` before any
+            // later program call, so it was never frozen at all and reported `null` -- which the request log
+            // documents as "produced no token", the opposite of what it meant.
+            request->host_timing.freeze_ttft_window();
+        }
         if (!observe_wall) { return std::nullopt; }
         if (!request->admitted_at || !request->first_token) {
             throw std::logic_error("committed output has no observed admission boundary");
@@ -823,6 +861,36 @@ private:
         request->cv.notify_one();
     }
 
+    // Best-effort noexcept completion for OOM/fatal paths.  Clears request
+    // state (prompt, base_plan, sequence, lane, budget, terminal_reason),
+    // releases reserved capacity if the consumer already left, sets
+    // response_done, and notifies the consumer.  Each step is individually
+    // guarded so a throw on one step does not skip the rest.
+    void force_complete_error(const std::shared_ptr<Request>& request,
+                              const std::exception_ptr& error) noexcept {
+        try { request->prompt = {}; } catch (...) {}
+        try { request->base_plan.reset(); } catch (...) {}
+        try { request->model_state = EngineRequestState::ModelFinished; } catch (...) {}
+        try { request->sequence.reset(); } catch (...) {}
+        try { request->lane.reset(); } catch (...) {}
+        try { request->budget.reset(); } catch (...) {}
+        try { request->terminal_reason.reset(); } catch (...) {}
+        bool release_capacity = false;
+        try {
+            std::lock_guard lock(request->mutex);
+            if (!request->response_done) {
+                request->error         = error;
+                request->response_done = true;
+            }
+            if (request->consumer_released && !request->capacity_released) {
+                request->capacity_released = true;
+                release_capacity            = true;
+            }
+        } catch (...) {}
+        if (release_capacity) { try { release_reserved_capacity(); } catch (...) {} }
+        try { request->cv.notify_one(); } catch (...) {}
+    }
+
     void complete_success(const std::shared_ptr<Request>& request, FinishReason reason) {
         HostPhaseMeasurement completion = begin_host_phase();
         double prompt_wall_seconds      = 0.0;
@@ -908,6 +976,7 @@ private:
 
     void remove_completed_slot(std::uint32_t lane) {
         slots_[lane].reset();
+        if (scheduler_.owns_prefill_lane(lane)) { scheduler_.clear_prefill_lane(lane); }
         request_admission_check();
     }
 
@@ -985,7 +1054,7 @@ private:
             auto aborted = resources_.abort(*instance_.program, *request->lane, *request->sequence);
             request->generation_timings = aborted.timings;
             request->speculative_stats  = std::move(aborted.speculative);
-            if (scheduler_.prefill_lane() == lane) { scheduler_.clear_prefill_lane(lane); }
+            if (scheduler_.owns_prefill_lane(lane)) { scheduler_.clear_prefill_lane(lane); }
             append_output(request, request->output.commit_preview());
             finish_engine_phase(boundary, EngineHostPhase::Boundary);
             complete_success(request, FinishReason::Cancelled);
@@ -1082,6 +1151,24 @@ private:
             generated_staged = false;
         };
         try {
+            // Batch-composition audit (NINFER_MAT_DEBUG=1): cross-session bleed needs >=3
+            // lanes and only occurs when lanes reuse prefixes (i.e. when a batch mixes
+            // prefilling and decoding lanes). Print the composition so a bleeding turn can be
+            // matched to the batch shape that produced it.
+            if (std::getenv("NINFER_MAT_DEBUG") != nullptr) {
+                std::string shape;
+                std::uint32_t prefilling = 0;
+                for (std::size_t row = 0; row < row_count; ++row) {
+                    const std::uint32_t lane = lane_indices[row];
+                    const auto& probe        = slots_[lane];
+                    const bool pref          = probe != nullptr && probe->is_prefilling();
+                    if (pref) { ++prefilling; }
+                    shape += pref ? "P" : "d";
+                }
+                std::fprintf(stderr, "[mat-debug] BATCH rows=%zu shape=%s prefilling=%u decode_round=%d\n",
+                             row_count, shape.c_str(), prefilling, decode_round ? 1 : 0);
+                std::fflush(stderr);
+            }
             for (std::size_t row = 0; row < row_count; ++row) {
                 const std::uint32_t lane = lane_indices[row];
                 const auto& request      = slots_[lane];
@@ -1367,7 +1454,7 @@ private:
             throw std::logic_error("runtime Begin summary differs from committed admission");
         }
         const std::uint32_t lane = request->lane->value;
-        if (scheduler_.prefill_lane() == lane) {
+        if (scheduler_.owns_prefill_lane(lane)) {
             scheduler_.clear_prefill_lane(lane);
             request_admission_check();
         }
@@ -1381,7 +1468,8 @@ private:
     void run_prefill_step(const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start) {
         nvtx::ScopedRange prefill_range(nvtx::Name::Prefill, nvtx::Category::Prefill);
         EnginePhaseScope setup(*this, EngineHostPhase::CommitOutput);
-        const auto prefill_lane = scheduler_.prefill_lane();
+        const auto prefill_lane =
+            scheduler_.select_runnable_prefill_lane(max_concurrency_, slots_);
         if (!prefill_lane) { throw std::logic_error("no request owns staged prefill"); }
         const std::uint32_t lane = *prefill_lane;
         const auto request       = slots_[lane];
@@ -1397,6 +1485,10 @@ private:
             instance_.program->advance_prefill(*request->sequence, &program_call.failed_timing());
         program_call.finish(progress.timing);
         resolve_prefill_progress(request, std::move(progress), cancelled_at_unit_start);
+        // A completed prefill already re-arms admission (owner cleared above). Re-arm again when
+        // the request keeps prefilling: each prefill boundary is an admission point, so a waiting
+        // request can be admitted to a free lane while another request is still prefilling.
+        if (!progress.complete && request->is_prefilling()) { request_admission_check(); }
         publish_runtime_stats();
     }
 
@@ -1424,8 +1516,17 @@ private:
 
     void ensure_base_plan(const std::shared_ptr<Request>& request) {
         if (!request->base_plan) {
-            request->base_plan.emplace(
-                instance_.program->plan_request(request->prompt, request->options.execution));
+            // THE BRANCH ANCHOR'S FRONTIER, computed BEFORE the plan is built so the capture group can be part
+            // of it from the start (identity and pricing included). GATED, because the search scans the
+            // catalog's ledgers and that cost has never been measured at 64 cells -- the default path must not
+            // pay it.
+            static const bool branch_anchor_enabled = std::getenv("NINFER_BRANCH_ANCHOR") != nullptr;
+            std::optional<std::uint32_t> branch_anchor;
+            if (branch_anchor_enabled) {
+                branch_anchor = resources_.branch_anchor_frontier(*instance_.program, request->prompt);
+            }
+            request->base_plan.emplace(instance_.program->plan_request(
+                request->prompt, request->options.execution, branch_anchor));
         }
         const RequestPlanSummary& summary = request->base_plan->summary();
         if (summary.service_work_quanta == 0) {
@@ -1533,6 +1634,23 @@ private:
                     request->backfill_epoch              = control.protection_epoch;
                     request->backfill_class              = control.backfill_class;
                     request->materialization_diagnostics = terminal.diagnostics;
+                    {
+                        // What this request's admission cost in context transfers.  The
+                        // totals are process-monotonic and at most one materialization is
+                        // in flight (the context transaction is a single variant), so the
+                        // difference belongs to this request.  Without this split the
+                        // restore is invisible: it runs before prefill starts and therefore
+                        // lands in `proc` under no host-phase counter.
+                        const ContextTransferTotals now = resources_.transfer_totals();
+                        request->host_timing.restore_ns +=
+                            now.host_to_device_ns - control.transfer_baseline.host_to_device_ns;
+                        request->host_timing.demote_ns +=
+                            now.device_to_host_ns - control.transfer_baseline.device_to_host_ns;
+                        request->host_timing.restore_pages +=
+                            now.host_to_device_pages - control.transfer_baseline.host_to_device_pages;
+                        request->host_timing.demote_pages +=
+                            now.device_to_host_pages - control.transfer_baseline.device_to_host_pages;
+                    }
                     request->model_state                 = EngineRequestState::Prefill;
                     request->host_timing.queue_wait_ns =
                         elapsed_ns(request->submitted, Clock::now());
@@ -1614,11 +1732,31 @@ private:
             .backfill_class   = grant.backfill_class(),
             .protection_epoch = grant.protection_epoch(),
             .started          = Clock::now(),
+            .transfer_baseline = resources_.transfer_totals(),
         };
 
-        const auto reserved = resources_.reserve_materialization(
-            *instance_.program, std::move(choice), std::move(request->prompt),
-            CancellationFlagView{&request->cancelled});
+        typename ResourceManagement::MaterializationReserveResult reserved;
+        try {
+            reserved = resources_.reserve_materialization(
+                *instance_.program, std::move(choice), std::move(request->prompt),
+                CancellationFlagView{&request->cancelled});
+        } catch (const std::bad_alloc& oom) {
+            std::fprintf(stderr, "[engine] OOM during materialization reserve: %s\n", oom.what());
+            oom_backoff_ = kOomBackoffIterations;
+            ++oom_recovery_count_;
+            if (!erase_pending(request)) {
+                // The prompt was already moved into reserve_materialization before the
+                // throw, so the request is unrecoverable.  This is a logic error — the
+                // request must have been in pending_ — but we cannot serve it with a
+                // moved-from prompt.  Fail hard rather than silently producing garbage.
+                throw std::logic_error("OOM admission lost its waiting request");
+            }
+            on_waiting_removed(request);
+            force_complete_error(request, oom_fallback_error_);
+            try { publish_runtime_stats(); } catch (...) {}
+            request_admission_check();
+            return AdmissionProgress::ControlProgress;
+        }
         if (reserved == ResourceManagement::MaterializationReserveResult::Stale) {
             request_admission_check();
             return AdmissionProgress::ControlProgress;
@@ -1720,7 +1858,68 @@ private:
             const ActiveAdmissionSet active =
                 scheduler_.active_admission_set(slots_, max_concurrency_);
             if (active.size == 0) {
-                throw std::logic_error("isolated-feasible request is blocked in an idle Engine");
+                // A stall, not a corruption. What this throw actually did, corrected 2026-09-25
+                // after a review checked it: the logic_error goes through WORKER RECOVER (it does not
+                // kill the worker directly). The journal shows nine RECOVER lines over about 35 ms,
+                // then "8 consecutive recoveries -- failing all", and only then the worker exits --
+                // which left prod answering 503 to everything with a completely EMPTY scheduler
+                // while /stats still responded, a wedge only a restart cleared
+                // (tasks #14). Reporting no progress keeps the engine able to move and turns the
+                // condition into a client-visible outcome rather than a dead worker.
+                //
+                // What resolves it, stated accurately: the request's own deadline is 900 s
+                // (--pending-timeout-ms in prod), and the wedge sentinel's Class A fires far
+                // earlier at ~150 s. Its cap is two restarts per 30 min -- the third trigger sets
+                // its stopped flag instead of restarting -- so the sentinel is the resolver. Better
+                // than before, when the empty scheduler armed none of the sentinel's classes.
+                //
+                // NOTE: this line prints "[engine] admission stalled", which does NOT match the
+                // token list in CLAUDE.md's journal-monitor pattern -- add it there or the condition
+                // is invisible to the documented monitor. Rate-limited, because it can persist for
+                // the whole deadline.
+                // Fail-fast, rather than waiting for the head's deadline. With an empty active set
+                // there is nothing that can free what the head waits for, so the block cannot be
+                // satisfied by waiting -- and a stalled FIFO head blocks *every* request behind it,
+                // so the cost of waiting is not one request but the queue. The 2026-09-25 wedge was
+                // exactly this: a recovery left occupancy owned by nothing, so a request above the
+                // remaining capacity was classed feasible and then blocked forever, and the only
+                // resolver was a restart (the sentinel's Class A, twice, then it stops).
+                //
+                // Bounded by a persistence window so a transient race does not fail a request the next
+                // boundary would admit: the condition must hold continuously for the grace period
+                // before the head is rejected. `Overloaded` is the honest kind -- the engine is up and
+                // answering, it simply cannot serve this request.
+                // The window is monotone per head, in `IdleBlockGrace`, which has a unit test: the
+                // inline version this replaces reset its own start with the same condition it tested,
+                // so it could only fire if a poll landed exactly on the boundary -- and its "0
+                // rejections on healthy traffic" evidence was a negative that could not have failed.
+                static IdleBlockGrace idle_block_grace;
+                const auto now = Clock::now();
+                if (idle_block_grace.observe(head->id, now, kIdleBlockGracePeriod)) {
+                    std::fprintf(stderr,
+                                 "[engine] admission rejected: request %llu stayed blocked for %lld s "
+                                 "with an empty active set; nothing can free what it waits for\n",
+                                 static_cast<unsigned long long>(head->id),
+                                 static_cast<long long>(kIdleBlockGracePeriod.count()));
+                    std::fflush(stderr);
+                    (void)remove_pending_error(
+                        head, std::make_exception_ptr(RequestError(
+                                  RequestErrorKind::Overloaded,
+                                  "the engine is idle and cannot admit this request within its "
+                                  "remaining capacity")));
+                    return AdmissionProgress::ControlProgress;
+                }
+                static auto last_report = Clock::time_point{};
+                if (now - last_report > std::chrono::seconds(5)) {
+                    last_report = now;
+                    std::fprintf(stderr,
+                                 "[engine] admission stalled: request %llu is feasible but the active "
+                                 "set is empty (engine idle); grace %lld s before it is rejected\n",
+                                 static_cast<unsigned long long>(head->id),
+                                 static_cast<long long>(kIdleBlockGracePeriod.count()));
+                    std::fflush(stderr);
+                }
+                return control_progress ? AdmissionProgress::ControlProgress : AdmissionProgress::None;
             }
             if (!scheduler_.protect_blocked_head(head->id, active.span(),
                                                  instance_.program->resource_revision())) {
@@ -1805,6 +2004,29 @@ private:
 
     void run_decode_round(const RoundMembership& membership,
                           const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start) {
+        // WITHDRAWN CONTROL -- kept only for reference, do not use for measurements: it slices the
+        // decode membership to one row while the scheduler still believes the whole membership
+        // decoded, so it perturbs the bookkeeping it was meant to hold fixed (a queued run with it
+        // armed bled where the queued run without it was clean).
+        //
+        // It is also compiled out by default. The rule for anything left in the tree is that a
+        // probe must not be *able* to harm; this one substitutes a different decode membership in
+        // the live scheduler, so an operator who exported the variable from an old shell would run
+        // a perturbed engine believing it was the shipped one. Rebuild with
+        // -DNINFER_ENABLE_HARMFUL_CONTROLS to get it back -- a deliberate act, which is the point.
+        const bool decode_batch_one = diagnostic_control_enabled("NINFER_DECODE_BATCH");
+        if (decode_batch_one && membership.size > 1) {
+            const auto sequences = membership.sequence_span().first(1);
+            const auto budgets   = membership.budget_span().first(1);
+            const auto lanes     = membership.lane_span().first(1);
+            nvtx::ScopedRange decode_range(nvtx::Name::Decode, nvtx::Category::Decode, 1);
+            ProgramCallScope program_call(*this);
+            auto pending = instance_.program->decode(sequences, budgets, &program_call.failed_timing());
+            program_call.finish(pending.execution_timing());
+            commit_pending(std::move(pending), lanes, true, cancelled_at_unit_start);
+            publish_runtime_stats();
+            return;
+        }
         nvtx::ScopedRange decode_range(nvtx::Name::Decode, nvtx::Category::Decode,
                                        static_cast<std::uint64_t>(membership.size));
         ProgramCallScope program_call(*this);
@@ -1816,6 +2038,23 @@ private:
     }
 
     void run_control_batch(const ControlMembership& membership) {
+        // Membership probe (NINFER_FORCED_PROBE=1), read-only. It answers the question three load shapes
+        // could not: whether a one-row membership is the *scheduler's choice* or simply all there was.
+        // The membership is built by `build_control_membership(slots_, max_concurrency_)`, so if several
+        // lanes are control-ready here and the membership still holds one row, the multi-row case
+        // `append_forced_tokens` guards cannot be produced by concurrency at all in this configuration --
+        // which is an answer about the fix's reach, not a defect in it. If only one lane is ready, the
+        // separation is timing, and the answer is scheduling.
+        if (std::getenv("NINFER_FORCED_PROBE") != nullptr) {
+            std::uint32_t control_ready = 0;
+            for (const auto& request : slots_) {
+                if (request != nullptr && request->is_control_ready()) { ++control_ready; }
+            }
+            std::fprintf(stderr,
+                         "[forced] run_control_batch membership=%zu control_ready_lanes=%u\n",
+                         membership.size, control_ready);
+            std::fflush(stderr);
+        }
         nvtx::ScopedRange control_range(nvtx::Name::ControlBatch, nvtx::Category::Control,
                                         static_cast<std::uint64_t>(membership.size));
         EnginePhaseScope phase(*this, EngineHostPhase::CommitOutput);
@@ -1909,6 +2148,86 @@ private:
         publish_runtime_stats();
     }
 
+    // Recover from any std::bad_alloc in the work loop by clearing active state and
+    // continuing.  The most common trigger is device-KV reservation failure, but host
+    // allocations can also trigger it.  Errors active and materializing requests, resets
+    // the scheduler and program state, but leaves pending requests in the FIFO so they
+    // can retry once memory is freed.  The worker loop continues after this.
+    // The worker holds execution_mutex_ across the failing operation and this cleanup.
+    // Post-recovery residual (I1). A recovery clears the scheduler and the program's catalogs, and is
+    // *expected* to release every page and slot those were holding -- so the occupancy measured
+    // immediately afterwards should be zero, and a non-zero line here is the leak, named.
+    //
+    // This exists because of the 2026-09-25 wedge, whose first stage was a recovery that left about
+    // 958 device pages and one host state slot owned by nothing. Nothing reported it: the residual was
+    // visible only to someone who later correlated `/stats` by hand, and the block it left could not
+    // be freed by any path, so a request above the remaining capacity was classed feasible and then
+    // blocked forever. The point of printing at the moment of recovery is that the journal -- which is
+    // what the monitor watches -- then carries the residual next to the recovery line.
+    //
+    // Runs only on an exceptional path, so it is not gated and costs nothing in normal operation.
+    // Reports the same quantities the request log's throughput records carry (`program.physical_usage`
+    // is the accessor behind both), so a residual here can be compared with them directly.
+    void report_recovery_residual(const char* what) noexcept {
+        try {
+            const auto usage = instance_.program->physical_usage();
+            std::fprintf(stderr,
+                         "[engine] post-recovery residual (%s): main_kv_pages=%u backend_kv_pages=%u "
+                         "device_state_slots=%u host_state_slots=%u host_kv_bytes=%zu\n",
+                         what, usage.device_main_kv_pages, usage.device_backend_kv_pages,
+                         usage.device_state_slots, usage.host_state_slots, usage.host_kv_bytes);
+            std::fflush(stderr);
+            // #9: the amount is printed above; this names the owner -- but ONLY when there is something
+            // to name. A zero residual needs no owner, and the census itself is the expensive part.
+            //
+            // CORRECTED 2026-09-26 (this comment used to blame teardown -- "also runs on the shutdown
+            // path (`fail-all`), where the stores may already be torn down" -- and that attribution was
+            // wrong): the guard is here for the residual check, and the crash that taught it was a NULL
+            // STORE, not a torn-down one. Under gdb the fault was `census(this=0x0, label="backend")`:
+            // `backend_kv_addresses` is only constructed when `backend_kv_cache()` is non-null
+            // (`program_impl.cpp:174-181`), so in every scenario without a backend KV cache the pointer
+            // is null for the whole life of the engine, not merely at the end of it. The lesson that
+            // holds is narrower than the old sentence: a `try` cannot catch a segfault, and a fault here
+            // is worth the null-check in `resource_census` rather than a call-site condition.
+            if (usage.device_main_kv_pages != 0 || usage.device_backend_kv_pages != 0 ||
+                usage.device_state_slots != 0 || usage.host_state_slots != 0 ||
+                usage.host_kv_bytes != 0) {
+                instance_.program->resource_census();
+            }
+        } catch (...) {}
+    }
+
+    // How long a head may remain blocked with an *empty* active set before it is rejected outright.
+    // Nothing can free resources while no lane is active, so this is a persistence window that
+    // separates a transient race from the unsatisfiable block the 2026-09-25 wedge was; 5 s is far
+    // below the 900 s request deadline and far below the sentinel's ~150 s Class A restart.
+    static constexpr std::chrono::seconds kIdleBlockGracePeriod{5};
+
+    void recover_from_oom_locked(std::exception_ptr error) noexcept {
+        if (!error) { error = oom_fallback_error_; }
+        try { scheduler_.reset(); } catch (...) {}
+        const std::shared_ptr<Request> materializing_request =
+            materializing_ ? materializing_->request : nullptr;
+        try { materializing_.reset(); } catch (...) {}
+        try { instance_.program->fail_all_cleanup(); } catch (...) {}
+        try { resources_.clear_after_program_cleanup(); } catch (...) {}
+        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+            if (slots_[lane] != nullptr) {
+                auto slot_request = std::move(slots_[lane]);
+                slots_[lane].reset();
+                force_complete_error(slot_request, error);
+            }
+        }
+        if (materializing_request != nullptr) {
+            force_complete_error(materializing_request, error);
+        }
+        // Slots were just freed while the worker keeps running: re-arm admission so the still-pending
+        // FIFO requests are re-inspected on the next boundary without waiting for a new submission.
+        request_admission_check();
+        try { publish_runtime_stats(); } catch (...) {}
+        report_recovery_residual("recover");
+    }
+
     // The worker holds execution_mutex_ across the failing operation and this cleanup, so no
     // Program introspection can observe a partially cleared physical state.
     void fail_all_locked(std::exception_ptr error) noexcept {
@@ -1918,21 +2237,25 @@ private:
             failed_ = true;
             pending.swap(pending_);
         }
-        scheduler_.reset();
+        try { scheduler_.reset(); } catch (...) {}
         const std::shared_ptr<Request> materializing_request =
             materializing_ ? materializing_->request : nullptr;
-        materializing_.reset();
-        instance_.program->fail_all_cleanup();
-        resources_.clear_after_program_cleanup();
+        try { materializing_.reset(); } catch (...) {}
+        try { instance_.program->fail_all_cleanup(); } catch (...) {}
+        try { resources_.clear_after_program_cleanup(); } catch (...) {}
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             if (slots_[lane] != nullptr) {
-                complete_error(slots_[lane], error);
+                auto slot_request = std::move(slots_[lane]);
                 slots_[lane].reset();
+                force_complete_error(slot_request, error);
             }
         }
-        if (materializing_request != nullptr) { complete_error(materializing_request, error); }
-        for (const auto& request : pending) { complete_error(request, error); }
-        publish_runtime_stats();
+        if (materializing_request != nullptr) {
+            force_complete_error(materializing_request, error);
+        }
+        for (const auto& request : pending) { force_complete_error(request, error); }
+        try { publish_runtime_stats(); } catch (...) {}
+        report_recovery_residual("fail-all");
     }
 
     void worker_loop() noexcept {
@@ -1972,7 +2295,10 @@ private:
                     scheduler_.build_round_membership(slots_, max_concurrency_);
                 const bool admission_check_pending =
                     admission_check_pending_.load(std::memory_order_acquire);
-                if (scheduler_.should_attempt_admission(
+                const bool skip_admission = oom_backoff_ > 0;
+                if (skip_admission) { --oom_backoff_; }
+                if (!skip_admission &&
+                    scheduler_.should_attempt_admission(
                         have_pending, admission_check_pending, !membership.empty(),
                         previous_unit_was_decode, instance_.program->has_context_transaction()) &&
                     consume_admission_check()) {
@@ -1992,16 +2318,29 @@ private:
                     finish_engine_phase(boundary, EngineHostPhase::Boundary);
                     run_control_batch(control_membership);
                     previous_unit_was_decode = true;
+                    oom_recovery_count_ = 0;
                     continue;
                 }
                 membership = scheduler_.build_round_membership(slots_, max_concurrency_);
 
                 bool prefill_runnable = false;
-                if (const auto lane = scheduler_.prefill_lane(); lane) {
-                    if (slots_[*lane] == nullptr || !slots_[*lane]->is_prefilling()) {
+                const std::uint64_t prefill_mask = scheduler_.prefill_lane_mask();
+                if (prefill_mask != 0) {
+                    bool owner_invalid = false;
+                    for (std::uint32_t lane = 0;
+                         lane < max_concurrency_ && prefill_mask != 0; ++lane) {
+                        if ((prefill_mask & (1ULL << lane)) == 0) { continue; }
+                        if (slots_[lane] == nullptr || !slots_[lane]->is_prefilling()) {
+                            owner_invalid = true;
+                        } else if (prefill_runnable) {
+                            continue;
+                        } else {
+                            prefill_runnable = !slots_[lane]->capture_pending;
+                        }
+                    }
+                    if (owner_invalid) {
                         throw std::logic_error("prefill owner has no active Engine request");
                     }
-                    prefill_runnable = !slots_[*lane]->capture_pending;
                 }
                 const ExecutionAction action = scheduler_.choose_execution(
                     !membership.empty(), prefill_runnable, previous_unit_was_decode);
@@ -2010,6 +2349,7 @@ private:
                     finish_engine_phase(boundary, EngineHostPhase::Boundary);
                     run_prefill_step(cancelled_at_unit_start);
                     previous_unit_was_decode = false;
+                    oom_recovery_count_ = 0;
                     continue;
                 }
                 if (action == ExecutionAction::Decode) {
@@ -2017,13 +2357,82 @@ private:
                     finish_engine_phase(boundary, EngineHostPhase::Boundary);
                     run_decode_round(membership, cancelled_at_unit_start);
                     previous_unit_was_decode = true;
+                    oom_recovery_count_ = 0;
                     continue;
                 }
                 set_host_work_class(HostWorkClass::Control);
                 finish_engine_phase(boundary, EngineHostPhase::Boundary);
+                // Do NOT reset oom_recovery_count_ here: idle iterations and
+                // admission-only iterations (where admit_planned_request caught
+                // an OOM internally) did not complete a real work unit.  Only
+                // successful control/prefill/decode above clears the streak.
+            } catch (const std::bad_alloc& oom) {
+                {
+                    char buf[256];
+                    buf[0] = '\0';
+                    int n = std::snprintf(buf, sizeof(buf),
+                                          "[engine] WORKER OOM: %s - recovering", oom.what());
+                    if (n < 0) { n = 0; buf[0] = '\0'; }
+                    if (materializing_ && (size_t)n < sizeof(buf)) {
+                        n += std::snprintf(buf + n, sizeof(buf) - n, " mat=%llu",
+                                           (unsigned long long)materializing_->request->id);
+                    }
+                    for (std::uint32_t lane = 0; lane < max_concurrency_ && (size_t)n < sizeof(buf);
+                         ++lane) {
+                        if (slots_[lane]) {
+                            n += std::snprintf(buf + n, sizeof(buf) - n, " lane%u=%llu", lane,
+                                               (unsigned long long)slots_[lane]->id);
+                        }
+                    }
+                    std::fprintf(stderr, "%s\n", buf);
+                }
+                if (++oom_recovery_count_ > kOomMaxRecoveries) {
+                    std::fprintf(stderr,
+                                 "[engine] WORKER OOM: %u consecutive recoveries — failing all "
+                                 "pending\n",
+                                 oom_recovery_count_ - 1);
+                    const std::exception_ptr fatal_error = oom_fallback_error_;
+                    fail_all_locked(fatal_error);
+                    return;
+                }
+                std::exception_ptr oom_error;
+                try { oom_error = std::current_exception(); } catch (...) {}
+                if (!oom_error) { oom_error = oom_fallback_error_; }
+                HostPhaseMeasurement cleanup = begin_host_phase();
+                recover_from_oom_locked(oom_error);
+                finish_engine_phase(cleanup, EngineHostPhase::Maintenance);
+                oom_backoff_ = kOomBackoffIterations;
+                // Scheduler state was cleared by recover_from_oom_locked; treat the next
+                // iteration as a fresh scheduling boundary (no decode continuity).
+                previous_unit_was_decode = false;
+                continue;
+            } catch (const std::logic_error& logic_err) {
+                // Recoverable logic error (e.g. stale checkpoint state image).
+                // Fail the active/materializing requests but keep the worker alive.
+                std::fprintf(stderr, "[engine] WORKER RECOVER: %s\n", logic_err.what());
+                if (++oom_recovery_count_ > kOomMaxRecoveries) {
+                    std::fprintf(stderr,
+                                 "[engine] WORKER: %u consecutive recoveries — failing all\n",
+                                 oom_recovery_count_ - 1);
+                    fail_all_locked(std::current_exception());
+                    return;
+                }
+                HostPhaseMeasurement cleanup = begin_host_phase();
+                recover_from_oom_locked(std::current_exception());
+                finish_engine_phase(cleanup, EngineHostPhase::Maintenance);
+                oom_backoff_ = kOomBackoffIterations;
+                previous_unit_was_decode = false;
+                continue;
             } catch (...) {
                 const std::exception_ptr error = std::current_exception();
-                HostPhaseMeasurement cleanup   = begin_host_phase();
+                try {
+                    std::rethrow_exception(error);
+                } catch (const std::exception& e) {
+                    std::fprintf(stderr, "[engine] WORKER CRASH: %s\n", e.what());
+                } catch (...) {
+                    std::fprintf(stderr, "[engine] WORKER CRASH: unknown exception\n");
+                }
+                HostPhaseMeasurement cleanup = begin_host_phase();
                 fail_all_locked(error);
                 finish_engine_phase(cleanup, EngineHostPhase::Maintenance);
                 try {
@@ -2065,6 +2474,12 @@ private:
     RuntimeStats published_stats_;
     bool stopping_ = false;
     bool failed_   = false;
+    static constexpr std::uint32_t kOomBackoffIterations = 4;
+    static constexpr std::uint32_t kOomMaxRecoveries = 8;  // before failing all pending
+    std::uint32_t oom_backoff_                    = 0;  // iterations to skip admission after OOM
+    std::uint32_t oom_recovery_count_ = 0;  // consecutive OOMs without a successful work unit
+    const std::exception_ptr oom_fallback_error_ = std::make_exception_ptr(
+        RequestError(RequestErrorKind::Overloaded, "engine out of memory during execution"));
     std::thread worker_;
 };
 

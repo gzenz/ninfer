@@ -778,19 +778,23 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--spec mtp\|dflash\|dflash2` | speculative backend | off |
 | `--draft-tokens N` | MTP `1..5`; DFlash/DFlash2 `1..15` | unset |
 | `--lm-head-draft` | optimized proposal head | off |
+| `--rope-scaling-factor F` | YaRN position-scaling factor `1.0..32.0`; `1.0` disables scaling, larger values extend the effective context limit by the factor | `1.0` |
+| `--rope-scaling-original-context N` | YaRN ramp threshold; positions at or below it are unscaled | `262144` |
 | `--default-max-tokens N` | output limit when omitted by a request | `8192` |
 | `--default-thinking-budget N` | positive thinking cap inherited by thinking-enabled requests | unset |
 | `--vision` | enable media input and load Vision GPU allocations | off |
+| `--vision-cpu` | enable media input with the Vision encoder on the CPU (weights stay in host DRAM, saving device memory). Implies `--vision` | off |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--no-prefix-reuse` | disable compatible-prefix caching | prefix reuse on |
 | `--device-state-slots N` | extra Device checkpoint StateImages beyond the active-lane guarantee | `max-concurrency` |
 | `--host-state-slots N` | pinned Host StateImage capacity | `8` |
-| `--host-kv-mib N` | shared pinned Host Main/Backend KV byte capacity in MiB | `8192` |
+| `--host-kv-mib N` | ceiling for ALL pinned host caching in MiB -- the KV arena and the host state slots share it | `8192` |
 | `--max-private-continuations N` | private continuation descriptor capacity | `2 * max-concurrency` |
 | `--max-shared-prefixes N` | Engine-wide shared stable-prefix descriptor capacity | `max(max-concurrency, 4)` |
 | `--max-long-anchors-per-continuation N` | private long-anchor limit per continuation | `2` |
 | `--no-thinking` | disable thinking by default | thinking on |
 | `--preserve-thinking` | preserve closed-turn assistant reasoning by default | off |
+| `--tolerant-tool-calls` | recover complete Qwen calls with malformed wrapper/suffix output, keep a final call cut by the output budget, and keep a complete call whose name is not in the declared tools | off |
 | `--cors` | permissive browser CORS headers | off |
 | `--temperature F` | process-level temperature override | unset |
 | `--top-p F` | process-level top-p override | unset |
@@ -800,6 +804,14 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--frequency-penalty F` | process-level frequency-penalty override | unset |
 | `--seed N` | fixed seed when a request omits one | fresh random seed per request |
 | `--greedy` | force exact argmax for all requests | off |
+
+`--rope-scaling-factor` extends the effective context limit with `--spec mtp`, the sliding-window
+`--spec dflash2` backend, and ordinary decode; it is not supported with the full-context
+`--spec dflash` backend. `--max-context` may then exceed the native limit up to
+`min(native * factor, 8388608)`; KV capacity still bounds the physical pool, so long contexts need
+enough device memory (often with a quantized `--kv-dtype`). The DFlash2 draft keeps its context in
+a fixed window addressed by un-scaled logical positions, so the extended frontier does not feed its
+attention; the target model sees the scaled positions.
 
 Context-cost coefficients resolve once at startup from generic defaults, matching compiled values,
 and optional transfer or prefill entries from `--context-cost-presets FILE`. Prefill entries match
@@ -816,8 +828,22 @@ Frequency penalty is `0` for all registered presets. Process flags override regi
 request fields override process flags, and `--greedy` finally forces temperature `0`.
 
 For `C=--max-concurrency` and `H=--device-state-slots`, total Device StateImage capacity is `C+H`:
-`C` slots guarantee active requests and `H` is a global checkpoint pool. Host State and Host KV are
-independent startup-fixed pinned-memory capacities; Host KV is shared by Main and the selected
+`C` slots guarantee active requests and `H` is a global checkpoint pool. Host State and Host KV are both
+drawn from ONE shared elastic pinned-memory budget (`PinnedHostPool` + `HostMemoryBudget`, 2026-09-26),
+split on demand and bounded by `--host-kv-mib` (the ceiling for all host caching) and the host's own RAM
+minus a reserve.
+
+**What the two axes report to the planner is deliberately NOT symmetric (2026-09-28):**
+* the **KV** axis reports the ceiling, because a KV demote whose growth fails returns `nullopt` and the
+  caller falls back (`host_kv_store.h`) -- an over-stated ceiling costs a declined demote, not an error;
+* the **state** axis reports only what is PINNED (`HostStatePool::capacity()`), because the state path
+  threw `bad_alloc` and recovered a worker when it was priced on growth that later failed. Memory that is
+  already pinned cannot be taken away between planning and allocation; a memory *reading* can.
+* `--host-kv-mib` sets the shared ceiling and the KV arena starts at a quarter of it, growing on demand.
+  `--host-state-slots` remains a floor the pool grows above.
+
+Do not read this as "the limits are gone": the ceiling is real and enforced, and it is now enforced for
+the *cache as a whole* rather than only for the KV arena. Host KV is shared by Main and the selected
 Backend pool and is consumed in physical page extents. `--no-prefix-reuse` selects root-only Engine
 mode and cannot be combined with any of the seven explicit context-cache capacity flags, including
 zero-valued flags.
@@ -885,6 +911,30 @@ round count; `units` reports its prefill/control unit counts. In a compact batch
 request is delayed by the full round, so these values explain request latency but **must not be
 summed across concurrent requests**.
 
+`request_done.engine_timing.ttft_window` is the only object in the record scoped to the **first-token
+window**, which is the window `ttft` — and therefore `proc = ttft - queue`, the number the monitor reports —
+is defined over. `host_exposed_seconds.total` and `device_wait_exposed_seconds` above are whole-request
+figures, so subtracting them from `ttft` compares two different windows; measured on 290 e2e records that
+mixed residual had a median of -7 ms while 33 records carried a median 3.5 s, and the host term in it was
+whole-request. `ttft_window` carries `host_exposed_seconds` and `device_wait_seconds` as copies of those
+accumulators taken **where `first_token` is set**, which is after that round's `program_call.finish()` has
+recorded the round's device wait — plus the
+`prefill_seconds` the record already reports and
+`unaccounted_seconds = ttft - queue_wait_seconds - host_exposed_seconds - device_wait_seconds`.
+**The subtrahend is the DEVICE WAIT, not `prefill_seconds`, and that is a correction**: `prefill_seconds` is program wall time and already contains the same `program_submit`/`program_post` host time `host_exposed_seconds` does, so subtracting both double-counted the host term and drove the value negative (measured: min -622 ms, 78 of 290 below -10 ms). With the device-wait form the same records read min +0.6 ms. **Non-negative means NOT OVER-INCLUSIVE, not complete** -- anything the window misses inflates it, and 65 of 290 records exceed 50 ms (range 61-428 ms, 47 of them clustered at the ~400 ms planner search budget), unattributed.
+`unaccounted_seconds` is **`null`, not zero**, when the window was never frozen (a request that produced no
+token); do not read null as a clean zero residual.
+
+`request_done.engine_timing.transfers` is the exception to that rule: `restore_seconds` /
+`restore_pages` (HostToDevice -- resuming a checkpoint) and `demote_seconds` / `demote_pages`
+(DeviceToHost -- parking a victim to make room) are a per-request *volume*, summed from the
+materialization's own `ContextTransferObservation`s, so they **are** additive across requests.
+They exist because the restore runs before prefill starts and therefore lands inside `proc`
+(`ttft - queue`) under no host phase -- a request that resumed a checkpoint otherwise shows a
+proc it cannot account for. `pages` counts KV pages only: the State transfer site reports no page
+count, so a state-only restore is non-zero `restore_seconds` against `restore_pages == 0`, and
+`pages` must not be used as a denominator for `seconds`.
+
 The JSONL file contains no generated response text and never records an API-key value; `argv`
 replaces that value with `<redacted>`. Operational stderr summaries are rounded and are not the
 aggregation source. OpenAI Responses, OpenAI Chat, and Anthropic generation requests receive a
@@ -930,9 +980,12 @@ raw counters and seconds over rounded stderr rates.
 
 The server owns one resident Engine with a startup-fixed capacity of `1..8` active generation
 requests. At each decode boundary, every decode-ready request is compacted into one batch and
-processed by one model traversal and, when graphs are enabled, one exact-batch CUDA Graph replay. A
-request joins that batch only after its single-request prefill finishes; when it completes or is
-cancelled, the next boundary rebuilds the batch without an empty row.
+processed by one model traversal and, when graphs are enabled, one exact-batch CUDA Graph replay.
+A request joins that batch only after its staged prefill finishes; while other requests are
+prefilling, waiting requests may still be admitted to free lanes, so prefill of one request can
+overlap the prefill and decode of the others (each prefill unit advances exactly one staged lane
+per worker boundary). When a request completes or is cancelled, the next boundary rebuilds the
+batch without an empty row.
 
 `--max-pending-requests` bounds the requests waiting behind the active set. The total generation
 request lifetime capacity is `max_concurrency + max_pending_requests`, including requests still in

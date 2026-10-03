@@ -46,6 +46,8 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
       speculative_backend(plan.speculative_backend), kv_storage(plan.kv_storage),
       proposal_head(plan.proposal_head), vision_enabled(plan.features.vision),
       use_cuda_graph(plan.use_cuda_graph), causal_scoring(plan.causal_scoring),
+      rope_scaling_factor(plan.rope_scaling_factor),
+      rope_scaling_original_context(plan.rope_scaling_original_context),
       kv_payload_bytes(plan.persistent.kv_payload_bytes),
       graph_allowance_bytes(plan.graph_allowance_bytes), workspace_plan(plan.workspace),
       persistent(plan.persistent.bytes), workspace_storage(plan.workspace.capacity),
@@ -106,8 +108,16 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     const auto address_capacity      = static_cast<std::uint32_t>(address_capacity64 + 1U);
     const auto logical_page_capacity = [&](const DeviceKVPagePool& pool) {
         const HostKVPageLayout host_layout = plan_host_kv_page_layout(pool.geometry());
-        const std::uint64_t host_pages =
-            plan.context_cache.host_kv_capacity_bytes / host_layout.page_stride;
+        // SIZED FROM THE CEILING, NOT THE ARENA'S INITIAL SPAN (2026-09-28). `host_kv_capacity_bytes` became
+        // the span the arena *starts* at, and this table cannot resize (`LogicalKVPageStore` has no growth
+        // path at all), so sizing it from the span silently capped host-only logical pages at the span: past
+        // it, `materialize` throws `logic_error("logical KV descriptors exhausted before physical capacity")`
+        // -> WORKER RECOVER. The ceiling is what the arena may actually reach.
+        const std::uint64_t host_budget_bytes =
+            plan.context_cache.host_pinned_max_bytes != 0
+                ? static_cast<std::uint64_t>(plan.context_cache.host_pinned_max_bytes)
+                : static_cast<std::uint64_t>(plan.context_cache.host_kv_capacity_bytes);
+        const std::uint64_t host_pages = host_budget_bytes / host_layout.page_stride;
         const std::uint64_t total = static_cast<std::uint64_t>(pool.capacity_pages()) + host_pages;
         if (total > std::numeric_limits<std::uint32_t>::max()) {
             throw std::overflow_error("Qwen3.5 logical KV page capacity exceeds uint32");
@@ -125,14 +135,43 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         decoder->text_kv.execution_tables().logical_page_capacity());
     state_images =
         std::make_unique<qwen3_5::StateImageDevicePool>(backing, plan.persistent.state_images);
+    // THE SHARED PINNED BUDGET, created before its consumers. `host_state_slots` is now an INITIAL
+    // RESERVATION rather than a capacity, and there is no fixed ceiling: growth is bounded by the host's own
+    // RAM minus a reserve, evaluated at each attempt (HostMemoryBudget), with the pinning primitives reused
+    // from arena.cu so there is one pinning path and one place that reports its errors.
+    host_memory_budget = std::make_unique<ninfer::HostMemoryBudget>(ninfer::HostMemoryBudgetConfig{
+        plan.context_cache.host_pinned_reserve_bytes, plan.context_cache.host_pinned_max_bytes,
+        /*shmem_cap_bytes=*/0U});
+    pinned_host_pool = std::make_unique<ninfer::PinnedHostPool>(
+        ninfer::PinnedHostPool::Config{plan.context_cache.host_pinned_chunk_bytes, /*alignment=*/256U,
+                                       /*initial_bytes=*/0U, plan.context_cache.host_pinned_max_bytes},
+        [](std::size_t bytes) { return ninfer::pin_host_memory(bytes); },
+        [](void* base) { ninfer::free_host_memory(base); });
+    pinned_host_pool->set_growth_policy([this](std::size_t bytes) {
+        host_memory_budget->set_pinned_bytes(pinned_host_pool->capacity_bytes());
+        return host_memory_budget->allow(bytes);
+    });
+    // The PURE companion to the policy above, and deliberately a separate hook: the policy answers
+    // "may I grow by `bytes`?" by re-reading /proc/meminfo and mutating the budget's counters, which the
+    // planner cannot do per assessed node. This answers "how much more may be pinned?" from the cached
+    // reading, and is safe to call inside the search. See `set_growth_headroom_query`.
+    pinned_host_pool->set_growth_headroom_query(
+        [this] { return host_memory_budget->max_pinnable(); });
+
     if (plan.context_cache.host_state_slots != 0) {
         const std::uint64_t host_state_bytes =
             static_cast<std::uint64_t>(state_images->host_layout().image_bytes) *
             plan.context_cache.host_state_slots;
         StartupPhaseScope host_state_phase(startup_observer, StartupPhase::HostStatePin,
                                            StartupProgressUnit::Bytes, host_state_bytes);
-        host_state_images = std::make_unique<qwen3_5::HostStatePool>(
-            state_images->host_layout(), plan.context_cache.host_state_slots);
+        host_state_images =
+            std::make_unique<qwen3_5::HostStatePool>(state_images->host_layout(), *pinned_host_pool);
+        // The configured count is a FLOOR and an initial reservation. It is no longer the effective
+        // ceiling for demotion: `ensure_host_state_headroom()` grows the pool by one slot when it is FULL,
+        // before the planner prices anything (§3 item 6, 2026-09-26), so a demote can be offered where the
+        // capacity that existed at the time said there was no room. The in-search pre-grow that was
+        // removed stays removed -- this one runs once per planning session, not per assessed node.
+        (void)host_state_images->reserve_slots(plan.context_cache.host_state_slots);
         host_state_phase.complete(host_state_bytes, host_state_bytes);
     }
     const std::uint64_t logical_state_capacity =
@@ -196,8 +235,12 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         StartupPhaseScope host_kv_phase(
             startup_observer, StartupPhase::HostKvPin, StartupProgressUnit::Bytes,
             static_cast<std::uint64_t>(plan.context_cache.host_kv_capacity_bytes));
+        // The arena now draws on the SHARED pinned budget: `host_kv_capacity_bytes` is its initial span and
+        // it grows on demand, so host KV and host state slots are finally one pile rather than two fixed,
+        // mutually-blind allocations.
         host_kv_arena = std::make_unique<HostKVArena>(
-            plan.context_cache.host_kv_capacity_bytes,
+            *pinned_host_pool, plan.context_cache.host_kv_capacity_bytes,
+            plan.context_cache.host_pinned_chunk_bytes,
             std::span<const HostKVPageLayout>(layouts.data(), layouts.size()));
         host_kv_phase.complete(
             static_cast<std::uint64_t>(plan.context_cache.host_kv_capacity_bytes),
@@ -206,8 +249,15 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         for (const HostKVPageLayout& layout : layouts) {
             minimum_stride = std::min(minimum_stride, layout.page_stride);
         }
-        const std::size_t extent_capacity =
-            plan.context_cache.host_kv_capacity_bytes / minimum_stride;
+        // ...and the same reason as `logical_page_capacity` above: this store's capacity grows only through
+        // `ensure_capacity_for`, which sizes from the arena's CURRENT capacity, so starting it at the span
+        // left it able to grow -- but sizing it from the span made the first growth the only thing standing
+        // between a demote and a refusal. Size it from the ceiling so the tables match what can be pinned.
+        const std::size_t extent_budget_bytes =
+            plan.context_cache.host_pinned_max_bytes != 0
+                ? static_cast<std::size_t>(plan.context_cache.host_pinned_max_bytes)
+                : static_cast<std::size_t>(plan.context_cache.host_kv_capacity_bytes);
+        const std::size_t extent_capacity = extent_budget_bytes / minimum_stride;
         if (extent_capacity > std::numeric_limits<std::uint32_t>::max()) {
             throw std::overflow_error("Qwen3.5 Host KV extent capacity exceeds uint32");
         }
@@ -373,6 +423,16 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
         if (text_kv_addresses->bound_row(*address) != 0) {
             throw std::logic_error("causal score did not bind the unique Main KV row");
         }
+        // Publish that row into the shared scalar the prefill kernels actually read. The
+        // lane-specific KV view handed to `PrefillContext` below is stored and never read (the D2
+        // carrier, fixed for the serving path in 479c92c4), so without this the score's prefill
+        // attends through whatever row the last `bind_sequence_kv` left -- another lane's, in the
+        // serving engine. Latent rather than live: `EnginePurpose::CausalScoring` is instanced only
+        // by `apps/perplexity/main.cpp`, a single-owner offline core with no lanes, where the scalar
+        // is still at its initialisation value. The assert above proves the row is 0, so this is the
+        // same value the initialisation wrote; it exists so the dependence is stated in code rather
+        // than resting on an uninitialised scalar happening to be zero.
+        set_device_i32(io.text_kv_table_row, text_kv_addresses->bound_row(*address));
         text_kv_addresses->ensure_mapped_to_tokens(*address, predictor_count, device.stream);
 
         const std::int32_t state_slot = state_store->physical_slot(*state);
@@ -390,8 +450,11 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
             Tensor logprobs   = work.alloc(DType::FP32, {columns});
             Tensor hidden     = score_hidden->slice(1, 0, columns);
             execution::project(hidden, parameters.text.output_head, logits, work, device.stream);
+            // Async + settle: `staged_targets` is a function-local buffer, and the copy must stay
+            // ordered on the non-blocking compute stream.
             CUDA_CHECK(cudaMemcpyAsync(target_ids.data, staged_targets.data(), target_ids.bytes(),
-                                                    cudaMemcpyHostToDevice, device.stream));
+                                       cudaMemcpyHostToDevice, device.stream));
+            CUDA_CHECK(cudaStreamSynchronize(device.stream));
             ops::target_logprobs(logits, target_ids,
                                               dimension(parameters.model.resources().public_token_count),
                                               logprobs, device.stream);
@@ -410,7 +473,8 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
             const std::uint32_t nominal = std::min(prefill_chunk, predictor_count - cursor);
             execution::PrefillContext schedule_state{
                 {device, parameters, work, state_images->linear(), nullptr, io, prefill_hidden,
-                 prefill_chunk, proposal_head},
+                 prefill_chunk, proposal_head, rope_scaling_factor,
+                 rope_scaling_original_context},
                 decoder->text_kv.execution_view(text_kv_addresses->execution_row(*address)),
                 {},
                 decoder->text_kv,
@@ -548,7 +612,62 @@ MemorySummary ProgramImpl::memory_summary() const noexcept {
     out.kv_payload_bytes             = kv_payload_bytes;
     if (host_state_images) {
         out.host_state_capacity_slots = host_state_images->capacity();
+        if (pinned_host_pool) {
+            out.host_pinned_capacity_bytes = pinned_host_pool->capacity_bytes();
+            out.host_pinned_free_bytes     = pinned_host_pool->free_bytes();
+            out.host_pinned_chunks         = static_cast<std::uint32_t>(pinned_host_pool->chunk_count());
+            out.host_pinned_grows          = pinned_host_pool->growth_count();
+            out.host_pinned_largest_free_run_bytes =
+                static_cast<std::size_t>(pinned_host_pool->largest_free_run());
+            // GROWTH HEADROOM ONLY -- `max_pinnable()` is `MemAvailable - reserve`, how much MORE could be
+            // pinned, not a capacity total. (This line said "capacity plus what growth could add"; a review
+            // caught it.) It is the figure the planner consults (`pressure.cpp`'s feasibility site) and
+            // therefore the one that makes a "growable" verdict legible from outside, but it is read from a
+            // CACHED reading last refreshed at a pre-grow or a growth, so its age is unrecorded. Without it the tri-state's `Growable` arm can be exercised and still
+            // read 0 in `/stats`, which cannot be told from the query never being wired -- the same
+            // absence-is-not-zero trap the counters beside it were added to close. 0 also means "no query
+            // installed", which is why `host_pinned_grow_refusals`/`last_veto` are read with it.
+            out.host_pinned_growth_headroom_bytes =
+                static_cast<std::size_t>(pinned_host_pool->growth_headroom_bytes());
+            out.host_pinned_growth_policy_refusals =
+                pinned_host_pool->growth_policy_refusals();
+            out.host_pinned_growth_pin_failures = pinned_host_pool->growth_pin_failures();
+            out.host_pinned_allocation_refusals = pinned_host_pool->allocation_refusals();
+            out.host_pinned_allocation_speculative_refusals =
+                pinned_host_pool->allocation_speculative_refusals();
+            out.host_pinned_allocation_ram_refusals =
+                pinned_host_pool->allocation_ram_refusals();
+            out.host_pinned_allocation_post_grow_failures =
+                pinned_host_pool->allocation_post_grow_failures();
+            out.host_pinned_allocation_fragmented_misses =
+                pinned_host_pool->allocation_fragmented_misses();
+        }
+        if (host_memory_budget) {
+            out.host_pinned_grow_refusals = host_memory_budget->refusals();
+            out.host_pinned_reserve_bytes = host_memory_budget->config().reserve_bytes;
+            out.host_pinned_last_wanted_bytes = host_memory_budget->last_wanted_bytes();
+            // THE REFUSAL'S OWN READING, not the live one -- see HostMemoryBudget::last_veto_mem_available.
+            out.host_pinned_last_veto_mem_available_bytes =
+                host_memory_budget->last_veto_mem_available();
+            out.host_pinned_last_veto = ninfer::growth_veto_name(host_memory_budget->last_veto());
+        }
+        if (host_kv_arena) {
+            out.host_kv_grows         = host_kv_arena->growth_count();
+            out.host_kv_grow_refusals = host_kv_arena->growth_refusals();
+        }
         out.host_state_occupied_slots = host_state_images->occupied();
+        out.host_state_pregrow_attempts = host_state_pregrow_attempts_;
+        out.host_state_pregrows         = host_state_pregrows_;
+        out.host_state_pregrow_refusals = host_state_pregrow_refusals_;
+        out.host_kv_pregrow_attempts    = host_kv_pregrow_attempts_;
+        out.host_kv_pregrows            = host_kv_pregrows_;
+        out.host_kv_pregrow_refusals    = host_kv_pregrow_refusals_;
+        out.host_kv_pregrow_fragmented  = host_kv_pregrow_fragmented_;
+        out.host_kv_fit_growable        = host_kv_fit_growable_;
+        out.host_kv_blocked_checks      = host_kv_blocked_checks_;
+        out.host_kv_blocked_max_bytes   = host_kv_blocked_max_bytes_;
+        out.host_kv_fit_pinned          = host_kv_fit_pinned_;
+        out.host_kv_fit_blocked         = host_kv_fit_blocked_;
     }
     if (host_kv_arena) {
         out.host_kv_capacity_bytes = host_kv_arena->capacity_bytes();

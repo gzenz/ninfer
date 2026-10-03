@@ -4,6 +4,8 @@
 #include "models/qwen3_5/program/context.h"
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <iterator>
 #include <limits>
 #include <stdexcept>
@@ -207,7 +209,8 @@ detail::PhysicalResources positive_difference(detail::PhysicalResources value,
 } // namespace
 
 RequestBasePlan ProgramImpl::plan_request(const PreparedPromptData& prompt,
-                                          const runtime::ResolvedExecutionOptions& options) {
+                                          const runtime::ResolvedExecutionOptions& options,
+                                              std::optional<std::uint32_t> branch_anchor_frontier) {
     if (prompt.token_ids.empty()) { throw std::invalid_argument("prompt must contain tokens"); }
     if (prompt.token_ids.size() > capacity) {
         throw std::invalid_argument("prompt exceeds configured context capacity");
@@ -289,11 +292,19 @@ RequestBasePlan ProgramImpl::plan_request(const PreparedPromptData& prompt,
             if (begin < previous_end) {
                 throw std::invalid_argument("vision item consumer spans overlap");
             }
-            if (item.merged_count > workspace_plan.vision->max_merged_tokens ||
-                execution::VisionContext::workspace_bytes(
-                    *parameters.model.config().vision, *parameters.vision,
-                    prompt.vision_items[index].patch_count, item.merged_count,
-                    *workspace_plan.vision) > workspace_plan.vision->encode_peak_bytes) {
+            // `--vision-cpu` runs the encoder on the host, so there is no device encode scratch to
+            // bound against; only the handoff extent (`max_merged_tokens`) is checked. The device
+            // path additionally requires the device encode layout to fit `encode_peak_bytes`.
+            const bool vision_offload = parameters.model.options().vision_cpu_offload;
+            const bool item_too_large =
+                item.merged_count > workspace_plan.vision->max_merged_tokens ||
+                (!vision_offload &&
+                 execution::VisionContext::workspace_bytes(
+                     *parameters.model.config().vision, *parameters.vision,
+                     prompt.vision_items[index].patch_count, item.merged_count,
+                     *workspace_plan.vision) >
+                     workspace_plan.vision->encode_peak_bytes);
+            if (item_too_large) {
                 throw std::invalid_argument("vision item exceeds the Program workspace envelope");
             }
             previous_end = item.token_end;
@@ -322,6 +333,102 @@ RequestBasePlan ProgramImpl::plan_request(const PreparedPromptData& prompt,
         base->prefix_digests.assign(prompt);
         base->prefix_identity_tag =
             capture_identity_tag(speculative_backend, proposal_head, kv_storage);
+        if (std::getenv("NINFER_MAT_DEBUG")) {
+            const std::uint32_t n = static_cast<std::uint32_t>(prompt.token_ids.size());
+            std::fprintf(stderr,
+                         "[digest] pub tok=%u rewrite_n=%zu",
+                         n, prompt.identity.rewrite_execution_frontiers.size());
+            for (const std::uint32_t rf : prompt.identity.rewrite_execution_frontiers) {
+                std::fprintf(stderr, " rf=%u", rf);
+            }
+            if (n > 0) {
+                std::fprintf(stderr, " pos00=%d pos01=%d pos02=%d ", prompt.positions[0],
+                             prompt.positions[1], prompt.positions[2]);
+                if (n >= 3) {
+                    std::fprintf(stderr, "posFm3=%d posFm2=%d posFm1=%d ",
+                                 prompt.positions[n - 3U], prompt.positions[n - 2U],
+                                 prompt.positions[n - 1U]);
+                }
+                std::fprintf(stderr, "tt0=%u tt1=%u tt2=%u ",
+                             prompt.token_types.size() > 0 ? prompt.token_types[0] : 0U,
+                             prompt.token_types.size() > 1 ? prompt.token_types[1] : 0U,
+                             prompt.token_types.size() > 2 ? prompt.token_types[2] : 0U);
+                std::fprintf(stderr, "led_n=%zu", prompt.token_ids.size());
+                if (prompt.token_ids.size() > 2) {
+                    std::fprintf(stderr, " tok0=%u tok1=%u tok2=%u", prompt.token_ids[0],
+                                 prompt.token_ids[1], prompt.token_ids[2]);
+                }
+                if (n >= 3) {
+                    std::fprintf(stderr, " tokFm3=%u tokFm2=%u tokFm1=%u",
+                                 prompt.token_ids[n - 3U], prompt.token_ids[n - 2U],
+                                 prompt.token_ids[n - 1U]);
+                }
+                for (const std::uint32_t rf : prompt.identity.rewrite_execution_frontiers) {
+                    if (rf < base->prefix_digests.size()) {
+                        const auto d = base->prefix_digests.at(rf);
+                        std::fprintf(stderr, " d@%u=%lx,%lx", rf, d[0], d[1]);
+                    }
+                }
+                const auto dend = base->prefix_digests.at(base->prefix_digests.size());
+                std::fprintf(stderr, " dend=%lx,%lx", dend[0], dend[1]);
+                // Grid digest+token trace: localizes where an incoming re-render diverges
+                // from a stored checkpoint's running digest (NINFER_MAT_DEBUG only).
+                if (std::getenv("NINFER_MAT_GRID")) {
+                    std::fprintf(stderr, " GRID");
+                    for (std::uint32_t f = 0; f < n; f += 64) {
+                        const auto d = base->prefix_digests.at(f);
+                        std::fprintf(stderr, " g%u=%u:%lx", f, prompt.token_ids[f], d[0]);
+                    }
+                    std::fprintf(stderr, "\n");
+                    std::fflush(stderr);
+                }
+                // Per-token dump of the response region: start at the establishment end
+                // (2nd rewrite frontier, if present) so it aligns with [tail] F= (NINFER_MAT_TAIL).
+                if (std::getenv("NINFER_MAT_FINE")) {
+                    const auto& frs = prompt.identity.rewrite_execution_frontiers;
+                    std::uint32_t base_pos = (frs.size() >= 2) ? frs[1] : 0;
+                    std::uint32_t lo = base_pos > 256 ? base_pos - 256 : 0;
+                    std::uint32_t hi = base_pos + 256;
+                    std::fprintf(stderr, "[fine] in base=%u ", base_pos);
+                    for (std::uint32_t f = lo; f < hi && f < base->prefix_digests.size(); ++f) {
+                        const auto d = base->prefix_digests.at(f);
+                        std::fprintf(stderr, " %u=%lx:%lx", f, d[0], d[1]);
+                    }
+                    std::fprintf(stderr, "\n");
+                    std::fflush(stderr);
+                }
+                if (std::getenv("NINFER_MAT_TAIL")) {
+                    const auto& rfs = prompt.identity.rewrite_execution_frontiers;
+                    std::uint32_t base0 = (rfs.size() >= 2) ? rfs[1] : 0;
+                    const std::uint32_t nt = static_cast<std::uint32_t>(prompt.token_ids.size());
+                    std::fprintf(stderr, "[tail] in est_end=%u n=%u nt=%zu ", base0, n,
+                                 prompt.token_ids.size());
+                    // Log the response-region tokens from base0; if base0 exceeds the prompt
+                    // (suffix-indexed plan) log from 0 instead so we never come up empty.
+                    const std::size_t nt64 = prompt.token_ids.size();
+                    std::uint32_t lo = (base0 < nt) ? base0 : 0;
+                    for (std::uint32_t f = lo; f < lo + 60 && f < nt; ++f) {
+                        // positions is 3*n flat: track a at index a*n+f.
+                        const int32_t p0 = f < nt64 ? prompt.positions[f] : -1;
+                        const int32_t p1 = f + nt64 < prompt.positions.size()
+                                               ? prompt.positions[f + nt64]
+                                               : -1;
+                        const int32_t p2 = f + 2 * nt64 < prompt.positions.size()
+                                               ? prompt.positions[f + 2 * nt64]
+                                               : -1;
+                        std::fprintf(stderr, "%u:p0=%d,p1=%d,p2=%d,tt=%u,t=%u ", f, p0, p1, p2,
+                                     f < prompt.token_types.size()
+                                         ? static_cast<unsigned>(prompt.token_types[f])
+                                         : -1,
+                                     prompt.token_ids[f]);
+                    }
+                    std::fprintf(stderr, "\n");
+                    std::fflush(stderr);
+                }
+            }
+            std::fprintf(stderr, "\n");
+            std::fflush(stderr);
+        }
     }
     if (options.allow_prefix_reuse && prompt.identity.reusable && context_cache.enabled) {
         const auto add_capture = [&](std::uint32_t frontier, std::uint32_t input_order,
@@ -357,6 +464,17 @@ RequestBasePlan ProgramImpl::plan_request(const PreparedPromptData& prompt,
                         opportunity.kind == PromptCacheMarkerKind::SharedStablePrefix,
                         opportunity.kind == PromptCacheMarkerKind::PrivateLongAnchor,
                         opportunity.evidence);
+        }
+        // THE BRANCH ANCHOR: a capture at the depth this prompt matched stored content to, when no checkpoint
+        // below that depth can resume from it. INSERTED HERE, through the plan's own `add_capture`, so it is
+        // merged, sorted, given an identity and priced exactly like a client marker -- the thing both earlier
+        // attempts missed. (Attempt 1 attached it after the plan was sealed, to a discarded copy; attempt 2 put
+        // it in the candidate's copy and produced a group with no identity, which the engine rejected with
+        // `planned capture identity is invalid` and then recovered through, on prod.)
+        if (branch_anchor_frontier && *branch_anchor_frontier != 0 &&
+            *branch_anchor_frontier <= base->summary.prompt_tokens) {
+            add_capture(*branch_anchor_frontier, 0, std::nullopt, false, true,
+                        SharedCandidateEvidence::None);
         }
         std::sort(base->capture_groups.begin(), base->capture_groups.end(),
                   [](const CaptureGroup& left, const CaptureGroup& right) {
@@ -480,6 +598,53 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
         plan->reuse       = ReusePath::SharedStablePrefix;
         plan->reuse_base  = selected.frontier;
         plan->source_mode = runtime::PrivateSourceMode::Retain;
+
+        // THE REUSE INSTRUMENT, AND ITS FIRST VERSION WAS MISLABELLED AND MISREAD (corrected 2026-09-27 after
+        // a code analysis showed both). **"chosen" was the damaging word**: this fires once for EVERY shared
+        // CANDIDATE CONSTRUCTED, including the ones that lose. At 14:19:37 it printed four times while the
+        // request went on to report `private_endpoint` at 45815 -- so a diagnosis of "the request plan takes
+        // the shared path while a longer private candidate exists" was built on a line that said nothing
+        // about which candidate won. It now says CONSTRUCTED.
+        //
+        // **And `best_private_frontier` had no prompt-length check**, so in 11 of 19 prints it named a
+        // continuation LONGER THAN THE PROMPT ITSELF -- which cannot be a prefix of that prompt, making
+        // `longer_private_exists=1` largely meaningless. A continuation can only be a prefix if its frontier
+        // fits inside the prompt, and that is now required.
+        //
+        // The shared path reuses a SNAPSHOT -- the stable head as published -- so its frontier never grows,
+        // while a session's growing part lives in private continuations. With both defects fixed this
+        // separates the two explanations for the production reuse stall:
+        //   * a LONGER private frontier exists here  -> availability was NOT the obstacle, and the cost is
+        //     the CHOICE (selection);
+        //   * nothing longer exists                  -> there was no growing candidate to take, and the cost
+        //     is RETENTION/capture.
+        // Rate-limited like the eviction line (first 8, then every 512th), so it is readable on prod without
+        // an env change and cannot flood the journal -- and it prints its own denominator so "never fired"
+        // is distinguishable from "fired and found nothing longer".
+        {
+            static std::uint64_t shared_choices = 0;
+            ++shared_choices;
+            if (shared_choices <= 8U || shared_choices % 512U == 0U) {
+                std::uint32_t best_private = 0U;
+                std::size_t   live_private = 0U;
+                for (const SequenceState& candidate_state : continuation_states) {
+                    if (candidate_state.execution_frontier == 0U) { continue; }
+                    ++live_private;
+                    // ONLY WHAT COULD BE A PREFIX OF THIS PROMPT. A continuation longer than the prompt
+                    // cannot be one, and counting it manufactured the reading this instrument was misread for.
+                    if (candidate_state.execution_frontier > prompt.token_ids.size()) { continue; }
+                    best_private = std::max(best_private, candidate_state.execution_frontier);
+                }
+                std::fprintf(stderr,
+                             "[engine] shared candidate CONSTRUCTED: frontier=%u prompt=%zu "
+                             "best_private_frontier=%u live_private=%zu longer_private_exists=%d "
+                             "choice=%llu\n",
+                             selected.frontier, prompt.token_ids.size(), best_private, live_private,
+                             static_cast<int>(best_private > selected.frontier), 
+                             static_cast<unsigned long long>(shared_choices));
+                std::fflush(stderr);
+            }
+        }
     } else if (source != nullptr) {
         const runtime::CheckpointRef selected = *checkpoint;
         plan->selected_checkpoint             = selected;
@@ -628,6 +793,42 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
             selected_state_requires_fork(*source, plan->reuse, plan->rewrite_disposition,
                                          plan->selected_checkpoint, plan->reuse_base);
     }
+    // Probe (NINFER_CAPTURE_PROBE): WHY `preserve_rewrite` came out the way it did. `preserve_rewrite`
+    // is `rewrite_disposition == RetainExisting` (`prefill.cpp:526`), and RetainExisting is off whenever
+    // `can_retain_rewrite` is false -- which silently reduces the turn to a consume-and-clear, erasing
+    // the precondition #11(a) needs. Printed alongside the fork decision, because a Move consume also
+    // clears the checkpoint at commit (`commit.cpp:662`: rewrite_state aliasing state.read is dropped at :676-678),
+    // so "retained" is not sufficient on its own: the consume must FORK.
+    if (std::getenv("NINFER_CAPTURE_PROBE") != nullptr) {
+        // `n` and `tokens` exist to attribute a plan line to a turn. The scenario prints its own turn
+        // lines on stdout, which is block-buffered when piped while these probes are fflush'd on
+        // stderr, so line ORDER between the two streams is not evidence -- and the first reading of
+        // this trace was sequenced by position. `tokens` is the incoming prompt's length, which
+        // distinguishes the turns directly.
+        static std::uint64_t plan_probe_seq = 0;
+        std::fprintf(stderr,
+                     "[plan] n=%llu tokens=%zu reuse=%d reuse_base=%u desired=%d desired_frontier=%u "
+                     "src=%d ckpt_valid=%d ckpt_frontier=%u ckpt_refs=%d can_retain=%d disposition=%d "
+                     "fork_required=%d source_mode=%d\n",
+                     static_cast<unsigned long long>(++plan_probe_seq), prompt.token_ids.size(),
+                     static_cast<int>(plan->reuse), plan->reuse_base,
+                     static_cast<int>(desired.has_value()),
+                     desired ? desired->frontier : 0U, static_cast<int>(source != nullptr),
+                     static_cast<int>(source != nullptr && source->rewrite_checkpoint.valid),
+                     source != nullptr ? source->rewrite_checkpoint.frontier : 0U,
+                     // `valid()` is not decoration: `checkpoint_references` calls `require()`, which
+                     // throws on a stale handle -- and the neighbouring `can_retain_rewrite_checkpoint`
+                     // checks `valid()` precisely because a stale handle is possible here. Without this
+                     // guard, setting the probe variable could turn a probe into a planning exception.
+                     static_cast<int>(source != nullptr && source->rewrite_state &&
+                                              state_store->valid(*source->rewrite_state)
+                                          ? state_store->checkpoint_references(*source->rewrite_state)
+                                          : -1),
+                     static_cast<int>(can_retain_rewrite),
+                     static_cast<int>(plan->rewrite_disposition),
+                     static_cast<int>(plan->state_fork_required), static_cast<int>(plan->source_mode));
+        std::fflush(stderr);
+    }
     if (source != nullptr && is_rewrite_checkpoint_restore(plan->reuse) &&
         plan->source_mode == runtime::PrivateSourceMode::ConsumeToActive) {
         std::vector<StateImageHandle> optional_states;
@@ -673,6 +874,7 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
         if (!group.rewrite && !group.shared && !group.long_anchor) { continue; }
         plan->capture_groups.push_back(std::move(group));
     }
+
     plan->shared_candidates.reserve(base.shared_candidates.size());
     for (CaptureGroup group : base.shared_candidates) {
         if (group.frontier >= plan->reuse_base) {

@@ -28,7 +28,11 @@ struct Options {
     KvCacheStorage kv_cache = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
     bool enable_vision  = false;
+    bool vision_cpu_offload = false;
     bool use_cuda_graph = true;
+
+    float rope_scaling_factor = 1.0f;
+    std::uint32_t rope_scaling_original_context = 262144;
 
     bool raw_output      = false;
     bool print_token_ids = false;

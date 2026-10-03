@@ -203,6 +203,13 @@ Json request_json(const RequestLogContext& context) {
                 {"model", context.model},
                 {"stream", context.stream},
                 {"message_count", context.message_count},
+                // HOW MANY EXPLICIT `cache_control` BREAKPOINTS THE CLIENT SENT. The denominator for the
+                // 2026-10-01 regression: explicit markers become shared-prefix candidates, so "is the
+                // planner's work proportional to the markers?" has no per-request answer without it --
+                // which is what made that regression unattributable between the input and the engine.
+                // ANTHROPIC PATH ONLY: the OpenAI translators do not separate explicit from automatic
+                // markers, so they log 0 -- read that as "not counted", never as "the client sent none".
+                {"explicit_cache_markers", context.explicit_cache_markers},
                 {"media_item_count", context.media_item_count},
                 {"requested_output_tokens", context.requested_output_tokens},
                 {"requested_output_tokens_source",
@@ -217,6 +224,15 @@ Json request_json(const RequestLogContext& context) {
                 {"preserve_thinking",
                  context.preserve_thinking ? Json(*context.preserve_thinking) : Json(nullptr)},
                 {"preserve_thinking_semantic_change", context.preserve_thinking_semantic_change},
+                // The key the engine actually scoped this request to (derived on the Messages path, explicit
+                // on the Responses path). Absent means the request ran with no key at all -- the condition
+                // that made everything session-scoped unreachable until 2026-09-27.
+                {"session_key", context.session_key ? Json(*context.session_key) : Json(nullptr)},
+                {"client_session_id",
+                 context.client_session_id ? Json(*context.client_session_id) : Json(nullptr)},
+                // Join key with the engine's eviction line (`session=%016llx`, `prefill.cpp`'s hash).
+                {"session_key_hash",
+                 context.session_key_hash ? Json(*context.session_key_hash) : Json(nullptr)},
                 {"sampling", sampler_json(context.sampling)}};
 }
 
@@ -240,7 +256,15 @@ Json preparation_json(const RequestLogContext& context) {
 }
 
 Json rejected_request_json(const RequestRejectionLogContext& context) {
+    // A RECORD THAT SAYS WHAT IT DOES NOT KNOW. Every field below is rendered with its DEFAULT when the
+    // body never parsed -- so `tool_choice: "auto"` and `requested_output_tokens_source: "server_default"`
+    // are INVENTED values, not observations, and the record read as a request that happened to have zero
+    // messages rather than one that was never parsed at all. `parsed:false` and the `phase` beside it are
+    // what let a reader tell those apart; the comment on the producer claimed the record "says so" when it
+    // did not (measured 2026-10-01).
     return Json{{"request_id", context.id},
+                {"parsed", context.parsed},
+                {"phase", context.parsed ? "prepare" : "parse"},
                 {"protocol", context.protocol},
                 {"model", context.model},
                 {"stream", context.stream},
@@ -307,6 +331,128 @@ Json materialization_json(const ninfer::MaterializationDiagnostics& diagnostics)
         {"budget_exhausted", diagnostics.budget_exhausted},
         {"selected_degradation_units", diagnostics.selected_degradation_units},
         {"selected_maximal_fallback", diagnostics.selected_maximal_fallback},
+        // #6 (2026-09-27): the pair, with its denominator below. Both non-zero in one request means a plan that preserved a
+        // restorable checkpoint was assessed FEASIBLE and a plan that destroyed one was taken anyway --
+        // the defect surviving. `chosen_restorable_evictions > 0` with the other at 0 is the honest other
+        // case: nothing feasible preserved, which is what the KV-saturated prod evictions looked like.
+        {"feasible_preserving_alternatives", diagnostics.feasible_preserving_alternatives},
+        // ITS DENOMINATOR: assessed preserving targets, goal or no goal. Without it a 0 in the field above
+        // cannot be told from "no preserving option was ever assessed" -- which is the #6 shape.
+        {"preserving_alternatives_assessed", diagnostics.preserving_alternatives_assessed},
+        // WHERE the run's goal probes came from, by planner call site, plus how many targets it visited.
+        // Without these, "4,630 probes" is a total with no shape.
+        {"goal_probes_by_site",
+         Json::array({diagnostics.goal_probes_by_site[0], diagnostics.goal_probes_by_site[1],
+                      diagnostics.goal_probes_by_site[2], diagnostics.goal_probes_by_site[3],
+                      diagnostics.goal_probes_by_site[4]})},
+        {"targets_assessed", diagnostics.targets_assessed},
+        {"chosen_restorable_evictions", diagnostics.chosen_restorable_evictions},
+        // The total WITH its split, because the total alone conflates two opposite populations: a target
+        // that was never physically feasible (no probe was made, the refusal is CAPACITY) and one that was
+        // feasible and refused by the goal gate (the refusal is the CATALOG). See the header comment.
+        {"assessed_targets_without_goal", diagnostics.assessed_targets_without_goal},
+        {"assessed_targets_without_goal_infeasible",
+         diagnostics.assessed_targets_without_goal_infeasible},
+        {"assessed_targets_without_goal_unadoptable",
+         diagnostics.assessed_targets_without_goal_unadoptable},
+        // THE CANDIDATE SET, per request. Each row says what happened to that candidate -- how many goal
+        // probes it got, how many produced an adoptable goal, and how many were blocked by the publication
+        // cell alone versus anything else -- plus the election terms it was ranked on.
+        // CORRECTED 2026-10-02: "`longer_lost` true ... is the defect" was WRONG and cost a live reading.
+        // `longer_lost` compares `reused_prompt_tokens` ALONE, which is element 10 of `FoldedCost::key()`;
+        // ten terms outrank it, so the flag fires whenever any of them differs -- the ordinary case. The
+        // defect-shaped reading is `longer_lost_eligible` (eligible candidates only), and `decided_by` names
+        // the term responsible.
+        {"candidates", [&] {
+             Json array = Json::array();
+             for (const auto& row : diagnostics.candidates) {
+                 array.push_back(Json{{"reuse", row.reuse},
+                                      {"probes", row.probes},
+                                      {"goals", row.goals},
+                                      {"cell_only", row.cell_only},
+                                      {"other", row.other},
+                                      {"winner", row.winner},
+                                      {"private_source", row.private_source},
+                                      {"shared_source", row.shared_source},
+                                      // WHAT THE ELECTION RANKED IT ON, so a loss is attributable. Without
+                                      // these a `longer_lost` can only be read as "reuse lost", which is
+                                      // element 10 of an ordering with ten terms above it.
+                                      {"eligible", row.eligible},
+                                      {"restorable_evictions", row.restorable_evictions},
+                                      {"total_ns", row.total_ns},
+                                      {"affected_selected_hits", row.affected_selected_hits},
+                                      {"owner_evictions", row.owner_evictions},
+                                      {"checkpoint_drops", row.checkpoint_drops},
+                                      // COMPARE ELECTED AGAINST ELECTED -- see `ElectionTerm`. The winner's
+                                      // row above is its SEATED cost; these are the terms the election used.
+                                      {"seated_differs", row.seated_differs},
+                                      {"elected_reuse", row.elected_reuse},
+                                      {"elected_restorable_evictions", row.elected_restorable_evictions},
+                                      {"elected_total_ns", row.elected_total_ns},
+                                      {"elected_affected_selected_hits", row.elected_affected_selected_hits},
+                                      {"elected_owner_evictions", row.elected_owner_evictions},
+                                      {"elected_checkpoint_drops", row.elected_checkpoint_drops}});
+             }
+             return array;
+         }()},
+        {"chosen_reuse", diagnostics.chosen_reuse},
+        {"best_loser_reuse", diagnostics.best_loser_reuse},
+        {"longer_lost", diagnostics.longer_lost},
+        // THE COMPARISON THAT CAN BE CALLED A DEFECT (eligible candidates only), and WHICH TERM DECIDED it.
+        // `longer_lost` alone fires on any of the ten terms ranked above reuse, so it is the ordinary case
+        // rather than the defect case. CORRECTED 2026-10-02 (a review found this legend still pre-fix):
+        // `decided_by` is an index into `FoldedCost::key()` over ALL FOURTEEN elements -- 0 =
+        // restorable_evictions, 1 = total_ns, 2 = affected_selected_hits, 3 = newest_affected_hit_epoch,
+        // 4 = owner_evictions, 5 = checkpoint_drops, 6 = copy_operations, 7 = transferred_bytes,
+        // 8 = remaining_text_prefill, 9 = remaining_vision_prefill, 10 = reused_prompt_tokens,
+        // 11 = current_session_binding, 12 = candidate_ordinal, 13 = target_ordinal.
+        // **255 means NO ELIGIBLE LOSER EXISTED AT ALL** and nothing else -- the old text's "or the two agree
+        // on every carried term" is false, because every element is walked now.
+        // **254 means THE COSTS ARE NOT A COMPARABLE PAIR**: the recorded winner does not beat this loser
+        // on `key()`, so no element can honestly be named. It is emitted by `election_deciding_element`, and
+        // seeing it means the attribution was handed a cost the election did not rank -- the seal-fallback
+        // shape. Read it as an instrument fault, never as a finding.
+        // **AND READ IT WITH `longer_lost_eligible`, NOT `longer_lost`**: the invariant below holds for the
+        // eligible comparison only. Row-based `longer_lost` can be true because of an INELIGIBLE longer
+        // candidate, while a legitimate `decided_by == 10` comes from a SHORTER eligible loser.
+        // It is computed by the planner from the cost the ELECTION compared, which on a seal fallback is
+        // NOT the cost that was sealed -- see `finalize_selection`.
+        {"best_eligible_loser_reuse", diagnostics.best_eligible_loser_reuse},
+        {"longer_lost_eligible", diagnostics.longer_lost_eligible},
+        {"longer_lost_decided_by", diagnostics.longer_lost_decided_by},
+        // THE SPLIT (§2f): the deepest token-exact match against ANY stored ledger, the deepest restorable
+        // checkpoint at or below it, and the entry count examined.
+        {"split_best_tokens", diagnostics.split_best_tokens},
+        {"split_best_restorable", diagnostics.split_best_restorable},
+        {"split_entries", diagnostics.split_entries},
+        {"split_identity_ok", diagnostics.split_identity_ok},
+        {"split_ended_by", diagnostics.split_ended_by},
+        {"split_best_stored", diagnostics.split_best_stored},
+        // WHICH LEDGER the deepest match came from, and its resume point -- see the diagnostics.
+        {"split_best_source", diagnostics.split_best_source},
+        {"split_best_frontier", diagnostics.split_best_frontier},
+        // WHERE THE DEEPEST MATCH STOPPED, as an index. The 12-id windows that used to be emitted beside it
+        // were removed 2026-09-28: they had answered their question and they carried user content.
+        {"split_probe_index", diagnostics.split_probe_index},
+        // WHICH TURN OF THE PROMPT'S OWN HISTORY that stop fell in, and its role (a ChatRole value;
+        // 255 means no message starts at that index -- the end-of-prompt boundary). PROMPT-SIDE ONLY,
+        // and meaningful only when split_ended_by is 0 (a divergence); see the diagnostics comment.
+        {"split_message_index", diagnostics.split_message_index},
+        {"split_message_offset", diagnostics.split_message_offset},
+        {"split_message_role", diagnostics.split_message_role},
+        {"split_past_last_message", diagnostics.split_past_last_message},
+        // THE ARENA CEILING, in the request's own record. `http_server.cpp`'s delta gate says this must
+        // reach the record "or the per-request story cannot say why the plan was short" -- and it did NOT:
+        // the flag went to the aggregate counter only, so the comment described an emission that did not
+        // exist. It is emitted here now.
+        {"target_arena_truncated", diagnostics.target_arena_truncated},
+        {"session_cell_frontier", diagnostics.session_cell_frontier},
+        {"session_cell_offered", diagnostics.session_cell_offered},
+        {"session_cell_skip", diagnostics.session_cell_skip},
+        {"session_endpoint_skip", diagnostics.session_endpoint_skip},
+        {"sibling_candidates", diagnostics.sibling_candidates},
+        {"retained_sources", diagnostics.retained_sources},
+        {"consumed_sources", diagnostics.consumed_sources},
         {"initial_predicted_total_ns", diagnostics.initial_predicted_total_ns},
         {"first_improvement_ns", diagnostics.first_improvement_ns
                                      ? Json(*diagnostics.first_improvement_ns)
@@ -337,7 +483,37 @@ double request_host_exposed_seconds(const ninfer::GenerationEngineTiming& timing
            timing.engine_maintenance_exposed_seconds;
 }
 
-Json request_engine_timing_json(const ninfer::GenerationEngineTiming& timing) {
+Json request_engine_timing_json(const ninfer::GenerationEngineTiming& timing, double ttft_seconds,
+                                double prefill_seconds) {
+    // THE FIRST-TOKEN WINDOW, and the residual over it. `proc = ttft - queue` is what the monitor reads,
+    // and no field in the record shared its window until these: `host_exposed_seconds.total` and
+    // `device_wait_exposed_seconds` both run for the WHOLE request, so subtracting them from `ttft` mixed
+    // two windows. These are all scoped to the first token.
+    //
+    // **THE SUBTRAHEND IS `ttft_device_wait_seconds`, NOT `prefill_seconds`, AND THAT IS A CORRECTION.**
+    // The first version subtracted `prefill_seconds`, whose value is program WALL time -- it ALREADY
+    // contains the `program_submit`/`program_post` host time that `ttft_host_exposed_seconds` also
+    // contains, so the host term was subtracted TWICE and the "residual" went negative. Measured on the
+    // 2026-10-01 run: the emitted field had min **-622 ms with 78 of 290 records below -10 ms**, while the
+    // same records' `ttft - queue - ttft_host - ttft_device_wait` had min **+0.6 ms and 0 below -10**. The
+    // verification used the second form and the record emitted the first -- **the check and the artifact
+    // were different quantities**, which is how a broken residual passed as a verified one. `plan.md` drew
+    // a conclusion from the broken form ("no residual left to explain on QA") and that conclusion is void.
+    //
+    // WHAT THIS NUMBER IS AND IS NOT: with the placement correct it is NON-NEGATIVE, because the window's
+    // terms cannot exceed the wall it sits in. **So a non-negative value means NOT OVER-INCLUSIVE and
+    // nothing more -- it is NOT evidence of completeness.** Anything the window misses inflates it, so an
+    // early or incomplete window also reads non-negative; completeness would require the value to equal the
+    // known unattributed terms (planner search inside the first-token window, and the commit phase's own
+    // host time before the token). Measured: 65 of 290 records exceed 50 ms (range 61-428 ms), 47 of them
+    // clustered at the ~400 ms planner search budget, which is one such term and is NOT attributed.
+    // `nullopt` -- emitted as null -- when the window was never frozen (no token); do NOT read null as zero.
+    const std::optional<double> ttft_residual =
+        timing.ttft_window_frozen
+            ? std::optional<double>(ttft_seconds - timing.queue_wait_seconds -
+                                    timing.ttft_host_exposed_seconds -
+                                    timing.ttft_device_wait_seconds)
+            : std::nullopt;
     return Json{
         {"queue_wait_seconds", timing.queue_wait_seconds},
         {"host_exposed_seconds",
@@ -347,6 +523,21 @@ Json request_engine_timing_json(const ninfer::GenerationEngineTiming& timing) {
               {"engine_commit_output", timing.engine_commit_output_exposed_seconds},
               {"engine_maintenance", timing.engine_maintenance_exposed_seconds},
               {"total", request_host_exposed_seconds(timing)}}},
+        // Context transfers this request's own admission caused: the HostToDevice restore
+        // that resumed its checkpoint, and the DeviceToHost demotes it forced to make room.
+        // Reported as volume (additive across requests), unlike the host-exposed figures
+        // above, which are latency exposure and must not be summed.  It is the only place
+        // the restore appears: it runs before prefill starts, so it is inside `proc` and
+        // under no host phase.
+        {"ttft_window",
+         Json{{"host_exposed_seconds", timing.ttft_host_exposed_seconds},
+              {"device_wait_seconds", timing.ttft_device_wait_seconds},
+              {"prefill_seconds", prefill_seconds},
+              {"unaccounted_seconds", ttft_residual}}},
+        {"transfers", Json{{"restore_seconds", timing.restore_seconds},
+                           {"restore_pages", timing.restore_pages},
+                           {"demote_seconds", timing.demote_seconds},
+                           {"demote_pages", timing.demote_pages}}},
         {"device_wait_exposed_seconds", timing.device_wait_exposed_seconds},
         {"decode", Json{{"host_exposed_seconds", timing.decode_host_exposed_seconds},
                         {"device_wait_exposed_seconds", timing.decode_device_wait_exposed_seconds},
@@ -475,6 +666,8 @@ std::string format_server_start_json(
               product::speculative_backend_name(engine_options.speculative.backend)},
              {"speculative_draft_window", engine_options.speculative.draft_tokens},
              {"proposal_head", proposal_head_name(engine_options.speculative.proposal_head)},
+             {"rope_scaling_factor", engine_options.rope_scaling_factor},
+             {"rope_scaling_original_context", engine_options.rope_scaling_original_context},
              {"context_cost", Json{{"transfer_source", ninfer::context_cost_preset_source_name(
                                                            context_cost.transfer_source)},
                                    {"prefill_source", ninfer::context_cost_preset_source_name(
@@ -542,7 +735,10 @@ std::string format_request_rejected_json(const std::string& server_instance_id,
                                          std::uint64_t timestamp,
                                          const RequestRejectionLogContext& context) {
     Json record       = event_base(server_instance_id, timestamp, "request_rejected");
-    record["phase"]   = "prepare";
+    // DERIVED, so the top-level phase and the one inside `request` cannot disagree. It was hardcoded
+    // "prepare" while the nested field said "parse" for an unparsed body -- one record, two phases, and a
+    // reader had no way to tell which was meant.
+    record["phase"]   = context.parsed ? "prepare" : "parse";
     record["request"] = rejected_request_json(context);
     record["error"]   = error_json(context.error);
     return record.dump();
@@ -574,7 +770,8 @@ std::string format_request_done_json(const std::string& server_instance_id, std:
         {"prepare", outcome.metrics.prepare_seconds}, {"ttft", outcome.metrics.ttft_seconds},
         {"vision", outcome.metrics.vision_seconds},   {"prefill", outcome.metrics.prefill_seconds},
         {"decode", outcome.metrics.decode_seconds},   {"total", outcome.metrics.total_seconds}};
-    record["engine_timing"]   = request_engine_timing_json(outcome.metrics.engine_timing);
+    record["engine_timing"]   = request_engine_timing_json(
+        outcome.metrics.engine_timing, outcome.metrics.ttft_seconds, outcome.metrics.prefill_seconds);
     record["speculative"]     = speculative_json(outcome.metrics);
     record["materialization"] = materialization_json(outcome.metrics.materialization);
     return record.dump();
@@ -751,6 +948,13 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
               monotonic_delta(previous.partial_tail_cow_pages, current.partial_tail_cow_pages)},
              {"private_owners_degraded", monotonic_delta(previous.pressure_private_owners_degraded,
                                                          current.pressure_private_owners_degraded)},
+             {"private_owners_demoted", monotonic_delta(previous.pressure_private_owners_demoted,
+                                                        current.pressure_private_owners_demoted)},
+             {"private_owners_demoted_kv", monotonic_delta(previous.pressure_private_owners_demoted_kv,
+                                                           current.pressure_private_owners_demoted_kv)},
+             {"private_owners_demoted_kv_only",
+              monotonic_delta(previous.pressure_private_owners_demoted_kv_only,
+                              current.pressure_private_owners_demoted_kv_only)},
              {"private_owners_evicted", monotonic_delta(previous.pressure_private_owners_evicted,
                                                         current.pressure_private_owners_evicted)},
              {"shared_owners_degraded", monotonic_delta(previous.pressure_shared_owners_degraded,
@@ -763,6 +967,9 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
              {"search_budget_exhaustions",
               monotonic_delta(previous.pressure_search_budget_exhaustions,
                               current.pressure_search_budget_exhaustions)},
+             {"target_arena_truncations",
+              monotonic_delta(previous.pressure_target_arena_truncations,
+                              current.pressure_target_arena_truncations)},
              {"maximal_fallback_selections",
               monotonic_delta(previous.pressure_maximal_fallback_selections,
                               current.pressure_maximal_fallback_selections)},
@@ -805,7 +1012,8 @@ ServerLogEnvironment query_server_log_environment(int device) {
 
 JsonlRequestLog::JsonlRequestLog(const std::string& path,
                                  const std::string& protected_artifact_path,
-                                 std::shared_ptr<spdlog::logger> logger)
+                                 std::shared_ptr<spdlog::logger> logger,
+                                 const std::uint32_t max_mib, const std::uint32_t keep)
     : path_(path), logger_(std::move(logger)) {
     if (path_.empty()) { return; }
     if (!protected_artifact_path.empty() &&
@@ -817,6 +1025,11 @@ JsonlRequestLog::JsonlRequestLog(const std::string& path,
     if (!output_) {
         throw std::runtime_error("failed to open request JSONL log for append: " + path_);
     }
+    max_bytes_ = static_cast<std::uint64_t>(max_mib) * (1ULL << 20);
+    keep_      = keep;
+    std::error_code size_error;
+    const std::uintmax_t existing = std::filesystem::file_size(path_, size_error);
+    written_bytes_ = size_error ? 0 : static_cast<std::uint64_t>(existing);
 }
 
 void JsonlRequestLog::write_server_start(const ServeOptions& options,
@@ -872,10 +1085,43 @@ void JsonlRequestLog::append(std::string record) {
         if (!output_) {
             failed_        = true;
             report_failure = true;
+        } else {
+            written_bytes_ += record.size() + 1;
+            if (max_bytes_ > 0 && written_bytes_ >= max_bytes_) {
+                rotate_locked();
+            }
         }
     }
     if (report_failure && logger_ != nullptr) {
         logger_->error("request log disabled | write failed | {}",
+                       product::format_pretty_text(path_));
+    }
+}
+
+// Caller holds mutex_ and output_ is open. Renames the active file to .1, shifts
+// .1 -> .2 -> ... -> .keep (dropping the oldest), then reopens a fresh active
+// file. Rename-based, so no record is lost (unlike copytruncate).
+void JsonlRequestLog::rotate_locked() {
+    output_.close();
+    std::error_code ec;
+    if (keep_ >= 1) {
+        for (std::uint32_t i = keep_ - 1; i >= 1; --i) {
+            const std::string src = path_ + "." + std::to_string(i);
+            const std::string dst = path_ + "." + std::to_string(i + 1);
+            if (std::filesystem::exists(src, ec)) {
+                std::filesystem::remove(dst, ec); // drop the file about to be overwritten
+                std::filesystem::rename(src, dst, ec);
+            }
+        }
+        std::filesystem::rename(path_, path_ + ".1", ec);
+    } else {
+        std::filesystem::remove(path_, ec); // keep=0: retain no rotated copies
+    }
+    output_.open(path_, std::ios::out | std::ios::app);
+    written_bytes_ = 0;
+    if (!output_ && logger_ != nullptr) {
+        failed_ = true;
+        logger_->error("request log rotation failed | {}",
                        product::format_pretty_text(path_));
     }
 }

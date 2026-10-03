@@ -9,6 +9,7 @@
 
 #include <array>
 #include <cstdint>
+#include <cstdlib>
 #include <exception>
 #include <iostream>
 #include <new>
@@ -63,7 +64,15 @@ void test_state_store(ninfer::DeviceContext& device) {
     const q36::StateImageDeviceLayout layout = q36::plan_state_image_device_pool(builder, spec);
     ninfer::DeviceArena arena(builder.finish(256));
     q36::StateImageDevicePool physical({arena.base(), arena.capacity()}, layout);
-    q36::HostStatePool host(layout.host, 2);
+    // The host slots come from the SHARED pinned budget now; the two slots this test needs are an initial
+    // reservation. A CPU-only chunk source keeps this test's pool bookkeeping independent of whether the
+    // machine has a GPU -- the test itself still needs one for the device pool.
+    ninfer::PinnedHostPool host_pool(
+        ninfer::PinnedHostPool::Config{/*chunk_bytes=*/layout.host.image_bytes * 2U, /*alignment=*/256U},
+        [](std::size_t bytes) { return std::malloc(bytes); },
+        [](void* base) { std::free(base); });
+    q36::HostStatePool host(layout.host, host_pool);
+    expect(host.reserve_slots(2) == 2U, "host slots reserved from the shared pool");
     store::StateImageStore images(
         physical, &host, static_cast<std::uint32_t>(physical.slot_count()) + host.capacity());
 
@@ -113,6 +122,47 @@ void test_state_store(ninfer::DeviceContext& device) {
     expect(images.content_epoch(*source) == rewrite_epoch &&
                images.checkpoint_references(*source) == 1,
            "aborted rewrite rotation restores the prior checkpoint identity");
+
+    // #11(b): `complete()` is the StateImage half of invariant #6 -- the KV side walks every required
+    // page and throws, and this expresses "there is a settled replica to restore from". Its first version
+    // returned false for any image with a pending replica, which includes an IN-FLIGHT Host-to-Device
+    // restore (`begin_host_to_device` sets `pending_device_slot`, `transfer_id` and `destination_pinned`
+    // while the host replica is settled) -- a false positive that would have failed pricing for a whole
+    // owner on healthy traffic, and the reason the condition now tests the settled slots instead. This
+    // case pins that: an image mid-restore IS complete, because its host replica is there.
+    const auto demoted = images.reserve_reset(device.stream);
+    expect(demoted.has_value(), "completeness case could reserve an image");
+    if (demoted.has_value()) {
+        images.freeze(*demoted);
+        expect(images.role(*demoted) == store::StateImageRole::CheckpointImmutable,
+               "completeness case froze its image into a checkpoint");
+        auto to_host = images.reserve_device_to_host(*demoted);
+        expect(to_host.has_value(), "completeness case could start a Device-to-Host demotion");
+        if (to_host.has_value()) {
+            images.enqueue_device_to_host(*to_host, device.stream);
+            images.publish_transfer(std::move(*to_host), false);
+            expect(images.complete(*demoted),
+                   "a checkpoint with a settled Host replica is complete");
+            auto to_device = images.begin_host_to_device(*demoted, device.stream);
+            expect(to_device.has_value(),
+                   "completeness case could start a Host-to-Device restore");
+            if (to_device.has_value()) {
+                expect(images.complete(*demoted),
+                       "a checkpoint mid-RESTORE is complete: its Host replica is settled, so an "
+                       "in-flight Device replica must not be read as incompleteness");
+                images.abort_transfer(std::move(*to_device));
+                expect(images.complete(*demoted),
+                       "aborting the restore leaves the checkpoint complete on its Host replica");
+            }
+        }
+        // Release what this case created, or the store's ownership-closure check at the end of this
+        // function fails -- which is exactly what the first version of this case did: two teardown
+        // failures ("rotated state image ownership closes after release" among them) that had nothing to
+        // do with `complete()` and everything to do with a leaked image.
+        expect(images.release(*demoted), "completeness case released the image it created");
+    }
+    expect(!images.complete(store::StateImageHandle{}),
+           "an invalid handle is not a complete checkpoint");
 
     images.freeze(*destination);
     (void)images.recycle_checkpoint_destination(*source);
@@ -167,6 +217,80 @@ void test_state_store(ninfer::DeviceContext& device) {
            "State Host/Device replica ownership closes without leaked slots");
 }
 
+// THE SESSION-START PRE-GROW for the host-KV axis, which had no equivalent while the STATE axis has had
+// one since §3 item 6 (measured firing, `17 -> 18` slots). The state pre-grow could not convert the one
+// eviction that workload produced, because that one was bound by host KV BYTES -- `host_kv` at 99.3% --
+// so this is the missing half of the same mechanism.
+//
+// It asserts the CAPACITY DIFFERENCE, which is the lesson the state axis's equivalent records: `pre_grow`
+// returning `Grew` while pinning nothing would satisfy a flag assertion and leave the demote unaffordable.
+//
+// The TRIGGER is the part worth pinning: `NotFull` only while the arena can place a whole STEP as one
+// contiguous run, and `Grew` the moment it cannot -- INCLUDING when free bytes remain. That second case is
+// what a "no free bytes at all" trigger would decline, and it is the measured case (99.3% leaves ~224 MiB,
+// which is not zero).
+void test_host_kv_pregrow(ninfer::DeviceContext& device) {
+    // NO DEVICE POOL HERE, deliberately: the pre-grow is decided from the HOST arena's extent map and the
+    // pool's growth policy alone, so a host layout is all this needs. (An earlier draft of this test carried
+    // the neighbouring fixture's device scaffolding and would not compile -- it was never used.)
+    (void)device;
+    const std::array geom{ninfer::KVPageGeometry{
+        .device_plane_order = ninfer::PagedKVPlaneOrder::PageMajor,
+        .planes             = {{.dtype = ninfer::DType::I8, .leading_extent = 8, .head_extent = 2},
+                               {.dtype = ninfer::DType::FP16, .leading_extent = 1, .head_extent = 2}},
+    }};
+    const ninfer::HostKVPageLayout host_layout = ninfer::plan_host_kv_page_layout(geom.front());
+    const std::array host_layouts{host_layout};
+    const std::size_t step = host_layout.page_stride * 8U;
+
+    ninfer::PinnedHostPool pool(
+        ninfer::PinnedHostPool::Config{step, 256U},
+        [](std::size_t bytes) { return std::malloc(bytes); },
+        [](void* base) { std::free(base); });
+    ninfer::HostKVArena arena(pool, step, step, host_layouts);
+    store::HostKVExtentStore extents(arena, 64);
+
+    expect(store::HostKVExtentStore::pre_grow(arena, extents) ==
+               store::HostKVExtentStore::HostKVPreGrow::NotFull,
+           "pre-grow: a fresh arena reports NotFull");
+    expect(arena.capacity_bytes() == step, "pre-grow: NotFull pinned nothing");
+
+    auto taken = arena.allocate(host_layout, 1);
+    expect(taken.has_value(), "pre-grow: fixture allocation");
+    expect(arena.free_bytes() > 0U, "pre-grow: the fixture still holds free BYTES");
+    expect(arena.largest_free_run_bytes() < step,
+           "pre-grow: and no longer a whole-step run -- the trigger condition");
+    const std::size_t capacity_before = arena.capacity_bytes();
+    const std::size_t free_before     = arena.free_bytes();
+
+    expect(store::HostKVExtentStore::pre_grow(arena, extents) ==
+               store::HostKVExtentStore::HostKVPreGrow::Grew,
+           "pre-grow: a fragmented arena grows rather than declining");
+    expect(arena.capacity_bytes() == capacity_before + step,
+           "pre-grow: and it added EXACTLY one step -- the difference, not a flag");
+    expect(arena.free_bytes() == free_before + step, "pre-grow: the new step is free, not occupied");
+
+    // REFUSED, on a FRESH arena. Reusing the one above does not work and the first version of this test
+    // tried to: after a successful pre-grow the arena holds a whole new step, so it is `NotFull` again and
+    // the refusal is never reached -- a fixture that cannot fail for the reason it claims.
+    ninfer::PinnedHostPool refusing_pool(
+        ninfer::PinnedHostPool::Config{step, 256U},
+        [](std::size_t bytes) { return std::malloc(bytes); },
+        [](void* base) { std::free(base); });
+    ninfer::HostKVArena refusing_arena(refusing_pool, step, step, host_layouts);
+    store::HostKVExtentStore refusing_extents(refusing_arena, 64);
+    auto held = refusing_arena.allocate(host_layout, 1);
+    expect(held.has_value(), "pre-grow: refusal-arm fixture allocation");
+    expect(refusing_arena.largest_free_run_bytes() < step, "pre-grow: the refusal arm is fragmented");
+    const std::size_t before_refusal = refusing_arena.capacity_bytes();
+    refusing_pool.set_growth_policy([](std::size_t) { return false; });
+    expect(store::HostKVExtentStore::pre_grow(refusing_arena, refusing_extents) ==
+               store::HostKVExtentStore::HostKVPreGrow::Refused,
+           "pre-grow: a refusing policy reports Refused, not silence");
+    expect(refusing_arena.capacity_bytes() == before_refusal,
+           "pre-grow: a refused pre-grow left the arena exactly as it was");
+}
+
 void test_kv_store(ninfer::DeviceContext& device) {
     ninfer::LayoutBuilder builder;
     ninfer::DeviceKVPagePoolSpec page_spec{
@@ -189,7 +313,12 @@ void test_kv_store(ninfer::DeviceContext& device) {
     const ninfer::HostKVPageLayout host_layout =
         ninfer::plan_host_kv_page_layout(physical_pages.geometry());
     const std::array host_layouts{host_layout};
-    ninfer::HostKVArena host_arena(host_layout.page_stride * 8, host_layouts);
+    ninfer::PinnedHostPool kv_pool(  // CPU-only source: this suite checks allocation, not pinning
+        ninfer::PinnedHostPool::Config{host_layout.page_stride * 8U, 256U},
+        [](std::size_t bytes) { return std::malloc(bytes); },
+        [](void* base) { std::free(base); });
+    ninfer::HostKVArena host_arena(kv_pool, host_layout.page_stride * 8, host_layout.page_stride * 8,
+                                   host_layouts);
     store::LogicalKVPageStore pages(physical_pages, physical_pages.capacity_pages() + 8U);
     store::HostKVExtentStore extents(host_arena, 8);
     store::KVAddressSpaceStore addresses(pages, physical_tables, 4, 4);
@@ -642,6 +771,7 @@ int main() {
         ninfer::DeviceContext device(0);
         test_state_store(device);
         test_kv_store(device);
+        test_host_kv_pregrow(device);
         device.synchronize();
     } catch (const std::exception& error) {
         std::cerr << "FAIL: unexpected exception: " << error.what() << '\n';

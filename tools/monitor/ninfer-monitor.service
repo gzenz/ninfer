@@ -1,0 +1,17 @@
+[Unit]
+Description=NInfer monitor sidecar (:8090)
+After=ninfer.service
+Wants=ninfer.service
+
+[Service]
+Type=simple
+User=zenz
+Group=zenz
+WorkingDirectory=/home/zenz/ninfer-yarn/tools/monitor
+EnvironmentFile=-/home/zenz/.config/ninfer-monitor.env
+ExecStart=/usr/bin/python3 /home/zenz/ninfer-yarn/tools/monitor/monitor.py --port 8090 --bind 0.0.0.0 --server-url http://127.0.0.1:8080 --stats-url http://127.0.0.1:8081 --jsonl /home/zenz/ninfer-requests.jsonl --serve-log /home/zenz/ninfer-serve.log --log-source $MONITOR_LOG_SOURCE
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

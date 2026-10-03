@@ -1,0 +1,338 @@
+diff --git a/include/ninfer/types.h b/include/ninfer/types.h
+index 32ec0097..248a0157 100644
+--- a/include/ninfer/types.h
++++ b/include/ninfer/types.h
+@@ -977,6 +977,13 @@ struct RuntimeStats {
+     std::uint64_t pressure_private_owners_evicted      = 0;
+     std::uint64_t pressure_shared_owners_degraded      = 0;
+     std::uint64_t pressure_shared_owners_evicted       = 0;
++    // A shared slot whose catalogued owner was REPLACED by a new publication (`capture.cpp`, where
++    // `replaces_shared` is set and the slot becomes `ReservedReplacement`). It had no counter at all,
++    // which meant a run where shared prefixes were replaced was indistinguishable from one where none
++    // were -- and the one assertion that would have covered replacement in the suite could not be
++    // written for want of it (`pressure_shared_owners_evicted` is the KV-pressure path only, so it
++    // reads 0/0 across a replacement).
++    std::uint64_t pressure_shared_owners_replaced      = 0;
+     std::uint64_t pressure_checkpoints_dropped         = 0;
+     std::uint64_t pressure_searches                    = 0;
+     std::uint64_t pressure_search_budget_exhaustions   = 0;
+diff --git a/plan.md b/plan.md
+index 9101d608..3a9a1391 100644
+--- a/plan.md
++++ b/plan.md
+@@ -93,7 +93,11 @@ wedge; when it says `#13`, the accounting underflow.
+ 
+ ### 2. Open, in priority order
+ 
+-1. **#9 — the leak (the wedge's actual cause).** A recovery leaves occupancy owned by nothing: two
++1. **#9 — the leak, a LATENT FRAGILITY with a named mechanism and an UNEXPLAINED incident.** Not "the
++   wedge's actual cause": the mechanism is reproduced under injection (a pinned-but-unrecorded page
++   replica is invisible to cleanup) and the benign explanation for it has been removed, but nothing on
++   any measured path throws in that window, so what caused the 2026-09-25 incident is still unknown. What
++   the incident looked like: a recovery leaves occupancy owned by nothing -- two
+    readings agree to the byte (main 958 pages, host 1 state slot, `host_kv 418,775,040 B`), which drops
+    usable capacity to 3138 pages while `isolated_request_feasible` still compares against 4096 — so a
+    request in that band is called feasible and blocked. **A trigger has now been produced under injection
+@@ -127,11 +131,15 @@ wedge; when it says `#13`, the accounting underflow.
+      this path, and it stands.
+    The lesson is the repo's own, unlearned again: I counted print lines as events without checking how
+    often the function is called. `assess` and `[plan]` were misread the same way (see #11 below).
+-2. **#10 — the feasibility predicate.** Shipped: reject after a 5 s grace window instead of stalling
+-   900 s (verified negatively — 0 rejections on healthy traffic). **Open**: make
+-   `isolated_request_feasible` account for occupancy it cannot evict, so the honest outcome is a clean
+-   "infeasible" rather than a rejection-by-timeout. No leak needed to make sense of it.
+-3. **#11 — W1 residues.** (a) the recycled-checkpoint abort restores an old content epoch over content
++2. **#10 — the feasibility predicate. IMPLEMENTED AND COMMITTED; what is open is its POSITIVE PATH.**
++   Shipped: reject after a 5 s grace window instead of stalling 900 s (verified negatively -- 0 rejections
++   on healthy traffic), and `inspect` returns `PermanentlyInfeasible` when every lane is Free, so an
++   unsatisfiable block is refused at its decision site. **Open**: neither branch has been exercised
++   against a *real* orphan -- the one attempt (an injected skipped release) was reverted because the
++   thing it skipped was a logical destination with no slots, i.e. not the orphan shape the predicate is
++   about. No leak needed to make sense of it.
++3. **#11 — W1 residues.** (a) **disposal implemented**: the recycled-checkpoint abort no longer restores
++   an old content epoch over content
+    the fork may have written — the abort arm now DROPS the checkpoint instead of restoring its epoch
+    (disposal implemented 2026-09-26), which makes the question moot: a dropped checkpoint cannot carry
+    stale bytes under a live name. `restore_recycled_checkpoint` stays in the store because it has its own
+@@ -276,17 +284,21 @@ wedge; when it says `#13`, the accounting underflow.
+      ExplicitBoundary/ToolBoundary shared marker: the observed turn now PUBLISHES a shared prefix, and the
+      scenario's plan trace went from one `reuse=5` to **two** -- shared publication and reuse from that
+      half are exercised again, verified twice with saved logs
+-     (`results/golden-attribution/20260926-142815/`). What is STILL uncovered is the *displacement*: an
+-     assertion that the single shared slot is evicted when the second candidate is published reads
+-     `evicted=0/0`, and the reason is that `pressure_shared_owners_evicted` is incremented only by the
+-     KV-pressure shared-victim path (`resource_manager.h:2761`, `apply_shared_action`) -- so it cannot fire
+-     for a replacement. Writing that assertion would have been an assertion that cannot fire, so the
+-     measurement is recorded instead, with the open question attached: what does a shared REPLACEMENT do,
+-     and does any counter see it? `test_shared_slot_release.cpp` is where that answer should start.
++     (`results/golden-attribution/`). **The displacement is now covered too, because the missing
++     instrument was built rather than worked around.** The gap was never in the test: nothing counted a
++     shared replacement. `pressure_shared_owners_evicted` is incremented only by the KV-pressure
++     shared-victim path (`resource_manager.h:2761`, `apply_shared_action`) and reads 0 across a
++     replacement, so the first attempt at this assertion -- on that counter -- could never fire. So
++     `pressure_shared_owners_replaced` was added where the displacement is decided (`capture.cpp`,
++     `replaces_shared` -> `ReservedReplacement`), carried through `Program` into
++     `populate_runtime_stats` and out to `/stats` (`stats_json.cpp`). It reads **1** in this scenario,
++     twice, and the scenario now ASSERTS the delta. The question "did a shared owner get replaced, and how
++     often" is answerable in production now, and was not before.
+      It now asserts the policy -- `path=Root reused=0`, printed by the scenario and confirmed twice --
+-     and its comment names the gap correctly: what is lost is **replacement**, since `max_shared_prefixes`
+-     is 1 and Bravo now publishes into an *empty* slot, displacing nobody; `pressure_shared_owners_evicted`
+-     is printed but never asserted. Not lost: `test_shared_slot_release.cpp` covers the slot-release
++     and its comment records the history: with `plain_prompt` the observed half had no shared candidate, so
++     `max_shared_prefixes = 1` left the slot EMPTY and Bravo displaced nobody -- which is why the replacement
++     went unexercised. With the tool, the slot is occupied and Bravo's publication displaces it (`replaced=1`),
++     and that delta is asserted. Not lost: `test_shared_slot_release.cpp` covers the slot-release
+      disposition at unit level and `anthropic-prefix-regression` covers shared reuse -- so it is
+      real-engine *replacement* that is uncovered, not shared reuse in general.
+    Verified, with the logs saved this time (`results/golden-attribution/20260926-142216/`, run twice):
+@@ -342,7 +354,12 @@ wedge; when it says `#13`, the accounting underflow.
+    `StateImageStore::complete` expresses it (immutable, a settled replica, non-zero epoch), and the
+    pricing walk that already checks the KV half now counts incomplete states with its denominator and
+    prints rather than throwing — this file's neighbours are explicit that a throw on that path kills the
+-   worker, and the condition has never been observed.
++   worker, and the condition has never been observed. **Unit test added 2026-09-26** (`test_context_store.cpp`,
++   passes): a checkpoint with a settled Host replica is complete; one MID-RESTORE is complete (the false
++   positive a review pass caught — `begin_host_to_device` sets `pending_device_slot` while the host
++   replica is settled, and the first version read that as incompleteness); aborting the restore leaves it
++   complete; and an invalid handle is not. That case is the one that matters, because the alternative
++   reading would have failed pricing for a whole owner on healthy traffic.
+    **CONSTRUCTED SCENARIOS ALSO NEGATIVE (2026-09-25 23:26).** Five real-engine scenarios ran in GPU
+    windows via the new `tools/e2e/ninfer-gpu-window.sh`, each against prod's own artifact with every
+    leak instrument enabled: `pressure-resume`, `private-checkpoint-pressure`,
+@@ -593,8 +610,13 @@ wedge; when it says `#13`, the accounting underflow.
+    request, not by config text), the wiring is in `~/ninfer-ensure.sh` so it survives a reboot, and the
+    old 22 GB artifact was deleted after checking that nothing referenced or held it open (`df`: 655 ->
+    676 GB free).
+-6. **#6 — W2's demote-for-evict-only victims.** Measure-first: nothing counts evictions that could have
+-   been demoted. The v2 safety-net items are **moot** (zero references in v3). `guided_closure` is **not**: it has zero
++6. **#6 — W2's demote-for-evict-only victims. MEASURED; the counter exists and read 7.** It counts
++   private victims committed as `Evicted` while the host tier still had room, with its denominator
++   (`demotable_evictions_` / `demotable_eviction_checks_`, printed rate-limited); the census over the
++   scenarios gave 7 in 2 scenarios and explained every zero by its denominator. **Open**: whether those 7
++   *should* have been demoted -- which needs the victim's value and the host-placement cost at the commit
++   site, a design change, not a counter. History: it began as "measure-first: nothing counts evictions that
++   could have been demoted". The v2 safety-net items are **moot** (zero references in v3). `guided_closure` is **not**: it has zero
+    references because the plan says to port the *idea* (demote-first ordering) rather than the diff, and
+    `root_maximal` has 21 references in the tree -- absence of a port proposal is where that item starts,
+    not where it closes.
+@@ -640,11 +662,26 @@ wedge; when it says `#13`, the accounting underflow.
+    * the construction that should force coincidence -- short prompt so both prefills finish in one chunk,
+      tiny budget so both exhaust in the same step -- **is blocked by the API**: `thinking.budget_tokens`
+      must be at least 1024 (`anthropic_messages_request.cpp:866`), and a smaller value returns 400.
+-   **So the next step is reading the scheduler's admission path, not another run.** If admission is one
+-   lane per boundary and control-readiness is a one-shot per-lane event, the two can never coincide and
+-   `multi_row=1` is unreachable in this configuration -- which would make #8's per-row bind defensive
+-   rather than load-bearing, the same shape as #11(a). That is a question of reach, so it is answerable by
+-   reading, and it should be answered before another window is spent here.
++   **ANSWERED BY READING (2026-09-26, dev time): `multi_row=1` is unreachable in this scheduling, so the
++   per-row bind is DEFENSIVE, not load-bearing -- the same shape as #11(a)'s branch.** The chain:
++   * `build_control_membership` (`scheduler.h:176-198`) includes every lane with `is_control_ready()`, so
++     a one-row membership means exactly one lane was ready -- the probe's own criterion, not an artifact.
++   * `is_control_ready()` is `model_state == EngineRequestState::ControlReady` (`request_record.h:146`),
++     and the boundary loop builds at most ONE control batch per iteration (`engine_core.h:2245-2252`),
++     then `continue`s. So two lanes are in one batch iff they ENTER that state in the same boundary.
++   * Entering it is a per-lane one-shot event (the thinking budget exhausting at a fixed token count), so
++     coincidence needs both lanes to reach it in the same step -- i.e. lockstep from the same start.
++   * `try_admit_one` **admits at most one request per call**: it loops, but `return admit_planned_request(...)`
++     sits inside the loop and leaves on the first admission (`engine_core.h:1730-1793`); the loop only
++     skips cancelled or expired FIFO heads. So the second lane is admitted at least one boundary later,
++     decodes at least one step behind, and its budget exhausts at least one boundary after the first --
++     never in the same batch.
++   The four runs agree: `control_ready_lanes=1` in every shape tried (byte-identical prompts, distinct
++   equal-length prompts, long prefills). The two remaining ways this could be wrong, named so the argument
++   is not treated as a proof: a lane that is *already* ControlReady when another enters it (the batch runs
++   on the first, so it does not linger), and any path that admits two lanes in one boundary outside
++   `try_admit_one`. **So #8's fix guards a case the scheduler cannot produce** -- worth keeping as
++   defence-in-depth, and it should not be described as covering a reachable case.
+ 
+ ### 3. Next actions, each with its validation
+ 
+diff --git a/src/models/qwen3_5/program/program.cpp b/src/models/qwen3_5/program/program.cpp
+index 71b8f05b..af828fb9 100644
+--- a/src/models/qwen3_5/program/program.cpp
++++ b/src/models/qwen3_5/program/program.cpp
+@@ -470,6 +470,7 @@ ReleaseResult Program::release_shared_prefix(SharedPrefixHandle&& shared) noexce
+ 
+ void Program::fail_all_cleanup() noexcept { impl_->fail_all_cleanup(); }
+ void Program::resource_census() const noexcept { impl_->resource_census(); }
++std::uint64_t Program::shared_replacements() const noexcept { return impl_->shared_replacements(); }
+ 
+ bool Program::isolated_request_feasible(const RequestBasePlan& base) const noexcept {
+     return impl_->isolated_request_feasible(base);
+diff --git a/src/models/qwen3_5/program/program.h b/src/models/qwen3_5/program/program.h
+index 9a98415c..4383d48b 100644
+--- a/src/models/qwen3_5/program/program.h
++++ b/src/models/qwen3_5/program/program.h
+@@ -939,6 +939,7 @@ public:
+     [[nodiscard]] ReleaseResult release_shared_prefix(SharedPrefixHandle&& shared) noexcept;
+     void fail_all_cleanup() noexcept;
+     void resource_census() const noexcept;
++    [[nodiscard]] std::uint64_t shared_replacements() const noexcept;
+ 
+     [[nodiscard]] bool isolated_request_feasible(const RequestBasePlan& base) const noexcept;
+     [[nodiscard]] runtime::ProgramResourceRevision resource_revision() const noexcept;
+diff --git a/src/models/qwen3_5/program/program_impl.h b/src/models/qwen3_5/program/program_impl.h
+index 0db9cc39..664e7ecb 100644
+--- a/src/models/qwen3_5/program/program_impl.h
++++ b/src/models/qwen3_5/program/program_impl.h
+@@ -567,6 +567,8 @@ public:
+     // #9 diagnostic: what the KV address spaces still hold, per address. Called by the engine's recovery
+     // path so a non-zero residual can be attributed to an owner instead of remaining an amount.
+     void resource_census() const noexcept;
++    // Shared-prefix replacements observed (see `shared_replacements_`).
++    [[nodiscard]] std::uint64_t shared_replacements() const noexcept { return shared_replacements_; }
+     [[nodiscard]] detail::PhysicalResources admission_capacity() const noexcept;
+     [[nodiscard]] bool isolated_request_feasible(const RequestBasePlan& base) const noexcept;
+ 
+@@ -896,6 +898,9 @@ private:
+     // could only ever read 0 (the branch is unreachable), and a counter that can only read zero is a
+     // claim, not an instrument.
+     std::uint64_t recycled_checkpoint_drops_             = 0;
++    // A shared catalogued slot replaced by a new capture (`prepare_active_capture`). Counted so the
++    // replacement path is observable at all; read back through `Program::shared_replacements()`.
++    std::uint64_t shared_replacements_                   = 0;
+     // #11(b): a checkpoint priced with no settled StateImage replica. Counted with its denominator, never
+     // thrown on -- see the comment at the observation site.
+     // `mutable`: the observation site is a const pricing walk, which is where the condition has to be
+diff --git a/src/models/qwen3_5/program/transactions/capture.cpp b/src/models/qwen3_5/program/transactions/capture.cpp
+index 9bec3fea..6fbb3da7 100644
+--- a/src/models/qwen3_5/program/transactions/capture.cpp
++++ b/src/models/qwen3_5/program/transactions/capture.cpp
+@@ -553,6 +553,9 @@ runtime::ContextTransactionReserveStatus ProgramImpl::reserve_active_capture_imp
+                 transaction.replaces_shared        = true;
+                 transaction.replacement_generation = shared_prefix_slots[index].generation;
+                 shared_prefix_slots[index].role    = SharedPrefixSlotRole::ReservedReplacement;
++                // Counted HERE, at the decision, because this is the only place that knows a catalogued
++                // shared owner is being displaced. Nothing else reported it -- see the field's comment.
++                ++shared_replacements_;
+             } else {
+                 for (std::uint32_t index = 0; index < shared_prefix_capacity; ++index) {
+                     if (shared_prefix_slots[index].role == SharedPrefixSlotRole::Free) {
+diff --git a/src/runtime/engine/context_cache/resource_manager.h b/src/runtime/engine/context_cache/resource_manager.h
+index 093b5ab0..85d35d86 100644
+--- a/src/runtime/engine/context_cache/resource_manager.h
++++ b/src/runtime/engine/context_cache/resource_manager.h
+@@ -1205,6 +1205,7 @@ public:
+         out.pressure_private_owners_evicted    = context_stats_.pressure_private_owners_evicted;
+         out.pressure_shared_owners_degraded    = context_stats_.pressure_shared_owners_degraded;
+         out.pressure_shared_owners_evicted     = context_stats_.pressure_shared_owners_evicted;
++        out.pressure_shared_owners_replaced    = program.shared_replacements();
+         out.pressure_checkpoints_dropped       = context_stats_.pressure_checkpoints_dropped;
+         out.pressure_searches                  = context_stats_.pressure_searches;
+         out.pressure_search_budget_exhaustions = context_stats_.pressure_search_budget_exhaustions;
+diff --git a/src/serve/stats_json.cpp b/src/serve/stats_json.cpp
+index cc5eef2b..e8faf524 100644
+--- a/src/serve/stats_json.cpp
++++ b/src/serve/stats_json.cpp
+@@ -104,6 +104,7 @@ std::string format_stats_json(const ninfer::RuntimeStats& s, const ninfer::Memor
+         {"private_owners_evicted", s.pressure_private_owners_evicted},
+         {"shared_owners_degraded", s.pressure_shared_owners_degraded},
+         {"shared_owners_evicted", s.pressure_shared_owners_evicted},
++        {"shared_owners_replaced", s.pressure_shared_owners_replaced},
+         {"checkpoints_dropped", s.pressure_checkpoints_dropped},
+         {"searches", s.pressure_searches},
+         {"search_budget_exhaustions", s.pressure_search_budget_exhaustions},
+diff --git a/tests/models/qwen3_5/test_context_store.cpp b/tests/models/qwen3_5/test_context_store.cpp
+index 1ae5041b..4d5cc01f 100644
+--- a/tests/models/qwen3_5/test_context_store.cpp
++++ b/tests/models/qwen3_5/test_context_store.cpp
+@@ -114,6 +114,47 @@ void test_state_store(ninfer::DeviceContext& device) {
+                images.checkpoint_references(*source) == 1,
+            "aborted rewrite rotation restores the prior checkpoint identity");
+ 
++    // #11(b): `complete()` is the StateImage half of invariant #6 -- the KV side walks every required
++    // page and throws, and this expresses "there is a settled replica to restore from". Its first version
++    // returned false for any image with a pending replica, which includes an IN-FLIGHT Host-to-Device
++    // restore (`begin_host_to_device` sets `pending_device_slot`, `transfer_id` and `destination_pinned`
++    // while the host replica is settled) -- a false positive that would have failed pricing for a whole
++    // owner on healthy traffic, and the reason the condition now tests the settled slots instead. This
++    // case pins that: an image mid-restore IS complete, because its host replica is there.
++    const auto demoted = images.reserve_reset(device.stream);
++    expect(demoted.has_value(), "completeness case could reserve an image");
++    if (demoted.has_value()) {
++        images.freeze(*demoted);
++        expect(images.role(*demoted) == store::StateImageRole::CheckpointImmutable,
++               "completeness case froze its image into a checkpoint");
++        auto to_host = images.reserve_device_to_host(*demoted);
++        expect(to_host.has_value(), "completeness case could start a Device-to-Host demotion");
++        if (to_host.has_value()) {
++            images.enqueue_device_to_host(*to_host, device.stream);
++            images.publish_transfer(std::move(*to_host), false);
++            expect(images.complete(*demoted),
++                   "a checkpoint with a settled Host replica is complete");
++            auto to_device = images.begin_host_to_device(*demoted, device.stream);
++            expect(to_device.has_value(),
++                   "completeness case could start a Host-to-Device restore");
++            if (to_device.has_value()) {
++                expect(images.complete(*demoted),
++                       "a checkpoint mid-RESTORE is complete: its Host replica is settled, so an "
++                       "in-flight Device replica must not be read as incompleteness");
++                images.abort_transfer(std::move(*to_device));
++                expect(images.complete(*demoted),
++                       "aborting the restore leaves the checkpoint complete on its Host replica");
++            }
++        }
++        // Release what this case created, or the store's ownership-closure check at the end of this
++        // function fails -- which is exactly what the first version of this case did: two teardown
++        // failures ("rotated state image ownership closes after release" among them) that had nothing to
++        // do with `complete()` and everything to do with a leaked image.
++        expect(images.release(*demoted), "completeness case released the image it created");
++    }
++    expect(!images.complete(store::StateImageHandle{}),
++           "an invalid handle is not a complete checkpoint");
++
+     images.freeze(*destination);
+     (void)images.recycle_checkpoint_destination(*source);
+     (void)images.begin_fork(*destination, *source);
+diff --git a/tests/models/qwen3_5/test_engine_prefix_real.cpp b/tests/models/qwen3_5/test_engine_prefix_real.cpp
+index c8d353ef..0ae60057 100644
+--- a/tests/models/qwen3_5/test_engine_prefix_real.cpp
++++ b/tests/models/qwen3_5/test_engine_prefix_real.cpp
+@@ -641,7 +641,8 @@ int exercise_shared_replacement_and_full_capacity_reuse(const char* artifact) {
+     // sessions, and this asserts that -- which is the policy -- while recording that the *shared
+     // *replacement* half now has no material to exercise it: `max_shared_prefixes` is 1 here, and with
+     // no observed-prefix publication the Bravo half publishes into an EMPTY slot, so no existing shared
+-    // owner is ever displaced -- `pressure_shared_owners_evicted` is printed but never asserted. A
++    // owner is ever displaced. (`pressure_shared_owners_evicted` had appeared only inside a failure
++    // MESSAGE, never as a standing reading, so nothing showed whether the pressure path moves at all.) A
+     // scenario that covers replacement would have to give the observed prompt a STRUCTURAL shared
+     // boundary (a tool marker, or a leading instruction boundary via a System/Developer message), so
+     // Bravo must displace it from the single slot. What is NOT lost, stated so nobody rebuilds the wrong
+@@ -685,15 +686,27 @@ int exercise_shared_replacement_and_full_capacity_reuse(const char* artifact) {
+         std::cerr << "shared replacement fixture did not produce its deterministic stop token\n";
+         return 1;
+     }
+-    // NOT asserted, and the reason is worth more than the assertion would have been:
+-    // `pressure_shared_owners_evicted` is incremented ONLY by the KV-pressure shared-victim path
+-    // (`resource_manager.h:2761`, `apply_shared_action`), and it reads `0/0` across this sequence even
+-    // though the observed half now publishes a shared prefix and this turn publishes another. So either
+-    // the replacement does not displace through that path, or nothing observes it. Asserting the counter
+-    // would have been an assertion that cannot fire -- the shape this repo keeps being burned by -- so the
+-    // measurement is recorded here instead, and the open question is written down: what does a shared
+-    // REPLACEMENT do, and does any counter see it? (`test_shared_slot_release.cpp` covers the slot-release
+-    // disposition at unit level, which is where that answer should start.)
++    // THE REPLACEMENT, asserted -- and the counter it asserts on did not exist until this change. The
++    // observed half publishes a shared prefix into the single slot; this turn publishes a different one,
++    // so a catalogued owner must have been displaced. The first attempt at this assertion used
++    // `pressure_shared_owners_evicted` and read `0/0`, because that stat is incremented only by the
++    // KV-pressure shared-victim path (`resource_manager.h:2761`) and cannot fire for a replacement --
++    // an assertion that could never fail. `pressure_shared_owners_replaced` is counted where the
++    // displacement is decided (`capture.cpp`, `replaces_shared`), reads 1 here on two runs, and is
++    // surfaced in `/stats`, so the same question can be asked of production.
++    std::fprintf(stderr, "[scenario] shared-replacement owners_replaced=%llu owners_evicted=%llu "
++                         "(after the Bravo turn; evicted is the KV-PRESSURE path)\n",
++                 static_cast<unsigned long long>(
++                     after_replacement.pressure_shared_owners_replaced),
++                 static_cast<unsigned long long>(
++                     after_replacement.pressure_shared_owners_evicted));
++    if (after_replacement.pressure_shared_owners_replaced <=
++        after_observed_second.pressure_shared_owners_replaced) {
++        std::cerr << "single shared slot was never displaced: replaced="
++                  << after_observed_second.pressure_shared_owners_replaced << '/'
++                  << after_replacement.pressure_shared_owners_replaced << '\n';
++        return 1;
++    }
+     // Remove the exact private endpoint without publishing another shared marker. The following
+     // identical Bravo prompt must therefore materialize from the retained shared prefix.
+     const ninfer::GenerationResult filled =

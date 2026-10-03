@@ -1,4 +1,22 @@
 #include "runtime/engine/context_cache/materialization_budget.h"
+#include "runtime/engine/context_cache/materialization_planner.h"
+#include "models/qwen3_5/program/planning/pressure_target_arena.h"
+
+// THE COUPLING THE DESIGN DEPENDS ON, COMPILE-CHECKED. The pressure planner stops a search at its own
+// `kTargetBudget`; the model's target arena is sized as `candidates + 1 + kSearchTargetBudget + reserve`
+// and holds the search to `kSearchTargetBudget`. The reserve is only unreachable while
+// `kTargetBudget <= kSearchTargetBudget` -- if someone raises the planner's budget past the arena's, a
+// search that respects its budget could reach into the room the terminal calls need, and the failure
+// returns. It is asserted HERE, in a test TU, because no production TU can see both: the runtime planner
+// does not include a model header, and routing one in to satisfy a static_assert would invert the
+// layering that keeps `ResourceManager` model-agnostic. Careful about WHEN it fires: this is a TEST
+// target, and `BUILD_TESTING` defaults to OFF (`CMakeLists.txt`), while the prescribed deploy build is
+// `--target ninfer-serve` -- so a build that only relinks the server will NOT compile this guard. It
+// fires for anyone building the test targets, which is everyone who changes this code.
+static_assert(ninfer::runtime::kPlannerTargetBudget <=
+                  ninfer::models::qwen3_5::detail::planning_detail::kSearchTargetBudget,
+              "the planner's target budget must not exceed the arena's search budget, or the search can "
+              "spend the room reserved for the calls that cannot degrade");
 
 #include <iostream>
 #include <stdexcept>
@@ -13,24 +31,45 @@ int main() {
     constexpr std::uint64_t ms = 1'000'000;
     try {
         auto idle = PlanningAllowance::boundary(0, 0);
+        // CONTRACT (changed 2026-09-24, deliberately): the initial window is
+        // min(economic(initial_cost), allowance.remaining) -- the whole allowance, not a flat
+        // millisecond figure. The consequence, and the reason this block reads as it does: *inside*
+        // the window no per-step economic test runs, so discovery is bounded by the allowance.
+        //
+        // THE MEASURED A/B (2026-09-24, prod4 4x150k; arms by instance id -- neither recorded a binary). Counts per COMPLETED turn: records the 420 s cap cancelled in flight (`finish_reason=cancelled`, `prefill=0`) carry no reuse evidence and are excluded.
+        //   * 5 ms arm 1 (serve-293952): cut after 9 of 16 turns completed (rc=124), 3 cancelled in flight. Of the 9: 9/9 root with 0 hits, 8 with search_work>0 (granted 5e6, time_budget), 1 no_pressure (granted 0).
+        //   * 5 ms arm 2 (serve-307902, 3 rounds): cut after 9 of 12 completed, 3 cancelled. Of the 9: 8/9 root with 0 hits, 1 private_endpoint (152,227 hits), 7 with search_work>0.
+        //   * combined: 17 of 18 completed turns re-prefilled from root.
+        //   * 400 ms arm (serve-292073): completed 16/16; rounds 2-3 (records 5-12) 8/8 private_endpoint with hits 152,333-154,799; overall 12 of 16 private_endpoint (152,333-157,004), 4 root (round 1), 15 of 16 with search_work>0 (exception: record 1, no_pressure, granted 0).
+        // SCOPE: at 5 ms the old capped expression and the new one are numerically identical (both 5 ms) with `allow()` byte-identical, so this pair measures THE WINDOW'S VALUE; the cap's removal is what makes 400 ms reachable (arithmetic), not separately measured.
+        // STILL TUNED: 400 ms is the only value measured PASSING. 100 ms fails the gate (`/tmp/cmp-ms100.json`: root 12/16, 614,577 hits, queue_wait_s.max 153.03 s); a 32 ms arm failed too but its artifact is byte-identical to an 800 ms arm's and tagged only `build`, so it establishes nothing.
         MaterializationSearchBudget expensive(idle, 0, 80'000 * ms);
+        require(expensive.granted_ns() == idle.remaining(0),
+                "the initial window is not the allowance bound");
         require(expensive.allow(4 * ms, 2 * ms, 3 * ms, 70'000 * ms, true, 1),
                 "valuable completion could not cross the initial window");
-        require(expensive.granted_ns() == 10 * ms && expensive.renewals() == 1,
-                "extension did not retain cumulative accounting");
-        require(!expensive.allow(9 * ms, 2 * ms, 2 * ms, ms, true, 2),
-                "improved incumbent retained the expensive root's budget");
-        require(expensive.stop_reason() ==
-                    ninfer::MaterializationStopReason::InsufficientExpectedGain,
-                "economic stopping was reported as wall exhaustion");
+        require(expensive.renewals() == 0,
+                "a step inside the window renewed the allowance");
+        require(!expensive.allow(40 * ms, 20 * ms, 20 * ms, ms, true, 2),
+                "the allowance did not stop an operation larger than its remainder");
+        require(expensive.stop_reason() == ninfer::MaterializationStopReason::TimeBudget,
+                "an operation beyond the allowance was not reported as wall exhaustion");
 
-        MaterializationSearchBudget discovery(idle, 0, 80'000 * ms);
-        require(discovery.allow(5 * ms, ms, 4 * ms, 70'000 * ms, false, 1),
+        // An uncertain (incomplete-prediction) candidate's renewal is capped at 5 ms, and a
+        // renewal with stalled progress is denied -- that is the boundedness that exists. A cost
+        // of 200 ms (economic cap 10 ms) is used so the window is narrower than the allowance and
+        // renewals are reachable at all.
+        MaterializationSearchBudget discovery(idle, 0, 200 * ms);
+        require(discovery.granted_ns() == 10 * ms, "economic cap did not bound the initial window");
+        require(discovery.allow(12 * ms, ms, ms, 70'000 * ms, false, 1),
                 "unknown candidate could not receive bounded discovery");
-        require(!discovery.allow(10 * ms, ms, ms, 70'000 * ms, false, 2),
-                "unknown candidate repeatedly renewed discovery");
-        require(discovery.allow(10 * ms, ms, ms, 70'000 * ms, true, 2),
+        require(discovery.renewals() == 1 && discovery.granted_ns() <= 15 * ms,
+                "an incomplete step was not held to the 5 ms discovery cap");
+        require(discovery.allow(16 * ms, ms, ms, 70'000 * ms, true, 2),
                 "complete prediction could not continue after discovery");
+        // Past the (renewed) window, where the progress guard applies.
+        require(!discovery.allow(31 * ms, ms, ms, 70'000 * ms, true, 2),
+                "stalled work renewed its allowance");
 
         auto busy = PlanningAllowance::boundary(2, 0);
         MaterializationSearchBudget first(busy, busy.limit_ns - 4 * ms, 80'000 * ms);
@@ -49,17 +88,34 @@ int main() {
         require(restore_after_setup.allow(3 * ms + ms / 2, 2 * ms, 2 * ms, 70'000 * ms, true, 1),
                 "mandatory setup starved the first complete reuse assessment in a busy boundary");
 
+        // The value threshold is a per-request fact: the same gain must clear the same
+        // completion solo and under 10-way load (only the time allowance shrinks with it).
+        auto ten_way = PlanningAllowance::boundary(9, 0);
+        require(ten_way.limit_ns == 10 * ms && ten_way.affected_requests == 10,
+                "10-way boundary did not apply the load limits");
+        MaterializationSearchBudget solo(idle, 0, 80'000 * ms);
+        MaterializationSearchBudget loaded(ten_way, 0, 80'000 * ms);
+        require(solo.allow(5 * ms, 2 * ms, 5 * ms, 200 * ms, true, 1),
+                "solo boundary denied a completion within its economic allowance");
+        require(loaded.allow(5 * ms, 2 * ms, 5 * ms, 200 * ms, true, 1),
+                "the value threshold shrank with concurrency for an identical gain");
+
         MaterializationSearchBudget cheap(idle, 0, ms);
         require(cheap.granted_ns() == ms / 20, "cheap request received a minimum 5 ms grant");
         require(!cheap.allow(ms / 20, ms, ms, ms, false, 1),
                 "discovery ignored the economic cap for a cheap request");
+        require(cheap.stop_reason() ==
+                    ninfer::MaterializationStopReason::InsufficientExpectedGain,
+                "economic stopping was reported as wall exhaustion");
         MaterializationSearchBudget saturated(idle, 0, UINT64_MAX);
         require(saturated.granted_ns() == 0 && !saturated.allow(0, ms, ms, UINT64_MAX, true, 1),
                 "saturated cost was used as evidence of unlimited gain");
-        MaterializationSearchBudget seeded(idle, 0, 80'000 * ms);
-        require(!seeded.allow(5 * ms, ms, ms, 70'000 * ms, false, 1, false),
+        // Cost 200 ms (economic cap 10 ms) so the window is narrower than the allowance and the
+        // per-step guards are reachable past it.
+        MaterializationSearchBudget seeded(idle, 0, 200 * ms);
+        require(!seeded.allow(12 * ms, ms, ms, 70'000 * ms, false, 1, false),
                 "an already-seeded candidate renewed solely on an incomplete optimistic estimate");
-        require(seeded.allow(5 * ms, ms, ms, 70'000 * ms, true, 1, false),
+        require(seeded.allow(12 * ms, ms, ms, 70'000 * ms, true, 1, false),
                 "a complete profitable refinement was denied after seeding");
         std::atomic<bool> cancelled{false};
         auto controlled                = PlanningAllowance::boundary(0, 0);
@@ -68,13 +124,302 @@ int main() {
         require(controlled.remaining(2 * ms) == ms, "control deadline did not constrain planning");
         cancelled.store(true);
         require(controlled.remaining(0) == 0, "cancelled request kept optional planning headroom");
-        MaterializationSearchBudget stalled(idle, 0, 80'000 * ms);
-        require(stalled.allow(5 * ms, ms, ms, 70'000 * ms, true, 7), "first forecast grant failed");
-        require(!stalled.allow(10 * ms, ms, ms, 70'000 * ms, true, 7),
+        // Cost 200 ms => economic cap 10 ms => the window (10 ms) is narrower than the allowance
+        // (50 ms), so the renewal-progress guard is reachable at all.
+        MaterializationSearchBudget stalled(idle, 0, 200 * ms);
+        require(stalled.granted_ns() == 10 * ms, "economic cap did not bound the initial window");
+        require(stalled.allow(12 * ms, ms, ms, 70'000 * ms, true, 7), "first forecast grant failed");
+        require(stalled.renewals() == 1 && stalled.granted_ns() == 20 * ms,
+                "complete renewal did not extend the allowance");
+        require(!stalled.allow(22 * ms, ms, ms, 70'000 * ms, true, 7),
                 "stalled work renewed its allowance");
         std::cout << "ok\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;
+    }
+
+    // THE SPLIT'S AGGREGATION. The first version returned `restorable` from whichever entry matched deepest,
+    // so a deep match with NO restorable checkpoint hid a shallower match WITH one -- and the value then
+    // contradicted the request's own reuse in 94 of 309 records. These two cases pin the maxima as
+    // INDEPENDENT, which is the property that was wrong.
+    {
+        const ninfer::runtime::PrefixSplitSample deep_without_checkpoint{.tokens = 28530,
+                                                                        .restorable = 0};
+        const ninfer::runtime::PrefixSplitSample shallow_with_checkpoint{.tokens = 23353,
+                                                                        .restorable = 23353};
+        const std::array samples{deep_without_checkpoint, shallow_with_checkpoint};
+        const ninfer::runtime::PrefixSplitBest best = ninfer::runtime::best_prefix_split(samples);
+        if (best.tokens != 28530) { std::cerr << "deepest match must come from the deepest entry\n"; return 1; }
+        if (best.restorable != 23353) {
+            std::cerr << "MUTATION-SENSITIVE: restorable must be the max over entries, not the deepest "
+                         "entry's own value (the bug that produced restorable=0 and sent a fix the wrong "
+                         "way)\n";
+            return 1;
+        }
+        if (best.entries != 2) { std::cerr << "the denominator must count every entry scanned\n"; return 1; }
+    }
+    // And the degenerate shapes: no entries, and one entry whose checkpoint is below its match.
+    {
+        const ninfer::runtime::PrefixSplitBest none =
+            ninfer::runtime::best_prefix_split(std::span<const ninfer::runtime::PrefixSplitSample>{});
+        if (none.entries != 0 || none.tokens != 0 || none.restorable != 0) {
+            std::cerr << "an empty scan must report zeroes, not stale values\n";
+            return 1;
+        }
+    }
+    // WHY THE MATCH STOPPED, AND HOW FAR THE LEDGER WENT. `match_end` and `stored` were added to the split
+    // with no test at all, and the first deployment of `split_ended_by` read `diverged` on every sample --
+    // which is exactly what an unwired field reads like, so it cost a deploy cycle to tell a real reading from
+    // a dead one. Both halves of that ambiguity are pinned here: the values must follow the DEEPEST entry, and
+    // a tie must not silently pick by iteration order without the rule being written down.
+    {
+        // The shallow entry deliberately has the LONGER ledger, so a max-over-entries implementation cannot
+        // coincide with the right answer. The first draft of this case used a shallow entry with a SHORTER
+        // ledger and passed against a mutant that took the max -- the test measured nothing. (Mutation-checked
+        // both ways, which is the only reason that was caught.)
+        const ninfer::runtime::PrefixSplitSample deep{      .tokens = 28530, .match_end = 0, .stored = 41000};
+        const ninfer::runtime::PrefixSplitSample shallow{   .tokens = 23353, .match_end = 2, .stored = 90000};
+        const std::array samples{shallow, deep};
+        const ninfer::runtime::PrefixSplitBest best = ninfer::runtime::best_prefix_split(samples);
+        if (best.match_end != 0) {
+            std::cerr << "match_end must come from the DEEPEST entry, not the max over entries: a shallow "
+                         "entry whose ledger ended says nothing about where the deepest match stopped\n";
+            return 1;
+        }
+        if (best.stored != 41000) {
+            std::cerr << "stored must be the deepest entry's own ledger length -- it is the denominator that "
+                         "localises the divergence, so a shallow value would move the reported position\n";
+            return 1;
+        }
+    }
+    // The tie rule, written down rather than left to the iteration order: the FIRST entry at the greatest
+    // depth wins, so among equally-deep entries the reading depends on catalog order. That is a real limit of
+    // this field and it is asserted here so a reader meets it, instead of rediscovering it as "why does the
+    // same prompt read differently on another run".
+    {
+        const ninfer::runtime::PrefixSplitSample first{ .tokens = 900, .match_end = 1, .stored = 900};
+        const ninfer::runtime::PrefixSplitSample tie{   .tokens = 900, .match_end = 2, .stored = 1400};
+        const std::array samples{first, tie};
+        const ninfer::runtime::PrefixSplitBest best = ninfer::runtime::best_prefix_split(samples);
+        if (best.match_end != 1 || best.stored != 900) {
+            std::cerr << "an equal-depth tie must resolve to the first sample (documented), not to the "
+                         "deeper ledger or the larger restorable\n";
+            return 1;
+        }
+    }
+    // THE DIVERGENCE PROBE. Same rule as `match_end`/`stored` -- the windows belong to the DEEPEST entry --
+    // and the sample order here is deliberate: the deepest entry is FIRST, so an implementation that let the
+    // last entry win would take the shallow one's window and fail. (The order is the whole test: with the
+    // reverse order a last-wins mutant passes, which is how the previous case in this file was written wrong
+    // the first time.)
+    {
+        // THREE samples, the deepest LAST so that a "last sample wins" mutant fails. (The counts that used to
+        // distinguish more mutant classes went with the id windows in the 2026-09-28 cleanup.)
+        ninfer::runtime::PrefixSplitSample head{.tokens = 100, .stored = 200, .probe_index = 100};
+        ninfer::runtime::PrefixSplitSample deep{.tokens = 900, .stored = 1000, .probe_index = 900};
+        ninfer::runtime::PrefixSplitSample tail{.tokens = 300, .stored = 400, .probe_index = 300};
+        const std::array samples{head, deep, tail};
+        const ninfer::runtime::PrefixSplitBest best = ninfer::runtime::best_prefix_split(samples);
+        if (best.probe_index != 900) {
+            std::cerr << "the divergence window must come from the DEEPEST entry: a shallow entry's tokens "
+                         "are not the ones that stopped this match, and reading them would name the wrong "
+                         "token as the cause\n";
+            return 1;
+        }
+    }
+    // MESSAGE-BOUNDARY ATTRIBUTION. `split_probe_index` localises a divergence to a token, and a token
+    // index is unreadable on its own -- nothing a reader can consult retains the prompt's per-message
+    // layout -- so this is what turns "23,401" into "8 tokens into a user turn". Every case below is a
+    // hand-worked position; the POINT of the block is that the mapping takes the LAST frontier at or below
+    // the divergence (a first-wins loop passes an unmutated eye and reports message 0 for every prompt with
+    // a system preamble).
+    {
+        using ninfer::ChatRole;
+        const std::array<std::optional<std::uint32_t>, 4> frontiers{0U, 100U, 250U, 300U};
+        const std::array<ChatRole, 3> roles{ChatRole::System, ChatRole::User, ChatRole::Assistant};
+
+        // 150 is inside message 1, 50 tokens past its own frontier.
+        const DivergencePosition inside = attribute_divergence(frontiers, roles, 150);
+        require(inside.message_index == 1, "the divergence must fall in the last message it reached");
+        require(inside.message_offset == 50, "the offset is measured from that message's own frontier");
+        require(inside.role == static_cast<std::uint8_t>(ChatRole::User),
+                "the role must be the one of the message the divergence falls in");
+        require(!inside.past_last_message, "message 1 is a message");
+
+        // The last frontier starts no message: it is the end of the prompt, so there is no role.
+        const DivergencePosition at_end = attribute_divergence(frontiers, roles, 300);
+        require(at_end.message_index == 3 && at_end.message_offset == 0,
+                "a divergence at the end boundary is reported at that index, offset 0");
+        require(at_end.past_last_message, "the end boundary is not a message");
+        require(at_end.role == kNoMessageRole, "the end boundary starts no message, so it has no role");
+
+        // Zero-length match: no frontier was reached at all, and the offset is from the prompt's start.
+        const DivergencePosition none = attribute_divergence(frontiers, roles, 0);
+        require(none.message_index == 0 && none.message_offset == 0 && !none.past_last_message,
+                "a zero-length match is attributed to the prompt's first message");
+        require(none.role == static_cast<std::uint8_t>(ChatRole::System),
+                "the first message's role must still be reported");
+
+        // THE MUTATION-SENSITIVE CASE: 260 has passed TWO frontiers, and a first-wins loop reports index 0.
+        const DivergencePosition deepest = attribute_divergence(frontiers, roles, 260);
+        require(deepest.message_index == 2,
+                "MUTATION-SENSITIVE: the mapping must take the LAST frontier at or below the divergence; a "
+                "first-wins loop reports message 0 for every prompt that has a system preamble");
+        require(deepest.message_offset == 10, "the offset is from the frontier that was taken");
+
+        // A hole in the boundaries (a leading instruction folded into the preamble) is skipped, not treated
+        // as position 0 -- and the frontier before the hole is what the offset is measured from.
+        const std::array<std::optional<std::uint32_t>, 4> holed{0U, std::nullopt, 250U, 300U};
+        const DivergencePosition past_hole = attribute_divergence(holed, roles, 200);
+        require(past_hole.message_index == 0 && past_hole.message_offset == 200,
+                "a missing boundary is skipped: the last frontier actually reached is the one that counts");
+
+        // No boundaries at all: the offset falls back to distance from the prompt's start, and no role is
+        // claimed -- an index of 0 here must not be read as "the divergence is in a system turn".
+        const DivergencePosition bare =
+            attribute_divergence(std::span<const std::optional<std::uint32_t>>{}, roles, 42);
+        require(bare.message_index == 0 && bare.message_offset == 42 && bare.role == kNoMessageRole,
+                "with no frontiers the offset is from the prompt's start and no role is invented");
+    }
+    // The divergence is carried from the DEEPEST entry, like `probe_index` and for the same reason: a
+    // shallower entry's divergence is a different divergence. The deepest sample is FIRST here, so a
+    // last-wins implementation takes the shallow one and fails.
+    {
+        using ninfer::ChatRole;
+        const std::array<ChatRole, 2> roles{ChatRole::System, ChatRole::User};
+        const std::array<std::optional<std::uint32_t>, 3> frontiers{0U, 400U, 500U};
+        ninfer::runtime::PrefixSplitSample deep{.tokens = 900};
+        deep.divergence = attribute_divergence(frontiers, roles, 430);
+        ninfer::runtime::PrefixSplitSample shallow{.tokens = 300};
+        shallow.divergence = attribute_divergence(frontiers, roles, 20);
+        const std::array samples{deep, shallow};
+        const ninfer::runtime::PrefixSplitBest best = ninfer::runtime::best_prefix_split(samples);
+        require(best.divergence.message_index == 1 && best.divergence.message_offset == 30,
+                "the divergence must come from the DEEPEST entry, not the last one scanned");
+        require(best.divergence.role == static_cast<std::uint8_t>(ChatRole::User),
+                "the deepest entry's role must travel with its own position");
+    }
+    std::cout << "prefix-split aggregation ok\n";
+
+    // WHICH ELEMENT OF THE SELECTION ORDERING DECIDED, PINNED AGAINST `key()` ITSELF.
+    // The subject is the defect in the READING, not in the planner: `longer_lost` compares
+    // `reused_prompt_tokens` ALONE, which is element 10 of a 14-element key, so it fires whenever any of the
+    // ten terms ranked above it differ -- the ORDINARY case -- and a live reading took that for a defect
+    // rate. The helper names the element instead.
+    //
+    // THE FIRST VERSION OF THIS TEST COULD NOT FAIL ON THAT. Its expected values were a hand-written copy
+    // of the indices, and it had no arm combining an UNCARRIED term with a carried one -- which is exactly
+    // the case in which the old six-term helper returned 10, the value its own legend called "the real
+    // defect". A review found both. So every arm below is checked TWO ways: the exact index (the regression
+    // pin, including the mixed arm that failed before), and the DEFINING PROPERTY walked over `key()`
+    // itself -- the answer must be a true difference, and every element before it must be equal.
+    {
+        const auto property_holds = [&](const FoldedCost& a, const FoldedCost& b) {
+            const auto ka = a.key();
+            const auto kb = b.key();
+            constexpr std::size_t count = std::tuple_size_v<decltype(ka)>;
+            const std::uint8_t got      = ninfer::runtime::first_differing_key_element(a, b);
+            if (ka == kb) {
+                require(got == ninfer::runtime::kNoDifferingKeyElement,
+                        "key-equal costs must read as \"no differing element\"");
+                return;
+            }
+            // THE FIRST DIFFERING ELEMENT, DERIVED FROM `key()` -- not from a literal, so a reorder of
+            // `key()` cannot leave this green.
+            std::size_t first = count;
+            const auto note = [&]<std::size_t I>() {
+                if (first == count && std::get<I>(ka) != std::get<I>(kb)) { first = I; }
+            };
+            [&]<std::size_t... I>(std::index_sequence<I...>) { (note.template operator()<I>(), ...); }
+            (std::make_index_sequence<count>{});
+            require(static_cast<std::size_t>(got) == first,
+                    "the attribution must be the FIRST element at which key() differs");
+        };
+        struct Arm {
+            const char*  what;
+            std::uint8_t expected;  // the index `key()` must name for this pair
+            FoldedCost   a;
+            FoldedCost   b;
+        };
+        const Arm arms[] = {
+            {"restorable_evictions (0)", 0U, FoldedCost{.restorable_evictions = 1U}, FoldedCost{}},
+            {"total_ns (1)", 1U, FoldedCost{.total_ns = 7U}, FoldedCost{}},
+            {"affected_selected_hits (2)", 2U, FoldedCost{.affected_selected_hits = 3U}, FoldedCost{}},
+            {"newest_affected_hit_epoch (3) -- UNCARRIED by the old helper",
+             3U, FoldedCost{.newest_affected_hit_epoch = 5U}, FoldedCost{}},
+            {"owner_evictions (4)", 4U, FoldedCost{.owner_evictions = 2U}, FoldedCost{}},
+            {"checkpoint_drops (5)", 5U, FoldedCost{.checkpoint_drops = 9U}, FoldedCost{}},
+            // THE ARM THAT FAILED BEFORE, and the reason this test exists: an uncarried element (6) decides
+            // while reuse ALSO differs. The old helper returned 10 -- "reuse itself decided, the real
+            // defect" -- for a pair that `copy_operations` decided.
+            {"copy_operations (6) DECIDES with reuse also differing",
+             6U, FoldedCost{.copy_operations = 1U, .reused_prompt_tokens = 4U},
+             FoldedCost{.reused_prompt_tokens = 5U}},
+            {"transferred_bytes (7) with reuse also differing",
+             7U, FoldedCost{.transferred_bytes = 1U, .reused_prompt_tokens = 4U},
+             FoldedCost{.reused_prompt_tokens = 5U}},
+            {"remaining_text_prefill (8) with reuse also differing",
+             8U, FoldedCost{.remaining_text_prefill = 1U, .reused_prompt_tokens = 4U},
+             FoldedCost{.reused_prompt_tokens = 5U}},
+            {"remaining_vision_prefill (9)", 9U, FoldedCost{.remaining_vision_prefill = 1U}, FoldedCost{}},
+            {"reused_prompt_tokens (10) alone",
+             10U, FoldedCost{.reused_prompt_tokens = 4U}, FoldedCost{.reused_prompt_tokens = 5U}},
+            // THE ORDINAL TIE-BREAKERS ARE NOW REACHABLE. The old helper could never return 11, 12 or 13,
+            // so "the winner was picked by ENUMERATION ORDER" -- the arbitrary tie-break that would be the
+            // real bug -- was indistinguishable from "an unlooked-at term decided". It is now its own answer.
+            {"candidate_ordinal (12) -- the ENUMERATION-ORDER tie-break", 12U,
+             FoldedCost{.candidate_ordinal = 3U}, FoldedCost{.candidate_ordinal = 4U}},
+        };
+        for (const Arm& arm : arms) {
+            // The arm must actually differ in `key()`, or it measures nothing.
+            require(arm.a.key() != arm.b.key(), arm.what);
+            require(ninfer::runtime::first_differing_key_element(arm.a, arm.b) == arm.expected, arm.what);
+            require(ninfer::runtime::first_differing_key_element(arm.b, arm.a) == arm.expected, arm.what);
+            property_holds(arm.a, arm.b);
+            // THE INVARIANT THAT MAKES A LIVE READING TRUSTWORTHY: element 10 is `max - reused_prompt_tokens`,
+            // so a cost with MORE reuse has a SMALLER key and wins on element 10. A LOSER holding more reuse
+            // therefore lost on one of elements 0..9, and `decided_by == 10` beside a longer loser is
+            // impossible -- if a live reading shows it, the two costs are not the ones the election compared.
+            // The loser is identified by `less()`, NOT by which operand was written first: the first version
+            // of this assertion assumed `a` was the winner and fired on the reuse-only arm, where `a` is the
+            // one that loses -- a test bug that would have looked like a helper bug.
+            const FoldedCost& winner = arm.a.less(arm.b) ? arm.a : arm.b;
+            const FoldedCost& loser  = arm.a.less(arm.b) ? arm.b : arm.a;
+            if (loser.reused_prompt_tokens > winner.reused_prompt_tokens) {
+                require(ninfer::runtime::first_differing_key_element(winner, loser) != 10U,
+                        "a LOSER with more reuse cannot have lost on the reuse element");
+            }
+        }
+        // THE DIRECTION CHECK, and this is the arm for the fault that made pass 1's fix wrong. The seal
+        // fallback seats a plan whose key can be WORSE than a loser's -- a pair the election never ranked --
+        // and `first_differing_key_element` is symmetric, so on that pair it would name an element where the
+        // LOSER was better and present it as the winner's reason. `election_deciding_element` refuses to
+        // name one. A review measured 974 of 977 such inverted pairs yielding `decided_by == 10`, the value
+        // its own legend called impossible.
+        {
+            const FoldedCost real_winner{.total_ns = 5U, .reused_prompt_tokens = 9U};
+            const FoldedCost real_loser{.total_ns = 7U, .reused_prompt_tokens = 4U};
+            require(ninfer::runtime::election_deciding_element(real_winner, real_loser) == 1U,
+                    "a genuine win is attributed to the element that decided it");
+            // THE INVERSION. The "winner" here has MORE restorable evictions, which element 0 prefers FEWER
+            // of, so it does not beat the loser at all -- the shape a fallback cost produces.
+            const FoldedCost seated_by_fallback{.restorable_evictions = 3U};
+            const FoldedCost loser_ahead{.restorable_evictions = 0U};
+            require(!seated_by_fallback.less(loser_ahead), "fixture: the fallback cost really is worse");
+            require(ninfer::runtime::election_deciding_element(seated_by_fallback, loser_ahead) ==
+                        ninfer::runtime::kNotAnElectedWinner,
+                    "an inverted pair must read 254, NOT an element where the loser was better");
+            // And the raw helper WOULD have named one -- which is why the wrapper exists. 0 here is not a
+            // bug in the helper; it is the helper answering the question it is asked.
+            require(ninfer::runtime::first_differing_key_element(seated_by_fallback, loser_ahead) == 0U,
+                    "fixture: the symmetric helper names element 0 for this pair");
+        }
+        // The equal pair: 255, and deliberately the same value as "differs only on an element this cannot
+        // see" is NOT a case any more -- every element is walked, so 255 now means key-equal and nothing else.
+        require(ninfer::runtime::first_differing_key_element(FoldedCost{}, FoldedCost{}) ==
+                    ninfer::runtime::kNoDifferingKeyElement,
+                "identical costs must read 255");
+        std::cout << "selection-term attribution ok\n";
     }
 }

@@ -34,7 +34,21 @@ struct RequestHostTiming {
     std::uint64_t program_post_exposed_ns         = 0;
     std::uint64_t engine_commit_output_exposed_ns = 0;
     std::uint64_t engine_maintenance_exposed_ns   = 0;
+    // THIS REQUEST'S OWN TRANSFER VOLUME, by direction. Unlike the "exposed" fields above -- which are
+    // latency exposure and must NOT be summed across concurrent requests -- these are a per-request volume,
+    // summed from the materialization's own observations, so they are additive.
+    std::uint64_t restore_ns                      = 0;  // HostToDevice
+    std::uint64_t demote_ns                       = 0;  // DeviceToHost
+    std::uint64_t restore_pages                   = 0;
+    std::uint64_t demote_pages                    = 0;
     std::uint64_t device_wait_exposed_ns          = 0;
+    // A COPY of the two accumulators above, taken WHERE `first_token` IS SET.  The fields they copy run
+    // for the whole request while `ttft` stops at the first token, so a difference across the two is a
+    // difference across two windows -- see `GenerationEngineTiming` for the measurement that made this
+    // necessary, and `freeze_ttft_window` below for why the placement is the correctness argument.
+    std::uint64_t ttft_host_exposed_ns            = 0;
+    std::uint64_t ttft_device_wait_ns             = 0;
+    bool ttft_window_frozen                       = false;
     std::uint64_t decode_host_exposed_ns          = 0;
     std::uint64_t decode_device_wait_exposed_ns   = 0;
     std::uint64_t prefill_units                   = 0;
@@ -67,6 +81,23 @@ struct RequestHostTiming {
         }
     }
 
+    [[nodiscard]] std::uint64_t host_exposed_ns() const noexcept {
+        return engine_boundary_exposed_ns + program_submit_exposed_ns + program_post_exposed_ns +
+               engine_commit_output_exposed_ns + engine_maintenance_exposed_ns;
+    }
+
+    // Freeze the first-token window.  Idempotent, and called by the engine at the point `first_token` is
+    // set (`record_committed_output`), which is AFTER the round's `program_call.finish()` has recorded
+    // `device_wait_ns`.  The first version froze at the END of
+    // the round instead, claiming the commit was inside the program call; it was not, so the window
+    // closed a round late.
+    void freeze_ttft_window() noexcept {
+        if (ttft_window_frozen) { return; }
+        ttft_host_exposed_ns = host_exposed_ns();
+        ttft_device_wait_ns  = device_wait_exposed_ns;
+        ttft_window_frozen   = true;
+    }
+
     [[nodiscard]] GenerationEngineTiming public_snapshot() const noexcept {
         constexpr double kNanosecondsToSeconds = 1.0e-9;
         return GenerationEngineTiming{
@@ -90,6 +121,17 @@ struct RequestHostTiming {
             .prefill_units = prefill_units,
             .decode_rounds = decode_rounds,
             .control_units = control_units,
+            .restore_seconds = static_cast<double>(restore_ns) * kNanosecondsToSeconds,
+            .demote_seconds  = static_cast<double>(demote_ns) * kNanosecondsToSeconds,
+            .restore_pages   = restore_pages,
+            .demote_pages    = demote_pages,
+            // NAMED HERE, LAST, BECAUSE DESIGNATED INITIALIZERS FOLLOW DECLARATION ORDER -- moving the
+            // declaration without moving this is a compile error, which is the guard working.
+            .ttft_host_exposed_seconds =
+                static_cast<double>(ttft_host_exposed_ns) * kNanosecondsToSeconds,
+            .ttft_device_wait_seconds =
+                static_cast<double>(ttft_device_wait_ns) * kNanosecondsToSeconds,
+            .ttft_window_frozen = ttft_window_frozen,
         };
     }
 };

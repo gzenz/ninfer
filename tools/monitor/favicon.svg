@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <g transform="translate(64,0) scale(-1,1)">
+    <rect width="64" height="64" rx="14" fill="#0F172A"/>
+    <!-- Left post -->
+    <rect x="12" y="14" width="8" height="36" rx="4" fill="#38BDF8"/>
+    <!-- Right post -->
+    <rect x="44" y="14" width="8" height="36" rx="4" fill="#38BDF8"/>
+    <!-- Central Pulse / Diagonal -->
+    <polyline points="16,32 26,44 38,20 48,32" fill="none" stroke="#22C55E" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+</svg>

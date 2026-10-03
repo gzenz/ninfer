@@ -1,0 +1,5 @@
+read_12vhpwr.sh
+monitor.pid
+monitor.log
+monitor.log.*
+__pycache__/

@@ -242,6 +242,9 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
     OpenAIResponsesCreateRequest request;
     OpenAIResponsesResolvedPrompt resolved;
     const std::string id = new_openai_response_id();
+    // TAKEN BEFORE THE PARSE, so a request rejected on the way in still carries an id.
+    const std::uint64_t req_id = ++request_seq_;
+
     try {
         RequestLimits limits;
         limits.default_max_tokens = options_.default_max_tokens;
@@ -250,7 +253,19 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
         resolved = resolve_openai_responses_prompt(request.prompt, openai_responses_store_, id,
                                                    request.store);
     } catch (const ApiException& exception) {
-        write_openai_error(res, responses_error(exception.error()));
+        // LOGGED, WHICH IT WAS NOT BEFORE -- the same silence the other two handlers had: the error went
+        // to the client and NOTHING was recorded, so a parse-time rejection left the journal and the
+        // request log looking idle while the client saw a 4xx.
+        const ApiError error = exception.error();
+        record_request_rejected(
+            make_unparsed_request_rejection_log_context(req_id, "openai_responses", error));
+        // LOGGED FROM THE SAME OBJECT THAT IS SENT. The first version logged `error` but wrote
+        // `responses_error(error)` to the client, so the recorded `param` could differ from what the client
+        // actually saw -- a record that disagrees with the response is worse than no record.
+        operational_log_.http_failure(
+            "openai_responses",
+            make_request_failure(RequestFailurePhase::Http, responses_error(error)));
+        write_openai_error(res, responses_error(error));
         return;
     } catch (const std::exception& exception) {
         operational_log_.http_failure(
@@ -260,7 +275,6 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
         return;
     }
 
-    const std::uint64_t req_id = ++request_seq_;
     const RequestLogMetadata metadata{
         .model                             = request.prompt.model,
         .stream                            = request.stream,

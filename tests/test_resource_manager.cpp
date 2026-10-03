@@ -1,3 +1,4 @@
+#include "models/qwen3_5/program/planning/pressure_value_ranking.h"
 #include "runtime/engine/context_cache/resource_manager.h"
 
 #include <algorithm>
@@ -6,6 +7,7 @@
 #include <chrono>
 #include <cstdint>
 #include <iostream>
+#include <map>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -46,6 +48,10 @@ using ninfer::runtime::RetentionClass;
 using ninfer::runtime::VictimDisposition;
 
 int failures = 0;
+// A DENOMINATOR. "Exactly one failure, the recorded baseline" is not a checkable statement when the suite
+// reports only failures -- a run that stopped early, or that never reached a case, reads the same. The count
+// is printed at the end for the same reason every instrument in this repo prints its denominator.
+int tests_run = 0;
 
 void require(bool condition, const char* message) {
     if (!condition) { throw std::runtime_error(message); }
@@ -53,6 +59,7 @@ void require(bool condition, const char* message) {
 
 template <class Test>
 void run_test(const char* name, Test&& test) {
+    ++tests_run;
     try {
         test();
     } catch (const std::exception& error) {
@@ -93,6 +100,10 @@ CheckpointRecoveryAlternativeWork fake_recovery_work(std::uint64_t ns) {
 
 struct FakePreparedPrompt {
     std::uint32_t content_key = 0;
+    // Caps the token match BELOW the entry's ledger length, which is the only way the fake can produce a
+    // Diverged match. Without it `split.tokens` was always either 0 or the full ledger, so the Diverged branch
+    // below was dead code and the probe fields could never be set -- the second review pass found exactly that.
+    std::uint32_t match_limit = 0;
 };
 
 struct FakeCacheSessionKey {
@@ -106,8 +117,11 @@ struct FakeCacheSessionKey {
 };
 
 struct FakeShortlistKey {
-    std::uint32_t digest   = 0;
-    std::uint32_t frontier = 0;
+    std::uint32_t digest    = 0;
+    std::uint32_t frontier  = 0;
+    // Match the real PrefixShortlistKey surface used by [candgen] instrumentation.
+    std::array<std::uint64_t, 2> digests{};
+    std::uint32_t identity_tag               = 0;
 
     friend bool operator==(FakeShortlistKey, FakeShortlistKey) = default;
 };
@@ -212,6 +226,15 @@ struct FakeRequestBasePlan {
     RequestPlanSummary value;
     FakeContextCache cache;
     std::uint32_t shortlist_digest = 0;
+    // Refuses the shortlist key AT ONE FRONTIER, so a slot's entries can differ in outcome. Without it the
+    // fake's key is refusal-free or refused-everywhere, every entry of a slot takes the same outcome, and the
+    // endpoint-vs-anchor discriminator is never exercised -- the fourth review pass built a mutant replacing
+    // that comparison with `true` and it survived.
+    std::uint32_t refuse_frontier = 0;
+    // The identity-tag half of the key. The stored entries carry tag 0, so a non-zero value here is a genuine
+    // mismatch -- and because the tag check runs BEFORE the digest comparison, it is the only way to reach
+    // reason 4. Without it that site had no test and deleting it survived.
+    std::uint32_t identity_tag = 0;
     bool allow_shortlist           = true;
     bool isolated_feasible         = true;
 
@@ -222,7 +245,13 @@ struct FakeRequestBasePlan {
     [[nodiscard]] std::optional<FakeShortlistKey>
     prefix_shortlist_key(std::uint32_t frontier) const noexcept {
         if (!allow_shortlist || frontier == 0) { return std::nullopt; }
-        return FakeShortlistKey{.digest = shortlist_digest, .frontier = frontier};
+        return FakeShortlistKey{.digest       = frontier == refuse_frontier ? 99U : shortlist_digest,
+                                .frontier     = frontier,
+                                .identity_tag = identity_tag};
+    }
+
+    [[nodiscard]] std::size_t prefix_shortlist_size() const noexcept {
+        return allow_shortlist ? 1 : 0;
     }
 
     [[nodiscard]] std::optional<PrefillWork>
@@ -306,8 +335,8 @@ struct FakeAdmissionCandidate {
     std::uint32_t shared_source_id          = 0;
     std::uint32_t shared_source_content_key = 0;
     std::uint32_t shared_source_frontier    = 0;
-
     [[nodiscard]] const RequestPlanSummary& summary() const noexcept { return value; }
+
 
     [[nodiscard]] const ninfer::runtime::IdentityMaterializationAssessment&
     identity_assessment() const noexcept {
@@ -558,7 +587,12 @@ public:
 
     [[nodiscard]] FakePressureTargetHandle root_maximal_target(PlanningCandidateId candidate);
     struct Cursor;
-    [[nodiscard]] FakePressureTargetHandle maximal_target(PlanningCandidateId candidate);
+    // `nullopt` models the target arena being full: a SEARCH alternative the planner must be able
+    // to give up on. `refuse_maximal_targets` is what lets a test drive that branch -- without it the
+    // graceful path is unreachable from here and a mutant that re-throws would survive.
+    bool refuse_maximal_targets = false;
+    [[nodiscard]] std::optional<FakePressureTargetHandle>
+    maximal_target(PlanningCandidateId candidate);
     [[nodiscard]] Cursor begin_construction(FakePressureTargetHandle target, bool restore = false);
     [[nodiscard]] ninfer::runtime::PressureConstructionStep
     next_construction_option(Cursor& cursor);
@@ -581,6 +615,8 @@ public:
     [[nodiscard]] std::optional<FakeResourcePlan> seal(FakeAssessedPressureTarget&& assessed);
     [[nodiscard]] std::optional<FakeResourcePlan>
     seal_capture(FakeAssessedPressureTarget&& assessed);
+    [[nodiscard]] bool try_claim_seal_window() noexcept;
+    void release_seal_window() noexcept;
 
 private:
     struct Owner {
@@ -648,6 +684,180 @@ public:
 
     [[nodiscard]] bool isolated_request_feasible(const FakeRequestBasePlan& base) const noexcept {
         return base.isolated_feasible;
+    }
+
+    // #6's counters, read by the stats assembly (`resource_manager.h`). The fake returns zeroes: this suite
+    // is host-only and asserts the plumbing, not the eviction policy -- but it must COMPILE, and it did not
+    // from the moment those two lines were added, because only the serve binary was built at the time.
+    [[nodiscard]] std::uint64_t demotable_evictions() const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t demotable_eviction_checks() const noexcept { return 0U; }
+    // Same class as the two above: in the real Program these are incremented inside ProgramImpl's own
+    // eviction/pressure TUs, which the fake does not model -- the fake never evaluates a victim's room or
+    // enumerates demote options, so zero is its truthful count, not a placeholder for one.
+    [[nodiscard]] std::uint64_t evictions_with_victim_room() const noexcept { return 0U; }
+    // THE FAKE MUST MIRROR THE REAL PROGRAM'S ACCESSORS, and a missing one is a COMPILE failure of the test
+    // target only -- which is why `--target ninfer-serve` never saw it and a full build did. See the note on
+    // the grep: the same blind spot let a real error read as "0 errors" for several builds today.
+    [[nodiscard]] std::uint64_t evictions_demote_possible() const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t options_refused_no_kv() const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t options_refused_active_lanes() const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t options_refused_evicting_current() const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t demote_option_refused_no_state_deficit() const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t demote_option_refused_precondition() const noexcept { return 0U; }
+    void note_pressure_successor_outcome(bool) noexcept {}
+    [[nodiscard]] std::uint64_t pressure_successor_calls() const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t pressure_successors_with_option() const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t pressure_options() const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t demote_options() const noexcept { return 0U; }
+
+    // The private-catalog counters. Unlike the block above, these are MUTATED BY `ResourceManager` itself
+    // (planning decides them and holds only the Program façade), so the fake implements the real contract
+    // (`program_impl.h`): `note_*` pre-increments and returns the new total, `add_*` accumulates. Tests can
+    // therefore read what the manager recorded.
+    [[nodiscard]] std::uint64_t note_publication_cell_loss() noexcept {
+        return ++publication_cell_losses_;
+    }
+    [[nodiscard]] std::uint64_t note_publication_cell_at_risk() noexcept {
+        return ++publication_cell_at_risk_;
+    }
+    void add_publication_cell_at_risk(std::uint32_t at_risk, std::uint32_t goals, std::uint32_t other,
+                                      std::uint32_t reuse) noexcept {
+        publication_cell_at_risk_runs_ += at_risk;
+        publication_cell_veto_goals_ += goals;
+        publication_cell_veto_other_ += other;
+        publication_cell_veto_reuse_ += reuse;
+    }
+    void add_publication_cell_probes(std::uint64_t count) noexcept {
+        publication_cell_probes_ += count;
+    }
+    // The UNGATED goal-failure split. Added to the fake when the manager began calling them: without these
+    // the RM suite did not COMPILE, so it never ran against the change that introduced them and "the suites
+    // are green" was a claim about a different set of suites.
+    void add_publication_goal_blocked(std::uint64_t cell_only, std::uint64_t other) noexcept {
+        publication_goal_blocked_cell_only_ += cell_only;
+        publication_goal_blocked_other_ += other;
+    }
+    [[nodiscard]] std::uint64_t publication_goal_blocked_cell_only() const noexcept {
+        return publication_goal_blocked_cell_only_;
+    }
+    [[nodiscard]] std::uint64_t publication_goal_blocked_other() const noexcept {
+        return publication_goal_blocked_other_;
+    }
+    [[nodiscard]] std::uint64_t publication_cell_losses() const noexcept {
+        return publication_cell_losses_;
+    }
+    [[nodiscard]] std::uint64_t publication_cell_probes() const noexcept {
+        return publication_cell_probes_;
+    }
+    [[nodiscard]] std::uint64_t publication_cell_at_risk_runs() const noexcept {
+        return publication_cell_at_risk_runs_;
+    }
+    [[nodiscard]] std::uint64_t publication_cell_veto_goals() const noexcept {
+        return publication_cell_veto_goals_;
+    }
+    [[nodiscard]] std::uint64_t publication_cell_veto_other() const noexcept {
+        return publication_cell_veto_other_;
+    }
+    [[nodiscard]] std::uint64_t publication_cell_veto_reuse() const noexcept {
+        return publication_cell_veto_reuse_;
+    }
+
+    // THE SPLIT (`Program::prefix_split`). Contract: `tokens` = longest token-exact common prefix of the
+    // prompt with the owner's stored ledger; `restorable` = deepest restorable checkpoint frontier <= tokens;
+    // `identity_ok` = the identity chain also agrees at that match (only evaluated when tokens != 0); a stale
+    // or unknown owner yields the empty split.
+    //
+    // The fake's model of a ledger, which is INVENTED and must be read as such: the fake prompt carries only
+    // a `content_key`, and the fake's own reuse rule (`inspect_admission`) is "same content_key = the prompt
+    // extends that owner's history". So an owner the fake itself PUBLISHED (a finished continuation, or a
+    // shared prefix it published at capture) has a ledger of its published frontier and content key; a
+    // prompt with the same key matches the whole ledger, any other key matches nothing. The restorable set
+    // is the owner's CURRENT checkpoint summary as the fake last reported it (finish, or a retained victim's
+    // final summary after checkpoint drops). identity_ok = (tokens != 0): the fake has no render, so it
+    // cannot model a same-tokens/different-render divergence. Owners the fake never published (handles a
+    // test constructs by hand) are unknown to it and give the empty split, like a stale handle does.
+    // The fake mirrors `Program::PrefixSplit`'s surface AND, since the second review pass, the values the
+    // manager consumes (`match_end`, `stored`, `probe_index`). It fell behind the real one twice (the split's
+    // `match_end`/`stored` and the divergence probe), and each time this test stopped COMPILING -- so it ran
+    // nothing at all while looking like a suite that simply had no new failures. A host test that cannot
+    // build is the same failure mode as an instrument that cannot fire.
+    struct PrefixSplit {
+        std::uint32_t tokens      = 0;
+        std::uint32_t restorable  = 0;
+        bool          identity_ok = false;
+        std::uint8_t  match_end   = 0;
+        std::uint32_t stored      = 0;
+        std::uint32_t probe_index = 0;
+        ninfer::runtime::DivergencePosition divergence;
+    };
+    [[nodiscard]] PrefixSplit prefix_split(const FakeContinuationHandle& owner,
+                                           const FakePreparedPrompt& prompt) const {
+        ++prefix_split_calls;
+        const auto found = private_ledgers_.find(owner.id);
+        if (owner.id == 0 || found == private_ledgers_.end()) { return {}; }
+        const PrivateLedger& ledger = found->second;
+        PrefixSplit split;
+        split.tokens = ledger.content_key == prompt.content_key ? ledger.length : 0U;
+        if (prompt.match_limit != 0U && split.tokens > prompt.match_limit) { split.tokens = prompt.match_limit; }
+        if (split.tokens == 0U) { return split; }
+        // THE VALUES, not just the shape. Adding the fields so the suite COMPILES left every manager-level
+        // assertion about them vacuous: the fake returned defaults, so a mutant dropping `.stored = split.stored`
+        // or `.match_end = split.match_end` in the manager survived. The fake has no prompt length, so it
+        // models StoredEnded (the match consumed the entry's whole ledger) and Diverged, and does NOT model
+        // PromptEnded; `probe_index` follows the real rule (set whenever diverged, gate or no gate).
+        split.stored     = ledger.length;
+        split.match_end  = split.tokens >= ledger.length ? 1U /*StoredEnded*/ : 0U /*Diverged*/;
+        if (split.match_end == 0U) {
+            split.probe_index = split.tokens;
+            // THE SAME LESSON AS `stored`/`match_end` ABOVE, for the divergence attribution: a fake that
+            // leaves it default makes every manager-level assertion about it vacuous, so a mutant dropping
+            // `.split_message_index = best.divergence.message_index` in the manager survives. The fake has no
+            // prompt, so it supplies SYNTHETIC frontiers and calls the REAL mapping -- the engine's own rule
+            // is then what the manager test pins, not a number invented here.
+            const std::array<std::optional<std::uint32_t>, 3> frontiers{0U, 5U, 16U};
+            const std::array<ninfer::ChatRole, 2> roles{ninfer::ChatRole::System,
+                                                        ninfer::ChatRole::User};
+            split.divergence = ninfer::runtime::attribute_divergence(frontiers, roles, split.tokens);
+        }
+        split.identity_ok = true;
+        const auto consider = [&](const std::optional<FakeCheckpointSummary>& checkpoint) {
+            if (checkpoint && checkpoint->ref.frontier <= split.tokens) {
+                split.restorable = std::max(split.restorable, checkpoint->ref.frontier);
+            }
+        };
+        consider(ledger.summary.endpoint);
+        consider(ledger.summary.rewrite);
+        for (const FakeCheckpointSummary& anchor : ledger.summary.long_anchors) { consider(anchor); }
+        return split;
+    }
+    [[nodiscard]] PrefixSplit prefix_split(const FakeSharedPrefixHandle& owner,
+                                           const FakePreparedPrompt& prompt) const {
+        ++prefix_split_calls;
+        const auto found = shared_ledgers_.find(owner.id);
+        if (owner.id == 0 || found == shared_ledgers_.end()) { return {}; }
+        const SharedLedger& ledger = found->second;
+        PrefixSplit split;
+        split.tokens = ledger.content_key == prompt.content_key ? ledger.length : 0U;
+        if (prompt.match_limit != 0U && split.tokens > prompt.match_limit) { split.tokens = prompt.match_limit; }
+        if (split.tokens == 0U) { return split; }
+        // Modelled the same way as the private overload; it returned defaults for these fields before.
+        split.stored    = ledger.length;
+        split.match_end = split.tokens >= ledger.length ? 1U /*StoredEnded*/ : 0U /*Diverged*/;
+        if (split.match_end == 0U) {
+            split.probe_index = split.tokens;
+            // THE SAME LESSON AS `stored`/`match_end` ABOVE, for the divergence attribution: a fake that
+            // leaves it default makes every manager-level assertion about it vacuous, so a mutant dropping
+            // `.split_message_index = best.divergence.message_index` in the manager survives. The fake has no
+            // prompt, so it supplies SYNTHETIC frontiers and calls the REAL mapping -- the engine's own rule
+            // is then what the manager test pins, not a number invented here.
+            const std::array<std::optional<std::uint32_t>, 3> frontiers{0U, 5U, 16U};
+            const std::array<ninfer::ChatRole, 2> roles{ninfer::ChatRole::System,
+                                                        ninfer::ChatRole::User};
+            split.divergence = ninfer::runtime::attribute_divergence(frontiers, roles, split.tokens);
+        }
+        split.identity_ok = true;
+        if (ledger.checkpoint_frontier <= split.tokens) { split.restorable = ledger.checkpoint_frontier; }
+        return split;
     }
 
     [[nodiscard]] std::optional<FakeAdmissionCandidate>
@@ -842,6 +1052,9 @@ public:
                             victim.final_summary->rewrite =
                                 rewrite_checkpoint(content, finish_frontier - 1U);
                         }
+                        note_private_summary(owner, *victim.final_summary);
+                    } else {
+                        private_ledgers_.erase(pending_plan_->private_owner_ids[index]);
                     }
                     result.victims.push_back(std::move(victim));
                 }
@@ -859,6 +1072,12 @@ public:
                         victim.final_summary      = FakeSharedPrefixSummary{
                                  .checkpoint = shared_checkpoint(owner, finish_frontier),
                         };
+                        const auto ledger = shared_ledgers_.find(owner);
+                        if (ledger != shared_ledgers_.end()) {
+                            ledger->second.checkpoint_frontier = finish_frontier;
+                        }
+                    } else {
+                        shared_ledgers_.erase(pending_plan_->shared_owner_ids[index]);
                     }
                     result.shared_victims.push_back(std::move(victim));
                 }
@@ -879,6 +1098,10 @@ public:
                     FakeSharedPrefixHandle handle;
                     handle.id          = next_shared_id_++;
                     handle.content_key = capture_assessment.shortlist_key.digest;
+                    shared_ledgers_[handle.id] = SharedLedger{
+                        .content_key         = capture_assessment.shortlist_key.digest,
+                        .length              = capture_assessment.shortlist_key.frontier,
+                        .checkpoint_frontier = capture_assessment.shortlist_key.frontier};
                     result.shared      = FakeSharedPrefixPublication{
                              .handle = std::move(handle),
                              .summary =
@@ -921,11 +1144,15 @@ public:
                     victim.final_summary->rewrite =
                         rewrite_checkpoint(content, finish_frontier - 1U);
                 }
+                note_private_summary(owner_id, *victim.final_summary);
+            } else {
+                private_ledgers_.erase(plan.private_owner_ids.at(index));
             }
             result.victims.push_back(std::move(victim));
         }
         for (std::size_t index = 0; index < plan.shared_actions.size(); ++index) {
             const FakeTargetDecision& action = plan.shared_actions[index];
+            if (action.evicts_continuation) { shared_ledgers_.erase(plan.shared_owner_ids.at(index)); }
             result.shared_victims.push_back(FakeMaterializationSharedVictimResult{
                 .owner              = plan.shared_planning_ids[index],
                 .disposition        = action.evicts_continuation ? VictimDisposition::Evicted
@@ -987,11 +1214,15 @@ public:
         return transaction_kind_ != TransactionKind::None;
     }
 
+    // The `site` parameter mirrors the real contract (`inspect_capture`'s call-site tag, which exists for
+    // the diagnostic line only): the mock must match the signature or the whole suite stops compiling,
+    // which is how this was found.
     [[nodiscard]] FakeCaptureAssessment inspect_capture(const FakeCaptureOffer&,
                                                         const FakeSharedPrefixHandle*,
                                                         const FakeSharedPrefixHandle*,
                                                         std::optional<CheckpointRef>,
-                                                        bool permit_shared_publication) const {
+                                                        bool permit_shared_publication,
+                                                        const char* /*site*/) const {
         FakeCaptureAssessment assessment = capture_assessment;
         if (!permit_shared_publication) { assessment.publishes_shared = false; }
         return assessment;
@@ -1100,10 +1331,16 @@ public:
         result.disposition      = FinishDisposition::Catalogued;
         const std::uint32_t key = sequence_content_keys_[sequence.id];
         result.summary.endpoint = endpoint(key, finish_frontier);
+        // THE CENSUS READS `state_residency`, and `endpoint()` builds every checkpoint DeviceOnly -- so without
+        // this knob no fixture could produce a host-resident checkpoint and `host_state_checkpoints_*` had
+        // nothing to count (two of its mutants survived on that).
+        if (host_residency != std::nullopt) { result.summary.endpoint->state_residency = *host_residency; }
         if (finish_with_rewrite) {
             result.summary.rewrite = rewrite_checkpoint(key, finish_frontier - 1U);
         }
         result.continuation.emplace(sequence.id, key);
+        private_ledgers_[sequence.id] =
+            PrivateLedger{.content_key = key, .length = finish_frontier, .summary = result.summary};
         return result;
     }
 
@@ -1118,6 +1355,7 @@ public:
     [[nodiscard]] FakeReleaseResult
     release_continuation(FakeContinuationHandle&& continuation) noexcept {
         released_continuations.push_back(continuation.id);
+        private_ledgers_.erase(continuation.id);
         advance_revision();
         return FakeReleaseResult{.status = ConsumeStatus::Consumed};
     }
@@ -1125,11 +1363,33 @@ public:
     [[nodiscard]] ProgramResourceRevision resource_revision() const noexcept { return revision_; }
 
     [[nodiscard]] FakePhysicalUsage physical_usage() const noexcept { return usage; }
+    // Added with the shared-replacement counter: `populate_runtime_stats` reads it, so the mock needs it.
+    [[nodiscard]] std::uint64_t shared_replacements() const noexcept { return 0; }
 
     void invalidate_resources() noexcept { advance_revision(); }
 
     std::vector<std::pair<std::uint32_t, std::vector<FakeTargetDecision>>> owner_decisions;
     std::size_t required_pressure_actions       = 0;
+    // Force the fake session's `maximal_target` to report a FULL TARGET ARENA, so the planner's
+    // graceful branch -- the one that replaced the 2026-09-28 throw -- is reachable from a host test.
+    bool refuse_maximal_targets = false;
+    // THE RESCUE BRANCH HAS NO HOST COVERAGE, AND THIS KNOB IS HOW THAT IS KNOWN RATHER THAN ASSUMED.
+    // `maximal_target_calls` is its denominator. Measured: in every host scenario tried it stays 0,
+    // because the rescue runs in the REFINEMENT phase, which the fake does not reach -- the same gap
+    // that makes `guided deep retention` fail (its message is "guided pressure search returned to eager
+    // breadth-first assessment"). Consequence, verified by mutation: replacing the rescue branch's
+    // graceful `break` with the pre-fix `throw std::length_error` SURVIVES this whole suite (51 run,
+    // 1 failed -- the baseline only). The construction branch is covered instead
+    // (`test_target_arena_bound_degrades_instead_of_throwing`), and that is the path that fired in
+    // production, but the rescue branch stays untested until the refinement phase is reachable here.
+    // Do not delete this knob: it is the measurement that keeps that residual honest.
+    std::uint32_t maximal_target_calls = 0;
+    // The CONSTRUCTION half of the same question. `construction_target` is reached in every guided
+    // search, so this is the arm that can actually be driven -- and it is the path that fired in
+    // production (`targets=4102/4102`). `construction_target_calls` is its denominator: without it a
+    // scenario that never called it reports zero truncations and looks identical to a graceful stop.
+    bool refuse_construction_targets = false;
+    std::uint32_t construction_target_calls = 0;
     std::size_t eviction_pressure_action_units  = 1;
     std::uint32_t private_pressure_alternatives = 1;
     std::optional<std::size_t> pressure_optional_target_capacity;
@@ -1152,6 +1412,8 @@ public:
     bool finish_fail_next                                = false;
     bool finish_release                                  = false;
     bool finish_with_rewrite                             = false;
+    // When set, published endpoints report this residency. Only the census consumes it.
+    std::optional<ninfer::runtime::ReplicaResidency> host_residency;
     bool abort_capture_start                             = false;
     bool report_shared_source_summary                    = false;
     bool change_shared_source_residency_on_second_report = false;
@@ -1173,16 +1435,53 @@ public:
     std::uint32_t started_source_id           = 0;
     PrivateSourceMode started_source_mode     = PrivateSourceMode::ConsumeToActive;
     std::vector<std::uint32_t> inspected_private_sources;
+    // The capture-skip counters the real `populate_runtime_stats` copies out. The fake skipped nothing, so
+    // all five are zero -- but they have to EXIST, or the suite does not compile. NO ASSERTION READS THEM, so
+    // the reason-to-field mapping in `populate_runtime_stats` (swapping two indices would survive) is
+    // untested; recorded rather than implied.
+    [[nodiscard]] std::uint64_t capture_skips(std::size_t) const noexcept { return 0; }
     std::vector<std::uint32_t> inspected_shared_sources;
     std::vector<std::vector<std::uint64_t>> seal_attempts;
     std::vector<std::uint64_t> started_action_ids;
     std::vector<std::uint32_t> selected_shared_capture_frontiers;
     std::vector<std::uint32_t> released_continuations;
 
+    mutable std::uint64_t prefix_split_calls = 0;
+
 private:
+    struct PrivateLedger {
+        std::uint32_t content_key = 0;
+        std::uint32_t length      = 0;
+        FakeContinuationSummary summary;
+    };
+    struct SharedLedger {
+        std::uint32_t content_key         = 0;
+        std::uint32_t length              = 0;
+        std::uint32_t checkpoint_frontier = 0;
+    };
+
     void advance_revision() noexcept {
         if (++revision_.value == 0) { ++revision_.value; }
     }
+
+    // A retained private victim's checkpoint set changed (drops): the ledger is unchanged, the restorable
+    // set follows the final summary the fake reported. Unknown owners stay unknown.
+    void note_private_summary(std::uint32_t id, const FakeContinuationSummary& summary) {
+        const auto found = private_ledgers_.find(id);
+        if (found != private_ledgers_.end()) { found->second.summary = summary; }
+    }
+
+    std::uint64_t publication_cell_losses_       = 0;
+    std::uint64_t publication_cell_probes_       = 0;
+    std::uint64_t publication_cell_at_risk_      = 0;
+    std::uint64_t publication_cell_at_risk_runs_ = 0;
+    std::uint64_t publication_cell_veto_goals_   = 0;
+    std::uint64_t publication_cell_veto_other_   = 0;
+    std::uint64_t publication_cell_veto_reuse_   = 0;
+    std::uint64_t publication_goal_blocked_cell_only_ = 0;
+    std::uint64_t publication_goal_blocked_other_     = 0;
+    std::map<std::uint32_t, PrivateLedger> private_ledgers_;
+    std::map<std::uint32_t, SharedLedger> shared_ledgers_;
 
     ProgramResourceRevision revision_{.value = 1};
     std::uint32_t planning_generation_ = 0;
@@ -1359,8 +1658,10 @@ FakePressurePlanningSession::root_maximal_target(PlanningCandidateId candidate) 
     };
 }
 
-FakePressureTargetHandle
+std::optional<FakePressureTargetHandle>
 FakePressurePlanningSession::maximal_target(PlanningCandidateId candidate) {
+    ++program_->maximal_target_calls;
+    if (refuse_maximal_targets) { return std::nullopt; }
     const auto target                   = root_maximal_target(candidate);
     targets_[target.index].root_maximal = false;
     return target;
@@ -1418,10 +1719,16 @@ void FakePressurePlanningSession::choose_construction(
 
 std::optional<FakePressureTargetHandle>
 FakePressurePlanningSession::construction_target(const Cursor& cursor) {
+    ++program_->construction_target_calls;
     auto found = std::find_if(targets_.begin(), targets_.end(), [&](const Target& other) {
         return same_target(other, cursor.target);
     });
     if (found == targets_.end()) {
+        if (program_->refuse_construction_targets) { return std::nullopt; }
+        // THE REAL BOUND, mirrored rather than derived: this fixture cannot include the model header that
+        // owns `target_arena_maximum`, and the arithmetic here is only the fallback for a fake that has no
+        // refusal knob set. If the model's sizing changes, this literal drifts -- the knob above is what
+        // the truncation tests actually use.
         if (targets_.size() >= candidates_.size() + 1U + 4096U) { return std::nullopt; }
         auto target           = cursor.target;
         target.stable_ordinal = static_cast<std::uint32_t>(targets_.size());
@@ -1760,6 +2067,10 @@ FakePressurePlanningSession::seal(FakeAssessedPressureTarget&& assessed, const F
     return plan;
 }
 
+bool FakePressurePlanningSession::try_claim_seal_window() noexcept { return true; }
+
+void FakePressurePlanningSession::release_seal_window() noexcept {}
+
 std::optional<FakeResourcePlan>
 FakePressurePlanningSession::seal_capture(FakeAssessedPressureTarget&& assessed) {
     return seal(std::move(assessed), FakePreparedPrompt{}, {});
@@ -1777,8 +2088,10 @@ FakeProgram::begin_pressure_planning(std::span<const FakeAdmissionCandidate* con
                                      std::span<const PlanningOwnerId> private_owner_ids,
                                      std::span<const FakeSharedPrefixHandle* const> shared_owners,
                                      std::span<const PlanningOwnerId> shared_owner_ids) {
-    return FakePressurePlanningSession(*this, candidates, candidate_ids, private_owners,
-                                       private_owner_ids, shared_owners, shared_owner_ids);
+    FakePressurePlanningSession session(*this, candidates, candidate_ids, private_owners,
+                                        private_owner_ids, shared_owners, shared_owner_ids);
+    session.refuse_maximal_targets = refuse_maximal_targets;
+    return session;
 }
 
 struct FakeModelContract {
@@ -2409,6 +2722,385 @@ void test_root_lifecycle_and_prefix_reuse() {
             "failed start did not roll back its logical source claim");
 }
 
+// THE SPLIT, end to end through `ResourceManager`: every Catalogued entry is scanned with
+// `Program::prefix_split`, and `best_prefix_split` folds them into the request's diagnostics. Asserts values
+// that DIFFER by prompt, so a fake (or a manager) that returns constants cannot pass both halves: the
+// unrelated prompt must read 0 tokens over the same entries the related prompt reads 16 over.
+// THE SESSION FIELDS' OWN SEMANTICS, on a fresh manager so the catalog holds exactly one session slot with
+// two entries (endpoint 16, rewrite 15) and the per-frontier refusal can make them disagree.
+//
+// Two things this pins that the pass-3 assertions could not:
+//   * `session_endpoint_skip` answers for the ENDPOINT, not for whichever entry of the slot was visited last.
+//     Replacing its `index.checkpoint == own.summary.endpoint->ref` test with `true` survives the older cases,
+//     because there every entry of the slot agreed.
+//   * `session_cell_skip`'s offered-is-sticky rule. An endpoint that was offered followed by a refused
+//     rewrite must still read 1: the cell DID produce a candidate. Without the rule it reports the rewrite's
+//     refusal instead, which is the confusion the field exists to remove.
+// THE ERASURE COUNTERS MUST BE WIRED, not merely present -- the cell-clear counters once shipped incrementing
+// at nine sites and never copying out, so `/stats` served a hardcoded zero that read like a clean finding. This
+// drives the ordinary consume path and requires the counter to move, and pins the occupancy/capacity pair.
+void test_session_erase_counters_are_wired() {
+    FakeManager manager = make_manager(1, 4);
+    FakeProgram program;
+    const FakeCacheSessionKey session{21};
+    const auto materialize = [&](std::uint64_t order) {
+        FakeRequestBasePlan base = make_base(21, session, RetentionClass::LiveSession);
+        auto inspection = manager.inspect(program, FakePreparedPrompt{21}, base, order);
+        require(inspection.choice.has_value(), "erase fixture produced no choice");
+        const LaneId lane = inspection.choice->destination();
+        require(manager.reserve_materialization(program, std::move(*inspection.choice),
+                                                FakePreparedPrompt{21}, {}) ==
+                    FakeManager::MaterializationReserveResult::Reserved,
+                "erase fixture was not reserved");
+        auto outcome = [&]() -> FakeManager::MaterializationOutcome {
+            auto progress = manager.progress_context_transaction(program, {});
+            if (!std::holds_alternative<ContextTransactionInProgress>(progress)) {
+                return std::get<FakeManager::MaterializationOutcome>(std::move(progress));
+            }
+            auto completed = manager.progress_context_transaction(program, {});
+            return std::get<FakeManager::MaterializationOutcome>(std::move(completed));
+        }();
+        require(outcome.status == ContextTransactionStatus::Published && outcome.activation,
+                "erase fixture did not publish");
+        auto activation                   = std::move(*outcome.activation);
+        const FakeSequenceHandle sequence = activation.sequence();
+        manager.adopt(program, std::move(activation));
+        return ActiveRequest{.lane = lane, .sequence = sequence};
+    };
+
+    const ActiveRequest seed = materialize(1);
+    (void)finish_active(manager, program, seed, 16);
+    RuntimeStats before;
+    manager.populate_runtime_stats(program, before);
+    require(before.session_index_capacity_cells == 4,
+            "the session index must report its capacity, or a full index is indistinguishable from an empty one");
+    // EXACTLY ONE, not "at least one": `occupied := capacity` was a surviving mutant, and a >= test cannot
+    // see it. The conversation has published one continuation into an index of four.
+    require(before.session_index_occupied_cells == 1,
+            "one published continuation must occupy exactly one session index entry of the four");
+
+    // The conversation's next turn: same key, matching digest, so the source is CONSUMED as the active source.
+    const ActiveRequest next = materialize(2);
+    (void)next;
+    RuntimeStats after;
+    manager.populate_runtime_stats(program, after);
+    require(after.session_erasures_consume > before.session_erasures_consume,
+            "consuming a session's own continuation must count as a session-index erasure: this is the path "
+            "that leaves the next turn with no cell and a 23k-token re-prefill");
+    require(after.session_erasures_eviction == before.session_erasures_eviction,
+            "a consume must not be counted as an eviction -- the two have different fixes");
+}
+
+// M2: THE EVICTION PATH MUST COUNT AS AN EVICTION, not as a consume. The split between the two erasure
+// reasons is the whole point of the pair (an eviction is the route that leaves a conversation with no cell;
+// a consume is the ordinary path that then republishes), and until this test the Eviction site had NO
+// coverage at all -- swapping it to Consume survived every other case, because nothing drove an eviction
+// through the manager. `require_evictions` forces a plan whose every alternative evicts.
+void test_session_erase_counts_an_eviction_as_eviction() {
+    FakeManager manager = make_manager(1, 3);
+    FakeProgram program;
+    const FakeCacheSessionKey victim_session{31};
+    const FakeCacheSessionKey keeper_session{32};
+    const ActiveRequest victim = start_active(
+        manager, program, 31, make_base(31, victim_session, RetentionClass::LiveSession), 1);
+    (void)finish_active(manager, program, victim, 16);
+    const ActiveRequest keeper = start_active(
+        manager, program, 32, make_base(32, keeper_session, RetentionClass::LiveSession), 2);
+    (void)finish_active(manager, program, keeper, 16);
+
+    RuntimeStats before;
+    manager.populate_runtime_stats(program, before);
+    require(before.session_erasures_eviction == 0 && before.session_erasures_consume == 0,
+            "the fixture erased a session entry before any pressure was applied");
+
+    program.required_pressure_actions = 1;
+    program.require_evictions         = true;
+    auto inspection = manager.inspect(
+        program, FakePreparedPrompt{33},
+        make_base(33, FakeCacheSessionKey{33}, RetentionClass::LiveSession), 3);
+    require(inspection.choice.has_value(), "the eviction fixture produced no choice");
+    require(manager.reserve_materialization(program, std::move(*inspection.choice),
+                                            FakePreparedPrompt{33}, {}) ==
+                FakeManager::MaterializationReserveResult::Reserved,
+            "the eviction fixture was not reserved");
+    auto outcome = [&]() -> FakeManager::MaterializationOutcome {
+        auto progress = manager.progress_context_transaction(program, {});
+        if (!std::holds_alternative<ContextTransactionInProgress>(progress)) {
+            return std::get<FakeManager::MaterializationOutcome>(std::move(progress));
+        }
+        auto completed = manager.progress_context_transaction(program, {});
+        return std::get<FakeManager::MaterializationOutcome>(std::move(completed));
+    }();
+    require(outcome.status == ContextTransactionStatus::Published && outcome.activation,
+            "the eviction fixture did not publish");
+    auto activation                   = std::move(*outcome.activation);
+    const FakeSequenceHandle sequence = activation.sequence();
+    manager.adopt(program, std::move(activation));
+
+    RuntimeStats after;
+    manager.populate_runtime_stats(program, after);
+    require(after.session_erasures_eviction > before.session_erasures_eviction,
+            "an eviction erased a session entry and was not counted as an Eviction: swapping the two reasons "
+            "at the Evicted call site must fail here");
+    require(after.session_erasures_consume == before.session_erasures_consume,
+            "an eviction was counted as a Consume -- the two reasons have different fixes and must not mix");
+    require(manager.catalog_state(0) == FakeManager::CatalogState::Vacant,
+            "the eviction fixture did not evict the victim, so it proves nothing about that path");
+    (void)keeper;
+    (void)sequence;
+}
+
+// M4/M5: THE CENSUS MUST COUNT WHAT IT CLAIMS. `host_state_checkpoints_*` splits host-resident checkpoints
+// by whether a session cell or an active lane edge can still reach them, and it is the measurement that
+// decides whether a reclaim policy has a population at all. It had NO test: swapping the two counts, or
+// hard-coding `orphaned` to 0, both survived.
+//
+// The shape is deliberately ASYMMETRIC -- one anchored against two unanchored -- because a 1/1 fixture would
+// pass under the swap as well. Three continuations for ONE conversation, published in order: its cell holds
+// the newest, and the two it superseded stay Catalogued as anonymous cache.
+void test_host_state_census_counts_unanchored_checkpoints() {
+    FakeManager manager = make_manager(1, 4);
+    FakeProgram program;
+    program.host_residency = ninfer::runtime::ReplicaResidency::HostOnly;
+    const FakeCacheSessionKey session{41};
+    for (std::uint32_t i = 0; i < 3; ++i) {
+        const ActiveRequest turn = start_active(
+            manager, program, 41 + i, make_base(41 + i, session, RetentionClass::LiveSession), 1 + i);
+        (void)finish_active(manager, program, turn, 16 + i);
+    }
+    RuntimeStats stats;
+    manager.populate_runtime_stats(program, stats);
+    require(stats.host_state_checkpoints_reachable == 1,
+            "exactly one host-resident checkpoint is the conversation's cell; the census must count it once");
+    require(stats.host_state_checkpoints_unanchored == 2,
+            "the two superseded continuations are host-resident and unanchored; counting them as 0 (or as "
+            "reachable) is the mutant this catches");
+    // CONTROL: with residency DeviceOnly the same three continuations hold nothing on host, so both counts
+    // must be zero -- otherwise the numbers above could come from the catalog rather than from residency.
+    FakeProgram cold;
+    cold.host_residency = ninfer::runtime::ReplicaResidency::DeviceOnly;
+    FakeManager cold_manager = make_manager(1, 4);
+    for (std::uint32_t i = 0; i < 3; ++i) {
+        const ActiveRequest turn = start_active(
+            cold_manager, cold, 41 + i, make_base(41 + i, session, RetentionClass::LiveSession), 1 + i);
+        (void)finish_active(cold_manager, cold, turn, 16 + i);
+    }
+    RuntimeStats cold_stats;
+    cold_manager.populate_runtime_stats(cold, cold_stats);
+    require(cold_stats.host_state_checkpoints_reachable == 0 &&
+                cold_stats.host_state_checkpoints_unanchored == 0,
+            "device-only checkpoints must count zero: the census measures residency, not catalog size");
+}
+
+void test_session_endpoint_reason_is_per_frontier() {
+    const auto refusal_diagnostics = [](std::uint32_t refuse_frontier, bool allow_shortlist,
+                                        std::uint32_t prompt_key, std::uint32_t identity_tag = 0) {
+        FakeManager manager = make_manager(1, 4);
+        FakeProgram program;
+        const FakeCacheSessionKey session{13};
+        const auto materialize = [&](std::uint64_t order, std::uint32_t key, bool shortlist) {
+            FakeRequestBasePlan base = make_base(13, session, RetentionClass::LiveSession);
+            base.refuse_frontier     = refuse_frontier;
+            base.allow_shortlist     = shortlist;
+            base.identity_tag        = identity_tag;
+            auto inspection = manager.inspect(program, FakePreparedPrompt{key}, base, order);
+            require(inspection.choice.has_value(), "per-frontier fixture produced no choice");
+            const LaneId lane = inspection.choice->destination();
+            require(manager.reserve_materialization(program, std::move(*inspection.choice),
+                                                    FakePreparedPrompt{key}, {}) ==
+                        FakeManager::MaterializationReserveResult::Reserved,
+                    "per-frontier fixture was not reserved");
+            auto outcome = [&]() -> FakeManager::MaterializationOutcome {
+                auto progress = manager.progress_context_transaction(program, {});
+                if (!std::holds_alternative<ContextTransactionInProgress>(progress)) {
+                    return std::get<FakeManager::MaterializationOutcome>(std::move(progress));
+                }
+                auto completed = manager.progress_context_transaction(program, {});
+                return std::get<FakeManager::MaterializationOutcome>(std::move(completed));
+            }();
+            require(outcome.status == ContextTransactionStatus::Published && outcome.activation,
+                    "per-frontier fixture did not publish");
+            auto activation                   = std::move(*outcome.activation);
+            const FakeSequenceHandle sequence = activation.sequence();
+            manager.adopt(program, std::move(activation));
+            // THE E INVARIANT, ENFORCED ON EVERY CALL THIS HELPER MAKES. `preserving_alternatives_assessed` is
+        // ungated and `feasible_preserving_alternatives` is its goal-gated subset -- both are incremented in
+        // the same function, the gated one INSIDE the ungated condition -- so the first must never be the
+        // smaller. The transposition that shipped on 2026-10-01 put the goal-less count into `assessed` and
+        // left the arena flag holding `assessed != 0`; nothing asserted this, and the field's first bug was
+        // invisible to every E-specific check because there were none.
+        return std::pair{ActiveRequest{.lane = lane, .sequence = sequence}, outcome.diagnostics};
+        };
+
+        auto [seed, seed_diagnostics] = materialize(1, 13, true);
+        (void)seed_diagnostics;
+        // The rewrite is requested only AFTER materializing: setting it before makes the seal throw
+        // `selected checkpoint outcome is unknown or duplicated`.
+        program.finish_with_rewrite = true;
+        (void)finish_active(manager, program, seed, 16);
+        program.finish_with_rewrite = false;
+
+        auto [reuse, diagnostics] = materialize(2, prompt_key, allow_shortlist);
+        (void)reuse;
+        return diagnostics;
+    };
+
+    // ORDER DEPENDENCY, stated rather than left to be discovered: `endpoint_any` (a mutant making the
+    // endpoint test always true) dies here only because `rebuild_prefix_index` appends the endpoint BEFORE the
+    // rewrite, so "last writer wins" and "the endpoint wins" differ. Reversing those two appends would disarm
+    // this assertion silently. Anchors are appended later still, which is why adding one would make it
+    // order-proof -- not done, because the order is what the code guarantees today.
+    //
+    // The endpoint's own key is refused; the shallower rewrite is offered. The cell WAS offered, so
+    // `session_cell_skip` must stay 1, and the endpoint's refusal must show in `session_endpoint_skip`.
+    const auto endpoint_refused = refusal_diagnostics(16, true, 13);
+    require(endpoint_refused.session_cell_skip == 1 && endpoint_refused.session_endpoint_skip == 5,
+            "an offered cell with a refused endpoint must read cell=1 (offered is sticky) and endpoint=5");
+    // The rewrite's key is refused; the endpoint is offered. Both fields read 1.
+    const auto rewrite_refused = refusal_diagnostics(15, true, 13);
+    require(rewrite_refused.session_cell_skip == 1 && rewrite_refused.session_endpoint_skip == 1,
+            "a refused shallower entry must not overwrite the endpoint's own reason");
+
+    // The two remaining reachable codes. Without these the field reads the provisional 2 ("no index entry at
+    // all") when either site is dropped, which is a wrong diagnosis no assertion could catch -- the fifth
+    // review pass deleted each note site and the suite stayed green.
+    const auto no_shortlist = refusal_diagnostics(0, /*allow_shortlist=*/false, 13);
+    require(no_shortlist.session_cell_skip == 3 && no_shortlist.session_endpoint_skip == 3,
+            "a request offering no shortlist key must report code 3 in both fields");
+    const auto admission_refused = refusal_diagnostics(0, true, /*prompt_key=*/12);
+    require(admission_refused.session_cell_skip == 8 && admission_refused.session_endpoint_skip == 8,
+            "an entry whose key matches but whose source admission refuses it must report code 8");
+
+    // Code 4 is the LAST site cheaply reachable: the identity tag is compared before the digests, so a
+    // non-zero tag on the request side is a mismatch the fixture can produce without new lanes or knobs.
+    const auto tag_mismatch = refusal_diagnostics(0, true, 13, /*identity_tag=*/7);
+    require(tag_mismatch.session_cell_skip == 4 && tag_mismatch.session_endpoint_skip == 4,
+            "a request whose identity tag differs from the stored entry's must report code 4");
+}
+
+void test_prefix_split_diagnostics_follow_catalog() {
+    FakeManager manager = make_manager(1, 4);
+    FakeProgram program;
+    const auto materialize_with = [&](FakePreparedPrompt prompt, const FakeRequestBasePlan& base,
+                                      std::uint64_t order) {
+        auto inspection = manager.inspect(program, prompt, base, order);
+        require(inspection.choice.has_value(), "split fixture produced no choice");
+        const LaneId lane   = inspection.choice->destination();
+        const auto reserved = manager.reserve_materialization(program, std::move(*inspection.choice),
+                                                              std::move(prompt), {});
+        require(reserved == FakeManager::MaterializationReserveResult::Reserved,
+                "split fixture was not reserved");
+        auto outcome = [&]() -> FakeManager::MaterializationOutcome {
+            auto progress = manager.progress_context_transaction(program, {});
+            if (!std::holds_alternative<ContextTransactionInProgress>(progress)) {
+                return std::get<FakeManager::MaterializationOutcome>(std::move(progress));
+            }
+            auto completed = manager.progress_context_transaction(program, {});
+            return std::get<FakeManager::MaterializationOutcome>(std::move(completed));
+        }();
+        require(outcome.status == ContextTransactionStatus::Published && outcome.activation,
+                "split fixture did not publish");
+        auto activation                   = std::move(*outcome.activation);
+        const FakeSequenceHandle sequence = activation.sequence();
+        manager.adopt(program, std::move(activation));
+        return std::pair{ActiveRequest{.lane = lane, .sequence = sequence}, outcome.diagnostics};
+    };
+    const auto materialize = [&](std::uint32_t key, std::uint64_t order) {
+        return materialize_with(FakePreparedPrompt{key}, make_base(key), order);
+    };
+
+    // Empty catalog: nothing scanned, nothing matched -- the denominator is what tells this from a miss.
+    auto [first, empty] = materialize(7, 1);
+    require(empty.split_entries == 0 && empty.split_best_tokens == 0,
+            "empty catalog reported split entries");
+    // THE RED CONTROL FOR THE SENTINEL COLLISION (review, 2026-09-28). With no session cell, `session_slot` is
+    // the no-cell sentinel -- and that value was ALSO `kInvalidCatalogSlot`, which is what every unoccupied
+    // `prefix_index_` tail entry defaults to. So `index.slot != session_slot` was false for each of them and
+    // this field read 9, "failed validation", on every request without a session key (the Bash classifier's
+    // traffic included) while the documented 0 was unreachable. This assertion FAILS on that code -- with the
+    // caveat that the two guards it rests on are redundant (`!index.occupied` alone would close the collision),
+    // so it pins their union, not each of them separately.
+    require(empty.session_cell_skip == 0,
+            "a request with no session cell must report no-cell (0), not a skip reason: the no-cell sentinel "
+            "collided with the invalid-catalog-slot sentinel that unoccupied index entries carry");
+    program.finish_with_rewrite = true;
+    (void)finish_active(manager, program, first, 16);  // key 7: ledger 16, endpoint 16, rewrite 15
+    program.finish_with_rewrite = false;
+    auto [second, one] = materialize(9, 2);
+    require(one.split_entries == 1 && one.split_best_tokens == 0 && one.split_best_restorable == 0 &&
+                !one.split_identity_ok,
+            "unrelated prompt matched a foreign catalog entry");
+    (void)finish_active(manager, program, second, 24);  // key 9: ledger 24, endpoint 24
+
+    const std::uint64_t calls_before = program.prefix_split_calls;
+    auto [third, related]            = materialize(7, 3);
+    require(program.prefix_split_calls - calls_before == 2,
+            "split did not scan every Catalogued entry exactly once");
+    require(related.split_entries == 2, "split denominator does not count both entries");
+    require(related.split_best_tokens == 16 && related.split_best_restorable == 16 &&
+                related.split_identity_ok,
+            "related prompt did not read its own entry's match and restorable frontier");
+    // THE MANAGER'S WIRING of the two fields added with the split's localisation. They are computed by
+    // `best_prefix_split` (covered in test_materialization_budget) and copied here; without this the copy could
+    // be dropped and nothing would fail.
+    require(related.split_best_stored == 16 && related.split_ended_by == 1,
+            "the manager did not carry the deepest entry's ledger length and match-end discriminator");
+    // WHICH LEDGER. This request carries no session key, so a private entry is ANOTHER session's (2) -- and
+    // without the tag a divergence window cannot be attributed to the entry whose refusal is the question.
+    require(related.split_best_source == 2 && related.split_best_frontier == 16,
+            "the deepest match must name its ledger (2 = another session's here) and that entry's resume point");
+    // `third` is left unfinished by the block above; the lane has to come back before anything else can be
+    // admitted, since this fixture has exactly one.
+    (void)finish_active(manager, program, third, 32);
+
+    // THE INSTRUMENT'S OWN FIELDS, MADE ABLE TO FAIL. `0` is the default, so asserting 0 proves nothing about
+    // the wiring -- with only that assertion, deleting the offered-note or either diagnostics copy left the
+    // suite green, and the third review pass built those three mutants and all survived. Each case below takes
+    // a value a dropped line would change.
+    const FakeCacheSessionKey session{7};
+    auto [seed, seed_diagnostics] = materialize_with(
+        FakePreparedPrompt{11}, make_base(11, session, RetentionClass::LiveSession), 4);
+    (void)seed_diagnostics;
+    (void)finish_active(manager, program, seed, 16);
+
+    auto [reuse, reuse_diagnostics] =
+        materialize_with(FakePreparedPrompt{11}, make_base(11, session, RetentionClass::LiveSession), 5);
+    require(reuse_diagnostics.split_best_source == 1,
+            "a session-keyed request's own continuation must be tagged as its own ledger (1)");
+    require(reuse_diagnostics.session_cell_offered && reuse_diagnostics.session_cell_skip == 1 &&
+                reuse_diagnostics.session_endpoint_skip == 1 && reuse_diagnostics.session_cell_frontier == 16,
+            "a same-session reuse must read offered=1 in BOTH session fields, with the cell's frontier -- "
+            "0 here means the note or the copy is missing");
+    (void)finish_active(manager, program, reuse, 16);
+
+
+
+    FakeRequestBasePlan key_mismatch = make_base(11, session, RetentionClass::LiveSession);
+    key_mismatch.shortlist_digest    = 99;
+    auto [refused, refused_diagnostics] = materialize_with(FakePreparedPrompt{11}, key_mismatch, 6);
+    require(refused_diagnostics.session_cell_skip == 5 && refused_diagnostics.session_endpoint_skip == 5,
+            "a same-session key mismatch must report digest-mismatch (5) in both fields, not a default");
+    (void)finish_active(manager, program, refused, 16);
+
+    // A DIVERGENT match: the fake caps the match below the entry's ledger, which is the only way it can
+    // produce one -- and the probe fields are why the cap exists.
+    auto [diverged, diverged_diagnostics] =
+        materialize_with(FakePreparedPrompt{11, /*match_limit=*/8}, make_base(11), 7);
+    require(diverged_diagnostics.split_ended_by == 0 && diverged_diagnostics.split_probe_index == 8 &&
+                diverged_diagnostics.split_best_stored == 16,
+            "a capped match must report Diverged, the probe index at the stop, and the entry's own ledger");
+    // The cap is 8, and the fake's synthetic frontiers put 5 at message 1 (a User turn): a manager that
+    // dropped the pass-through would report index 0 / offset 0 / role 0 (System) here.
+    require(diverged_diagnostics.split_message_index == 1 && diverged_diagnostics.split_message_offset == 3 &&
+                diverged_diagnostics.split_message_role ==
+                    static_cast<std::uint8_t>(ninfer::ChatRole::User) &&
+                !diverged_diagnostics.split_past_last_message,
+            "the divergence's message index, offset and role must reach the diagnostics, not their defaults");
+
+    (void)diverged;
+
+}
+
 void test_stale_revision_is_retryable() {
     FakeManager manager = make_manager();
     FakeProgram program;
@@ -2552,6 +3244,45 @@ void test_aborted_source_selection_does_not_create_hit_history() {
             "aborted source selection incorrectly biased later retention policy");
 }
 
+// #10 / #14 stage two. An unplannable request used to be reported as `TemporarilyBlocked` whatever
+// the engine's state, so when the capacity it needed was occupied by something no owner could free, the
+// request waited out its deadline for ever and blocked every request behind it (the 2026-09-25 wedge).
+// A block is only temporary when something can end it -- an occupied lane can finish -- so with every
+// lane Free and the plan finding nothing, the verdict is final.
+//
+// The control matters as much as the assertion: this must NOT pass against a manager that simply never
+// blocks anything, so the same request is re-inspected while a lane is occupied and must then be
+// *temporary*.
+void test_unplannable_request_with_no_active_lane_is_permanently_infeasible() {
+    FakeManager manager = make_manager(2, 3);
+    FakeProgram program;
+    program.required_pressure_actions = 1;  // the plan must reclaim something; nothing exists to reclaim
+
+    // No lane has been started, so every lane is Free: the request is classed feasible against total
+    // capacity (isolated_feasible) yet the plan can place it nowhere, and nothing is occupied that
+    // could finish and change that. This is #10's condition, and it must be final rather than a wait.
+    FakeRequestBasePlan idle_base = make_base(77);
+    idle_base.isolated_feasible   = true;
+    auto idle = manager.inspect(program, FakePreparedPrompt{77}, idle_base, 1);
+    require(idle.readiness == Readiness::PermanentlyInfeasible && !idle.choice,
+            "an unplannable request with every lane free was reported as merely blocked");
+
+    // Control, taken afterwards because establishing a lane requires an admittable request: with a lane
+    // occupied the same shape must remain a *temporary* block, or the assertion above would pass
+    // against a manager that never blocks anything.
+    program.required_pressure_actions = 0;
+    const FakeCacheSessionKey session{1};
+    const ActiveRequest active = start_active(
+        manager, program, 9, make_base(9, session, RetentionClass::LiveSession), 2);
+    program.required_pressure_actions = 1;
+    FakeRequestBasePlan busy_base = make_base(78);
+    busy_base.isolated_feasible   = true;
+    auto blocked = manager.inspect(program, FakePreparedPrompt{78}, busy_base, 3);
+    require(blocked.readiness == Readiness::TemporarilyBlocked && !blocked.choice,
+            "the same request with a lane occupied must remain a temporary block");
+    (void)finish_active(manager, program, active);
+}
+
 void test_retained_source_is_protected_until_terminal() {
     FakeManager manager = make_manager(2, 3);
     FakeProgram program;
@@ -2675,6 +3406,48 @@ void test_cumulative_owner_target_closes_pressure_without_eviction() {
     require(program.started_action_ids.size() == 1 &&
                 program.started_action_ids.front() == *program.required_action_id,
             "planner replaced a feasible cumulative owner target with eviction");
+
+    // THE RESCUE BRANCH, WHICH THIS SCENARIO IS THE ONE THAT REACHES. `maximal_target` has a single
+    // caller -- the rescue at `materialization_planner.h` -- and a full target arena must make it
+    // GIVE UP, not throw. An earlier version of this file claimed the branch was unreachable in the
+    // fake and left it untested; that was false, and the denominator it leaned on
+    // (`maximal_target_calls`) was never read by anything. It is read here.
+    {
+        FakeManager rescue_manager = make_manager(1, 2);
+        FakeProgram rescue_program;
+        rescue_program.finish_with_rewrite = true;
+        const ActiveRequest rescue_seed =
+            start_active(rescue_manager, rescue_program, 31, make_base(31), 1);
+        (void)finish_active(rescue_manager, rescue_program, rescue_seed);
+        rescue_program.required_pressure_actions         = 1;
+        rescue_program.include_cumulative_private_target = true;
+        rescue_program.required_action_id                = 5000U + rescue_seed.sequence.id;
+        rescue_program.refuse_maximal_targets            = true;
+        bool rescue_threw                                = false;
+        try {
+            auto rescue_inspection =
+                rescue_manager.inspect(rescue_program, FakePreparedPrompt{32}, make_base(32), 2);
+            if (rescue_inspection.choice.has_value()) {
+                (void)rescue_manager.reserve_materialization(rescue_program,
+                                                             std::move(*rescue_inspection.choice),
+                                                             FakePreparedPrompt{32}, {});
+            }
+        } catch (const std::exception&) {
+            rescue_threw = true;
+        }
+        RuntimeStats rescue_stats;
+        rescue_manager.populate_runtime_stats(rescue_program, rescue_stats);
+
+        require(rescue_program.maximal_target_calls > 0,
+                "THE RESCUE BRANCH WAS NOT REACHED, so this arm measures the scenario and not the "
+                "change -- `maximal_target` was never called");
+        require(!rescue_threw,
+                "A FULL TARGET ARENA THREW FROM THE RESCUE BRANCH: this is the 2026-09-28 HTTP 500 plus "
+                "worker recovery, and the rescue is the call site that must degrade instead");
+        require(rescue_stats.pressure_target_arena_truncations > 0,
+                "the rescue branch's truncation was not counted, so a capacity ceiling that stops the "
+                "search reads exactly like a healthy short search");
+    }
 }
 
 void test_two_owners_jointly_close_pressure() {
@@ -2787,6 +3560,103 @@ void test_materialization_result_is_adopted_by_owner_identity() {
     }
 }
 
+// A FULL TARGET ARENA MUST DEGRADE, NOT THROW -- and this is the case that can fail.
+//
+// WHY IT EXISTS. The 2026-09-28 abort was `intern_target` throwing `std::length_error` when the pressure
+// planner filled its 4096-target arena; the journal reported it as `WORKER RECOVER: pressure target arena
+// is full [target-count]` and the client saw an HTTP 500 on top of a worker recovery, on EVERY tree
+// (including the pre-change control), which made the e2e's phase 1 unreachable. The first version of the
+// fix was believed tested by a run that PASSED; it passed without reaching the bound, which is not a test.
+// Then a host test asserting the graceful path was written, its denominator showed it never reached the
+// branch, and it was DELETED rather than kept green -- correctly, but that left the path uncovered, which
+// a review then demonstrated with mutants: re-throwing instead of breaking, dropping the flag, dropping the
+// counter increment and dropping the JSON key ALL survived the suite.
+//
+// WHAT IT PINS, in one run of the construction path (the one that fired in production):
+//   * the request still produces a plan -- no throw, which is the whole point;
+//   * `pressure_target_arena_truncations` INCREMENTS, so a capacity ceiling is counted and not silently
+//     read as the search's own budget (`search_budget_exhaustions` must NOT move, which is the separation
+//     the two counters exist for);
+//   * and it prints both denominators, so "the branch was reached" is asserted rather than assumed.
+void test_target_arena_bound_degrades_instead_of_throwing() {
+    const auto run = [](bool refuse) {
+        constexpr std::size_t owner_count = 7;
+        FakeManager manager               = make_manager(1, owner_count + 1U);
+        FakeProgram program;
+        for (std::size_t index = 0; index < owner_count; ++index) {
+            const std::uint32_t content = static_cast<std::uint32_t>(70U + index);
+            const ActiveRequest active =
+                start_active(manager, program, content, make_base(content), index + 1U);
+            (void)finish_active(manager, program, active);
+        }
+        program.required_pressure_actions     = 3;
+        program.private_pressure_alternatives = 4;
+        program.pressure_assessment_delay_us  = 2'000;
+        program.refuse_construction_targets   = refuse;
+        // `Inspection` is not movable, so the facts are taken inside the try rather than the object kept.
+        // THE RESERVE IS THE POINT: `observe_planner_diagnostics` -- the only place the planner's
+        // diagnostics reach the counters -- runs during `reserve_materialization`, not during `inspect`.
+        // A test that only inspects reports the counter as zero whatever the planner did.
+        bool threw   = false;
+        bool planned = false;
+        try {
+            auto inspection = manager.inspect(program, FakePreparedPrompt{90}, make_base(90), 20);
+            planned         = inspection.choice.has_value();
+            if (planned) {
+                // NOT `abort_start`: an aborted reserve returns BEFORE `observe_planner_diagnostics`,
+                // which is the only path from the planner's diagnostics to the counters -- so an
+                // aborting arm would read zero however the planner behaved.
+                (void)manager.reserve_materialization(program, std::move(*inspection.choice),
+                                                      FakePreparedPrompt{90}, {});
+            }
+        } catch (const std::exception&) {
+            threw = true;
+        }
+        RuntimeStats stats;
+        manager.populate_runtime_stats(program, stats);
+        return std::make_tuple(threw, planned, stats.pressure_target_arena_truncations,
+                               stats.pressure_search_budget_exhaustions,
+                               program.construction_target_calls);
+    };
+
+    auto [control_threw, control_planned, control_trunc, control_budget, control_calls] = run(false);
+    auto [refused_threw, refused_planned, refused_trunc, refused_budget, refused_calls] = run(true);
+
+    // THE DENOMINATORS FIRST: without these a scenario that never walks the path reports the same zeroes
+    // as a graceful stop, and the assertions below would measure the scenario instead of the change.
+    require(control_calls > 0 && refused_calls > 0,
+            "THE CONSTRUCTION PATH WAS NEVER WALKED: `construction_target` was not called, so this test "
+            "would report a graceful stop that never had a chance to be otherwise");
+    require(control_trunc == 0,
+            "the CONTROL arm truncated the arena: with the refusal knob off nothing should report a "
+            "capacity ceiling, so this run cannot serve as a baseline");
+    require(!control_threw && control_planned,
+            "the control arm of the truncation test produced no admission plan at all");
+
+    require(!refused_threw,
+            "A FULL TARGET ARENA THREW: this is the 2026-09-28 HTTP 500 plus worker recovery -- the bound "
+            "must truncate the search and let the request continue, not raise");
+    if (!(refused_trunc > control_trunc)) {
+        std::fprintf(stderr, "[diag] control_trunc=%llu refused_trunc=%llu control_calls=%u refused_calls=%u "
+                             "refused_planned=%d control_planned=%d\n",
+                     (unsigned long long)control_trunc, (unsigned long long)refused_trunc,
+                     control_calls, refused_calls, (int)refused_planned, (int)control_planned);
+    }
+    require(refused_trunc > control_trunc,
+            "the truncation was NOT counted: with the arena refusing new targets, "
+            "pressure_target_arena_truncations must exceed the control's -- an arena ceiling that stops the "
+            "search without a counter reads exactly like a healthy short search");
+    // THE TWO COUNTERS PARTITION THE STOPS; THEY MUST NOT OVERLAP. Each arm makes ONE stop -- the
+    // control's by budget, the refused arm's by arena -- so the sums must be equal. A construction stop
+    // that set `budget_exhausted` as well (the first version did) would count the same event twice and
+    // read 2 here, which is exactly the conflation these two counters exist to prevent: "the search spent
+    // its own budget" is the DESIGNED stop, "no room for another target" is a CAPACITY CEILING, and a
+    // ceiling reported as a budget stop is how the 4096-target wall filled unnoticed.
+    require(refused_budget + refused_trunc == control_budget + control_trunc,
+            "a single stop was counted TWICE -- once as an arena ceiling and once as a budget exhaustion. "
+            "The two counters must partition the stops, not overlap");
+}
+
 void test_guided_pressure_reaches_deep_retention_before_maximal_fallback() {
     constexpr std::size_t owner_count = 7;
     FakeManager manager               = make_manager(1, owner_count + 1U);
@@ -2815,6 +3685,15 @@ void test_guided_pressure_reaches_deep_retention_before_maximal_fallback() {
         require(std::find(program.started_action_ids.begin(), program.started_action_ids.end(),
                           2000U + owner_id) == program.started_action_ids.end(),
                 "guided pressure search evicted a parked owner");
+    }
+    // THE MESSAGE CARRIES THE COUNT. It said only "returned to eager breadth-first assessment", so a
+    // failure could not distinguish 9 from 900 -- the number IS the diagnosis. Bound and actual are both
+    // printed, so the gap is visible in the failure rather than needing a re-run with a temporary print.
+    if (program.pressure_target_assessments > 8) {
+        std::cout << "    guided pressure search assessed " << program.pressure_target_assessments
+                  << " targets (bound 8, owners " << owner_count
+                  << ", required actions " << program.required_pressure_actions
+                  << ", alternatives " << program.private_pressure_alternatives << ")\n";
     }
     require(program.pressure_target_assessments <= 8,
             "guided pressure search returned to eager breadth-first assessment");
@@ -3373,9 +4252,13 @@ void test_complete_search_against_small_exhaustive_oracle() {
                     }
                     return std::nullopt;
                 };
-                std::uint64_t oracle = UINT64_MAX;
+                std::uint64_t oracle           = UINT64_MAX;
+                // The other half of the ranking: the oracle now minimises (restorable evictions, cost), the
+                // order `FoldedCost::key()` uses, so the pair needs a second accumulator.
+                std::uint32_t oracle_evictions = UINT32_MAX;
                 for (unsigned source = 0; source < 2; ++source) {
                     for (unsigned raw = 0; raw < 27; ++raw) {
+                        std::uint32_t evictions = 0;
                         unsigned digits = raw, relief = 0;
                         bool frees_slot = false, protects_source = true;
                         std::uint64_t cost                    = (source ? 100 : 800) * ms;
@@ -3389,6 +4272,18 @@ void test_complete_search_against_small_exhaustive_oracle() {
                             relief += choice;
                             if (choice == 2) {
                                 frees_slot = true;
+                                // THE POLICY THIS ORACLE ENCODES, and it changed under it (2026-09-27). The
+                                // operator's ruling is "evicting a victim that holds a restorable checkpoint
+                                // while the host has room is a defect", and `7746a98b` made the planner rank
+                                // RESTORABLE EVICTIONS ahead of cost. This oracle still chose the cheapest
+                                // plan, so it began failing on a configuration where the cheapest plan
+                                // evicts (912 ms, 1 eviction) while the best plan under the ruling does not
+                                // (1050 ms, 0). The planner picked 1050 -- the ruling, applied.
+                                //
+                                // So the oracle is updated to the policy rather than the case bent to go
+                                // green: in THIS test every chosen owner reports a restorable checkpoint, so
+                                // the count is simply the number of evicted owners.
+                                ++evictions;
                                 cost += drop[owner] +
                                         rebuild[owner] * weights[(owner + weight_rotation) % 3];
                             } else {
@@ -3402,7 +4297,13 @@ void test_complete_search_against_small_exhaustive_oracle() {
                             continue;
                         }
                         cost += rebuild[0] - remaining_public_saving;
-                        oracle = std::min(oracle, cost);
+                        // LEXICOGRAPHIC, the way `FoldedCost::key()` now is: fewer restorable evictions wins
+                        // outright, and cost decides among equals.
+                        if (evictions < oracle_evictions ||
+                            (evictions == oracle_evictions && cost < oracle)) {
+                            oracle_evictions = evictions;
+                            oracle           = cost;
+                        }
                     }
                 }
                 Planner planner;
@@ -3451,14 +4352,259 @@ void test_publication_only_pressure_constructs_adoptable_target() {
             "publication-only closure did not release exactly one private slot");
 }
 
+// Value-aware demote-vs-evict selection: when two private victims have DIFFERENT re-prefill
+// cost (endpoint rebuild_work) and device pressure forces one to demote-to-host and one to
+// evict-and-drop, the planner must demote the HIGHER-value victim (keep its restorable
+// checkpoint) and evict the cheaper one. The value weight is a property of the shared
+// materialization objective (the portfolio-value fold priced from checkpoint rebuild_ns), so
+// this drives the real MaterializationPlanner directly with two owners of distinct rebuild_ns
+// and gates feasibility through logical_goal to model the host-arena constraint.
+void test_value_aware_pressure_demotes_high_value_victim_over_eviction() {
+    using Planner = ninfer::runtime::MaterializationPlanner<FakeModelContract>;
+    constexpr std::uint64_t ms           = 1'000'000;
+    constexpr std::uint32_t weight       = 4;
+    constexpr std::uint64_t rebuild_high = 400 * ms;
+    constexpr std::uint64_t rebuild_low  = 40 * ms;
+    // Above both rebuild costs, so an evicted victim loses its full rebuild value in the
+    // portfolio fold while a retained/demoted victim (zero restore cost) loses nothing.
+    constexpr std::uint64_t recovery_cost = 1000 * ms;
+
+    // Owner 1 carries the high re-prefill value; owner 2 the low value.
+    const std::array<FakeContinuationHandle, 2> handles{
+        FakeContinuationHandle{1, 0},
+        FakeContinuationHandle{2, 0},
+    };
+    const std::array<const FakeContinuationHandle*, 2> owners{&handles[0], &handles[1]};
+    const std::array<PlanningOwnerId, 2> ids{
+        PlanningOwnerId{.value = 0},
+        PlanningOwnerId{.value = 1},
+    };
+    const std::array<ninfer::runtime::MaterializationOwnerPolicy, 2> policies{
+        ninfer::runtime::MaterializationOwnerPolicy{.owner                    = ids[0],
+                                                    .private_retention_weight = weight},
+        ninfer::runtime::MaterializationOwnerPolicy{.owner                    = ids[1],
+                                                    .private_retention_weight = weight},
+    };
+    const std::array<ninfer::runtime::MaterializationCheckpointPolicy, 2> checkpoints{
+        ninfer::runtime::MaterializationCheckpointPolicy{
+            .owner       = ids[0],
+            .checkpoint  = CheckpointRef{.kind     = CheckpointKind::SessionEndpoint,
+                                         .frontier = 16,
+                                         .ordinal  = 0},
+            .demand_mask = 1,
+            .rebuild_ns  = rebuild_high},
+        ninfer::runtime::MaterializationCheckpointPolicy{
+            .owner       = ids[1],
+            .checkpoint  = CheckpointRef{.kind     = CheckpointKind::SessionEndpoint,
+                                         .frontier = 16,
+                                         .ordinal  = 0},
+            .demand_mask = 1,
+            .rebuild_ns  = rebuild_low},
+    };
+    // Each owner can demote-to-host (preserve, one relief unit) or evict-and-drop (one relief
+    // unit). Both owners are touched under primary pressure; the host constraint decides the mix.
+    const std::vector<std::pair<std::uint32_t, std::vector<FakeTargetDecision>>> owner_decisions{
+        {1,
+         {{.id                  = 1000U + 1, .immediate_ns = 0, .degradation_units = 1},
+          {.id                  = 2000U + 1,
+           .immediate_ns        = 0,
+           .degradation_units   = 4,
+           .dropped_checkpoints = 1,
+           .evicts_continuation = true}}},
+        {2,
+         {{.id                  = 1000U + 2, .immediate_ns = 0, .degradation_units = 1},
+          {.id                  = 2000U + 2,
+           .immediate_ns        = 0,
+           .degradation_units   = 4,
+           .dropped_checkpoints = 1,
+           .evicts_continuation = true}}},
+    };
+    const auto inputs = [&]() -> Planner::PressureInputs {
+        return Planner::PressureInputs{
+            .private_owners    = owners,
+            .private_owner_ids = ids,
+            .shared_owners     = {},
+            .shared_owner_ids  = {},
+            .owner_policy      = policies,
+            .checkpoint_policy = checkpoints,
+        };
+    };
+
+    // Primary: host room holds exactly one demote, so one victim must evict. The value-aware
+    // objective must demote the high-value owner and evict the low-value owner.
+    {
+        FakeProgram program;
+        program.required_pressure_actions        = 2;
+        program.eviction_pressure_action_units   = 1;
+        program.pressure_action_immediate_ns     = 0;
+        program.pressure_checkpoint_recovery_ns  = recovery_cost;
+        program.owner_decisions                  = owner_decisions;
+
+        FakeAdmissionCandidate root;
+        set_fake_machine_costs(root.identity.machine_work, 100 * ms, 100 * ms);
+        root.identity.physical_status            =
+            ninfer::runtime::MaterializationPhysicalStatus::Infeasible;
+        root.identity.expandable                 = true;
+        root.identity.assessment_digest          = 7;
+        const std::array<Planner::CandidateInput, 1> candidates{
+            Planner::CandidateInput{.candidate        = &root,
+                                    .id               = PlanningCandidateId{.value = 0},
+                                    .stable_ordinal   = 0,
+                                    .current_session_binding = false},
+        };
+        const auto goal = [](PlanningCandidateId, PrivateSourceMode,
+                             std::span<const ninfer::runtime::PressureOwnerOutcome> outcomes)
+            -> std::optional<Planner::LogicalGoal> {
+            std::uint32_t evicted = 0;
+            for (const auto& outcome : outcomes) {
+                if (outcome.disposition == VictimDisposition::Evicted) { ++evicted; }
+            }
+            if (evicted == 0) { return std::nullopt; }  // host can't hold every demote
+            return Planner::LogicalGoal{.publication_slot = 0};
+        };
+        Planner planner;
+        auto allowance                      = ninfer::runtime::PlanningAllowance::boundary(0);
+        allowance.limit_ns                  = 100 * ms;
+        const auto result                   =
+            planner.plan(program, FakePreparedPrompt{}, test_cost_model(), candidates, 0, inputs,
+                         goal, Planner::Clock::now(), allowance);
+        require(result && result->plan,
+                "value-aware pressure search found no demote/evict closure");
+        const auto& plan = *result->plan;
+        require(plan.private_owner_ids.size() == 2 && plan.private_actions.size() == 2,
+                "value-aware pressure closure did not act on both victims");
+        std::uint64_t action_for_high = 0, action_for_low = 0;
+        for (std::size_t index = 0; index < plan.private_owner_ids.size(); ++index) {
+            if (plan.private_owner_ids[index] == 1) { action_for_high = plan.private_actions[index].id; }
+            if (plan.private_owner_ids[index] == 2) { action_for_low = plan.private_actions[index].id; }
+        }
+        require(action_for_high == 1000U + 1,
+                "planner evicted (or failed to demote) the HIGH-value victim instead of demoting it");
+        require(action_for_low == 2000U + 2,
+                "planner demoted the LOW-value victim and evicted a higher-value one");
+        // The evicted victim is the low-value owner, so the value-aware cost is the candidate
+        // immediate plus rebuild_low * retention_weight; the retained high-value owner keeps the
+        // public portfolio value, so it adds no future loss.
+        const std::uint64_t expected = 100 * ms + static_cast<std::uint64_t>(weight) * rebuild_low;
+        require(result->diagnostics.predicted_total_ns == expected,
+                "value-aware cost model mis-priced the demote-high/evict-low closure");
+    }
+
+    // Fallback: host is full (no demote successor), so the victim that must be sacrificed evicts.
+    // With relief = 1 the cheaper (low-value) victim evicts, preserving the value-aware outcome.
+    {
+        FakeProgram program;
+        program.required_pressure_actions        = 1;
+        program.eviction_pressure_action_units   = 1;
+        program.pressure_action_immediate_ns     = 0;
+        program.pressure_checkpoint_recovery_ns  = recovery_cost;
+        program.owner_decisions                  = owner_decisions;
+
+        FakeAdmissionCandidate root;
+        set_fake_machine_costs(root.identity.machine_work, 100 * ms, 100 * ms);
+        root.identity.physical_status            =
+            ninfer::runtime::MaterializationPhysicalStatus::Infeasible;
+        root.identity.expandable                 = true;
+        root.identity.assessment_digest          = 7;
+        const std::array<Planner::CandidateInput, 1> candidates{
+            Planner::CandidateInput{.candidate        = &root,
+                                    .id               = PlanningCandidateId{.value = 0},
+                                    .stable_ordinal   = 0,
+                                    .current_session_binding = false},
+        };
+        const auto goal = [](PlanningCandidateId, PrivateSourceMode,
+                             std::span<const ninfer::runtime::PressureOwnerOutcome> outcomes)
+            -> std::optional<Planner::LogicalGoal> {
+            std::uint32_t evicted = 0;
+            for (const auto& outcome : outcomes) {
+                if (outcome.disposition == VictimDisposition::Evicted) { ++evicted; }
+            }
+            if (evicted == 0) { return std::nullopt; }  // host full: a demote is impossible
+            return Planner::LogicalGoal{.publication_slot = 0};
+        };
+        Planner planner;
+        auto allowance                      = ninfer::runtime::PlanningAllowance::boundary(0);
+        allowance.limit_ns                  = 100 * ms;
+        const auto result                   =
+            planner.plan(program, FakePreparedPrompt{}, test_cost_model(), candidates, 0, inputs,
+                         goal, Planner::Clock::now(), allowance);
+        require(result && result->plan, "full-host pressure search found no evicting closure");
+        const auto& plan = *result->plan;
+        require(plan.private_owner_ids.size() == 1,
+                "full-host closure evicted more than the one required victim");
+        require(plan.private_owner_ids[0] == 2 && plan.private_actions[0].id == 2000U + 2,
+                "full-host closure did not evict the cheaper (low-value) victim");
+        // Same value-aware pricing as the primary closure: the sacrificed victim is the
+        // low-value owner, so the cost is the candidate immediate plus rebuild_low * weight.
+        const std::uint64_t expected = 100 * ms + static_cast<std::uint64_t>(weight) * rebuild_low;
+        require(result->diagnostics.predicted_total_ns == expected,
+                "full-host closure was not priced as a low-value eviction");
+    }
+}
+
+// Deterministic check of the REAL value-aware victim ranking that populate_options charges
+// to the evict cost: the highest re-prefill-cost private victim gets the highest
+// value_weight (so the planner demotes it to host), the cheapest gets 0 (so it is evicted),
+// and shared victims are always weight 0. This drives pressure_value_ranking.h directly —
+// the exact function the production planner calls — with no GPU/program, so the
+// demote-high/evict-low choice is reproducible on demand (unlike the e2e pressure search,
+// a rare timing race).
+void test_value_weights_rank_private_victims_by_rebuild_cost() {
+    using ninfer::models::qwen3_5::detail::value_weights_for_victims;
+
+    // Costs: A=high, B=low, C=mid, D=shared. Expected weights: A=3, B=0, C=1, D=0.
+    {
+        const std::array<std::uint8_t, 4> is_shared  = {0, 0, 0, 1};
+        const std::array<std::uint64_t, 4> cost      = {9000, 100, 5000, 0};
+        const auto weights                           = value_weights_for_victims(is_shared, cost);
+        require(weights.size() == 4, "weight vector size mismatch");
+        // 3 non-shared victims -> ranks are 0..2; the highest cost takes the top rank (2).
+        require(weights[0] == 2, "high-cost private victim did not get the top rank");
+        require(weights[1] == 0, "lowest-cost private victim did not get rank 0");
+        require(weights[2] == 1, "mid-cost private victim did not get rank 1");
+        require(weights[3] == 0, "shared victim must stay weight 0");
+    }
+
+    // All shared -> all weights 0 (nothing to rank).
+    {
+        const std::array<std::uint8_t, 2> is_shared  = {1, 1};
+        const std::array<std::uint64_t, 2> cost      = {123, 456};
+        const auto weights                           = value_weights_for_victims(is_shared, cost);
+        require(weights[0] == 0 && weights[1] == 0, "all-shared victims must all be weight 0");
+    }
+
+    // Ties are deterministic (the victim index breaks them): equal costs keep ascending order.
+    {
+        const std::array<std::uint8_t, 3> is_shared  = {0, 0, 0};
+        const std::array<std::uint64_t, 3> cost      = {7, 7, 7};
+        const auto weights                           = value_weights_for_victims(is_shared, cost);
+        require(weights[0] == 0 && weights[1] == 1 && weights[2] == 2,
+                "equal-cost victims must keep deterministic ascending order");
+    }
+
+    // Empty: no victims, no weights.
+    {
+        const std::array<std::uint8_t, 0> is_shared  = {};
+        const std::array<std::uint64_t, 0> cost      = {};
+        const auto weights                           = value_weights_for_victims(is_shared, cost);
+        require(weights.empty(), "no victims -> no weights");
+    }
+}
+
 
 } // namespace
 
 int main() {
     run_test("independent complete-target oracle",
              test_complete_search_against_small_exhaustive_oracle);
+    run_test("unplannable request with no active lane is permanently infeasible",
+             test_unplannable_request_with_no_active_lane_is_permanently_infeasible);
     run_test("publication-only construction",
              test_publication_only_pressure_constructs_adoptable_target);
+    run_test("value-aware demotes high-value victim over eviction",
+             test_value_aware_pressure_demotes_high_value_victim_over_eviction);
+    run_test("value-aware ranking of private victims by rebuild cost",
+             test_value_weights_rank_private_victims_by_rebuild_cost);
     run_test("private checkpoint identity loss",
              test_private_portfolio_loss_keeps_checkpoint_identity_fixed);
     run_test("portfolio demand and owner aggregation", test_portfolio_demand_and_owner_aggregation);
@@ -3477,6 +4623,14 @@ int main() {
     run_test("dominating identity fast path",
              test_dominating_identity_does_not_build_pressure_graph);
     run_test("root lifecycle and prefix reuse", test_root_lifecycle_and_prefix_reuse);
+    run_test("session erase counters are wired", test_session_erase_counters_are_wired);
+    run_test("session erase counts an eviction as eviction",
+             test_session_erase_counts_an_eviction_as_eviction);
+    run_test("host state census counts unanchored checkpoints",
+             test_host_state_census_counts_unanchored_checkpoints);
+    run_test("session endpoint reason is per frontier", test_session_endpoint_reason_is_per_frontier);
+    run_test("prefix split diagnostics follow the catalog",
+             test_prefix_split_diagnostics_follow_catalog);
     run_test("stale revision is retryable", test_stale_revision_is_retryable);
     run_test("materialization abort preserves source", test_materialization_abort_preserves_source);
     run_test("committed victim survives abort", test_committed_victim_survives_transaction_abort);
@@ -3500,6 +4654,7 @@ int main() {
              test_materialization_result_is_adopted_by_owner_identity);
     run_test("guided deep retention",
              test_guided_pressure_reaches_deep_retention_before_maximal_fallback);
+    run_test("target arena degrades", test_target_arena_bound_degrades_instead_of_throwing);
     run_test("combined target exact repricing",
              test_combined_target_reprices_cancelled_pressure_copy);
     run_test("in-progress and capture", test_in_progress_adoption_and_private_capture);
@@ -3525,7 +4680,10 @@ int main() {
     run_test("backfill proof and stats", test_backfill_proof_and_stats_follow_program_revision);
     run_test("shortlist exact verification",
              test_shortlist_collision_requires_program_exact_verification);
-    if (failures != 0) { return 1; }
-    std::cout << "ok\n";
+    if (failures != 0) {
+        std::cout << tests_run << " run, " << failures << " failed\n";
+        return 1;
+    }
+    std::cout << "ok (" << tests_run << " cases)\n";
     return 0;
 }

@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdio>
+#include <cstdlib>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -510,6 +512,13 @@ bool ProgramImpl::physical_peak_fits(detail::PhysicalResources peak) const noexc
                     limits.device.backend_kv_pages) &&
            fits_u32(occupied.host.state_slots, peak.host.state_slots, limits.host.state_slots) &&
            fits_size(occupied.host.kv_bytes, peak.host.kv_bytes, limits.host.kv_bytes);
+    // NO cross-dimension sum check, and that is deliberate: it existed in the first version of this change
+    // and was DEAD CODE. Both consumers do share one pool, but each axis is checked against a capacity its
+    // own consumer already owns, so `o_s+p_s <= L_s && o_k+p_k <= L_k` implies the weighted sum -- the extra
+    // check could never fail, and its stated rationale ("a proof can pass and the allocation then throw")
+    // was false. Removed rather than kept as reassurance. What WOULD be a real check is comparing the peak
+    // against pool capacity PLUS growable room, which needs the growth policy's answer at planning time; that
+    // is not this change.
 }
 
 StateImageHandle
@@ -748,6 +757,87 @@ ProgramImpl::checkpoint_summary(const SequenceState& sequence, runtime::Checkpoi
     const std::uint32_t identity_tag = static_cast<std::uint32_t>(speculative_backend) |
                                        (static_cast<std::uint32_t>(proposal_head) << 8U) |
                                        (static_cast<std::uint32_t>(kv_storage) << 16U);
+    if (std::getenv("NINFER_MAT_DEBUG") && checkpoint.kind == runtime::CheckpointKind::SessionEndpoint) {
+        const std::size_t F = checkpoint.frontier;
+        const auto& pid     = sequence.prefix_identity;
+        const auto& tt      = pid.token_types();
+        const auto& pos     = pid.positions(0);
+        std::fprintf(stderr, "[csum] frontier=%u rope=%d tt0=%u tt1=%u tt2=%u ",
+                     checkpoint.frontier, sequence.rope_delta,
+                     tt.empty() ? 0U : tt[0], tt.size() > 2 ? tt[1] : 0U,
+                     tt.size() > 2 ? tt[2] : 0U);
+        std::fprintf(stderr, "pos00=%d pos01=%d pos02=%d ", pos.size() > 0 ? pos[0] : 0,
+                     pos.size() > 1 ? pos[1] : 0, pos.size() > 2 ? pos[2] : 0);
+        if (F >= 3 && pos.size() >= F) {
+            std::fprintf(stderr, "posFm3=%d posFm2=%d posFm1=%d ", pos[F - 3], pos[F - 2],
+                         pos[F - 1]);
+        }
+        std::fprintf(stderr, "rw_n=%zu led_n=%zu", pid.rewrite_frontiers().size(),
+                     sequence.ledger.size());
+        if (sequence.ledger.size() > 2) {
+            std::fprintf(stderr, " tok0=%u tok1=%u tok2=%u", sequence.ledger[0],
+                         sequence.ledger[1], sequence.ledger[2]);
+        }
+        if (F >= 3 && sequence.ledger.size() >= F) {
+            std::fprintf(stderr, " tokFm3=%u tokFm2=%u tokFm1=%u", sequence.ledger[F - 3],
+                         sequence.ledger[F - 2], sequence.ledger[F - 1]);
+        }
+        if (F < sequence.prefix_digests.size()) {
+            const auto d = sequence.prefix_digests.at(F);
+            std::fprintf(stderr, " d=%lx,%lx", d[0], d[1]);
+        }
+        // Full rewrite-execution-frontier list dump (NINFER_MAT_FRONT): the digest's only
+        // remaining input after token/pos/type are byte-stable. Dumps the stored list so it
+        // can be diffed element-for-element against the incoming [frontiers] (request_plan).
+        if (std::getenv("NINFER_MAT_FRONT")) {
+            std::fprintf(stderr, " FRONT n=%zu [", pid.rewrite_frontiers().size());
+            for (const auto rf : pid.rewrite_frontiers()) { std::fprintf(stderr, "%u ", rf); }
+            std::fprintf(stderr, "]");
+        }
+        // Grid digest+token trace: mirrors the [digest] GRID so a stored endpoint can be
+        // compared position-by-position against the incoming re-render (NINFER_MAT_GRID).
+        if (std::getenv("NINFER_MAT_GRID")) {
+            std::fprintf(stderr, " GRID");
+            for (std::uint32_t f = 0; f < F; f += 64) {
+                if (f >= sequence.prefix_digests.size()) { break; }
+                const auto d = sequence.prefix_digests.at(f);
+                std::fprintf(stderr, " g%u=%u:%lx", f, sequence.ledger[f], d[0]);
+            }
+            std::fprintf(stderr, "\n");
+            std::fflush(stderr);
+        }
+        // Per-token dump of the response tail (last 50 ledger tokens) so the exact
+        // divergent token vs the incoming re-render can be diffed (NINFER_MAT_TAIL).
+        if (std::getenv("NINFER_MAT_FINE")) {
+            const std::uint32_t lo = F > 256 ? static_cast<std::uint32_t>(F - 256) : 0;
+            std::fprintf(stderr, "[fine] F=%zu ", F);
+            for (std::uint32_t f = lo; f < F && f < sequence.prefix_digests.size(); ++f) {
+                const auto d = sequence.prefix_digests.at(f);
+                std::fprintf(stderr, " %u=%lx:%lx", f, d[0], d[1]);
+            }
+            std::fprintf(stderr, "\n");
+            std::fflush(stderr);
+        }
+        if (std::getenv("NINFER_MAT_TAIL")) {
+            const std::uint32_t lo = F > 50 ? static_cast<std::uint32_t>(F - 50) : 0;
+            const auto& p0 = pid.positions(0);
+            const auto& p1 = pid.positions(1);
+            const auto& p2 = pid.positions(2);
+            const auto& ttv = pid.token_types();
+            std::fprintf(stderr, "[tail] F=%zu ", F);
+            for (std::uint32_t f = lo; f < F && f < sequence.ledger.size(); ++f) {
+                std::fprintf(stderr, "%u:p0=%d,p1=%d,p2=%d,tt=%u,t=%u ",
+                             f, f < p0.size() ? p0[f] : -1, f < p1.size() ? p1[f] : -1,
+                             f < p2.size() ? p2[f] : -1,
+                             f < ttv.size() ? static_cast<unsigned>(ttv[f]) : -1,
+                             sequence.ledger[f]);
+            }
+            std::fprintf(stderr, "\n");
+            std::fflush(stderr);
+        }
+        std::fprintf(stderr, "\n");
+        std::fflush(stderr);
+    }
     return qwen3_5::CheckpointSummary{
         .ref   = checkpoint,
         .scope = runtime::CheckpointScope::Private,
@@ -1074,6 +1164,59 @@ bool ProgramImpl::state_exclusive_to_sequence(const SequenceState& sequence,
 }
 
 void ProgramImpl::refresh_state_views(SequenceState& sequence) {
+    // Cross-lane slot audit (NINFER_MAT_DEBUG=1): two concurrently non-terminal lanes
+    // naming the same physical StateImage slot is the cross-session bleed signature --
+    // agent-found hazard: cached views/state bindings keyed by physical slot are only
+    // refreshed by convention, and a shared-prefix fork hands slots between lanes.
+    if (std::getenv("NINFER_MAT_DEBUG") != nullptr) {
+        const auto device_slot = [&](const StateImageHandle& handle) -> std::int32_t {
+            if (!state_store->valid(handle) ||
+                state_store->residency(handle) == StateReplicaResidency::HostOnly) {
+                return -1;
+            }
+            return state_store->physical_slot(handle);
+        };
+        const std::int32_t read_slot    = device_slot(sequence.state.read);
+        const std::int32_t write_slot   = device_slot(sequence.state.write);
+        const std::int32_t rewrite_slot = sequence.rewrite_state ? device_slot(*sequence.rewrite_state) : -1;
+        std::fprintf(stderr,
+                     "[mat-debug] STATE-VIEW lane=%u read_slot=%d write_slot=%d rewrite_slot=%d "
+                     "fork_pending=%d exec_frontier=%u\n",
+                     sequence.lane, read_slot, write_slot, rewrite_slot,
+                     sequence.state.fork_pending ? 1 : 0, sequence.execution_frontier);
+        std::fflush(stderr);
+    }
+    // Deterministic cross-lane slot invariant (NINFER_MAT_DEBUG=1): a physical StateImage
+    // slot must never be named by two lanes at once. Interleaved printouts cannot prove
+    // simultaneity, so check it here, where the whole lane set is visible.
+    if (std::getenv("NINFER_MAT_DEBUG") != nullptr) {
+        // physical_slot() throws for a HostOnly image (no device replica); the audit must
+        // never change engine behaviour, so skip those.
+        const auto device_slot_of = [&](const StateImageHandle& handle) -> std::int32_t {
+            if (!state_store->valid(handle) ||
+                state_store->residency(handle) == StateReplicaResidency::HostOnly) {
+                return -1;
+            }
+            return state_store->physical_slot(handle);
+        };
+        const auto slot_of = [&](const SequenceState& other) -> std::int32_t {
+            const std::int32_t w = device_slot_of(other.state.write);
+            return w >= 0 ? w : device_slot_of(other.state.read);
+        };
+        const std::int32_t mine = slot_of(sequence);
+        if (mine >= 0) {
+            for (const SequenceState& other : continuation_states) {
+                if (&other == &sequence || other.lane == sequence.lane) { continue; }
+                if (slot_of(other) == mine) {
+                    std::fprintf(stderr,
+                                 "[mat-debug] SLOT-CLASH lane=%u other_lane=%u slot=%d "
+                                 "(both lanes name the same StateImage)\n",
+                                 sequence.lane, other.lane, mine);
+                    std::fflush(stderr);
+                }
+            }
+        }
+    }
     sequence.tail_hidden               = {};
     sequence.rewrite_checkpoint_hidden = {};
     if (state_store->valid(sequence.state.read) && state_store->valid(sequence.state.write) &&
@@ -1291,17 +1434,26 @@ void ProgramImpl::release_sequence_state(SequenceState& sequence) noexcept {
     } catch (...) {}
 
     const auto releasable = [&](StateImageHandle handle) { return state_store->valid(handle); };
-    if (releasable(sequence.state.write)) { (void)state_store->release(sequence.state.write); }
+    // Ask the store WHY, before releasing: a false at the gate means the image is still owned (by a
+    // checkpoint or a fork pin); a false with the gate passed means the HOST release failed, which is the
+    // shape that can strand a slot. Querying before the attempt is what makes those two distinguishable.
+    const auto release_or_note = [&](const char* what, StateImageHandle handle) {
+        const auto blocker = state_store->release_blocker(handle);
+        if (!state_store->release(handle)) {
+            note_nonstrict_release_refusal(what, state_store->release_blocker_name(blocker));
+        }
+    };
+    if (releasable(sequence.state.write)) { release_or_note("state-write", sequence.state.write); }
     if (!sequence.state.read_has_external_owner() && sequence.state.read != sequence.state.write &&
         releasable(sequence.state.read)) {
-        (void)state_store->release(sequence.state.read);
+        release_or_note("state-read", sequence.state.read);
     }
     if (sequence.rewrite_state) {
         const StateImageHandle handle = *sequence.rewrite_state;
         const bool duplicates_binding =
             handle == sequence.state.write ||
             (!sequence.state.read_has_external_owner() && handle == sequence.state.read);
-        if (!duplicates_binding && releasable(handle)) { (void)state_store->release(handle); }
+        if (!duplicates_binding && releasable(handle)) { release_or_note("state-rewrite", handle); }
     }
     for (std::size_t index = 0; index < sequence.long_anchors.size(); ++index) {
         const StateImageHandle handle = sequence.long_anchors[index].state;
@@ -1312,7 +1464,9 @@ void ProgramImpl::release_sequence_state(SequenceState& sequence) noexcept {
         for (std::size_t previous = 0; !duplicate && previous < index; ++previous) {
             duplicate = sequence.long_anchors[previous].state == handle;
         }
-        if (!duplicate && releasable(handle)) { (void)state_store->release(handle); }
+        if (!duplicate && releasable(handle) && !state_store->release(handle)) {
+            note_nonstrict_release_refusal("state-long-anchor");
+        }
     }
     if (sequence.reserved_state) {
         const StateImageHandle handle = *sequence.reserved_state;
@@ -1323,7 +1477,9 @@ void ProgramImpl::release_sequence_state(SequenceState& sequence) noexcept {
         for (const LongAnchorCheckpoint& anchor : sequence.long_anchors) {
             duplicate = duplicate || anchor.state == handle;
         }
-        if (!duplicate && releasable(handle)) { (void)state_store->release(handle); }
+        if (!duplicate && releasable(handle) && !state_store->release(handle)) {
+            note_nonstrict_release_refusal("state-long-anchor");
+        }
     }
     sequence.state          = {};
     sequence.rewrite_state  = std::nullopt;
@@ -1378,6 +1534,13 @@ void ProgramImpl::resize_sequence_kv_entitlement(SequenceState& sequence, std::u
     }
 }
 
+std::pair<std::int32_t, std::int32_t> ProgramImpl::bound_kv_rows(
+    const SequenceState& sequence) const {
+    if (!sequence.kv) { throw std::logic_error("KV allocation bundle is unavailable"); }
+    return {text_kv_addresses->bound_row(sequence.kv->text),
+            sequence.kv->backend ? backend_kv_addresses->bound_row(*sequence.kv->backend) : 0};
+}
+
 void ProgramImpl::bind_sequence_kv(SequenceState& sequence) {
     if (!sequence.kv) { throw std::logic_error("KV allocation bundle is unavailable"); }
     const std::int32_t row = static_cast<std::int32_t>(sequence.lane);
@@ -1397,10 +1560,16 @@ void ProgramImpl::bind_sequence_kv(SequenceState& sequence) {
                     backend_kv_addresses->mapped_pages(*sequence.kv->backend), row);
             }
         }
-        set_device_i32(io.text_kv_table_row, text_kv_addresses->bound_row(sequence.kv->text));
-        set_device_i32(io.backend_kv_table_row,
-                       sequence.kv->backend ? backend_kv_addresses->bound_row(*sequence.kv->backend)
-                                            : 0);
+        const std::pair<std::int32_t, std::int32_t> rows = bound_kv_rows(sequence);
+        set_device_i32(io.text_kv_table_row, rows.first);
+        set_device_i32(io.backend_kv_table_row, rows.second);
+        // W1-A: remember what the two scalars now name. Recorded only on the success path, after
+        // both writes have settled (`set_device_i32` syncs the stream). Note the one gap a review
+        // found in the claim this comment used to make: if the text write succeeds and the backend
+        // write throws, the device holds a new text row while the record still holds the old pair --
+        // the rollback cannot undo a completed device write. That path is CUDA-fatal, so it is not
+        // reachable in practice, but the comment should not state an invariant the code lacks.
+        kv_row_binding_.bind(sequence.lane, rows.first, rows.second);
     } catch (...) {
         if (!text_active) {
             if (sequence.kv->backend && backend_kv_addresses->active(*sequence.kv->backend)) {
@@ -1412,6 +1581,35 @@ void ProgramImpl::bind_sequence_kv(SequenceState& sequence) {
         }
         throw;
     }
+}
+
+void ProgramImpl::release_kv_row_binding(std::uint32_t lane) noexcept {
+    // W1-A: release this lane's ownership -- attributed to the lane, because another lane's binding
+    // is what the record may legitimately hold while *this* one releases (lane-end paths run for one
+    // lane at a time), and clearing it wholesale made that other lane's next observation count as a
+    // foreign rebind it never had.
+    kv_row_binding_.clear(lane);
+    // The only emission that can report a run's cumulative totals: every per-step print is
+    // rate-limited by design, so without a line at a lane's end the last figure anyone can read is
+    // whatever the schedule happened to stop at -- which is how a capped value came to be quoted as
+    // a run total.
+    //
+    // How to read it, because the label alone is not enough: the counters are monotone and
+    // process-wide, each line reports the totals *at that release*, and the lines are emitted
+    // repeatedly during a run (once per request end, plus once per slot torn down at shutdown, where
+    // `lane` is the slot's stale last lane). **The run total is the last line before exit, and it is
+    // only a run total if it follows the run's last `req# ... done`.** An earlier version of this
+    // line was labelled FINAL, which invited reading the first one -- and a review caught exactly
+    // that.
+    std::fprintf(stderr,
+                 "[kv-binding] LANE-RELEASE lane=%u checks=%llu diverged=%llu unverifiable=%llu "
+                 "foreign=%llu/%llu\n",
+                 lane, static_cast<unsigned long long>(kv_row_binding_.verified_readings()),
+                 static_cast<unsigned long long>(kv_row_binding_.diverged_readings()),
+                 static_cast<unsigned long long>(kv_row_binding_.unverifiable_readings()),
+                 static_cast<unsigned long long>(kv_row_binding_.foreign_observations()),
+                 static_cast<unsigned long long>(kv_row_binding_.total_observations()));
+    std::fflush(stderr);
 }
 
 void ProgramImpl::unbind_sequence_kv(SequenceState& sequence) noexcept {
@@ -1426,6 +1624,7 @@ void ProgramImpl::unbind_sequence_kv(SequenceState& sequence) noexcept {
             text_kv_addresses->deactivate(sequence.kv->text);
         }
     } catch (...) {}
+    release_kv_row_binding(sequence.lane);
 }
 
 void ProgramImpl::ensure_sequence_kv_mapped(SequenceState& sequence, std::uint32_t main_tokens,
@@ -1494,6 +1693,10 @@ void ProgramImpl::release_active_sequence_kv_strict(SequenceState& sequence) noe
     if (!text_kv_addresses->release_after_deactivate(sequence.kv->text)) { std::terminate(); }
     sequence.kv.reset();
     if (host_kv_extents) { (void)host_kv_extents->release_unreferenced(); }
+    // W1-A: a non-publishing finish frees this lane's KV through here and never unbinds, so without
+    // this call it released ownership silently -- a review found the seam by noticing that the
+    // teardown lines could not account for every lane end.
+    release_kv_row_binding(sequence.lane);
 }
 
 void ProgramImpl::release_sequence_kv_strict(SequenceState& sequence) noexcept {
@@ -1510,15 +1713,157 @@ void ProgramImpl::release_sequence_kv_strict(SequenceState& sequence) noexcept {
     if (!text_kv_addresses->release(sequence.kv->text)) { std::terminate(); }
     sequence.kv.reset();
     if (host_kv_extents) { (void)host_kv_extents->release_unreferenced(); }
+    release_kv_row_binding(sequence.lane);
+}
+
+void ProgramImpl::note_nonstrict_release_refusal(const char* what, const char* blocker) noexcept {
+    if (++nonstrict_release_refusals_ <= 8ULL || nonstrict_release_refusals_ % 512ULL == 0ULL) {
+        // It used to read "a leak of the #9 shape" for every refusal. That word was wrong for three of the
+        // five blockers: with a checkpoint reference or a fork pin holding the image, the slot is OWNED,
+        // so the release was premature and nothing was stranded. Naming the blocker is what separates a
+        // by-design refusal from the two shapes that can actually strand a slot.
+        std::fprintf(stderr,
+                     "[engine] non-strict release REFUSED (%s, blocker=%s): the caller dropped its handle "
+                     "and the store did not free the image. count=%llu\n",
+                     what,
+                     blocker != nullptr ? blocker
+                                       : "unclassified (this call site holds no state store to ask)",
+                     static_cast<unsigned long long>(nonstrict_release_refusals_));
+        std::fflush(stderr);
+    }
+}
+
+void ProgramImpl::maintain_host_memory(std::size_t retain_bytes) noexcept {
+    if (pinned_host_pool == nullptr) { return; }
+    // THE STREAM GATE, and it is the whole reason this is a separate step: a chunk can hold no live
+    // allocation while a D2H/H2D copy onto it is still in flight, and unpinning then is a use-after-free.
+    // Conservative: skip this round rather than wait for the stream.
+    if (device.transfer_stream != nullptr && cudaStreamQuery(device.transfer_stream) != cudaSuccess) {
+        return;
+    }
+    // Give back trailing idle slots first; their pool extents then become free, which is what lets a chunk
+    // go idle. Order matters: the pool can only unpin a chunk that holds NOTHING.
+    // The FLOOR is the configured slot count, and it is what keeps `admission_capacity()` from dropping
+    // below the count the operator asked for. The state pool IS pre-grown at planning time now
+    // (`ensure_host_state_headroom`, §3 item 6) -- the IN-SEARCH pre-grow is what was removed, not growth
+    // from the planner's path -- but a pre-grow happens before a plan is priced, so it is no substitute for
+    // this floor: without the floor a trim could leave the next plan with less room than the configuration
+    // promises, and nothing would put it back before that plan is priced.
+    if (host_state_images != nullptr) {
+        (void)host_state_images->trim_idle_slots(context_cache.host_state_slots);
+    }
+    // Then unpin idle chunks, keeping `retain_bytes` of room so a demote that just succeeded cannot
+    // immediately lose its room and force the next one to grow again -- growth/shrink thrash.
+    while (pinned_host_pool->free_bytes() > retain_bytes && pinned_host_pool->shrink_idle()) {
+    }
+}
+
+void ProgramImpl::ensure_host_kv_headroom() noexcept {
+    if (host_kv_arena == nullptr || host_kv_extents == nullptr || pinned_host_pool == nullptr) { return; }
+    // SEE `HostKVExtentStore::HostKVPreGrow`. Mirrors `ensure_host_state_headroom` directly below/beside it:
+    // once per planning session, OUTSIDE the search, because growth pins real memory and reads
+    // /proc/meminfo -- the state axis records that an earlier version ran inside the search and was removed.
+    //
+    // Refresh the budget reading first, so the headroom the search will consult is this session's rather
+    // than the last growth's. `refresh_reading` is the non-counting reader: `allow_with(reading, 0)` would
+    // count a `NothingWanted` refusal and corrupt `refusals()`.
+    host_memory_budget->refresh_reading();
+    // WHY the trigger is about to fire, taken BEFORE the growth changes the arena: free bytes still
+    // available means this is FRAGMENTATION rather than exhaustion, which is the expensive case (the arena
+    // holds space, just not one step-sized run) and the one whose frequency decides whether this trigger is
+    // affordable. Read here, not after, because growth adds a span and would make every firing look like
+    // exhaustion.
+    const bool fragmented = host_kv_arena->free_bytes() != 0U &&
+                            host_kv_arena->largest_free_run_bytes() < host_kv_arena->span_step_bytes();
+    switch (HostKVExtentStore::pre_grow(*host_kv_arena, *host_kv_extents)) {
+    case HostKVExtentStore::HostKVPreGrow::Disabled:
+    case HostKVExtentStore::HostKVPreGrow::NotFull:
+        return;
+    case HostKVExtentStore::HostKVPreGrow::Refused:
+        ++host_kv_pregrow_attempts_;
+        ++host_kv_pregrow_refusals_;
+        return;
+    case HostKVExtentStore::HostKVPreGrow::Grew:
+        ++host_kv_pregrow_attempts_;
+        ++host_kv_pregrows_;
+        if (fragmented) { ++host_kv_pregrow_fragmented_; }
+        if (host_kv_pregrows_ <= 8ULL || host_kv_pregrows_ % 512ULL == 0ULL) {
+            std::fprintf(stderr,
+                         "[engine] host KV arena PRE-GROWN before planning: capacity=%zu occupied=%zu "
+                         // `fragmented_triggered`, NOT `fragmented_skipped`. The counter is incremented
+                         // INSIDE the `Grew` case above, beside `++host_kv_pregrows_`, so it counts grows
+                         // that fired because the arena held free bytes but no single run of one step --
+                         // i.e. grows that DID happen. The old label said the opposite, and a live reading
+                         // of `fragmented_skipped=2` beside `grew=2` was read as two SKIPS until the
+                         // increment site was checked. Names are read at face value under load.
+                         "grew=%llu refused=%llu fragmented_triggered=%llu\n",
+                         host_kv_arena->capacity_bytes(), host_kv_arena->occupied_bytes(),
+                         static_cast<unsigned long long>(host_kv_pregrows_),
+                         static_cast<unsigned long long>(host_kv_pregrow_refusals_),
+                         static_cast<unsigned long long>(host_kv_pregrow_fragmented_));
+            std::fflush(stderr);
+        }
+        return;
+    }
+}
+
+void ProgramImpl::ensure_host_state_headroom() noexcept {
+    if (host_state_images == nullptr || pinned_host_pool == nullptr) { return; }
+    // §3 item 6: make the host state pool ONE slot bigger BEFORE the planner prices anything, so a demote
+    // can be chosen where it could only be evicted before. `admission_capacity()` reports
+    // `HostStatePool::capacity()` -- the slots that exist NOW -- so a demote option is priced against a full
+    // pool, fails feasibility, and is never offered; the measured shape is `demotable=0 restorable=1` at
+    // `host_state_slots=16/16` with 20+ GB of KV free.
+    //
+    // HERE and not in the search: growth pins real memory (~1 s/GiB on the engine thread, measured from the
+    // journal) and reads /proc/meminfo, so it cannot sit in a loop the search runs per assessed node -- an
+    // earlier version did exactly that and was removed. This runs once per planning session.
+    //
+    // The decision and the increment live in `pre_grow_host_state_pool` so a host-only unit test can assert
+    // them; ONE slot is that function's contract, and the first version of this call site asked for
+    // `capacity + 1` -- which ADDS, and doubled the pool. The counters below exist so "never fired" and
+    // "refused every time" are different observations.
+    //
+    // IT IS BOUNDED, and the bound is weaker than it first looks. A pool WITH room costs a comparison and
+    // pins nothing, and each growth buys exactly one slot -- but `host_state_pregrows_` is a GROSS count, not
+    // net capacity added: `maintain_host_memory` trims idle trailing slots back to the configured floor on
+    // every shared-prefix release, so a pre-grown slot nobody used is given back and can be grown again
+    // later, bumping this count twice for one net slot. Read `host_state_capacity_slots` (in `/stats`) for
+    // the net figure. A trim landing between planning and execution is recovered by the demote path's
+    // `allocate_growing`.
+    switch (pre_grow_host_state_pool(*host_state_images)) {
+    case qwen3_5::HostStatePreGrow::NotFull:
+    case qwen3_5::HostStatePreGrow::Disabled:
+        return;
+    case qwen3_5::HostStatePreGrow::Refused:
+        ++host_state_pregrow_attempts_;
+        ++host_state_pregrow_refusals_;
+        return;
+    case qwen3_5::HostStatePreGrow::Grew:
+        ++host_state_pregrow_attempts_;
+        ++host_state_pregrows_;
+        if (host_state_pregrows_ <= 8ULL || host_state_pregrows_ % 512ULL == 0ULL) {
+            std::fprintf(stderr,
+                         "[engine] host state pool PRE-GROWN before planning: slots=%u occupied=%u "
+                         "grew=%llu refused=%llu\n",
+                         host_state_images->capacity(), host_state_images->occupied(),
+                         static_cast<unsigned long long>(host_state_pregrows_),
+                         static_cast<unsigned long long>(host_state_pregrow_refusals_));
+            std::fflush(stderr);
+        }
+        return;
+    }
 }
 
 void ProgramImpl::release_sequence_kv(SequenceState& sequence) noexcept {
     if (!sequence.kv) { return; }
     unbind_sequence_kv(sequence);
     if (sequence.kv->backend && backend_kv_addresses) {
-        (void)backend_kv_addresses->release(*sequence.kv->backend);
+        if (!backend_kv_addresses->release(*sequence.kv->backend)) { note_nonstrict_release_refusal("kv-backend"); }
     }
-    if (text_kv_addresses) { (void)text_kv_addresses->release(sequence.kv->text); }
+    if (text_kv_addresses) {
+        if (!text_kv_addresses->release(sequence.kv->text)) { note_nonstrict_release_refusal("kv-text"); }
+    }
     sequence.kv.reset();
     if (host_kv_extents) { (void)host_kv_extents->release_unreferenced(); }
 }
@@ -1540,9 +1885,17 @@ qwen3_5::PagedKVCacheView ProgramImpl::mtp_kv_view(const SequenceState& sequence
         backend_kv_addresses->execution_row(*sequence.kv->backend));
 }
 
+// `value` is a by-value parameter, i.e. stack memory that dies with this frame, so the copy has to
+// be ordered and complete before the caller returns. A synchronous cudaMemcpy was tried and
+// reverted: it is ordered only on the legacy default stream while `device.stream` is
+// cudaStreamNonBlocking, and it is not recorded in a stream capture. Async-plus-settle keeps the
+// ordering the rest of the program uses and still guarantees the source is unread after return.
 void ProgramImpl::set_device_i32(Tensor& tensor, std::int32_t value) {
-    CUDA_CHECK(
-        cudaMemcpyAsync(tensor.data, &value, sizeof(value), cudaMemcpyHostToDevice, device.stream));
+    // Async on the compute stream, then settle: `value` is a by-value parameter, so the copy must
+    // complete before this frame dies -- and the copy must stay ordered on the non-blocking stream.
+    CUDA_CHECK(cudaMemcpyAsync(tensor.data, &value, sizeof(value), cudaMemcpyHostToDevice,
+                               device.stream));
+    CUDA_CHECK(cudaStreamSynchronize(device.stream));
 }
 
 void ProgramImpl::ordered_reset(SequenceState& sequence) {

@@ -38,6 +38,8 @@ struct ExecutionCore {
     Tensor& prefill_hidden;
     std::uint32_t prefill_chunk;
     ProposalHead proposal_head;
+    float rope_scaling_factor              = 1.0F;
+    std::uint32_t rope_scaling_original_context = 262144;
 };
 
 struct PrefillContext {
@@ -64,6 +66,10 @@ struct OrdinaryBatchContext {
     const qwen3_5::OrdinaryDecodeIngress& host_ingress;
     qwen3_5::OrdinaryDecodeEgress& host_egress;
     Tensor& continuation_hidden_store;
+    // Optional Device shadow of `frame.ingress`, filled by the batch body itself. A host-side read
+    // of `frame.ingress` after the step cannot see a mid-flight mismatch (the next step's copy
+    // repairs it first); sampling it inside the body captures exactly what the kernels will read.
+    void* ingress_shadow = nullptr;
 };
 
 struct MtpBatchContext {

@@ -54,6 +54,10 @@ void validate_options(const EngineOptions& options) {
         throw std::invalid_argument(
             "Engine media_live_bytes must be nonzero when Vision is enabled");
     }
+    if (options.vision_cpu_offload && !options.enable_vision) {
+        throw std::invalid_argument(
+            "vision_cpu_offload requires enable_vision (Vision must be enabled)");
+    }
     if (options.media_preprocess_threads > 64) {
         throw std::invalid_argument("Engine media_preprocess_threads must be in [0,64]");
     }
@@ -79,6 +83,7 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         options.kv_capacity          = KvCapacityPolicy::explicit_capacity(options.max_context);
         options.speculative          = {};
         options.enable_vision        = false;
+        options.vision_cpu_offload   = false;
         options.use_cuda_graph       = false;
         options.context_cache        = ContextCacheOptions{.enabled = false};
         break;
@@ -112,8 +117,13 @@ EngineOptions normalize_engine_options(EngineOptions options) {
     const std::uint64_t default_private = 2ULL * concurrency;
     cache.max_private_continuations =
         cache.max_private_continuations.value_or(static_cast<std::uint32_t>(default_private));
-    cache.max_shared_prefixes = cache.max_shared_prefixes.value_or(
-        std::max(concurrency, static_cast<std::uint32_t>(kMaximumExplicitPromptCacheMarkers)));
+    // DECOUPLED FROM THE MARKER CAP (2026-10-01). It read `max(concurrency, kMaximumExplicitPromptCache
+    // Markers)`, so raising that cap would have raised this DEFAULT shared-prefix count with it -- by 8x at
+    // the concurrency this host runs (c=4), not by a fixed factor, which is why one comment here said
+    // "quadrupled" and another said "eight fold" and both were wrong. The floor is a named constant now so
+    // the test that asserts this default and this line cannot drift apart.
+    cache.max_shared_prefixes =
+        cache.max_shared_prefixes.value_or(std::max(concurrency, kDefaultSharedPrefixFloor));
     cache.max_long_anchors_per_continuation = cache.max_long_anchors_per_continuation.value_or(2U);
 
     if (*cache.max_private_continuations < concurrency) {
@@ -148,7 +158,8 @@ ModelInstance::ModelInstance(std::unique_ptr<models::qwen3_5::Model> source,
                                .max_context              = options.max_context,
                                .media_cache_bytes        = options.media_cache_bytes,
                                .media_live_bytes         = options.media_live_bytes,
-                               .media_preprocess_threads = options.media_preprocess_threads})),
+                               .media_preprocess_threads = options.media_preprocess_threads,
+                               .vision_cpu_offload       = options.vision_cpu_offload})),
       capacity(options.max_context) {}
 
 ModelInstance::~ModelInstance() = default;

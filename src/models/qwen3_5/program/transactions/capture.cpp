@@ -512,6 +512,7 @@ runtime::ContextTransactionReserveStatus ProgramImpl::reserve_active_capture_imp
                 continuation_states[transaction.victim_indices[index]].long_anchors.size());
             transaction.pressure.push_back(MaterializationTransaction::PressureWork{
                 .option                  = pressure_details->pressure_options[index],
+                .planned_deficit         = pressure_details->demand.physical_peak_additional,
                 .continuation_index      = transaction.victim_indices[index],
                 .continuation_generation = transaction.victim_generations[index],
             });
@@ -532,6 +533,7 @@ runtime::ContextTransactionReserveStatus ProgramImpl::reserve_active_capture_imp
             }
             transaction.shared_pressure.push_back(MaterializationTransaction::PressureWork{
                 .option                  = pressure_details->shared_pressure_options[index],
+                .planned_deficit         = pressure_details->demand.physical_peak_additional,
                 .continuation_index      = victim,
                 .continuation_generation = transaction.shared_victim_generations[index],
                 .shared_owner            = true,
@@ -1380,11 +1382,7 @@ ProgramImpl::progress_active_capture_transaction(runtime::CancellationFlagView c
     }
 
     if (has_pressure() && pressure_transition.phase == PressureTransitionPhase::CopyPreparation) {
-        constexpr std::array resources{
-            runtime::ContextResourceClass::State,
-            runtime::ContextResourceClass::MainKV,
-            runtime::ContextResourceClass::BackendKV,
-        };
+        const auto& resources = runtime::k_pressure_allocation_order;
         context_source_ready_.record(device.stream);
         context_source_ready_.wait(device.transfer_stream);
         try {
@@ -1497,11 +1495,7 @@ ProgramImpl::progress_active_capture_transaction(runtime::CancellationFlagView c
                 };
             }
         }
-        constexpr std::array resources{
-            runtime::ContextResourceClass::State,
-            runtime::ContextResourceClass::MainKV,
-            runtime::ContextResourceClass::BackendKV,
-        };
+        const auto& resources = runtime::k_pressure_allocation_order;
         for (const runtime::ContextResourceClass resource : resources) {
             const std::size_t index = context_resource_index(resource);
             if ((pressure_transition.timer_mask & (1U << index)) == 0) { continue; }

@@ -876,11 +876,24 @@ public:
     // KV owned by nothing, and the aggregate residual line could say how much but not by whom. Read-only,
     // allocation-free, and called only on the recovery path.
     void census(const char* label) const noexcept {
+        // THE INVARIANT THIS CENSUS WAS MISSING (#9 candidate 4, "pool `reserved_pages` no slot owns").
+        // Each address's `reserved_pages` was printed, but NOTHING compared them to the POOL's own
+        // `reserved_pages()`, so a reservation whose owner is gone -- held by a struct that outlived it --
+        // appeared as a pool count no live address accounts for, and a reader summing ten lines by hand is
+        // not a check.
+        //
+        // **A NON-ZERO DIFFERENCE HERE IS A FINDING, BOTH SIGNS**, and that follows from the CALL SITE, not
+        // from the general case -- the reasoning is written out below the loop, where the comparison is made.
+        // Reported rather than asserted: this runs on the recovery path, the last place that should throw.
+        std::uint32_t address_reserved = 0;
         for (std::size_t index = 0; index < addresses_.size(); ++index) {
             const Address& address = addresses_[index];
             const bool live = address.occupied || address.active || address.row.has_value() ||
                               address.reservation.valid() || address.page_count != 0;
             if (!live) { continue; }
+            // Accumulated for EVERY live address, including ones whose other fields are empty: a reservation
+            // is exactly what can outlive its owner, so it must be summed rather than skipped over.
+            address_reserved += address.reservation.pages();
             std::uint32_t device_resident = 0;
             std::uint32_t host_resident   = 0;
             try {
@@ -898,6 +911,41 @@ public:
                          address.reservation.pages(), address.page_count, device_resident,
                          host_resident, address.committed_frontier);
         }
+        // ONE LINE THAT MAKES THE PER-ADDRESS NUMBERS MEAN SOMETHING -- and ANY non-zero value here is a
+        // FINDING, because of WHEN this runs rather than because of what is possible in general.
+        //
+        // The general invariant is Σ(address reservations) + (reservations held by NON-ADDRESS holders) ==
+        // pool.reserved_pages(), and non-address holders are real: a `MaterializationTransaction` carries SIX
+        // reservation-bearing members (`program_impl.h:1068-1073` -- text/backend ACTIVATION, text/backend
+        // SOURCE-RESTORE and text/backend PREFIX-FORK), so on an ordinary path the pool may legitimately
+        // exceed the address sum.
+        //
+        // NOT ON THIS PATH. `census` has exactly one caller, `resource_census`, reached from
+        // `report_recovery_residual` -- and every route to it runs `fail_all_cleanup` FIRST
+        // (`engine_core.h:2212`, then the residual at `:2228`), which does `pending_transaction_.reset()` and
+        // `context_transaction_.emplace<std::monostate>()` (`commit.cpp`). That DESTROYS the transaction and
+        // with it all six holders, so by the time this prints there is no non-address holder left to explain a
+        // difference. `unaccounted != 0` therefore means the pool is holding reserved pages NO live address
+        // claims -- #9's shape at the reservation layer, either sign.
+        //
+        // TWO EARLIER VERSIONS WERE BOTH WRONG ABOUT THIS, in opposite directions: the first compared for
+        // EQUALITY and cried MISMATCH; the second, written to fix that, called a positive "expected while a
+        // transaction holds its own reservations" -- true in general, false here. Both reasoned from what is
+        // possible rather than from the call order, which is the thing actually being asserted.
+        const std::uint32_t pool_reserved =
+            pages_ != nullptr ? pages_->physical_pool().reserved_pages() : 0;
+        const std::int64_t unaccounted =
+            static_cast<std::int64_t>(pool_reserved) - static_cast<std::int64_t>(address_reserved);
+        std::fprintf(stderr,
+                     "[census] %s TOTAL address_reserved_pages=%u pool_reserved_pages=%u unaccounted=%lld %s\n",
+                     label, address_reserved, pool_reserved, static_cast<long long>(unaccounted),
+                     unaccounted < 0
+                         ? "(NEGATIVE: addresses claim more than the pool holds -- #9's shape)"
+                     : unaccounted == 0
+                         ? "(exact: every reserved page belongs to a live address)"
+                         : "(POSITIVE: reserved pages no live address claims -- #9's shape; no transaction "
+                           "survives to hold them at this call site)");
+        std::fflush(stderr);
     }
 
 

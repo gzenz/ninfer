@@ -4,6 +4,7 @@
 #include "core/pinned_host_pool.h"
 #include "core/paged_kv_cache.h"
 #include "core/transfer_work.h"
+#include "ninfer/types.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -181,6 +182,7 @@ enum class HostKVFit : std::uint8_t {
     Blocked,   // neither. Today's behaviour, retained.
 };
 
+
 [[nodiscard]] inline constexpr const char* host_kv_fit_name(HostKVFit fit) noexcept {
     switch (fit) {
     case HostKVFit::Pinned:   return "pinned";
@@ -316,6 +318,13 @@ public:
     // Both pure. `largest_free_run_bytes` is the arena's counterpart to the pool's `largest_free_run`:
     // free BYTES can be plentiful while nothing large can be placed.
     [[nodiscard]] std::size_t span_step_bytes() const noexcept { return span_growth_bytes_; }
+    // THE REASON SPLIT for refusals on the `!valid || descriptors_short` path, counted by
+    // `fit_after_suballocation_releases` alone so `host_kv_blocked_checks` is the denominator. MUTABLE: the
+    // query is `const` and counting must not change that. Index with `HostKVBlockReason`.
+    [[nodiscard]] std::uint64_t block_reason_count(HostKVBlockReason reason) const noexcept {
+        const std::size_t index = static_cast<std::size_t>(reason);
+        return index < k_host_kv_block_reason_count ? block_reasons_[index] : 0U;
+    }
     [[nodiscard]] std::size_t largest_free_run_bytes() const noexcept;
 
     // The caller supplies already-sized empty outputs so successful adoption cannot allocate.
@@ -368,8 +377,18 @@ private:
         bool          valid              = false;
         std::uint32_t satisfied          = 0;
         std::uint32_t unsatisfied        = 0;
-        std::size_t   unsatisfied_bytes  = 0;  // sum of max(request_bytes, span step) over the unsatisfied
+        std::size_t   unsatisfied_bytes = 0;  // sum of max(request_bytes, span step) over the unsatisfied
         bool          descriptors_short  = false;
+        // ***WHY THE PLACEMENT WAS REFUSED, AND IT IS THE DISCRIMINATOR (2026-10-05).***
+        // `fit_after_suballocation_releases` maps `!valid || descriptors_short` to `Blocked` with the
+        // SHORTFALL NEVER SET, so every one of those refusals has the same shape and NOTHING could tell a
+        // descriptor shortage from a malformed release list -- the two have opposite fixes, and the second
+        // is a planner bug that no capacity setting can touch. FIVE returns produce it, and three of the
+        // five are about the RELEASE LIST the planner builds.
+        // CARRIED ON THE PLACEMENT RATHER THAN COUNTED HERE, because the boolean query and the tri-state
+        // BOTH call this simulation: counting inside would double every refusal, while counting in the
+        // tri-state alone gives `host_kv_blocked_checks` as the denominator.
+        HostKVBlockReason block_reason = HostKVBlockReason::None;
     };
     [[nodiscard]] Placement simulate_after_suballocation_releases(
         std::span<const HostKVSuballocationRelease> proposed_releases,
@@ -406,6 +425,10 @@ private:
     std::uint64_t revision_    = 1;
     std::uint64_t growth_count_    = 0;
     std::uint64_t growth_refusals_ = 0;
+    // The refusal-reason split, indexed by `HostKVBlockReason`. Mutable because the query that fills it is
+    // `const`; see `block_reason_count` for the denominator and why it is counted there and not in the
+    // simulation.
+    mutable std::array<std::uint64_t, k_host_kv_block_reason_count> block_reasons_{};
 };
 
 } // namespace ninfer

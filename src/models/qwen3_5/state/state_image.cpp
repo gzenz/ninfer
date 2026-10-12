@@ -224,6 +224,13 @@ bool HostStatePool::grow_slot(bool speculative) noexcept {
         ++growth_refusals_;
         return false;
     }
+    // THE CEILING, COUNTED APART FROM A POOL REFUSAL. The two are opposite facts: the shared pool refusing
+    // says the machine is out of room, while this refusing says the axis gave its room to KV on purpose.
+    // Bounded BEFORE the allocation, so a refused slot never pins bytes it must then unpin.
+    if (max_slots_ != 0U && slots_.size() >= max_slots_) {
+        ++growth_ceiling_refusals_;
+        return false;
+    }
     // `speculative` IS PART OF THE CONTRACT, not a convenience: the session-start pre-grow reaches the pool
     // through here, and a pre-grow refusal counted as a REAL allocation failure makes
     // `host_pinned_allocation_refusals` stop meaning what it says. Measured 2026-10-02: `host_state_pregrow_

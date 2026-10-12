@@ -37,9 +37,22 @@ struct CaptureAssessmentImpl;
 struct PhysicalUsageSnapshot {
     runtime::ProgramResourceRevision resource_revision;
     std::uint32_t device_state_slots      = 0;
+    // THE DEVICE STATE POOL'S CEILING, exported 2026-10-04 because `device_state_slots` alone cannot say
+    // whether a pool is FULL. It was the reason `ninfer-e2e.py`'s phase-13 saturation check read a key
+    // name that has never existed, took 0 as the capacity, and reported "not saturated (8/0)" on EVERY run
+    // -- a dead check whose denominator was structurally zero. The capacity is one number the engine holds
+    // and simply never published.
+    std::uint32_t device_state_capacity_slots = 0;
     std::uint32_t host_state_slots        = 0;
     std::uint32_t device_main_kv_pages    = 0;
     std::uint32_t device_backend_kv_pages = 0;
+    // THE DEVICE KV CEILINGS, IN PAGES -- the same units as the occupancy above. Without them
+    // `device_main_kv_occupied_pages` cannot be read as a fraction of anything: `/stats` reports
+    // `kv_capacity` in TOKENS and `kv_capacity_page_groups` in PAGE GROUPS, and neither converts to pages at
+    // the reader. This is the same gap the device-state pool had, and it made the axis the 2026-10-04 deficit
+    // instrument says is short in 100% of evictions (`device_main_kv`) UNREADABLE.
+    std::uint32_t device_main_kv_capacity_pages    = 0;
+    std::uint32_t device_backend_kv_capacity_pages = 0;
     std::size_t host_kv_bytes             = 0;
 
     [[nodiscard]] friend constexpr bool operator==(const PhysicalUsageSnapshot&,
@@ -954,7 +967,55 @@ public:
     [[nodiscard]] std::uint64_t shared_replacements() const noexcept;
     [[nodiscard]] std::uint64_t demotable_evictions() const noexcept;
     [[nodiscard]] std::uint64_t evictions_with_victim_room() const noexcept;
+    // Which axis each eviction relieved: the victim held device slots / host slots respectively.
+    [[nodiscard]] std::uint64_t evictions_victim_device_slots() const noexcept;
+    [[nodiscard]] std::uint64_t evictions_victim_host_slots() const noexcept;
+    // The NEEDED axis at each eviction (the plan's deficit), paired with the victim-axis accessors.
+    [[nodiscard]] std::uint64_t evictions_deficit_device_main_kv() const noexcept;
+    [[nodiscard]] std::uint64_t evictions_deficit_device_backend_kv() const noexcept;
+    [[nodiscard]] std::uint64_t evictions_deficit_device_state() const noexcept;
+    [[nodiscard]] std::uint64_t evictions_deficit_host_state() const noexcept;
+    [[nodiscard]] std::uint64_t evictions_deficit_host_kv() const noexcept;
+    // The PER-VICTIM KV half: was this victim's own device KV demotable to host? Denominator + magnitude +
+    // the fit tri-state (pinned = fitted as the arena is; growable = fitted only by growing; blocked = neither).
+    [[nodiscard]] std::uint64_t evictions_kv_pages() const noexcept;
+    [[nodiscard]] std::uint64_t evictions_kv_pages_total() const noexcept;
+    [[nodiscard]] std::uint64_t evictions_kv_fit_pinned() const noexcept;
+    [[nodiscard]] std::uint64_t evictions_kv_fit_growable() const noexcept;
+    [[nodiscard]] std::uint64_t evictions_kv_fit_blocked() const noexcept;
+    // The same tri-state in PAGES: the rate and the magnitude disagree, so both are needed.
+    [[nodiscard]] std::uint64_t evictions_kv_fit_pinned_pages() const noexcept;
+    [[nodiscard]] std::uint64_t evictions_kv_fit_growable_pages() const noexcept;
+    [[nodiscard]] std::uint64_t evictions_kv_fit_blocked_pages() const noexcept;
+    // The per-victim eviction record ring. `total` is the denominator (ever recorded), `count` what the ring
+    // still holds; `record(i)` is chronological, oldest first.
+    [[nodiscard]] std::uint64_t eviction_kv_records_total() const noexcept;
+    [[nodiscard]] std::uint32_t eviction_kv_record_count() const noexcept;
+    [[nodiscard]] RuntimeStats::EvictionKVRecord eviction_kv_record(std::size_t chronological) const noexcept;
+    // The host-state shortfall attributed out of physical_peak_fits, with its denominator.
+    [[nodiscard]] std::uint64_t physical_peak_fits_calls() const noexcept;
+    // WHICH AXIS REFUSED, per axis (see `ninfer::k_peak_axis_names` for the order). Denominator:
+    // `physical_peak_fits_calls`. The axes do NOT sum to the refusals.
+    [[nodiscard]] std::uint64_t physical_peak_refusals_by_axis(std::size_t axis) const noexcept;
+    // METHOD 2's decision counters. `grows` counts seals that pinned the room a `Growable` plan needed;
+    // `refusals` counts those where the pin failed. Their ratio decides whether the reserve stays.
+    [[nodiscard]] std::uint64_t host_kv_seal_grows() const noexcept;
+    [[nodiscard]] std::uint64_t host_kv_seal_refusals() const noexcept;
+    [[nodiscard]] std::uint64_t host_state_fit_checks() const noexcept;
+    [[nodiscard]] std::uint64_t host_state_shortfall_calls() const noexcept;
+    [[nodiscard]] std::uint64_t host_state_shortfall_max_slots() const noexcept;
+    // The device-KV axis's counterparts. See `host_state_shortfall_max_slots` for the reading rule.
+    [[nodiscard]] std::uint64_t device_main_kv_fit_checks() const noexcept;
+    [[nodiscard]] std::uint64_t device_main_kv_shortfall_calls() const noexcept;
+    [[nodiscard]] std::uint64_t device_main_kv_shortfall_max_pages() const noexcept;
     [[nodiscard]] std::uint64_t evictions_demote_possible() const noexcept;
+    // Every eviction's demote refusal, bucketed by clause IN `ninfer::k_demote_refusal_names` ORDER.
+    // Index-based so this header need not pull in the state store; the bucket count is tied to the enum by
+    // `state_store.h`'s static_assert that `DemoteRefusal::Count == k_demote_refusal_buckets`, so the two
+    // cannot drift apart. (This cited "a static_assert in program.cpp" until 2026-10-04; there is none --
+    // `grep static_assert src/models/qwen3_5/program/program.cpp` is empty. The tie is real, the citation
+    // was wrong.)
+    [[nodiscard]] std::uint64_t demote_refusal_at_eviction(std::size_t bucket) const noexcept;
     [[nodiscard]] std::uint64_t demotable_eviction_checks() const noexcept;
     [[nodiscard]] std::uint64_t pressure_options() const noexcept;
     [[nodiscard]] std::uint64_t demote_options() const noexcept;
@@ -978,9 +1039,81 @@ public:
     [[nodiscard]] std::uint64_t publication_goal_blocked_other() const noexcept;
     void add_publication_cell_probes(std::uint64_t count) noexcept;
     [[nodiscard]] std::uint64_t options_refused_no_kv() const noexcept;
-    void note_pressure_successor_outcome(bool nonevicting_available) noexcept;
+    void note_pressure_successor_outcome(bool no_nonevicting_option, bool evicting_current) noexcept;
     [[nodiscard]] std::uint64_t pressure_successor_calls() const noexcept;
-    [[nodiscard]] std::uint64_t pressure_successors_with_option() const noexcept;
+    [[nodiscard]] std::uint64_t pressure_successors_without_option() const noexcept;
+    [[nodiscard]] std::uint64_t pressure_successor_calls_evicting_current() const noexcept;
+    // Index into `ninfer::k_successor_empty_reason_names` order.
+    [[nodiscard]] std::uint64_t pressure_successor_empty_by_reason(std::size_t reason) const noexcept;
+    // Index direction by `ninfer::k_kv_relief_direction_names`, clause by `k_kv_relief_clause_names`.
+    [[nodiscard]] std::uint64_t kv_relief_rejected(std::size_t direction,
+                                                   std::size_t clause) const noexcept;
+    [[nodiscard]] std::uint64_t kv_relief_calls(std::size_t direction) const noexcept;
+    [[nodiscard]] std::uint64_t kv_relief_requested(std::size_t direction) const noexcept;
+    [[nodiscard]] std::uint64_t kv_relief_saturated_asks(std::size_t direction) const noexcept;
+    [[nodiscard]] std::uint64_t kv_relief_max_ask(std::size_t direction) const noexcept;
+    [[nodiscard]] std::uint64_t kv_relief_relieved(std::size_t direction) const noexcept;
+    [[nodiscard]] std::uint64_t kv_relief_gate_blocks(std::size_t clause) const noexcept;
+    [[nodiscard]] std::uint64_t peak_refusal_by_preserving(bool preserving, std::size_t axis) const noexcept;
+    void note_successor_relief(bool evicting, std::uint32_t main_kv, std::uint32_t backend_kv,
+                               std::uint32_t state_slots) noexcept;
+    void record_assessed_peak(bool preserving, bool feasible, std::uint32_t peak_main,
+                              std::uint32_t peak_backend, std::uint8_t refusal_mask = 0U,
+                              std::uint32_t reservation_main = 0U, std::uint32_t removed_main = 0U,
+                              std::uint32_t evicted_victim_main = 0U) const noexcept;
+    [[nodiscard]] std::uint64_t assessed_agg_count(bool feasible, bool preserving) const noexcept;
+    [[nodiscard]] std::uint64_t assessed_axis_shortfall(bool feasible, bool preserving,
+                                                        std::size_t axis) const noexcept;
+    [[nodiscard]] std::uint64_t assessed_agg_reservation(bool feasible, bool preserving) const noexcept;
+    [[nodiscard]] std::uint64_t assessed_agg_removed(bool feasible, bool preserving) const noexcept;
+    [[nodiscard]] std::uint64_t assessed_agg_selected(bool feasible, bool preserving) const noexcept;
+    [[nodiscard]] std::uint64_t assessed_agg_evicting(bool feasible, bool preserving) const noexcept;
+    [[nodiscard]] std::uint64_t assessed_agg_available(bool feasible, bool preserving) const noexcept;
+    [[nodiscard]] std::uint64_t assessed_agg_chosen(bool feasible, bool preserving) const noexcept;
+    [[nodiscard]] std::uint64_t assessed_larger_available(bool feasible, bool preserving) const noexcept;
+    [[nodiscard]] std::uint64_t assessed_chose_largest(bool feasible, bool preserving) const noexcept;
+    [[nodiscard]] std::uint64_t assessed_agg_kv_entries(bool feasible, bool preserving) const noexcept;
+    // THE VICTIM'S OWN FIGURES, worth exposing because the two that matter live at DIFFERENT sites: the
+    // decision-level relief is at the successor site (`pressure_planner.cpp`) and the ownership figures at the
+    // eviction site (`materialization.cpp`). Comparing them across RUNS is what kept this unattributable.
+    void note_victim_ownership(std::uint64_t release_main, std::uint64_t resident_main) noexcept;
+    [[nodiscard]] std::uint64_t victim_ownership_calls() const noexcept;
+    [[nodiscard]] std::uint64_t victim_ownership_release_sum() const noexcept;
+    [[nodiscard]] std::uint64_t victim_ownership_resident_sum() const noexcept;
+    [[nodiscard]] std::uint64_t victim_ownership_gap_sum() const noexcept;
+    [[nodiscard]] std::uint64_t victim_ownership_gap_max() const noexcept;
+    [[nodiscard]] std::uint64_t victim_release_main_kv_pages(std::size_t state_index) const noexcept;
+    [[nodiscard]] std::uint64_t victim_resident_main_kv_pages(std::size_t state_index) const noexcept;
+    [[nodiscard]] std::uint64_t assessed_total(bool preserving) const noexcept;
+    [[nodiscard]] std::uint64_t assessed_feasible(bool preserving) const noexcept;
+    [[nodiscard]] std::uint64_t assessed_refused_host_blocked(bool preserving) const noexcept;
+    [[nodiscard]] std::uint64_t assessed_peak_record_total() const noexcept;
+    [[nodiscard]] const AssessedPeakRecord& assessed_peak_record(std::size_t chronological) const noexcept;
+    void note_successor_relief_best_only(std::uint64_t preserving_options_seen) noexcept;
+    [[nodiscard]] std::uint64_t successor_relief_preserving_options_seen() const noexcept;
+    [[nodiscard]] std::uint64_t successor_relief_count(bool evicting) const noexcept;
+    [[nodiscard]] std::uint64_t successor_relief_main_kv(bool evicting) const noexcept;
+    [[nodiscard]] std::uint64_t successor_relief_backend_kv(bool evicting) const noexcept;
+    [[nodiscard]] std::uint64_t successor_relief_state_slots(bool evicting) const noexcept;
+    [[nodiscard]] std::uint64_t entitlement_split_calls() const noexcept;
+    [[nodiscard]] std::uint64_t entitlement_split_prompt_tokens() const noexcept;
+    [[nodiscard]] std::uint64_t entitlement_split_output_tokens() const noexcept;
+    [[nodiscard]] std::uint64_t entitlement_split_reserved_tokens() const noexcept;
+    [[nodiscard]] std::uint64_t reservation_composition_calls() const noexcept;
+    [[nodiscard]] std::uint64_t reservation_composition(std::size_t term, std::size_t axis) const noexcept;
+    [[nodiscard]] std::uint64_t victim_entitlement_gap_calls() const noexcept;
+    [[nodiscard]] std::uint64_t victim_entitlement_gap_pages_sum() const noexcept;
+    [[nodiscard]] std::uint64_t victim_entitlement_gap_pages_max() const noexcept;
+    [[nodiscard]] std::uint64_t peak_model_calls() const noexcept;
+    [[nodiscard]] std::uint64_t peak_model_added(std::size_t axis) const noexcept;
+    [[nodiscard]] std::uint64_t peak_model_removed(std::size_t axis) const noexcept;
+    [[nodiscard]] std::uint64_t peak_model_peak_max(std::size_t axis) const noexcept;
+    [[nodiscard]] std::uint64_t kv_relief_demote_calls_host_req_zero() const noexcept;
+    [[nodiscard]] std::uint64_t kv_relief_demote_calls_host_req_nonzero() const noexcept;
+    [[nodiscard]] std::uint64_t kv_relief_demote_relieved_host_req_zero() const noexcept;
+    [[nodiscard]] std::uint64_t kv_relief_demote_relieved_host_req_nonzero() const noexcept;
+    [[nodiscard]] std::uint64_t kv_relief_host_blocked_bytes_sum() const noexcept;
+    [[nodiscard]] std::uint64_t kv_relief_host_blocked_bytes_max() const noexcept;
     [[nodiscard]] std::uint64_t demote_option_refused_no_state_deficit() const noexcept;
     [[nodiscard]] std::uint64_t demote_option_refused_precondition() const noexcept;
     [[nodiscard]] std::uint64_t options_refused_active_lanes() const noexcept;
@@ -1009,6 +1142,16 @@ public:
                                            const PreparedPrompt& prompt) const;
     [[nodiscard]] std::uint64_t publication_cell_losses() const noexcept;
     [[nodiscard]] std::uint64_t publication_cell_probes() const noexcept;
+
+    // Shared-prefix release refusals, per clause. Four named forwarders rather than one enum, because the
+    // enum lives on the impl (pimpl) and one accessor per clause is cheaper than exporting a type for a
+    // counter. See `ProgramImpl::SharedPrefixReleaseRefusal` for why these are counted rather than printed.
+    // The denominator beside the four refusal counters: zero attempts means they are UNMEASURED, not clean.
+    [[nodiscard]] std::uint64_t shared_prefix_release_attempts() const noexcept;
+    [[nodiscard]] std::uint64_t shared_prefix_release_refusals_stale_index() const noexcept;
+    [[nodiscard]] std::uint64_t shared_prefix_release_refusals_in_flight() const noexcept;
+    [[nodiscard]] std::uint64_t shared_prefix_release_refusals_not_releasable() const noexcept;
+    [[nodiscard]] std::uint64_t shared_prefix_release_refusals_check_threw() const noexcept;
 
     [[nodiscard]] bool isolated_request_feasible(const RequestBasePlan& base) const noexcept;
     [[nodiscard]] runtime::ProgramResourceRevision resource_revision() const noexcept;

@@ -234,6 +234,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.context_cache.host_state_slots = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--host-state-slots"), "host-state-slots"));
             context_capacity_explicit = true;
+        } else if (arg == "--host-state-max-slots") {
+            // 0 = unbounded. Keep it at or above `--host-state-slots`, or the initial reservation is refused.
+            options.context_cache.host_state_max_slots = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--host-state-max-slots"), "host-state-max-slots"));
+            context_capacity_explicit = true;
         } else if (arg == "--host-kv-mib") {
             const std::uint64_t mib = parse_u64(require_value("--host-kv-mib"), "host-kv-mib");
             if (mib > std::numeric_limits<std::size_t>::max() / (1ULL << 20)) {

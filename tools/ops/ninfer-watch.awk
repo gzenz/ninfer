@@ -28,6 +28,7 @@ function alert(line) { print line; fflush(); keep(line) }
     next
 }
 
+
 # #6's evidence, and it is NOT an error: an eviction taken while the host tier still had room. It must be
 # tested BEFORE the log-only rule below, which matches every eviction -- otherwise this line is swallowed
 # and the item it serves goes blind while the filter still looks correct. (The test caught exactly that.)
@@ -55,9 +56,36 @@ function alert(line) { print line; fflush(); keep(line) }
 # denominator, and a denominator is exactly the thing that must not alert.
 /catalog cell blocked reuse: occupied=/ { alert($0); next }
 
+# #13'S ONLY REMAINING TRACE, AND THE FIX IS WHY IT NEEDS A RULE. While the planned-vs-actual throw existed,
+# the event surfaced as WORKER RECOVER + HTTP 500 -- both of which alert. The throw was REMOVED because its
+# only reachable condition was a correct state, so the skew print is now the sole line the event leaves. A
+# watcher that drops it cannot tell "the fix stopped it" from "the fix tolerates it silently", which is
+# precisely the question the fix's acceptance turns on. The whole line is alerted rather than a summary,
+# because `planned` beside `before` is what distinguishes the two candidate mechanisms.
+/mat-remove skew/ { alert($0); next }
+
+# THE HOST-KV CENSUS AT A FAIL-ALL: a non-zero retained count there IS the 2026-09-25 shape (occupancy owned by
+# nothing), and at that call site nothing should be retained. TESTED BEFORE the `fail-all cleanup` keep below --
+# that rule matches every cleanup line and would otherwise swallow this one, which is the same ordering trap the
+# `demotable=1` rule above documents.
+#
+# NO `fail-all cleanup` GUARD ON THESE TWO, deliberately: it is the ONLY line that carries `retained-*`, so the
+# guard buys nothing -- and writing them as a compound `/a/ && /b/` made
+# `tools/ops/watcher-token-reachability.sh` extract a malformed token and report BOTH rules unreachable. A
+# reachability check that false-positives on a rule FORM is worse than useless: it trains the reader to ignore
+# the one warning that exists to catch a token that cannot fire. Simple rules; the ordering does the guarding.
+/retained-pinned=[1-9]/ { alert($0); next }
+/retained-referenced=[1-9]/ { alert($0); next }
+
 # Insight, logpath-only: too frequent to notify on. Their ABSENCE is the signal -- a denominator that never
 # appears means the instrument stopped running, not that the count is zero.
 /checkpoint StateImage priced|fail-all cleanup|private victim evicted|catalog cell at-risk/ { keep($0); next }
+
+# The reservation census: LOG-ONLY, deliberately. Its verdict string ("exact" / "POSITIVE: ... #9's shape")
+# carries the judgement, so a reader gets it from `latest.log`; alerting would fire on every recovery whose
+# read is ordinary, which is the "instrument that fires on healthy traffic" failure the probe-count rule above
+# records. The header line is kept so "priced, none unaccounted" can be told from "the census never ran".
+/TOTAL address_reserved_pages/ { keep($0); next }
 
 # THE WEDGE ITSELF. It lives in the SENTINEL's journal, not ninfer.service's: the sentinel is what
 # detects "engine idle with work pending" and restarts prod. The watcher tailed ONE unit, so on

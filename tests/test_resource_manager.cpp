@@ -555,8 +555,13 @@ struct FakeDiscardResult {
 
 struct FakePhysicalUsage {
     std::uint32_t device_state_slots      = 0;
+    // Mirrors the real snapshot's ceiling. A missing field here is a COMPILE failure of the TEST target
+    // only -- `--target ninfer-serve` never sees it -- which is why the whole tree is built, not one target.
+    std::uint32_t device_state_capacity_slots = 0;
     std::uint32_t host_state_slots        = 0;
     std::uint32_t device_main_kv_pages    = 0;
+    std::uint32_t device_main_kv_capacity_pages    = 0;
+    std::uint32_t device_backend_kv_capacity_pages = 0;
     std::uint32_t device_backend_kv_pages = 0;
     std::size_t host_kv_bytes             = 0;
 };
@@ -695,18 +700,148 @@ public:
     // eviction/pressure TUs, which the fake does not model -- the fake never evaluates a victim's room or
     // enumerates demote options, so zero is its truthful count, not a placeholder for one.
     [[nodiscard]] std::uint64_t evictions_with_victim_room() const noexcept { return 0U; }
+    // THE COUNTERS `resource_manager.h` READS FROM `Program`, which this fake must satisfy or the TEMPLATE
+    // does not instantiate -- `ninfer-serve` builds either way, because the real `Program` has them, so a
+    // missing member here fails ONLY this target. That is what happened: the refusal counters and the
+    // eviction-axis counters were added and `ninfer-serve` stayed green while this test could not build.
+    //
+    // THEY RETURN 0, matching `evictions_with_victim_room` above, which means these keys' PLUMBING IS NOT
+    // EXERCISED by any case here -- the values are the real Program's. Read a 0 from them in this test as
+    // "not driven", never as "the engine counted zero". Driving them would need cases that make the engine
+    // evict and refuse, which this host-only fake does not.
+    [[nodiscard]] std::uint64_t evictions_victim_device_slots() const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t evictions_victim_host_slots() const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t evictions_deficit_device_main_kv() const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t evictions_deficit_device_backend_kv() const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t evictions_deficit_device_state() const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t evictions_deficit_host_state() const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t evictions_deficit_host_kv() const noexcept { return 0U; }
+    // The per-victim KV half. Zero here because this stub reports no evictions at all; the values are
+    // asserted by the engine's own tests, not by this one.
+    [[nodiscard]] std::uint64_t evictions_kv_pages() const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t evictions_kv_pages_total() const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t evictions_kv_fit_pinned() const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t evictions_kv_fit_growable() const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t evictions_kv_fit_blocked() const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t evictions_kv_fit_pinned_pages() const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t evictions_kv_fit_growable_pages() const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t evictions_kv_fit_blocked_pages() const noexcept { return 0U; }
+    // The per-victim record ring. Empty here because this stub reports no evictions at all; the ring's
+    // cursor arithmetic is exercised by the engine's own runs, not by this stub.
+    [[nodiscard]] std::uint64_t eviction_kv_records_total() const noexcept { return 0U; }
+    [[nodiscard]] std::uint32_t eviction_kv_record_count() const noexcept { return 0U; }
+    [[nodiscard]] ninfer::RuntimeStats::EvictionKVRecord
+    eviction_kv_record(std::size_t) const noexcept {
+        return ninfer::RuntimeStats::EvictionKVRecord{};
+    }
+    [[nodiscard]] std::uint64_t shared_prefix_release_attempts() const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t shared_prefix_release_refusals_stale_index() const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t shared_prefix_release_refusals_in_flight() const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t shared_prefix_release_refusals_not_releasable() const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t shared_prefix_release_refusals_check_threw() const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t physical_peak_fits_calls() const noexcept { return 0U; }
+    // Which axis of the six-way conjunction refused, by index into `ninfer::k_peak_axis_names`.
+    [[nodiscard]] std::uint64_t physical_peak_refusals_by_axis(std::size_t) const noexcept { return 0U; }
+    // Method 2's decision counters. Zero here: this stub reports no planning at all.
+    [[nodiscard]] std::uint64_t host_kv_seal_grows() const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t host_kv_seal_refusals() const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t host_state_fit_checks() const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t host_state_shortfall_calls() const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t host_state_shortfall_max_slots() const noexcept { return 0U; }
     // THE FAKE MUST MIRROR THE REAL PROGRAM'S ACCESSORS, and a missing one is a COMPILE failure of the test
     // target only -- which is why `--target ninfer-serve` never saw it and a full build did. See the note on
     // the grep: the same blind spot let a real error read as "0 errors" for several builds today.
     [[nodiscard]] std::uint64_t evictions_demote_possible() const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t demote_refusal_at_eviction(std::size_t) const noexcept { return 0U; }
     [[nodiscard]] std::uint64_t options_refused_no_kv() const noexcept { return 0U; }
     [[nodiscard]] std::uint64_t options_refused_active_lanes() const noexcept { return 0U; }
     [[nodiscard]] std::uint64_t options_refused_evicting_current() const noexcept { return 0U; }
     [[nodiscard]] std::uint64_t demote_option_refused_no_state_deficit() const noexcept { return 0U; }
     [[nodiscard]] std::uint64_t demote_option_refused_precondition() const noexcept { return 0U; }
-    void note_pressure_successor_outcome(bool) noexcept {}
+    void note_pressure_successor_outcome(bool, bool) noexcept {}
     [[nodiscard]] std::uint64_t pressure_successor_calls() const noexcept { return 0U; }
-    [[nodiscard]] std::uint64_t pressure_successors_with_option() const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t pressure_successors_without_option() const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t pressure_successor_calls_evicting_current() const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t pressure_successor_empty_by_reason(std::size_t) const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t kv_relief_rejected(std::size_t, std::size_t) const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t kv_relief_calls(std::size_t) const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t kv_relief_requested(std::size_t) const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t kv_relief_saturated_asks(std::size_t) const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t kv_relief_max_ask(std::size_t) const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t kv_relief_relieved(std::size_t) const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t kv_relief_gate_blocks(std::size_t) const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t peak_refusal_by_preserving(bool, std::size_t) const noexcept { return 0U; }
+    void note_successor_relief(bool, std::uint32_t, std::uint32_t, std::uint32_t) noexcept {}
+    void record_assessed_peak(bool, bool, std::uint32_t, std::uint32_t, std::uint8_t = 0U,
+                              std::uint32_t = 0U, std::uint32_t = 0U, std::uint32_t = 0U,
+                              std::uint32_t = 0U, std::uint32_t = 0U,
+                              std::uint32_t = 0U, std::uint32_t = 0U, std::uint32_t = 0U) const noexcept {}
+    [[nodiscard]] std::uint64_t assessed_agg_count(bool, bool) const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t assessed_agg_reservation(bool, bool) const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t assessed_agg_removed(bool, bool) const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t assessed_agg_selected(bool, bool) const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t assessed_agg_evicting(bool, bool) const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t assessed_agg_available(bool, bool) const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t assessed_agg_chosen(bool, bool) const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t assessed_larger_available(bool, bool) const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t assessed_chose_largest(bool, bool) const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t assessed_agg_kv_entries(bool, bool) const noexcept { return 0U; }
+    // The per-axis shortfall getter, which `ResourceManager` reads when it fills `pressure.assessed_*_
+    // axis_shortfall_*`. **A FAKE MUST CARRY EVERY METHOD ITS CALLER USES, and this one was missing while
+    // the tree only ever built with `--target ninfer-serve` -- which does not build the tests, so the break
+    // went unseen.** `cmake --build build` is what catches this class.
+    [[nodiscard]] std::uint64_t assessed_axis_shortfall(bool, bool, std::size_t) const noexcept {
+        return 0U;
+    }
+    void note_victim_ownership(std::uint64_t, std::uint64_t) noexcept {}
+    [[nodiscard]] std::uint64_t victim_ownership_calls() const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t victim_ownership_release_sum() const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t victim_ownership_resident_sum() const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t victim_ownership_gap_sum() const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t victim_ownership_gap_max() const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t victim_release_main_kv_pages(std::size_t) const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t victim_resident_main_kv_pages(std::size_t) const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t assessed_total(bool) const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t assessed_feasible(bool) const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t assessed_refused_host_blocked(bool) const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t assessed_peak_record_total() const noexcept { return 0U; }
+    [[nodiscard]] const ninfer::AssessedPeakRecord& assessed_peak_record(std::size_t) const noexcept {
+        static const ninfer::AssessedPeakRecord empty{};
+        return empty;
+    }
+    void note_successor_relief_best_only(std::uint64_t) noexcept {}
+    [[nodiscard]] std::uint64_t successor_relief_preserving_options_seen() const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t successor_relief_count(bool) const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t successor_relief_main_kv(bool) const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t successor_relief_backend_kv(bool) const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t successor_relief_state_slots(bool) const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t entitlement_split_calls() const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t entitlement_split_prompt_tokens() const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t entitlement_split_output_tokens() const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t entitlement_split_reserved_tokens() const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t reservation_composition_calls() const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t reservation_composition(std::size_t, std::size_t) const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t victim_entitlement_gap_calls() const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t victim_entitlement_gap_pages_sum() const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t victim_entitlement_gap_pages_max() const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t peak_model_calls() const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t peak_model_added(std::size_t) const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t peak_model_removed(std::size_t) const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t peak_model_peak_max(std::size_t) const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t kv_relief_demote_calls_host_req_zero() const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t kv_relief_demote_calls_host_req_nonzero() const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t kv_relief_demote_relieved_host_req_zero() const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t kv_relief_demote_relieved_host_req_nonzero() const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t kv_relief_host_blocked_bytes_sum() const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t kv_relief_host_blocked_bytes_max() const noexcept { return 0U; }
+    // MISSING SINCE THE DEVICE-KV MAGNITUDE INSTRUMENT (added 2026-10-06, found 2026-10-06): the three
+    // accessors it wired through `ResourceManager` were never added to this stub, so THIS TARGET DID NOT
+    // COMPILE from that change until now -- and because the binary on disk was stale, its run still printed a
+    // verdict, which is how it went unnoticed. A stub that fails to compile is not a red test; it is a test
+    // that silently did not run.
+    [[nodiscard]] std::uint64_t device_main_kv_fit_checks() const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t device_main_kv_shortfall_calls() const noexcept { return 0U; }
+    [[nodiscard]] std::uint64_t device_main_kv_shortfall_max_pages() const noexcept { return 0U; }
     [[nodiscard]] std::uint64_t pressure_options() const noexcept { return 0U; }
     [[nodiscard]] std::uint64_t demote_options() const noexcept { return 0U; }
 
@@ -2870,9 +3005,9 @@ void test_host_state_census_counts_unanchored_checkpoints() {
     }
     RuntimeStats stats;
     manager.populate_runtime_stats(program, stats);
-    require(stats.host_state_checkpoints_reachable == 1,
+    require(stats.host_state_checkpoints_held == 1,
             "exactly one host-resident checkpoint is the conversation's cell; the census must count it once");
-    require(stats.host_state_checkpoints_unanchored == 2,
+    require(stats.host_state_checkpoints_unheld == 2,
             "the two superseded continuations are host-resident and unanchored; counting them as 0 (or as "
             "reachable) is the mutant this catches");
     // CONTROL: with residency DeviceOnly the same three continuations hold nothing on host, so both counts
@@ -2887,8 +3022,8 @@ void test_host_state_census_counts_unanchored_checkpoints() {
     }
     RuntimeStats cold_stats;
     cold_manager.populate_runtime_stats(cold, cold_stats);
-    require(cold_stats.host_state_checkpoints_reachable == 0 &&
-                cold_stats.host_state_checkpoints_unanchored == 0,
+    require(cold_stats.host_state_checkpoints_held == 0 &&
+                cold_stats.host_state_checkpoints_unheld == 0,
             "device-only checkpoints must count zero: the census measures residency, not catalog size");
 }
 
@@ -4153,6 +4288,10 @@ void test_backfill_proof_and_stats_follow_program_revision() {
 
     program.usage = FakePhysicalUsage{
         .device_state_slots      = 3,
+        // THE CEILING IS PINNED WITH A DISTINCT VALUE (8, not 3) so the assertion below cannot pass by
+        // coincidence if the plumbing is dropped. Without this, deleting the copy in `resource_manager.h`
+        // left every check green: the field would read 0 and nothing compared it. A review found that.
+        .device_state_capacity_slots = 8,
         .host_state_slots        = 2,
         .device_main_kv_pages    = 11,
         .device_backend_kv_pages = 5,
@@ -4164,6 +4303,9 @@ void test_backfill_proof_and_stats_follow_program_revision() {
                 stats.device_main_kv_occupied_pages == 11 &&
                 stats.device_backend_kv_occupied_pages == 5 && stats.host_kv_occupied_bytes == 4096,
             "runtime physical gauges did not come directly from Program");
+    require(stats.device_state_capacity_slots == 8,
+            "the device state CEILING did not reach /stats -- the e2e's saturation check needs it, and "
+            "without this assertion deleting the copy in resource_manager.h leaves every suite green");
 }
 
 void test_shortlist_collision_requires_program_exact_verification() {
@@ -4594,7 +4736,37 @@ void test_value_weights_rank_private_victims_by_rebuild_cost() {
 
 } // namespace
 
+// THE JOURNAL VOCABULARY, PINNED. `demote_refusal=` is a documented alert string (`already-on-host`) and the
+// `/stats` keys are derived from this same table, so an edit here silently moves both at once. The
+// enum-order tie is a compile-time static_assert in `state_store.h`; what a static_assert cannot check is the
+// TEXT, so it is checked here -- and deliberately against LITERALS, because the enum's own accessor now reads
+// this table and comparing the two would be circular and would pass no matter what it said.
+void test_demote_refusal_name_table() {
+    require(ninfer::k_demote_refusal_buckets == 10,
+            "the bucket count moved without the /stats export being extended");
+    // ALL TEN, pinned against literals -- not indices 0, 6 and 9 as the first version did, which left
+    // `names[3]`/`names[4]` swappable: that would pass every assert and silently split the journal's
+    // `demote_refusal=` token from the `/stats` key it is supposed to agree with.
+    static const char* const expected[] = {
+        "none",          "host-tier-disabled", "invalid-handle",   "stale-generation", "not-immutable-checkpoint",
+        "not-device-resident", "already-on-host", "pending-replica", "pin-saturated",   "no-host-capacity"};
+    for (std::size_t i = 0; i < ninfer::k_demote_refusal_buckets; ++i) {
+        require(std::string_view(ninfer::k_demote_refusal_names[i]) == expected[i],
+                "a clause name moved: the journal token and the /stats key would now disagree");
+    }
+    for (std::size_t i = 0; i < ninfer::k_demote_refusal_buckets; ++i) {
+        require(ninfer::k_demote_refusal_names[i][0] != '\0',
+                "an empty clause name would produce a bare `/stats` key");
+        for (std::size_t j = i + 1; j < ninfer::k_demote_refusal_buckets; ++j) {
+            require(std::string_view(ninfer::k_demote_refusal_names[i]) !=
+                        ninfer::k_demote_refusal_names[j],
+                    "two clauses share a name, so their /stats keys collide");
+        }
+    }
+}
+
 int main() {
+    run_test("demote refusal names are the journal vocabulary", test_demote_refusal_name_table);
     run_test("independent complete-target oracle",
              test_complete_search_against_small_exhaustive_oracle);
     run_test("unplannable request with no active lane is permanently infeasible",

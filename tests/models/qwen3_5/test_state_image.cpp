@@ -210,6 +210,42 @@ void test_host_roundtrip(bool dflash, ninfer::DeviceContext& device, bool dflash
     expect(host.trim_idle_slots(floor) == 3U, "trim gives back exactly what is above the floor");
     expect(host.capacity() == floor, "capacity is back AT the floor, never below it");
     expect(host.trim_idle_slots(floor) == 0U, "and a second trim has nothing to give back");
+
+    // ***THE CEILING, AND BOTH DIRECTIONS OF IT (2026-10-05).*** Host KV and host state share one pinned pool,
+    // and this pool had no bound of its own: it grew until the pool was full, so the KV side kept no growth
+    // room, `Growable` could not be returned, and the planner evicted restorable victims whose own KV WOULD
+    // have fitted. The bound is the lever. A control that only asserted the REFUSAL would pass on a pool that
+    // refuses everything, so the raised ceiling below is the mutation check.
+    const std::uint64_t ceiling_refusals_before = host.growth_ceiling_refusals();
+    const std::uint64_t pool_refusals_before    = host.growth_refusals();
+    // FILL EVERY FREE SLOT FIRST, and this is not tidiness: `allocate_growing` tries `allocate()` BEFORE it
+    // grows, so with a free slot present it returns one and NEVER REACHES `grow_slot` -- the ceiling is not
+    // consulted and the test measures nothing. The first version of this block asserted the refusal with
+    // free slots still available and failed on all three lines, which is the control working on my own test.
+    std::vector<q36::HostStateSlotHandle> filled;
+    while (const auto extra = host.allocate()) { filled.push_back(*extra); }
+    expect(host.capacity() == filled.size(), "the pool is FULL, so the next allocation must grow");
+    host.set_max_slots(host.capacity());
+    expect(host.max_slots() == host.capacity(), "the ceiling is what was set");
+    expect(!host.allocate_growing().has_value(), "growth is refused AT the ceiling");
+    expect(host.capacity() == host.max_slots(), "and the refusal did not change the capacity");
+    expect(host.growth_ceiling_refusals() == ceiling_refusals_before + 1U,
+           "the ceiling refusal is counted -- a silent refusal is not a measurement");
+    // THE TWO REFUSALS MEAN OPPOSITE THINGS: the ceiling is room this axis gave to KV ON PURPOSE, the pool's
+    // own refusal is the machine being out of room. This asserts they are not the same counter.
+    expect(host.growth_refusals() == pool_refusals_before,
+           "a CEILING refusal is not counted as a POOL refusal (opposite facts)");
+
+    // AND THE SAME CALL SUCCEEDS ONCE THE CEILING MOVES, so the control can fail in both directions.
+    host.set_max_slots(host.max_slots() + 1U);
+    const auto regrown = host.allocate_growing();
+    expect(regrown.has_value(), "the same growth SUCCEEDS once the ceiling is raised");
+    expect(host.capacity() == host.max_slots(), "capacity reaches the raised ceiling");
+    expect(host.release(*regrown), "the regrown slot releases");
+    for (const auto& slot : filled) { expect(host.release(slot), "each filled slot releases"); }
+    // Back to unbounded, so a later assertion in this test cannot inherit a ceiling that was set here.
+    host.set_max_slots(0);
+    expect(host.max_slots() == 0U, "zero means unbounded again");
 }
 
 } // namespace

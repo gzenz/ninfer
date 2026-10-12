@@ -798,34 +798,60 @@ ProgramImpl::release_shared_prefix_state_strict(std::uint32_t index,
 }
 
 ReleaseResult ProgramImpl::release_shared_prefix(SharedPrefixHandle&& handle) noexcept {
+    // THE DENOMINATOR, and it is counted BEFORE any early return -- an attempt that refuses still counts as an
+    // attempt, which is the whole point. Without it the four refusal counters cannot be read.
+    (void)note_shared_prefix_release_attempt();
     // I3(a): every refusal here is silent by design (this is a noexcept release path), which is how a
     // slot whose role is wrong, or whose KV address cannot be released, keeps its occupancy without
-    // anyone learning why. `NINFER_RELEASE_PROBE=1` names the reason instead. Read-only.
-    const auto refusal = [](const char* reason, std::uint32_t index) noexcept {
+    // anyone learning why.
+    //
+    // COUNTED ALWAYS; PRINTED ONLY ON REQUEST. The count is the instrument -- `SharedPrefixReleaseRefusal`
+    // in `program_impl.h` explains why a probe behind an environment variable could not be one: it is set
+    // nowhere, so its silence proved nothing. The print stays for a focused run, where the REASON matters
+    // more than the rate; the counter answers the rate, which the print cannot.
+    const auto refusal = [this](SharedPrefixReleaseRefusal reason, const char* reason_name,
+                                std::uint32_t index) noexcept {
+        (void)note_shared_prefix_release_refusal(reason);
         if (std::getenv("NINFER_RELEASE_PROBE") != nullptr) {
             std::fprintf(stderr, "[release-probe] shared-prefix release refused: %s index=%u\n",
-                         reason, index);
+                         reason_name, index);
             std::fflush(stderr);
         }
     };
     ReleaseResult out;
     const std::uint32_t index      = ContractAccess::index(handle);
     const std::uint64_t generation = ContractAccess::epoch(handle);
-    const bool valid =
-        !has_context_transaction() && !pending_transaction_ && valid_shared_prefix(handle);
-    if (!valid || index >= shared_prefix_capacity ||
-        shared_prefix_slots[index].generation != generation) {
-        refusal(valid ? "stale-generation-or-index" : "transaction-in-flight-or-invalid-handle",
-                index);
+    // THE DISCRIMINATOR IS WHICH CLAUSE FAILED, NOT WHETHER THE CONJUNCTION DID.
+    //
+    // The first version of this computed `valid` as the CONJUNCTION of the no-transaction test and
+    // `valid_shared_prefix`, then reported `valid ? stale : in_flight`. That made `stale` UNREACHABLE and is
+    // worth spelling out, because the code looked right: `valid_shared_prefix` already tests
+    // `index < shared_prefix_capacity` and the generation (`context.cpp`), so whenever `valid` was true those
+    // same terms were false and the enclosing `if` could only have fired on `!valid` -- the `if (valid)` arm
+    // could not be entered. Every stale handle was therefore counted as `in_flight`, i.e. the two counters said
+    // the opposite of their comment.
+    //
+    // They are now tested SEPARATELY, so each fires for its own cause: a transaction in flight is contention,
+    // an invalid handle is a caller bug, and a counter that cannot increment is not an instrument.
+    const bool no_transaction = !has_context_transaction() && !pending_transaction_;
+    const bool live_handle    = valid_shared_prefix(handle);
+    if (!no_transaction || !live_handle) {
+        if (!no_transaction) {
+            refusal(SharedPrefixReleaseRefusal::TransactionInFlightOrInvalidHandle,
+                    "transaction-in-flight-or-invalid-handle", index);
+        } else {
+            refusal(SharedPrefixReleaseRefusal::StaleGenerationOrIndex, "stale-generation-or-index", index);
+        }
         return out;
     }
     try {
         if (!can_release_shared_prefix_state(index, SharedPrefixSlotRole::Catalogued)) {
-            refusal("state-not-releasable", index);
+            refusal(SharedPrefixReleaseRefusal::StateNotReleasable, "state-not-releasable", index);
             return out;
         }
     } catch (...) {
-        refusal("state-releasable-check-threw", index);
+        refusal(SharedPrefixReleaseRefusal::StateReleasableCheckThrew,
+                "state-releasable-check-threw", index);
         return out;
     }
     (void)release_shared_prefix_state_strict(index, SharedPrefixSlotRole::Catalogued);
@@ -916,11 +942,34 @@ void ProgramImpl::fail_all_cleanup() noexcept {
     // cannot be counted from here. What it buys is attribution by elimination -- if the residual line
     // is non-zero while every live continuation was released and the shared counts are clean, the leak
     // is inside the non-strict release path or below it, not in a skipped slot.
+    // THE HOST-KV EXTENT LAYER, WHICH THIS LINE DID NOT REPORT. The note above attributes by elimination --
+    // "every live continuation was released and the shared counts are clean, so the leak is inside the
+    // non-strict release path or below it" -- and "below it" is exactly here. Until now the layer returned
+    // only what it RELEASED, so a page retained by a stale source pin was silent: `partition_extent` computes
+    // `retained_runs` for descriptor capacity and discards it, and an extent whose pages are ALL retained
+    // returns 0 early and reaches no counter at all.
+    //
+    // AT A FAIL-ALL NOTHING SHOULD BE RETAINED. So both numbers are expected to be ZERO here, which is what
+    // makes this readable without a threshold -- the same reading as `skipped` beside it. Non-zero is the
+    // 2026-09-25 shape (occupancy owned by nothing) named at the layer that owns it, rather than inferred
+    // from a residual two levels up. The two causes are printed apart because they are different #9
+    // candidates: a legitimate share still mapped, versus a pin that outlived its owner.
+    std::size_t   host_released     = 0;
+    std::uint32_t host_retained_ref = 0;
+    std::uint32_t host_retained_pin = 0;
+    if (host_kv_extents) {
+        const auto census  = host_kv_extents->release_unreferenced();
+        host_released      = census.released_bytes;
+        host_retained_ref  = census.retained_referenced;
+        host_retained_pin  = census.retained_pinned;
+    }
     std::fprintf(stderr,
                  "[engine] fail-all cleanup: shared catalogued=%u released-refused=%u skipped=%u "
-                 "(reserved-capture=%u reserved-replacement=%u) continuations-live=%u\n",
+                 "(reserved-capture=%u reserved-replacement=%u) continuations-live=%u "
+                 "| host-kv released-bytes=%zu retained-referenced=%u retained-pinned=%u\n",
                  shared_catalogued, shared_release_refus, shared_skipped, shared_reserved_cap,
-                 shared_reserved_rep, continuations_live);
+                 shared_reserved_rep, continuations_live, host_released, host_retained_ref,
+                 host_retained_pin);
     std::fflush(stderr);
 }
 

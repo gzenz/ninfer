@@ -23,15 +23,21 @@ The event, verbatim:
   ERROR req#136 failed during generation | HTTP 500
   ERROR req#116 failed during generation | HTTP 500
 
-Attribution (by the throw site, materialization.cpp:250-260 + :633-635):
-  The check tests active_lanes and state_slots BEFORE main_kv_pages, so both were
-  clean and only the KV page axis underflowed, by 2.
-  The message renders "have <value>, removing <removed>" with value=planned
-  final_removed and removed=actual, i.e. line 635:
-      (void)checked_resource_difference(details.demand.final_removed, removed);
-  --> the engine removed 1059 device main-KV pages where its plan said 1057.
-  This is the site plan.md:1489 called "the likelier one" by reading; the
-  occurrence confirms it rather than assuming it.
+Attribution -- THE AXIS ONLY. CORRECTED 2026-10-04.
+  The two paragraphs that claimed the CALL SITE are replaced, not kept: this file
+  asserted "the occurrence confirms it", and the occurrence does not.
+    AXIS, established: The check tests active_lanes and state_slots BEFORE
+    main_kv_pages, so both were clean and only the KV page axis underflowed, by 2.
+    --> the engine removed 1059 device main-KV pages where its plan said 1057.
+    SITE, NOT established: the message renders "have <value>, removing <removed>"
+    IDENTICALLY at BOTH sites that raise it -- `checked_resource_difference` on the
+    subtraction, and on the planned-vs-actual comparison -- so that text cannot say
+    which one threw. Reading it as the planned-vs-actual site from the argument
+    order ASSUMES the conclusion it claims to reach.
+    The discriminator that would settle it (`mat-remove skew`, printing `planned`
+    beside `before`) was DEPLOYED by 2026-10-02 but does not appear in
+    occurrence-120642.journal; whether it was in the 12:06 binary is UNRESOLVED, so
+    its absence carries no information either way.
 
 ## E2E REPRODUCES #2/#13 ON DEMAND (2026-10-02 14:0x, e2e run on the frozen binary)
 

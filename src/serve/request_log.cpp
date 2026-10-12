@@ -90,7 +90,13 @@ Json tool_call_parse_json(const ninfer::ToolCallParseDiagnostics& diagnostics) {
                 {"empty_arguments_omitted", diagnostics.empty_arguments_omitted},
                 {"schema_mismatch_arguments", diagnostics.schema_mismatch_arguments},
                 {"fallback_reason",
-                 ninfer::tool_call_parse_fallback_reason_name(diagnostics.fallback_reason)}};
+                 ninfer::tool_call_parse_fallback_reason_name(diagnostics.fallback_reason)},
+                // WHICH PATH RAISED IT (#29). The reason alone says only the SYMPTOM, and both causes
+                // produce the same symptoms -- so a per-request record without this cannot answer "does the
+                // engine's parser do this, or did the model emit bad markup?", which is the question that
+                // decides whether the e2e check may BLOCK a commit on it. `unset` is meaningful and NOT
+                // omitted: it says the parser's recovery arm never ran.
+                {"parse_path", ninfer::tool_call_parse_path_name(diagnostics.parse_path)}};
 }
 
 std::string tool_choice_name(const ToolChoice& choice) {

@@ -814,6 +814,58 @@ int test_tolerant_spurious_leading_marker() {
     return failures;
 }
 
+int test_fallback_path_discriminator() {
+    using Reason = ninfer::ToolCallParseFallbackReason;
+    using Path   = ninfer::ToolCallParsePath;
+    int failures = 0;
+
+    // #29'S CONTROL, AND IT IS TWO-DIRECTIONAL ON PURPOSE. The question -- "is this a parser leak or the
+    // model's own output?" -- was unanswerable because the fallback reasons describe the SYMPTOM and both
+    // causes produce the same ones. `parse_path` is the parser's own record that its tolerant content-skip
+    // arm ran. A control that only asserted the SET case would pass on a mutant that reports the path
+    // unconditionally, so the strict arm below is the mutation check.
+    const auto contract = output_contract_for("write_file", Json{{"path", Json{{"type", "string"}}}});
+
+    // The value carries a literal `</parameter>` that does NOT continue the call (the text after it is
+    // `xyz`), so the tolerant content-skip arm runs; a LATER close IS accepted, so the value completes and
+    // the parse moves on to `</tool_call>` where no parameter can open -- an unconditional
+    // `MalformedStructure`. BOTH events are in one parse, which is exactly the case the discriminator exists
+    // to make visible. (The first version of this test used an input that tolerant mode RECOVERED as a
+    // truncated tail instead of falling back, so the arm ran and there was no fallback to attribute -- the
+    // assertion failed and the input, not the instrument, was wrong.)
+    const std::string text = "<tool_call>\n<function=write_file>\n"
+                             "<parameter=path>abc</parameter>xyz</parameter></tool_call>";
+
+    const auto tolerant = fi::parse_qwen_tool_call_output(text, 64, *contract, /*tolerant*/ true);
+    failures += check(!tolerant.is_tool_call_response,
+                      "discriminator case recovered instead of falling back to text");
+    failures += check(tolerant.diagnostics.fallback_reason == Reason::MalformedStructure,
+                      "discriminator case did not fall back as malformed structure");
+    failures += check(tolerant.diagnostics.parse_path == Path::AfterTolerantContentSkip,
+                      "the tolerant content-skip arm ran but the path did not record it (#29)");
+
+    // THE SAME INPUT IN STRICT MODE: the arm cannot run (`tolerant_` is false), so the path must stay Unset.
+    const auto strict = fi::parse_qwen_tool_call_output(text, 64, *contract);
+    failures += check(strict.diagnostics.parse_path == Path::Unset,
+                      "strict mode reported a tolerant content skip it cannot have taken (#29 control)");
+
+    // AND A RECOVERED PARSE REPORTS NO PATH: the arm DOES run on this payload (literal markers in a value),
+    // but no fallback occurs, so there is nothing for the discriminator to attribute. Asserted because a
+    // path on a successful parse would make the field unreadable as "this fallback's cause".
+    const auto recovered_contract = output_contract_for(
+        "write_file", Json{{"path", Json{{"type", "string"}}}, {"content", Json{{"type", "string"}}}});
+    const std::string recovered =
+        "<tool_call>\n<function=write_file>\n<parameter=path>/tmp/o.txt</parameter>\n"
+        "<parameter=content>a</parameter>b</parameter>\n</function>\n</tool_call>";
+    const auto recovered_out =
+        fi::parse_qwen_tool_call_output(recovered, 64, *recovered_contract, /*tolerant*/ true);
+    failures += check(recovered_out.is_tool_call_response,
+                      "recovered discriminator payload did not parse as a call");
+    failures += check(recovered_out.diagnostics.parse_path == Path::Unset,
+                      "a RECOVERED parse reported a fallback path, so the field cannot mean 'this cause'");
+    return failures;
+}
+
 int test_tolerant_literal_markers_in_value() {
     using Reason = ninfer::ToolCallParseFallbackReason;
     int failures = 0;
@@ -1101,6 +1153,7 @@ int main() {
     failures += test_tolerant_recovery();
     failures += test_tolerant_spurious_leading_marker();
     failures += test_tolerant_literal_markers_in_value();
+    failures += test_fallback_path_discriminator();
     failures += test_tolerant_truncated_final_call();
     failures += test_tolerant_missing_function_close_bracket();
     failures += test_tolerant_truncated_final_parameter_value();

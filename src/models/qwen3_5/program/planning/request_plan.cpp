@@ -263,6 +263,13 @@ RequestBasePlan ProgramImpl::plan_request(const PreparedPromptData& prompt,
                                            ? 0U
                                            : base->summary.effective_output_tokens - 1U);
     base->text_kv_page_entitlement = pages_for_tokens(reserved_context_tokens);
+    // *** THE ENTITLEMENT'S OWN SPLIT (2026-10-06). *** The reservation was measured to be 100% this
+    // entitlement (arm A14), so the remaining question is WHAT the entitlement is: the prompt, the output
+    // budget, or both. It is EXACTLY `prompt_tokens + (effective_output_tokens - 1)`, so the three token
+    // counts settle it -- and the page split is `pages_for_tokens` of each, which is NOT the same as the token
+    // split (the `1 + (n-1)/64` rounding is per term, not per sum). Captured here, where all three are known.
+    note_entitlement_split(base->summary.prompt_tokens, base->summary.effective_output_tokens,
+                           reserved_context_tokens);
     if (speculative_backend == SpeculativeBackend::Mtp) {
         const std::uint32_t mtp_tokens    = static_cast<std::uint32_t>(std::min<std::uint64_t>(
             capacity, static_cast<std::uint64_t>(reserved_context_tokens) + draft_window - 1ULL));
@@ -1390,6 +1397,17 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
     const detail::PhysicalDeviceResources exclusive_additional =
         additional_resources(exclusive_active, conversions);
     detail::PhysicalResources reservation_added{.device = exclusive_additional};
+    // *** THE RESERVATION'S COMPOSITION (2026-10-06). *** The peak `physical_peak_fits` judges a plan on IS
+    // this reservation (`:1422`), so a remedy aimed at "the reservation" without knowing which TERM dominates
+    // is aimed at a sum. Three terms are summed into the device-KV field below --
+    // `exclusive_additional` (the request's own exclusive entitlement), `shared_replica_additions`, and
+    // `transient_source_restores` -- and each implies a different remedy. Captured BEFORE the additions so the
+    // base is the base and not the running total.
+    note_reservation_composition(exclusive_additional.main_kv_pages, exclusive_additional.backend_kv_pages,
+                                 shared_replica_additions.device.main_kv_pages,
+                                 shared_replica_additions.device.backend_kv_pages,
+                                 transient_source_restores.device.main_kv_pages,
+                                 transient_source_restores.device.backend_kv_pages);
     if (shared_replica_additions.device.main_kv_pages >
             std::numeric_limits<std::uint32_t>::max() - reservation_added.device.main_kv_pages ||
         shared_replica_additions.device.backend_kv_pages >

@@ -1258,6 +1258,17 @@ function renderKvBars(latest){
     h+=bar([{pct:poolPct,color:C.kv[2],label:'used'},{pct:100-poolPct,color:'#30363d',label:'free'}]);
     h+='<div style="font-size:12px;color:var(--muted);margin:2px 0 2px">growth: state '+(mem.host_pinned_grows||0)+' · kv '+(mem.host_kv_grows||0)+' · refusals '+(mem.host_pinned_grow_refusals||0)+'/'+(mem.host_kv_grow_refusals||0)+'</div>';
     h+='<div style="font-size:12px;color:var(--muted);margin:2px 0 2px">demotable evictions '+(pstats.private_evictions_demotable||0)+' / '+(pstats.private_eviction_checks||0)+' checked · maximal fallback '+(pstats.maximal_fallback_selections||0)+'</div>';
+    h+='<div style="font-size:12px;color:var(--muted);margin:2px 0 2px">host-state fit '+(pstats.host_state_fit_checks||0)+' assessed of '+(pstats.physical_peak_fits_calls||0)+' queries · shortfall '+(pstats.host_state_shortfall_calls||0)+' (worst '+(pstats.host_state_shortfall_max_slots||0)+' slots)</div>';
+    // `none` IS SHOWN FIRST, and the reason is a correction: this line previously omitted it and claimed the
+    // other seven clauses "have never been observed to fire". That was false, and measurably so on the day it
+    // was written -- `demote_refusal_at_eviction_none` was 29 of 104 evictions, and `none` is exactly the #6
+    // population (a demote fully available and the victim evicted anyway). So the dashboard showed one class
+    // and hid the other. `evictions_demote_possible` sits beside it because that counter IS the same
+    // population by construction (`demote_possible` == `demote_refusal == None`), so the pair reads together.
+    // **`already-on-host` is NOT benign**, and this line said it was until 2026-10-04: state on host +
+    // evicted frees the host slots and DESTROYS the copy -- what is moot is the demote, not the loss.
+    // All ten clauses remain in `/stats`.
+    h+='<div style="font-size:12px;color:var(--muted);margin:2px 0 2px">demote refusal of '+(pstats.private_eviction_checks||0)+' evictions: none '+(pstats.demote_refusal_at_eviction_none||0)+' (demote-possible '+(pstats.evictions_demote_possible||0)+') · already-on-host '+(pstats.demote_refusal_at_eviction_already_on_host||0)+' · no-host-capacity '+(pstats.demote_refusal_at_eviction_no_host_capacity||0)+' · pin-saturated '+(pstats.demote_refusal_at_eviction_pin_saturated||0)+'</div>';
     // FRAGMENTATION, as a bar in the same idiom as the pool bar above. `free` alone is misleading: the pool
     // can hold gigabytes while no single run is large enough to place anything (measured 2026-10-01:
     // 2175 MiB free, 290 MiB largest run, a state image needing ~187 MiB). The bar splits the pool's FREE

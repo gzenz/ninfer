@@ -51,6 +51,14 @@ private:
 // checkpoint, retention, or scheduling policy.
 class HostKVExtentStore {
 public:
+    // THE REFUSAL SPLIT for the three places this wrapper returns `Blocked` BEFORE the arena is asked.
+    // Mutable because the query is `const`. See `HostKVBlockReason` for why they are counted here AND in
+    // the arena: the two sets cannot see each other's refusals.
+    [[nodiscard]] std::uint64_t block_reason_count(HostKVBlockReason reason) const noexcept {
+        const std::size_t index = static_cast<std::size_t>(reason);
+        return index < k_host_kv_block_reason_count ? block_reasons_[index] : 0U;
+    }
+
     HostKVExtentStore(HostKVArena& arena, std::uint32_t descriptor_capacity)
         : arena_(&arena), extents_(descriptor_capacity), free_(descriptor_capacity),
           memberships_(descriptor_capacity),
@@ -358,7 +366,7 @@ public:
     can_release_page_replicas(std::span<const HostKVPageReplicaRelease> releases) const noexcept {
         begin_release_marks();
         for (const HostKVPageReplicaRelease& release : releases) {
-            if (release.pages == nullptr || !mark_release(*release.pages, release.page, false)) {
+            if (release.pages == nullptr || mark_release(*release.pages, release.page, false) != HostKVBlockReason::None) {
                 return false;
             }
         }
@@ -370,7 +378,7 @@ public:
                               std::span<const LogicalKVPageHandle> releases) const noexcept {
         begin_release_marks();
         for (const LogicalKVPageHandle release : releases) {
-            if (!mark_release(pages, release, false)) { return false; }
+            if (mark_release(pages, release, false) != HostKVBlockReason::None) { return false; }
         }
         return true;
     }
@@ -402,13 +410,13 @@ public:
             return true;
         };
         for (const HostKVPageReplicaRelease& release : releases) {
-            if (release.pages == nullptr || !mark_release(*release.pages, release.page, false) ||
+            if (release.pages == nullptr || mark_release(*release.pages, release.page, false) != HostKVBlockReason::None ||
                 !append(release)) {
                 return false;
             }
         }
         for (const HostKVPageReplicaRelease& release : last_reference_releases) {
-            if (release.pages == nullptr || !mark_release(*release.pages, release.page, true) ||
+            if (release.pages == nullptr || mark_release(*release.pages, release.page, true) != HostKVBlockReason::None ||
                 !append(release)) {
                 return false;
             }
@@ -473,7 +481,13 @@ public:
             if (release.pages == nullptr) { return false; }
             const HostKVPageReplica replica = release.pages->host_replica(release.page);
             const Extent& extent            = require(replica.extent);
-            if (!extent.allocation) { return false; }
+            if (!extent.allocation) {
+                // THE REFUSAL NEVER REACHES THE ARENA, so an arena-side split counts nothing
+                // for it. Counted where the cause is visible.
+                ++block_reasons_[static_cast<std::size_t>(
+                    HostKVBlockReason::StoreReleaseExtentUnallocated)];
+                return false;
+            }
             suballocation_scratch_.push_back(HostKVSuballocationRelease{
                 .allocation = extent.allocation->handle(),
                 .begin_page = replica.page_offset,
@@ -482,16 +496,38 @@ public:
             return true;
         };
         for (const HostKVPageReplicaRelease& release : releases) {
-            if (release.pages == nullptr || !mark_release(*release.pages, release.page, false) ||
-                !append(release)) {
+            if (release.pages == nullptr) {
+                ++block_reasons_[static_cast<std::size_t>(HostKVBlockReason::StoreReleasePagesNull)];
                 return HostKVFitResult{};
             }
+            {
+                // WHICH PREDICATE REFUSED, counted as itself. The single counter this replaced called
+                // all eight of `mark_release`'s causes `already_marked`, so the reading could not be
+                // trusted -- a name that claims one cause while counting eight is worse than none.
+                const HostKVBlockReason refused = mark_release(*release.pages, release.page, false);
+                if (refused != HostKVBlockReason::None) {
+                    ++block_reasons_[static_cast<std::size_t>(refused)];
+                    return HostKVFitResult{};
+                }
+            }
+            if (!append(release)) { return HostKVFitResult{}; }
         }
         for (const HostKVPageReplicaRelease& release : last_reference_releases) {
-            if (release.pages == nullptr || !mark_release(*release.pages, release.page, true) ||
-                !append(release)) {
+            if (release.pages == nullptr) {
+                ++block_reasons_[static_cast<std::size_t>(HostKVBlockReason::StoreReleasePagesNull)];
                 return HostKVFitResult{};
             }
+            {
+                // WHICH PREDICATE REFUSED, counted as itself. The single counter this replaced called
+                // all eight of `mark_release`'s causes `already_marked`, so the reading could not be
+                // trusted -- a name that claims one cause while counting eight is worse than none.
+                const HostKVBlockReason refused = mark_release(*release.pages, release.page, true);
+                if (refused != HostKVBlockReason::None) {
+                    ++block_reasons_[static_cast<std::size_t>(refused)];
+                    return HostKVFitResult{};
+                }
+            }
+            if (!append(release)) { return HostKVFitResult{}; }
         }
         HostKVFitResult result = arena_->fit_after_suballocation_releases(
             suballocation_scratch_, allocations, growth_headroom_bytes);
@@ -522,8 +558,31 @@ public:
     // Address-space teardown can leave part of an extent with no logical owner. Partition each
     // affected extent once, release all zero-reference runs, and republish retained runs with
     // generation-checked capabilities. Descriptor capacity is provisioned per Host page.
-    [[nodiscard]] std::size_t release_unreferenced() noexcept {
-        std::size_t released_bytes = 0;
+    // WHAT `release_unreferenced` DID, AND -- THE PART THAT WAS INVISIBLE -- WHAT IT LEFT.
+    //
+    // This is #9's blind candidate. The contract is "release every extent whose pages are all unreferenced",
+    // and a page is retained while an address still maps it OR a source pin survives. The retained side was
+    // counted by nothing: `partition_extent` computes `retained_runs` for descriptor capacity and discards
+    // it, an extent whose pages are ALL retained returns `0` early and reaches no counter at all, and the
+    // only symptom was `released_bytes` reading smaller than expected -- against an expectation nothing
+    // stated. A stale pin could therefore strand host KV and read exactly like a clean release.
+    //
+    // THE TWO ARE COUNTED APART, deliberately: they are DIFFERENT candidates in #9's list, and one "retained"
+    // total could not tell a leaked pin from a legitimately-shared page -- which is the mistake the shared
+    // slot counters beside this one were built to avoid.
+    //
+    // READ IT AT A CLEANUP, NOT AS A RUNNING TOTAL. `source_pins != 0` is a NORMAL TRANSIENT (an in-flight
+    // transfer pins its source), so a cumulative count over ordinary traffic is large and means nothing. The
+    // number that means something is this census taken when nothing SHOULD remain -- `fail_all_cleanup`,
+    // which is where the 2026-09-25 recovery left occupancy owned by nothing.
+    struct HostKVReleaseCensus {
+        std::size_t   released_bytes      = 0;
+        std::uint32_t retained_referenced = 0;  // kept: an address still maps the page
+        std::uint32_t retained_pinned     = 0;  // kept: a source pin survives -- the stale-pin candidate
+    };
+
+    [[nodiscard]] HostKVReleaseCensus release_unreferenced() noexcept {
+        HostKVReleaseCensus out{};
         try {
             extent_scan_scratch_.clear();
             for (std::uint32_t index = 0; index < extents_.size(); ++index) {
@@ -534,18 +593,28 @@ public:
                 }
             }
             for (const std::uint32_t index : extent_scan_scratch_) {
-                const std::size_t bytes =
-                    partition_extent(index, [](const LogicalKVPageStore& pages,
-                                               LogicalKVPageHandle page, std::uint32_t) {
-                        return pages.address_references(page) == 0 && pages.source_pins(page) == 0;
+                // The counted predicate is reached once per page and BEFORE the early return, so an extent
+                // that releases nothing is still counted -- that case was the invisible one.
+                const std::size_t bytes = partition_extent(
+                    index, [&out](const LogicalKVPageStore& pages, LogicalKVPageHandle page,
+                                  std::uint32_t) {
+                        if (pages.address_references(page) != 0) {
+                            ++out.retained_referenced;
+                            return false;
+                        }
+                        if (pages.source_pins(page) != 0) {
+                            ++out.retained_pinned;
+                            return false;
+                        }
+                        return true;
                     });
-                if (bytes > std::numeric_limits<std::size_t>::max() - released_bytes) {
+                if (bytes > std::numeric_limits<std::size_t>::max() - out.released_bytes) {
                     std::terminate();
                 }
-                released_bytes += bytes;
+                out.released_bytes += bytes;
             }
         } catch (...) { std::terminate(); }
-        return released_bytes;
+        return out;
     }
 
 private:
@@ -633,34 +702,44 @@ private:
         }
     }
 
-    [[nodiscard]] bool mark_release(LogicalKVPageStore& pages, LogicalKVPageHandle page,
-                                    bool last_reference) const noexcept {
+    // RETURNS WHICH PREDICATE REFUSED, not a bare bool. The single counter this replaced called all eight
+    // causes `already_marked`, and a name that claims one cause while counting eight is worse than none --
+    // a reader acts on the name. `None` means the release was marked.
+    // THE CALLER COUNTS IT, and only the tri-state caller does: the boolean query marks the same pages, so
+    // counting inside here would double every refusal.
+    [[nodiscard]] HostKVBlockReason mark_release(LogicalKVPageStore& pages, LogicalKVPageHandle page,
+                                                 bool last_reference) const noexcept {
         if (last_reference) {
-            if (!pages.valid(page) || !pages.host_resident(page) || pages.source_pins(page) != 0 ||
-                pages.address_references(page) != 1) {
-                return false;
+            if (!pages.valid(page) || !pages.host_resident(page)) {
+                return HostKVBlockReason::StoreMarkPageNotHostResident;
+            }
+            if (pages.source_pins(page) != 0) { return HostKVBlockReason::StoreMarkSourcePinned; }
+            if (pages.address_references(page) != 1) {
+                return HostKVBlockReason::StoreMarkNotSoleReference;
             }
         } else if (!can_release_page_replica(pages, page)) {
-            return false;
+            return HostKVBlockReason::StoreMarkCannotReleaseReplica;
         }
         const HostKVPageReplica replica = pages.host_replica(page);
         if (!valid(replica.extent) || replica.membership_node >= memberships_.size()) {
-            return false;
+            return HostKVBlockReason::StoreMarkReplicaInvalid;
         }
         const Membership& membership = memberships_[replica.membership_node];
         if (membership.page != page || membership.extent != replica.extent.index_ ||
             membership.offset != replica.page_offset ||
             replica.page_offset >= extents_[replica.extent.index_].page_count ||
             extents_[replica.extent.index_].page_store != &pages) {
-            return false;
+            return HostKVBlockReason::StoreMarkMembershipMismatch;
         }
-        if (release_marks_[replica.membership_node] == release_stamp_) { return false; }
+        if (release_marks_[replica.membership_node] == release_stamp_) {
+            return HostKVBlockReason::StoreMarkAlreadyMarked;
+        }
         release_marks_[replica.membership_node] = release_stamp_;
         if (extent_marks_[replica.extent.index_] != release_stamp_) {
             extent_marks_[replica.extent.index_] = release_stamp_;
             affected_extents_.push_back(replica.extent.index_);
         }
-        return true;
+        return HostKVBlockReason::None;
     }
 
     void release_marked_extents() {
@@ -860,6 +939,8 @@ private:
     mutable std::vector<std::uint32_t> affected_extents_;
     mutable std::vector<HostKVSuballocationRelease> suballocation_scratch_;
     mutable std::uint32_t release_stamp_ = 0;
+    // The refusal split for the three pre-arena returns. Mutable: the query is `const`.
+    mutable std::array<std::uint64_t, k_host_kv_block_reason_count> block_reasons_{};
     std::vector<std::uint32_t> extent_scan_scratch_;
     std::vector<PartitionRun> partition_runs_;
 };

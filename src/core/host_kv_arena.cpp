@@ -473,10 +473,14 @@ HostKVArena::Placement HostKVArena::simulate_after_suballocation_releases(
 
     for (std::size_t index = 0; index < proposed_releases.size(); ++index) {
         const HostKVSuballocationRelease& release = proposed_releases[index];
-        if (!valid_handle(release.allocation) || release.page_count == 0) { return out; }
+        if (!valid_handle(release.allocation) || release.page_count == 0) {
+            out.block_reason = HostKVBlockReason::ReleaseHandleInvalid;
+            return out;
+        }
         const Descriptor& descriptor = descriptors_[release.allocation.descriptor_];
         if (release.begin_page > descriptor.pages ||
             release.page_count > descriptor.pages - release.begin_page) {
+            out.block_reason = HostKVBlockReason::ReleaseRangeExceedsDescriptor;
             return out;
         }
         const std::uint32_t end = release.begin_page + release.page_count;
@@ -484,7 +488,10 @@ HostKVArena::Placement HostKVArena::simulate_after_suballocation_releases(
             const HostKVSuballocationRelease& other = proposed_releases[prior];
             if (other.allocation != release.allocation) { continue; }
             const std::uint32_t other_end = other.begin_page + other.page_count;
-            if (release.begin_page < other_end && other.begin_page < end) { return out; }
+            if (release.begin_page < other_end && other.begin_page < end) {
+                out.block_reason = HostKVBlockReason::ReleasesOverlap;
+                return out;
+            }
         }
         const std::size_t stride = layouts_[descriptor.layout].page_stride;
         insert_extent(FreeExtent{
@@ -535,12 +542,17 @@ HostKVArena::Placement HostKVArena::simulate_after_suballocation_releases(
         }
     }
     out.descriptors_short = required_descriptors > available_descriptors;
+    if (out.descriptors_short) { out.block_reason = HostKVBlockReason::DescriptorsShort; }
 
     for (const HostKVAllocationRequest& request : target_allocations) {
-        if (request.layout == nullptr || request.pages == 0) { return out; }
+        if (request.layout == nullptr || request.pages == 0) {
+            out.block_reason = HostKVBlockReason::RequestLayoutMissing;
+            return out;
+        }
         const std::optional<std::uint32_t> layout_index = find_layout(*request.layout);
         if (!layout_index ||
             request.layout->page_stride > std::numeric_limits<std::size_t>::max() / request.pages) {
+            out.block_reason = HostKVBlockReason::RequestLayoutUnknown;
             return out;
         }
         const std::size_t bytes =
@@ -588,6 +600,12 @@ HostKVFitResult HostKVArena::fit_after_suballocation_releases(
         // first is not a fit question at all, and for the second -- a span does add descriptors, so it is
         // growth-recoverable in principle -- this query does not model the table growth and MUST NOT
         // promise room it cannot count. Conservative, and identical to today's behaviour.
+        // COUNTED BY REASON HERE, not in the simulation: the boolean query calls the same simulation, so
+        // counting there would double every refusal. This is the call the veto makes, so
+        // `host_kv_blocked_checks` is the denominator and these are its split.
+        if (static_cast<std::size_t>(placement.block_reason) < k_host_kv_block_reason_count) {
+            ++block_reasons_[static_cast<std::size_t>(placement.block_reason)];
+        }
         return result;
     }
     result.shortfall_bytes   = placement.unsatisfied_bytes;

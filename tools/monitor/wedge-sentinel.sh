@@ -27,15 +27,22 @@
 #
 # Signal sources per poll, in order:
 #   1. HTTP /stats — scheduler gauges + counters sum.
-#   2. journal "throughput interval" line within 60s — fallback for the
-#      gauges. The line's NON-ZERO prefill/decode tok/s is ALSO progress
-#      evidence for C (v3.1): the 5s reporter samples the same cumulative
-#      counters on its own thread, so a non-zero rate proves the counters
-#      advanced even when the /stats poll failed (the HTTP pool can be
-#      saturated during a long engine step — 2026-09-17 21:10 misfire: a
-#      360k-token prefill armed C at 153s while the journal showed a healthy
-#      ~1000 tok/s prefill throughout). A wedged engine cannot fake this:
-#      it either goes silent (no fresh line) or logs 0.0 tok/s.
+#   2. a journal line within 60s carrying a NON-ZERO tok/s — fallback for the
+#      gauges, and progress evidence for C. TWO line shapes qualify and the
+#      patterns for both live in `sentinel-patterns.sh`: the periodic
+#      `INFO  throughput | 5.0s | prefill 2.86k tok/s (14,336 tok) | running 1`
+#      reporter AND every `req#N done | ... | prefill X tok/s | decode Y tok/s`
+#      line, because a completion is progress too.
+#      **THE PATTERN HERE WAS DEAD FOR ITS WHOLE LIFE, and this comment is
+#      corrected rather than deleted because the dead version is what a reader
+#      will find in history: it looked for "throughput interval" and parsed
+#      "prefill=X tok/s", neither of which this engine has ever printed.** So
+#      (2) never fired, C's only live evidence was (1), and a long engine step
+#      starves (1) on the execution mutex — the engine then looks wedged. On
+#      2026-10-04 14:47:45 that restarted a healthy engine mid-load (25 requests
+#      COMPLETED in the 159s window it called stalled). `monitor.py` had the same
+#      bug and was fixed on 2026-09-27; this script was left behind.
+#      A wedged engine cannot fake a non-zero rate: it goes silent or logs 0.0.
 #   3. no signal at all — A/B hold (a wedged engine goes silent, so absence
 #      of data must NOT clear an armed timer; v1 bug #1). For C, silence
 #      with work outstanding IS the no-progress signal (c_last_advance
@@ -73,6 +80,27 @@ STATS_PORT=8081   # dedicated single-thread /stats server (--stats-port); never
                   # saturates behind streaming handlers. Main port is the
                   # fallback (old binaries without --stats-port).
 if [ "$(id -u)" != "0" ]; then JC="sudo -n journalctl"; else JC="journalctl"; fi
+
+# The journal patterns, ONE definition shared with `tools/ops/sentinel-pattern-test.sh` so the test cannot
+# drift from the detector. Resolved relative to THIS script, which systemd invokes by absolute path
+# (`bash /home/zenz/ninfer/tools/monitor/wedge-sentinel.sh`), so no cwd assumption is baked in.
+# FAIL CLOSED. A missing or malformed patterns file must not leave these variables unset: an unset variable
+# expands to the empty string, `grep -E ""` matches EVERY line (including the `-- No entries --` that
+# `journalctl` prints for an empty window), so `engine_progress` would return true unconditionally and C could
+# NEVER arm. That is a safety net that reads exactly like a quiet system -- the defect this whole file is
+# about -- and it is silent, so the guard is explicit rather than left to `set -u` (which the loop's
+# deliberate non-zero returns would fight).
+# shellcheck source=tools/monitor/sentinel-patterns.sh
+. "$(dirname "$0")/sentinel-patterns.sh" || {
+  echo "FATAL: cannot source sentinel-patterns.sh beside $0 -- refusing to run blind"
+  exit 1
+}
+: "${SENTINEL_STATE_LINES_RE:?patterns.sh did not define it}"
+: "${SENTINEL_PROGRESS_RATE_RE:?patterns.sh did not define it}"
+: "${SENTINEL_RUNNING_RE:?patterns.sh did not define it}"
+: "${SENTINEL_WAITING_RE:?patterns.sh did not define it}"
+: "${SENTINEL_PREFILLING_RE:?patterns.sh did not define it}"
+: "${SENTINEL_DECODE_READY_RE:?patterns.sh did not define it}"
 
 # Capture what the restart is about to destroy. A wedged engine cannot run its OWN shutdown path -- the
 # shutdown needs the lock the wedge holds -- so a stack taken here is the entire forensics, and the restart
@@ -138,10 +166,36 @@ except Exception:
 }
 
 poll_journal_state() {
-  # prints "r p d w m" from the newest journal throughput line, or nothing
-  $JC -u ninfer.service --since "60 sec ago" --no-pager 2>/dev/null \
-    | grep "throughput interval" | tail -1 \
-    | sed -nE 's/.*running=([0-9]+) prefilling=([0-9]+) decode_ready=([0-9]+) waiting=([0-9]+) materializing=([0-9]+).*/\1 \2 \3 \4 \5/p'
+  # prints "r p d w m" from the newest journal `throughput |` line, or nothing.
+  #
+  # REWRITTEN 2026-10-04: the previous body grepped "throughput interval" and parsed
+  # "running=N prefilling=N decode_ready=N waiting=N materializing=N", neither of which the engine emits, so
+  # it returned nothing on every call since it was written (see tools/monitor/sentinel-patterns.sh).
+  #
+  # WHAT THIS FALLBACK CANNOT SEE, stated rather than implied: the throughput line carries no
+  # `materializing` figure, so that gauge is 0 here and class B (materializing>=1) is NOT detectable from the
+  # journal — it needs /stats. The parenthetical DOES report both phases at once when both are active
+  # (`running 2 (prefill 1, decode-ready 1)`, 49 of 101 such lines on 2026-10-04), so this is NOT an
+  # "at most one is non-zero" pair as an earlier comment here claimed.
+  #
+  # THE WINDOW IS 20 SECONDS, NOT 60, AND THAT IS A SAFETY BOUND RATHER THAN A TUNING CHOICE. This fallback
+  # used to be dead, so an /stats outage produced NO state at all and could not arm A/B; now it can, and A/B
+  # has no progress escape in its arm condition (r=p=d=0 && w>=1). A line up to 60 s old, taken while the
+  # engine sits in a long step that is starving /stats, would therefore arm A/B against a HEALTHY engine and
+  # hold it armed. At 20 s — barely more than this loop's own 15 s poll — the fallback still covers the
+  # transient /stats failures it exists for, while a long step finds no line and leaves `state` empty, which
+  # is the pre-existing, safer behaviour. C is unaffected: with `journal_progress` fixed it credits progress
+  # continuously, so a real wedge still arms C on its own evidence.
+  local line r w pf dr
+  line=$($JC -u ninfer.service --since "20 sec ago" --no-pager 2>/dev/null \
+    | grep -E "$SENTINEL_STATE_LINES_RE" | grep 'throughput |' | tail -1)
+  [ -n "$line" ] || return 0
+  r=$(printf '%s' "$line" | sed -nE "s/.*$SENTINEL_RUNNING_RE.*/\2/p")
+  w=$(printf '%s' "$line" | sed -nE "s/.*$SENTINEL_WAITING_RE.*/\1/p")
+  pf=$(printf '%s' "$line" | sed -nE "s/.*$SENTINEL_PREFILLING_RE.*/\1/p")
+  dr=$(printf '%s' "$line" | sed -nE "s/.*$SENTINEL_DECODE_READY_RE.*/\1/p")
+  [ -n "$r" ] || return 0
+  printf '%s %s %s %s %s\n' "$r" "${pf:-0}" "${dr:-0}" "${w:-0}" 0
 }
 
 journal_progress() {
@@ -152,13 +206,18 @@ journal_progress() {
   # /stats poll failed (HTTP pool saturated during a long engine step).
   # A wedged engine cannot satisfy this: it goes silent (no fresh line) or
   # logs 0.0 tok/s.
-  local rates
-  rates=$($JC -u ninfer.service --since "60 sec ago" --no-pager 2>/dev/null \
-    | grep "throughput interval" \
-    | sed -nE 's/.* prefill=([0-9]+\.[0-9]+)tok\/s decode=([0-9]+\.[0-9]+)tok\/s.*/\1 \2/p' \
-    | tail -1)
-  [ -n "$rates" ] && \
-    awk -v r="$rates" 'BEGIN { split(r, a, " "); exit !(a[1] > 0 || a[2] > 0) }'
+  # REWRITTEN 2026-10-04. A pattern that matches nothing reads exactly like a quiet system, and this one
+  # matched nothing for its whole life: it grepped "throughput interval" and parsed "prefill=X tok/s" while
+  # the journal emits "throughput |" and "prefill 3.59k tok/s". With NO progress credited during a /stats
+  # outage, `c_last_advance` went stale while 25 requests COMPLETED, and the arm fired the moment /stats
+  # answered again -- restarting a healthy engine at 14:48:13. Patterns live in sentinel-patterns.sh and are
+  # tested against real captured lines by tools/ops/sentinel-pattern-test.sh.
+  #
+  # ANY line in the window, NOT the newest one: `req#N done | ... cancelled` carries no rate, so a
+  # newest-line-only read calls a busy engine stalled whenever a cancellation lands most recently.
+  $JC -u ninfer.service --since "60 sec ago" --no-pager 2>/dev/null \
+    | grep -E "$SENTINEL_STATE_LINES_RE" \
+    | grep -qE "$SENTINEL_PROGRESS_RATE_RE"
 }
 
 journal_relief_progress() {

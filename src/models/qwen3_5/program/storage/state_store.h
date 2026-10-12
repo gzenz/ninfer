@@ -580,7 +580,26 @@ public:
         PendingReplica,     // a transfer is already in flight for it
         PinSaturated,       // source_pins at its maximum
         NoHostCapacity,     // the pool could not take it
+        // NOT A REFUSAL. A sentinel so an array can be sized and a switch can be exhaustive without a
+        // magic constant that drifts when a clause is added -- the drift is the failure mode this enum
+        // exists to make countable. `demote_refusal_name` never returns a name for it.
+        Count,
     };
+
+    // THE ENUM'S ORDER IS THE NAME TABLE'S ORDER, pinned so a reorder cannot silently relabel a `/stats`
+    // bucket or move a journal token. The table is `ninfer::k_demote_refusal_names` (types.h) because the
+    // serve layer needs it and cannot see this header, so these asserts are the only thing holding the two
+    // in step -- and a reorder here would otherwise produce a plausible-looking wrong answer, not a failure.
+    static_assert(static_cast<std::size_t>(DemoteRefusal::None) == 0, "name table order");
+    static_assert(static_cast<std::size_t>(DemoteRefusal::HostTierDisabled) == 1, "name table order");
+    static_assert(static_cast<std::size_t>(DemoteRefusal::InvalidHandle) == 2, "name table order");
+    static_assert(static_cast<std::size_t>(DemoteRefusal::StaleGeneration) == 3, "name table order");
+    static_assert(static_cast<std::size_t>(DemoteRefusal::NotImmutableCheckpoint) == 4, "name table order");
+    static_assert(static_cast<std::size_t>(DemoteRefusal::NotDeviceResident) == 5, "name table order");
+    static_assert(static_cast<std::size_t>(DemoteRefusal::AlreadyOnHost) == 6, "name table order");
+    static_assert(static_cast<std::size_t>(DemoteRefusal::PendingReplica) == 7, "name table order");
+    static_assert(static_cast<std::size_t>(DemoteRefusal::PinSaturated) == 8, "name table order");
+    static_assert(static_cast<std::size_t>(DemoteRefusal::NoHostCapacity) == 9, "name table order");
 
     [[nodiscard]] DemoteRefusal demote_refusal(StateImageHandle source) const noexcept {
         if (host_ == nullptr) { return DemoteRefusal::HostTierDisabled; }
@@ -606,20 +625,15 @@ public:
         return DemoteRefusal::None;
     }
 
+    // Reads `ninfer::k_demote_refusal_names` -- ONE table, shared with `/stats`, so the journal's
+    // `demote_refusal=` token and the stats key cannot come to disagree about what a clause is called.
+    // The static_assert turns an added clause into a compile error instead of a bucket that silently
+    // never fills, which is the failure this repo keeps recording.
     [[nodiscard]] static const char* demote_refusal_name(DemoteRefusal refusal) noexcept {
-        switch (refusal) {
-            case DemoteRefusal::None: return "none";
-            case DemoteRefusal::HostTierDisabled: return "host-tier-disabled";
-            case DemoteRefusal::InvalidHandle: return "invalid-handle";
-            case DemoteRefusal::StaleGeneration: return "stale-generation";
-            case DemoteRefusal::NotImmutableCheckpoint: return "not-immutable-checkpoint";
-            case DemoteRefusal::NotDeviceResident: return "not-device-resident";
-            case DemoteRefusal::AlreadyOnHost: return "already-on-host";
-            case DemoteRefusal::PendingReplica: return "pending-replica";
-            case DemoteRefusal::PinSaturated: return "pin-saturated";
-            case DemoteRefusal::NoHostCapacity: return "no-host-capacity";
-        }
-        return "unknown";
+        static_assert(static_cast<std::size_t>(DemoteRefusal::Count) == ninfer::k_demote_refusal_buckets,
+                      "every DemoteRefusal clause needs a name in ninfer::k_demote_refusal_names");
+        const auto index = static_cast<std::size_t>(refusal);
+        return index < ninfer::k_demote_refusal_buckets ? ninfer::k_demote_refusal_names[index] : "unknown";
     }
 
     [[nodiscard]] bool can_demote_to_host(StateImageHandle source) const noexcept {

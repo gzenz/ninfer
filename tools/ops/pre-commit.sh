@@ -145,6 +145,19 @@ else
   block "a watcher alert token matches nothing in src/ -- it cannot fire"
 fi
 
+# ---------------------------------------------------- 3b. SENTINEL journal patterns
+# The same class of check as the tokens above, for the same reason, and it earns its place in the gate rather
+# than in a manual ritual: the wedge sentinel's two journal patterns matched NOTHING for their whole lives
+# (wrong grep string AND wrong parser), and the consequence was not a quiet alert — it was the sentinel
+# restarting a HEALTHY engine mid-load on 2026-10-04, dropping 20 live continuations. A guard nobody runs is
+# the defect it guards against, so the test that can catch this runs here, on every commit.
+if bash tools/ops/sentinel-pattern-test.sh > /tmp/precommit-sentinel.txt 2>&1; then
+  note "ok  sentinel journal patterns: $(tail -1 /tmp/precommit-sentinel.txt)"
+else
+  grep -E "FAIL|\*\*\*" /tmp/precommit-sentinel.txt | head -10
+  block "a wedge-sentinel journal pattern no longer matches a real line -- the safety net is blind"
+fi
+
 # ---------------------------------------------------------------- 4. build
 note "building (a stale binary would make the suite test the wrong code)"
 if ! timeout "$HOOK_BUILD_TIMEOUT" cmake --build build -j > /tmp/precommit-build.txt 2>&1; then
@@ -255,6 +268,16 @@ if [ "$FAILED" -eq 0 ]; then
     for t in "${NOTRUN[@]}"; do note "    DID NOT RUN: $t"; done
     block "${#NOTRUN[@]} test(s) did not run. A skip is not a pass -- supply what it needs (artifact, GPU) or fix it."
   fi
+  # ***A NON-ZERO rc WITH NO EVIDENCE IS A RUN THAT DID NOT FINISH (2026-10-12).*** ctest reports a failure
+  # as a `***Failed` line, so a non-zero rc that produced NEITHER a FAILING nor a NOTRUN entry means the
+  # output was TRUNCATED -- killed from outside, OOM-killed, or crashed -- and zero evidence was being read
+  # as a full pass. The rc-124 branch above covers only the `timeout` expiry. Measured: killing the ctest
+  # process (rc=143) fell past it into `ok  every test in the suite PASSED and none was skipped`, and the
+  # e2e phase then ran on the strength of that verdict. A SIGNAL IS NOT A PASS, the same way a skip is not
+  # one. This cannot misfire on a real failure, which always leaves its `***Failed` line behind.
+  if [ "$CTEST_RC" -ne 0 ] && [ "${#FAILING[@]}" -eq 0 ] && [ "${#NOTRUN[@]}" -eq 0 ]; then
+    block "ctest exited $CTEST_RC and left no failure evidence -- the suite did not finish, so it did not pass"
+  fi
   if [ "${#FAILING[@]}" -eq 0 ] && [ "${#NOTRUN[@]}" -eq 0 ]; then
     note "ok  every test in the suite PASSED and none was skipped"
   fi
@@ -340,7 +363,16 @@ if [ "$FAILED" -eq 0 ]; then
       e2e_rc=$?
       summary="$(grep -E '^(PASS|FAIL): [0-9]+ PASS' /tmp/precommit-e2e.txt | tail -1)"
       note "  e2e: ${summary:-<no summary>} (rc=$e2e_rc)"
-      grep -E '^  \[[a-z-]+\] (FAIL|WARN)' /tmp/precommit-e2e.txt | head -8
+      # UNMEASURED IS INCLUDED, because it is the class this suite now emits when a check cannot observe what
+      # it claims to: printing only FAIL/WARN hid two of them from the gate's own transcript, which is the
+      # "a verdict class absent from the totals is a silent pass" failure one level up. It does not BLOCK --
+      # no engine change can create a missing log source, and blocking on it would push people to --no-verify.
+      # UNMEASURED AND QUARANTINE ARE BOTH SHOWN. UNMEASURED is the class this suite emits when a check cannot
+      # observe what it claims to; QUARANTINE is the named allowance for the three phases that fail in rotation
+      # (it prints every run, and says when an entry can be deleted). Neither BLOCKS: no engine change can
+      # create a missing log source, and blocking on a non-deterministic phase is what teaches people to reach
+      # for --no-verify, which is worse than the allowance. The rc below still blocks on every other FAIL.
+      grep -E '^  \[[a-z-]+\] (FAIL|WARN|UNMEASURED|QUARANTINE)' /tmp/precommit-e2e.txt | head -10
       if [ "$e2e_rc" -eq 124 ]; then
         block "the e2e exceeded ${HOOK_TOTAL_TIMEOUT}s and was killed"
       elif [ "$e2e_rc" -ne 0 ]; then

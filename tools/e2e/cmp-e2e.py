@@ -85,6 +85,20 @@ def _poll_max(samples, key):
     return max(vals) if vals else None
 
 
+def _poll_last(samples, key):
+    """LAST value of `key`, or None if no sample carried one.
+
+    Needed beside `_poll_max` for the fields that FALL as the run proceeds -- the pinned pool's growth
+    headroom shrinks as the pool fills, so its maximum is the value at the START and says nothing about
+    the window that produced the evictions. A cumulative counter's max IS its final value; a gauge's is
+    not, and the two need different summaries.
+    """
+    for s in reversed(samples):
+        if s.get(key) is not None:
+            return s[key]
+    return None
+
+
 class StatsPoller(threading.Thread):
     """Polls /stats (ours) every 5s; upstream has no /stats -> no data."""
 
@@ -106,10 +120,46 @@ class StatsPoller(threading.Thread):
                 ) as r:
                     d = json.load(r)
                 self.polls += 1
+                # The #6 two-arm experiment reads its answer from these. They are sampled per poll rather
+                # than read once at the end, because the swap tears the test server down the moment the
+                # workload returns -- a final read is a race, and a lost read is indistinguishable from a
+                # zero. The two arms differ ONLY in `HOST_STATE_MAX_SLOTS`, so `host_state_max_slots` is
+                # carried to prove which arm the sample came from rather than leaving it inferred.
+                _p = d.get("pressure", {})
+                _m = d.get("memory", {})
                 self.samples.append({
                     "t": time.time(),
                     "device_main_kv_pages": d.get("pressure", {}).get("device_main_kv_occupied_pages"),
                     "host_kv_bytes": d.get("memory", {}).get("host_kv_occupied_bytes"),
+                    # #6: was the victim's own KV demotable, and did the engine demote instead of evict?
+                    "private_eviction_checks": _p.get("private_eviction_checks"),
+                    "evictions_kv_fit_pinned": _p.get("evictions_kv_fit_pinned"),
+                    "evictions_kv_fit_growable": _p.get("evictions_kv_fit_growable"),
+                    "evictions_kv_fit_blocked": _p.get("evictions_kv_fit_blocked"),
+                    "evictions_kv_fit_pinned_pages": _p.get("evictions_kv_fit_pinned_pages"),
+                    "evictions_with_victim_room": _p.get("evictions_with_victim_room"),
+                    "private_evictions_demotable": _p.get("private_evictions_demotable"),
+                    "private_owners_demoted": _p.get("private_owners_demoted"),
+                    "private_owners_demoted_kv": _p.get("private_owners_demoted_kv"),
+                    "private_owners_evicted": _p.get("private_owners_evicted"),
+                    # WHICH AXIS the plan needed at each eviction, beside the axis it relieved.
+                    "evictions_deficit_device_main_kv": _p.get("evictions_deficit_device_main_kv"),
+                    "evictions_deficit_host_state": _p.get("evictions_deficit_host_state"),
+                    "device_main_kv_shortfall_max_pages": _p.get("device_main_kv_shortfall_max_pages"),
+                    # The veto's own split: a plan the arena could serve as it stood, with one growth, or not.
+                    "host_kv_fit_pinned": _m.get("host_kv_fit_pinned"),
+                    "host_kv_fit_growable": _m.get("host_kv_fit_growable"),
+                    "host_kv_fit_blocked": _m.get("host_kv_fit_blocked"),
+                    "host_kv_seal_grows": _m.get("host_kv_seal_grows"),
+                    # THE ARM: whether the state axis was bounded, how far it grew, and whether the bound bit.
+                    # `host_state_growth_ceiling_refusals` at 0 in arm B means the bound never engaged and the
+                    # arm is UNEXERCISED -- a different result from "the bound did not help".
+                    "host_state_max_slots": _m.get("host_state_max_slots"),
+                    "host_state_capacity_slots": _m.get("host_state_capacity_slots"),
+                    "host_state_occupied_slots": _m.get("host_state_occupied_slots"),
+                    "host_state_growth_ceiling_refusals": _m.get("host_state_growth_ceiling_refusals"),
+                    "host_pinned_growth_headroom_bytes": _m.get("host_pinned_growth_headroom_bytes"),
+                    "host_pinned_capacity_bytes": _m.get("host_pinned_capacity_bytes"),
                     "dead_bytes": (d.get("host_kv", {}).get("tier_census", {}) or {}).get("dead", {}).get("bytes"),
                     "waiting": d.get("scheduler", {}).get("waiting"),
                     "running": d.get("scheduler", {}).get("running"),
@@ -347,6 +397,39 @@ def run_profile(name, sessions, rounds, args, poller):
             # These two matter most: "the search never ran" is the load-bearing claim of the D1 fix.
             "searches": _poll_max(poller.samples, "searches"),
             "search_budget_exhaustions": _poll_max(poller.samples, "search_budget_exhaustions"),
+            # THE #6 ANSWER SET. Cumulative counters, so max == final value; every key is None when no
+            # sample carried it, so "not measured" cannot read as zero. `evictions_kv_fit_pinned` is the
+            # one the two arms are compared on.
+            "private_eviction_checks": _poll_max(poller.samples, "private_eviction_checks"),
+            "evictions_kv_fit_pinned": _poll_max(poller.samples, "evictions_kv_fit_pinned"),
+            "evictions_kv_fit_growable": _poll_max(poller.samples, "evictions_kv_fit_growable"),
+            "evictions_kv_fit_blocked": _poll_max(poller.samples, "evictions_kv_fit_blocked"),
+            "evictions_kv_fit_pinned_pages": _poll_max(poller.samples, "evictions_kv_fit_pinned_pages"),
+            "evictions_with_victim_room": _poll_max(poller.samples, "evictions_with_victim_room"),
+            "private_evictions_demotable": _poll_max(poller.samples, "private_evictions_demotable"),
+            "private_owners_demoted": _poll_max(poller.samples, "private_owners_demoted"),
+            "private_owners_demoted_kv": _poll_max(poller.samples, "private_owners_demoted_kv"),
+            "private_owners_evicted": _poll_max(poller.samples, "private_owners_evicted"),
+            "evictions_deficit_device_main_kv": _poll_max(poller.samples, "evictions_deficit_device_main_kv"),
+            "evictions_deficit_host_state": _poll_max(poller.samples, "evictions_deficit_host_state"),
+            "device_main_kv_shortfall_max_pages": _poll_max(poller.samples, "device_main_kv_shortfall_max_pages"),
+            "host_kv_fit_pinned": _poll_max(poller.samples, "host_kv_fit_pinned"),
+            "host_kv_fit_growable": _poll_max(poller.samples, "host_kv_fit_growable"),
+            "host_kv_fit_blocked": _poll_max(poller.samples, "host_kv_fit_blocked"),
+            "host_kv_seal_grows": _poll_max(poller.samples, "host_kv_seal_grows"),
+            # THE ARM AND ITS EXERCISE. `host_state_max_slots` proves which arm produced the sample;
+            # `host_state_growth_ceiling_refusals` at 0 in arm B means the bound NEVER ENGAGED, which is
+            # "the arm was unexercised", NOT "the bound did not help". Those two must not be confused.
+            "host_state_max_slots": _poll_max(poller.samples, "host_state_max_slots"),
+            "host_state_capacity_slots": _poll_max(poller.samples, "host_state_capacity_slots"),
+            "host_state_occupied_slots": _poll_max(poller.samples, "host_state_occupied_slots"),
+            "host_state_growth_ceiling_refusals": _poll_max(
+                poller.samples, "host_state_growth_ceiling_refusals"),
+            # GAUGES, so `last` not `max`: the headroom FALLS as the pool fills, and its maximum is the
+            # value before any traffic -- the one moment that says nothing about the eviction window.
+            "host_pinned_growth_headroom_bytes_last": _poll_last(
+                poller.samples, "host_pinned_growth_headroom_bytes"),
+            "host_pinned_capacity_bytes_last": _poll_last(poller.samples, "host_pinned_capacity_bytes"),
             "stats_poll_samples": len(poller.samples),
             "stats_poll_skipped": poller.skipped,   # dropped polls: poll_max is a lower bound
             # attempts = successes + failures; `polls` alone counts only the successes, so a

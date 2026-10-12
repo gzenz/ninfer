@@ -336,7 +336,8 @@ ProgramImpl::sequence_exclusive_state_resources(const SequenceState& sequence) c
 }
 
 detail::PhysicalResources
-ProgramImpl::owner_exclusive_resources(const SequenceState& sequence) const {
+ProgramImpl::owner_exclusive_resources(const SequenceState& sequence,
+                                       KVOwnershipCount count) const {
     if (!state_store || !text_kv_addresses || !text_kv_pages) {
         throw std::logic_error("sequence owner resources have no physical stores");
     }
@@ -368,7 +369,10 @@ ProgramImpl::owner_exclusive_resources(const SequenceState& sequence) const {
                     out.host.kv_bytes += stride;
                 }
             }
-            if (addresses.active(address)) {
+            // THE RESERVATION IS COUNTED ONLY FOR THE RELEASE QUESTION, and `count` is the single switch --
+            // see `KVOwnershipCount` in the header for why the two figures differ and why sampling the wrong
+            // one is a false result rather than a rounding difference.
+            if (count == KVOwnershipCount::TransitionEffect && addresses.active(address)) {
                 const std::uint32_t mapped      = addresses.mapped_pages(address);
                 const std::uint32_t entitlement = addresses.entitlement(address);
                 if (entitlement < mapped ||
@@ -494,24 +498,111 @@ ProgramImpl::guided_materialization_deficit(const ResourceCandidateState& admiss
 }
 
 bool ProgramImpl::physical_peak_fits(detail::PhysicalResources peak) const noexcept {
+    std::array<bool, ninfer::k_peak_axis_count> ignored{};
+    return physical_peak_fits(peak, ignored);
+}
+
+// THE OVERLOAD THAT NAMES THIS CALL'S REFUSING AXES, for the #6 assessment split. The one-argument form above
+// delegates, so there is ONE body -- a second copy is how the span-blind coalescing bug survived.
+bool ProgramImpl::physical_peak_fits(
+    detail::PhysicalResources peak,
+    std::array<bool, ninfer::k_peak_axis_count>& out_axis_fits) const noexcept {
     const detail::PhysicalResources occupied = physical_occupancy();
     const detail::PhysicalResources limits   = admission_capacity();
+
+    // WHICH AXIS, AND BY HOW MUCH -- the boolean below ANDs SIX checks and so cannot say which failed, exactly
+    // like the `valid` conjunction that hid a refusal clause until 2026-10-04. Only the HOST STATE axis is
+    // counted here, because it is the one the question is about: the sole pre-planning growth is ONE slot
+    // (`HOST_STATE_PREGROW_SLOTS`), so a plan needing more than one host slot at once reads infeasible and the
+    // caller evicts -- which is the hypothesis this measures.
+    // **READING RULE, CORRECTED 2026-10-04 -- the first version of this comment had it BACKWARDS.**
+    // `admission_capacity()` reports `HostStatePool::capacity()`, the slots that exist NOW
+    // (`context.cpp:1837`), so the limit this compares against ALREADY CONTAINS the pre-grown slot. Therefore
+    // ANY non-zero shortfall means the pre-grow did NOT suffice, and `max_slots = 1` means it fell short by
+    // exactly the one slot it supplies. The old rule ("0 or 1 says the pre-grow was sufficient") assumed the
+    // limit EXCLUDED that slot and so read a real shortfall as a pass.
+    //
+    // `host_state_growable_slots` is deliberately NOT computed here: the headroom is already exported as
+    // `memory.host_pinned_growth_headroom_bytes`, and dividing it by the slot size at the reader is one step
+    // rather than a second counter that can drift from it.
+    ++physical_peak_fits_calls_;
+    if (peak.host.state_slots != 0U) {
+        ++host_state_fit_checks_;
+        const std::uint64_t need = static_cast<std::uint64_t>(occupied.host.state_slots) +
+                                   static_cast<std::uint64_t>(peak.host.state_slots);
+        if (need > limits.host.state_slots) {
+            const std::uint64_t shortfall = need - limits.host.state_slots;
+            ++host_state_shortfall_calls_;
+            if (shortfall > host_state_shortfall_max_slots_) {
+                host_state_shortfall_max_slots_ = shortfall;
+            }
+        }
+    }
+    // *** THE DEVICE-KV SHORTFALL, THE ANALOGUE OF THE HOST-STATE PAIR ABOVE (2026-10-05).***
+    // The eviction deficit is `device_main_kv` in 60 of 73 evictions (82%), so this is the axis to measure --
+    // and until now only the CONJUNCTION's refusal was counted per axis, never the MAGNITUDE.
+    // **THE MAGNITUDE IS THE WHOLE POINT, and the live-occupancy reading of this axis is why.** The device
+    // pool reads 2,011 of 4,096 pages (49% -- "half empty"), yet the check refuses on device KV constantly
+    // (411,266 refusals). The two are not in conflict: 2,011 is LIVE OCCUPANCY, and `physical_peak_fits`
+    // reasons about the PEAK, which reserves each session's `prompt + full output budget`. At
+    // `--default-max-tokens 131072` and `--max-concurrency 4` that peak is 2-3x the pool. **So a shortfall
+    // MAX says whether the peak misses by a few pages or by a factor -- and those imply opposite fixes.**
+    // DENOMINATOR FIRST, on the same rule as the host-state pair: a zero shortfall count must be readable as
+    // "the axis was never demanded" versus "it was demanded and always fitted".
+    // IT HAS FIRED. On a dev-time 4-way load of long sessions (QA's own config, pool 4096 pages) it read
+    // 2790 shortfall calls of 5511 demands, with a MAX of 1837 pages -- 45% of the whole pool, and it agreed
+    // exactly with `physical_peak_refusals_device_main_kv_pages` (2790). So the miss on that shape is a
+    // FACTOR, not a few pages. It is one synthetic shape and the pool was full throughout; treat 1837 as a
+    // bound for that shape, not a typical value.
+    if (peak.device.main_kv_pages != 0U) {
+        ++device_main_kv_fit_checks_;
+        const std::uint64_t need = static_cast<std::uint64_t>(occupied.device.main_kv_pages) +
+                                   static_cast<std::uint64_t>(peak.device.main_kv_pages);
+        if (need > limits.device.main_kv_pages) {
+            const std::uint64_t shortfall = need - limits.device.main_kv_pages;
+            ++device_main_kv_shortfall_calls_;
+            if (shortfall > device_main_kv_shortfall_max_pages_) {
+                device_main_kv_shortfall_max_pages_ = shortfall;
+            }
+        }
+    }
     const auto fits_u32 = [](std::uint32_t used, std::uint32_t added, std::uint32_t capacity) {
         return added <= capacity && used <= capacity - added;
     };
     const auto fits_size = [](std::size_t used, std::size_t added, std::size_t capacity) {
         return added <= capacity && used <= capacity - added;
     };
-    return fits_u32(occupied.device.active_lanes, peak.device.active_lanes,
-                    limits.device.active_lanes) &&
-           fits_u32(occupied.device.state_slots, peak.device.state_slots,
-                    limits.device.state_slots) &&
-           fits_u32(occupied.device.main_kv_pages, peak.device.main_kv_pages,
-                    limits.device.main_kv_pages) &&
-           fits_u32(occupied.device.backend_kv_pages, peak.device.backend_kv_pages,
-                    limits.device.backend_kv_pages) &&
-           fits_u32(occupied.host.state_slots, peak.host.state_slots, limits.host.state_slots) &&
-           fits_size(occupied.host.kv_bytes, peak.host.kv_bytes, limits.host.kv_bytes);
+    // *** THE REFUSING AXIS, COUNTED PER AXIS AND NOT ONLY FOR HOST STATE. ***
+    // The conjunction below is the WHOLE feasibility verdict, and until 2026-10-04 only its host-state term
+    // was attributed (the block above). That left the question this instrument exists for unanswerable: a
+    // PRESERVING plan is refused by `feasible_preserving_alternatives == 0` in 878 of 878 eviction records,
+    // and nothing said WHICH of the six axes refused it -- so "the host had no room for that victim's share"
+    // and "the plan was short on a different axis entirely" read identically, and they imply opposite fixes.
+    //
+    // EACH FAILING AXIS IS COUNTED INDEPENDENTLY, not just the first: a peak can exceed several capacities at
+    // once, so these do NOT sum to the refusal count -- the same caveat the eviction deficit counters carry,
+    // and for the same reason. Denominator: `physical_peak_fits_calls_` (every call, before any axis filter).
+    //
+    // THE AXIS ORDER BELOW IS THE SAME SIX THE RETURN USES, and the return is now DERIVED from these flags
+    // rather than restating them, so the two cannot drift into disagreeing about which axis failed.
+    const std::array<bool, ninfer::k_peak_axis_count> axis_fits{
+        fits_u32(occupied.device.active_lanes, peak.device.active_lanes, limits.device.active_lanes),
+        fits_u32(occupied.device.state_slots, peak.device.state_slots, limits.device.state_slots),
+        fits_u32(occupied.device.main_kv_pages, peak.device.main_kv_pages, limits.device.main_kv_pages),
+        fits_u32(occupied.device.backend_kv_pages, peak.device.backend_kv_pages,
+                 limits.device.backend_kv_pages),
+        fits_u32(occupied.host.state_slots, peak.host.state_slots, limits.host.state_slots),
+        fits_size(occupied.host.kv_bytes, peak.host.kv_bytes, limits.host.kv_bytes),
+    };
+    bool fits = true;
+    for (std::size_t axis = 0; axis < axis_fits.size(); ++axis) {
+        out_axis_fits[axis] = axis_fits[axis];
+        if (!axis_fits[axis]) {
+            ++physical_peak_refusals_by_axis_[axis];
+            fits = false;
+        }
+    }
+    return fits;
     // NO cross-dimension sum check, and that is deliberate: it existed in the first version of this change
     // and was DEAD CODE. Both consumers do share one pool, but each axis is checked against a capacity its
     // own consumer already owns, so `o_s+p_s <= L_s && o_k+p_k <= L_k` implies the weighted sum -- the extra
@@ -1805,6 +1896,75 @@ void ProgramImpl::ensure_host_kv_headroom() noexcept {
         }
         return;
     }
+}
+
+// METHOD 2: PIN THE ROOM A `Growable` PLAN NEEDS, AT SEAL. See the declaration for why the seal and not
+// compose, and for the `WORKER OOM` this reserve exists to avoid.
+//
+// THE AMOUNT IS THE WHOLE SHORTFALL, IN ONE GROWTH. `grow_span` takes `max(bytes, span_step_bytes_)`, so a
+// single call of `shortfall` bytes yields ONE fresh, wholly-free run of at least the shortfall -- which is
+// what makes the shortfall land in a single free run rather than depending on the fragmentation that made
+// the plan `Growable`. **THIS PARAGRAPH DESCRIBED THE INTENT FOR WEEKS WHILE THE CODE BELOW DID SOMETHING
+// ELSE** (it bought `ceil(shortfall/step)` SEPARATE `step`-sized spans, so a request larger than one `step`
+// could never land in any of them); see the block on the growth itself.
+//
+// A FAILED GROWTH LEAVES THE ARENA UNCHANGED HERE, because there is now only one call to fail. If it
+// succeeds but the tables cannot describe the new span, the arena keeps the span and this returns false:
+// the caller then refuses the plan, which is the conservative direction, and the extra room is harmless --
+// the pool can return it later through `shrink_idle`. Undoing it would risk unpinning a chunk an in-flight
+// copy still uses.
+bool ProgramImpl::reserve_host_kv_for_seal(ResourceCandidateState& candidate) noexcept {
+    const std::size_t shortfall = candidate.blocked_host_kv_shortfall_bytes;
+    if (shortfall == 0U) { return false; }
+    if (host_kv_arena == nullptr || host_kv_extents == nullptr) {
+        ++host_kv_seal_refusals_;
+        return false;
+    }
+    // ***ONE SPAN OF THE WHOLE SHORTFALL -- NOT `ceil(shortfall/step)` SPANS OF `step`. THIS WAS THE DEFECT
+    // (found 2026-10-12 by the review pass, reproduced twice against a green control).***
+    // `fit_after_page_releases` charges each UNSATISFIED REQUEST one contiguous extent of
+    // `max(request_bytes, span_step)` and sums those into `shortfall` (`host_kv_arena.cpp:566-570`). The loop
+    // that stood here bought that total as SEPARATE fixed-size `step` spans -- so a request larger than one
+    // `step` could never land in any of them, the reserve still cleared both fields, and the plan was
+    // admitted on room that could not serve it. At seal and execution `HostKVExtentStore::prepare` then
+    // failed and grew AGAIN; if that also failed the demote threw `bad_alloc` -- the `WORKER OOM` class this
+    // reserve exists to prevent, while also spending roughly 2x the headroom.
+    // **The comment above always said "a fresh span is CONTIGUOUS, so the shortfall lands in a single free
+    // run". This is the code that makes that true:** `grow_span` takes `max(bytes, span_step_bytes_)`, so one
+    // call of `shortfall` bytes yields ONE fresh, wholly-free run of at least the shortfall. Every
+    // unsatisfied request is therefore `<=` that run, and their total is `<=` it by construction, so all of
+    // them fit inside it. **A request larger than `step` is the case that separates the two forms, and it is
+    // the only case that matters here**: QA's step is 1 GiB and the page stride is ~1.18 MB, so any single
+    // DemoteToHost run of 911 pages or more reaches it, and the code's own notes cite 1,607-page victims.
+    // DEFENSIVE, NOT LOAD-BEARING: `span_growth_bytes_` cannot be zero -- `host_kv_arena.cpp:214` falls
+    // back to `initial_bytes`, then to 1 MiB. `step` is read only by this guard now that the growth below
+    // takes the whole shortfall in one call. Kept so a future arena that could report zero is refused rather
+    // than dividing by it.
+    if (host_kv_arena->span_step_bytes() == 0U) {
+        ++host_kv_seal_refusals_;
+        return false;
+    }
+    // NOT SPECULATIVE: this room is taken for a plan the search has already elected, so a refusal is a real
+    // failure and must reach the pool's counters. `pre_grow` passes true for the opposite reason.
+    if (!host_kv_arena->grow_bytes(shortfall, /*speculative=*/false)) {
+        ++host_kv_seal_refusals_;
+        return false;
+    }
+    // THE TABLES GROW WITH THE ARENA. A grown arena whose store cannot describe the new span throws in
+    // `partition_extent` later; the two must move together, which is why the store exposes this as one call.
+    if (!host_kv_extents->ensure_capacity_for(*host_kv_arena)) {
+        ++host_kv_seal_refusals_;
+        return false;
+    }
+    ++host_kv_seal_grows_;
+    // CLEARED ONLY ON SUCCESS, and both fields together, so that no second check site has to learn about the
+    // reserve. **THE CALLER'S CHECK IS NOW ON `blocked_host_kv_shortfall_bytes`** -- the field THIS function
+    // reads, and the one that stays set when the reserve fails; both seal sites were re-gated onto it on
+    // 2026-10-12, because the compose-time clearance had already zeroed
+    // `blocked_host_allocation_bytes` and gating on that meant this function was never called at all.
+    candidate.blocked_host_kv_shortfall_bytes = 0;
+    candidate.blocked_host_allocation_bytes   = 0;
+    return true;
 }
 
 void ProgramImpl::ensure_host_state_headroom() noexcept {

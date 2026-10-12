@@ -314,7 +314,15 @@ std::optional<OperationalRecord> render_tool_call_fallback(const RequestLogConte
     return OperationalRecord{
         .severity = OperationalSeverity::Warning,
         .message  = "req#" + std::to_string(context.id) + " tool markup returned as text | " +
-                   pretty_code(ninfer::tool_call_parse_fallback_reason_name(reason)),
+                   pretty_code(ninfer::tool_call_parse_fallback_reason_name(reason)) +
+                   // #29'S DISCRIMINATOR, ON EVERY FALLBACK LINE. Printed ALWAYS rather than only when set,
+                   // because BOTH halves are the answer: `unset` says the parser's tolerant content-skip arm
+                   // did NOT run, i.e. the symptom came from the model's own markup, and
+                   // `after_tolerant_content_skip` says the parser's recovery was involved. Printing only the
+                   // set case would leave the more common reading implicit -- the absent-is-not-zero shape
+                   // this log has been corrected for twice.
+                   " | path=" +
+                   pretty_code(ninfer::tool_call_parse_path_name(outcome.tool_call_parse.parse_path)),
     };
 }
 

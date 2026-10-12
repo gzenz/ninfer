@@ -17,6 +17,19 @@ namespace ninfer::models::qwen3_5::detail {
 
 namespace {
 
+// WHY A PAGE WAS REJECTED AS A DEVICE-KV RELIEF CANDIDATE, in the eligibility test's own order, and indexed
+// by `ninfer::k_kv_relief_clause_names`. Kept as an enum rather than bare indices so the test below and the
+// name table cannot drift; the array's shape is the one `RuntimeStats` publishes.
+enum class KVReliefClause : std::uint8_t {
+    AlreadySelected = 0,
+    NotDeviceResident,
+    WriterReferences,
+    SourcePins,
+    NotReplicaSafe,
+    ActiveReference,
+    Protected,
+};
+
 struct KVPressureSelection {
     std::vector<qwen3_5::detail::PressureKVDecision> actions;
     std::vector<runtime::ContextTransferRequirement> transfer_requirements;
@@ -24,6 +37,41 @@ struct KVPressureSelection {
     std::size_t removed_host_bytes     = 0;
     std::size_t added_host_bytes       = 0;
     std::size_t host_bytes_remaining   = 0;
+    // [direction][clause]; direction 0 = demote to host, 1 = drop the device duplicate. Every examination
+    // that was REJECTED, so the counts are candidacies refused, not pages relieved.
+    std::uint64_t rejected_by_clause[2][ninfer::k_kv_relief_clause_count] = {};
+    // WHAT REACHED THE PEAK, which the rejection histogram above cannot show. `relieved` is the pages the
+    // pass actually took; `requested` is the demand it was asked to satisfy.
+    //
+    // **`requested` MUST EXCLUDE THE SENTINEL, and the first version of this counter did not.** The successor
+    // generator builds a `full` endpoint with `main_kv_pages = numeric_limits<uint32_t>::max()` meaning
+    // "relieve as much as you can" (`pressure.cpp:1118`, and `:741` on the option path), and summing that over
+    // calls produced 8.5e12 "pages" -- a number 2000x u32::max that measures nothing. The sentinel is counted
+    // separately so a reader can see how much of the demand was UNBOUNDED rather than large.
+    std::uint64_t calls_by_direction[2]           = {};
+    std::uint64_t requested_by_direction[2]       = {};  // bounded asks only
+    std::uint64_t saturated_asks_by_direction[2]  = {};  // asks that were the "as much as you can" sentinel
+    std::uint64_t max_ask_by_direction[2]         = {};  // largest BOUNDED ask, so the scale is readable
+    std::uint64_t relieved_by_direction[2]        = {};
+    // WHY THE DEMOTE PASS DID NOT RUN AT ALL, one bucket per clause of the gate below. A demote that never
+    // ran is not a demote that found nothing, and the rejection histogram reads the same for both.
+    std::uint64_t demote_gate_blocks[3] = {};
+    // **THE TEST OF THE READ MECHANISM.** PASS 1 (the host-duplicate drop) requires `host_resident` -- the SAME
+    // clause PASS 2 (the device-duplicate drop) requires -- and all three passes share one `selected[]` array,
+    // so when the plan has a NON-ZERO host request PASS 1 runs first and marks the host-resident pages,
+    // leaving PASS 2 nothing to drop there. **PREDICTION: the DEMOTE's relief is SHORTER when the host request
+    // was non-zero, and the shortfall is the pages PASS 1 took.** Split by whether `requested_host_bytes` was
+    // zero, so the prediction can fail.
+    std::uint64_t demote_relieved_host_req_zero      = 0;
+    std::uint64_t demote_relieved_host_req_nonzero   = 0;
+    std::uint64_t demote_calls_host_req_zero         = 0;
+    std::uint64_t demote_calls_host_req_nonzero      = 0;
+    // THE HOST DEFICIT THAT ACTUALLY BLOCKED THE DEMOTE PASS, in bytes. The veto's own trio
+    // (`host_kv_fit_*`) reads a different quantity, so "the host was never blocked" (2055 Growable, 0
+    // Blocked) and "the demote was refused 342 times for host bytes" could both be true and are not
+    // comparable from what is exported. Sum and max tell a real deficit from a rounding-sized one.
+    std::uint64_t demote_host_blocked_bytes_sum = 0;
+    std::uint64_t demote_host_blocked_bytes_max = 0;
 };
 
 std::uint32_t physical_kv_runs(const KVAddressSpaceStore& addresses,
@@ -247,22 +295,60 @@ select_kv_pressure_actions(const KVAddressSpaceStore& addresses, LogicalKVPageSt
         if (!found) { break; }
     }
 
+    // The plan's HOST request as it was on entry. PASS 1 marks pages only while this is non-zero.
+    const bool host_request_was_nonzero = requested_host_bytes != 0;
     std::uint32_t device_remaining = requested_device_pages;
+    // THE SENTINEL IS TESTED HERE, ON THE CALL'S OWN ASK, NOT ON `device_remaining`. The first version tested
+    // `device_remaining` inside the pass, and the two passes SHARE the budget: the drop pass decrements it
+    // before the demote pass sees it, so a sentinel minus the drop pass's relief (measured: u32::max - 677)
+    // leaked through as a "bounded" ask of 4.29e9 pages. The ask's character is fixed at entry and does not
+    // change because an earlier pass relieved a few pages.
+    const bool device_ask_saturated =
+        requested_device_pages == std::numeric_limits<std::uint32_t>::max();
     const auto select_device_runs  = [&](bool require_host) {
+        const std::size_t direction = require_host ? 1U : 0U;
+        ++selection.calls_by_direction[direction];
+        if (!require_host) {
+            if (host_request_was_nonzero) { ++selection.demote_calls_host_req_nonzero; }
+            else                          { ++selection.demote_calls_host_req_zero; }
+        }
+        if (device_ask_saturated) {
+            ++selection.saturated_asks_by_direction[direction];
+        } else {
+            selection.requested_by_direction[direction] += device_remaining;
+            selection.max_ask_by_direction[direction] =
+                std::max(selection.max_ask_by_direction[direction],
+                         static_cast<std::uint64_t>(device_remaining));
+        }
         std::uint32_t end = mapped;
         while (device_remaining != 0 && end != 0) {
+            // THE CLAUSES ARE EVALUATED IN THE SAME ORDER AS BEFORE THIS CHANGE, and the rejection is
+            // COUNTED at the clause that stopped the test -- so the shape of the published histogram is the
+            // shape of the eligibility rule, not a restatement of it.
             const auto eligible = [&](std::uint32_t page) {
-                if (selected[page] != 0) { return false; }
+                const std::size_t direction = require_host ? 1U : 0U;
+                const auto reject           = [&](KVReliefClause clause) {
+                    ++selection.rejected_by_clause[direction][static_cast<std::size_t>(clause)];
+                    return false;
+                };
+                if (selected[page] != 0) { return reject(KVReliefClause::AlreadySelected); }
                 const LogicalKVPageHandle logical = addresses.logical_page(address, page);
                 const bool replica_safe = require_host ? pages.can_drop_device_replica(logical)
                                                         : !pages.host_resident(logical);
                 const qwen3_5::detail::PressureKVDecisionKind action =
                     require_host ? qwen3_5::detail::PressureKVDecisionKind::DropDeviceDuplicate
                                   : qwen3_5::detail::PressureKVDecisionKind::DemoteToHost;
-                return pages.device_resident(logical) && pages.writer_references(logical) == 0 &&
-                       pages.source_pins(logical) == 0 && replica_safe &&
-                       !addresses.has_active_reference(logical) &&
-                       !protected_page(page, logical, action);
+                if (!pages.device_resident(logical)) { return reject(KVReliefClause::NotDeviceResident); }
+                if (pages.writer_references(logical) != 0) {
+                    return reject(KVReliefClause::WriterReferences);
+                }
+                if (pages.source_pins(logical) != 0) { return reject(KVReliefClause::SourcePins); }
+                if (!replica_safe) { return reject(KVReliefClause::NotReplicaSafe); }
+                if (addresses.has_active_reference(logical)) {
+                    return reject(KVReliefClause::ActiveReference);
+                }
+                if (protected_page(page, logical, action)) { return reject(KVReliefClause::Protected); }
+                return true;
             };
             while (end != 0 && !eligible(end - 1U)) { --end; }
             if (end == 0) { break; }
@@ -277,6 +363,12 @@ select_kv_pressure_actions(const KVAddressSpaceStore& addresses, LogicalKVPageSt
             };
             mark_action(action);
             selection.removed_device_pages += count;
+            selection.relieved_by_direction[require_host ? 1U : 0U] += count;
+            if (!require_host) {
+                // THE DEMOTE PASS, SPLIT BY THE PREDICTION.
+                if (host_request_was_nonzero) { selection.demote_relieved_host_req_nonzero += count; }
+                else                          { selection.demote_relieved_host_req_zero += count; }
+            }
             device_remaining -= count;
             end = action.begin_page;
 
@@ -316,6 +408,32 @@ select_kv_pressure_actions(const KVAddressSpaceStore& addresses, LogicalKVPageSt
     if (device_remaining != 0 && selection.host_bytes_remaining == 0 &&
         host_allocation_available && host_extents != nullptr) {
         select_device_runs(false);
+    } else if (device_remaining != 0) {
+        // A DEMOTE THAT NEVER RAN IS NOT A DEMOTE THAT FOUND NOTHING, and the rejection histogram reads the
+        // same for both. One bucket per clause, in the gate's own order.
+        if (selection.host_bytes_remaining != 0) {
+            ++selection.demote_gate_blocks[1];
+            // *** THE SENTINEL IS NOT A SIZE, AND ONE OF THEM WRAPS THIS SUM (2026-10-07). ***
+            // The host axis's own endpoint list asks for `std::numeric_limits<std::size_t>::max()` to mean
+            // "relieve what you can" (`full_host`, `inspect_pressure_options`). One such request added here
+            // overflows the sum to a SMALL number, which then reads exactly like a small value -- the failure
+            // mode this file records three times over. Measured on arm A32 (`eda631fe97de`), the only arm in
+            // which the sentinel reached this branch: `kv_relief_host_blocked_bytes_max` read
+            // 18446744073709551615 while `kv_relief_host_blocked_bytes_sum` read 1,340,744,760,616 -- the sum
+            // of the other 1,471 blocks MINUS ONE, i.e. `SIZE_MAX + T mod 2^64` exactly. The block is still
+            // COUNTED (it happened); only the byte figure is withheld, because there is no byte figure for
+            // "as much as you can".
+            if (selection.host_bytes_remaining != std::numeric_limits<std::size_t>::max()) {
+                selection.demote_host_blocked_bytes_sum += selection.host_bytes_remaining;
+                selection.demote_host_blocked_bytes_max =
+                    std::max(selection.demote_host_blocked_bytes_max,
+                             static_cast<std::uint64_t>(selection.host_bytes_remaining));
+            }
+        } else if (!host_allocation_available || host_extents == nullptr) {
+            ++selection.demote_gate_blocks[2];
+        }
+    } else {
+        ++selection.demote_gate_blocks[0];  // `device_remaining` was 0 on entry to the gate: nothing was asked for
     }
     return selection;
 }
@@ -623,6 +741,20 @@ std::optional<qwen3_5::detail::PressureDecision> ProgramImpl::inspect_shared_pre
         option.effect.removed.host.kv_bytes += selected.removed_host_bytes;
         option.effect.added.host.kv_bytes += selected.added_host_bytes;
         removed_dimension += selected.removed_device_pages;
+        note_kv_relief(selected.rejected_by_clause, selected.calls_by_direction,
+                       selected.requested_by_direction, selected.saturated_asks_by_direction,
+                       selected.max_ask_by_direction, selected.relieved_by_direction,
+                       selected.demote_gate_blocks,
+                       // ORDER MATTERS AND IT WAS WRONG ONCE: these two come BEFORE the four below,
+                       // because that is the order `note_kv_relief` declares them. Passing them after shifted
+                       // every binding silently -- the compiler cannot tell two `std::uint64_t`s apart -- and
+                       // arm A33 read `blocked_sum`/`blocked_max` in the two relief slots, which is how two
+                       // DISJOINT buckets came to report an identical total.
+                       selected.demote_host_blocked_bytes_sum,
+                       selected.demote_host_blocked_bytes_max,
+                       selected.demote_calls_host_req_zero, selected.demote_calls_host_req_nonzero,
+                       selected.demote_relieved_host_req_zero,
+                       selected.demote_relieved_host_req_nonzero);
         option.transfer_requirements.insert(option.transfer_requirements.end(),
                                             selected.transfer_requirements.begin(),
                                             selected.transfer_requirements.end());
@@ -909,6 +1041,20 @@ ProgramImpl::inspect_pressure_option(const SequenceState& sequence,
         option.effect.removed.host.kv_bytes += selected.removed_host_bytes;
         option.effect.added.host.kv_bytes += selected.added_host_bytes;
         removed_dimension += selected.removed_device_pages;
+        note_kv_relief(selected.rejected_by_clause, selected.calls_by_direction,
+                       selected.requested_by_direction, selected.saturated_asks_by_direction,
+                       selected.max_ask_by_direction, selected.relieved_by_direction,
+                       selected.demote_gate_blocks,
+                       // ORDER MATTERS AND IT WAS WRONG ONCE: these two come BEFORE the four below,
+                       // because that is the order `note_kv_relief` declares them. Passing them after shifted
+                       // every binding silently -- the compiler cannot tell two `std::uint64_t`s apart -- and
+                       // arm A33 read `blocked_sum`/`blocked_max` in the two relief slots, which is how two
+                       // DISJOINT buckets came to report an identical total.
+                       selected.demote_host_blocked_bytes_sum,
+                       selected.demote_host_blocked_bytes_max,
+                       selected.demote_calls_host_req_zero, selected.demote_calls_host_req_nonzero,
+                       selected.demote_relieved_host_req_zero,
+                       selected.demote_relieved_host_req_nonzero);
         option.transfer_requirements.insert(option.transfer_requirements.end(),
                                             selected.transfer_requirements.begin(),
                                             selected.transfer_requirements.end());
@@ -921,6 +1067,17 @@ ProgramImpl::inspect_pressure_option(const SequenceState& sequence,
         }
     };
 
+    // *** SIZE A DEMOTE TO THE VICTIM: TRIED, FAILED AND REVERTED (2026-10-07). ***
+    //
+    // The reading was that this argument -- `deficit.device.main_kv_pages` -- sizes a demote to the plan's
+    // NEED while an eviction removes the victim's WHOLE ownership, and that on a slack-0 pool the gap is what
+    // makes evictions win. Passing `max(deficit, owner_exclusive_resources(sequence, ResidentData))` instead
+    // was measured (arm A32, deployed `eda631fe97de`) and FAILED: evicting requests with ZERO feasible
+    // preserving alternatives stayed at 9 of 9, evictions at 8 and demotions at 0. **The demote's credit did
+    // not rise to the victim's resident figure (1,116 against 1,320.7, while the eviction matched it to the
+    // page at 1,320.7), so the mechanism did not engage as designed** -- and the decision gap moved 467.9 ->
+    // 204.4 only alongside BOTH figures falling (1,989.8 -> 1,320.7), which is what a different workload looks
+    // like rather than a fix. Reverted. `plan.md` carries the full chain.
     add_kv(*text_kv_addresses, *text_kv_pages, sequence.kv->text, deficit.device.main_kv_pages,
            retained_requirement ? std::optional<std::uint32_t>(retained_requirement->main_pages)
                                 : std::nullopt,
@@ -950,7 +1107,11 @@ ProgramImpl::inspect_pressure_successors(const SequenceState& sequence,
                                          const MaterializationSourceProtection* protection,
                                          const qwen3_5::detail::PressureDecision* current) const {
     std::vector<qwen3_5::detail::PressureDecision> successors;
-    if (!sequence.kv || (current != nullptr && current->evicts_continuation)) { return successors; }
+    if (!sequence.kv || (current != nullptr && current->evicts_continuation)) {
+        note_empty_successor(!sequence.kv ? SuccessorEmptyReason::NoKv
+                                          : SuccessorEmptyReason::EvictingCurrent);
+        return successors;
+    }
     const auto append_unique = [&](qwen3_5::detail::PressureDecision option) {
         if (current != nullptr && option == *current) { return; }
         if (std::find(successors.begin(), successors.end(), option) == successors.end()) {
@@ -1027,7 +1188,10 @@ ProgramImpl::inspect_pressure_successors(const SequenceState& sequence,
     const std::optional<qwen3_5::TargetKVRequirement> retained =
         dropped.empty() ? std::optional<qwen3_5::TargetKVRequirement>()
                         : retained_requirement_after_drops(summary, dropped);
-    if (!dropped.empty() && !retained) { return successors; }
+    if (!dropped.empty() && !retained) {
+        note_empty_successor(SuccessorEmptyReason::Unretained);
+        return successors;
+    }
     std::vector<detail::PhysicalResources> endpoints;
     endpoints.reserve(8);
     const auto endpoint = [&](detail::PhysicalResources value) {
@@ -1086,6 +1250,15 @@ ProgramImpl::inspect_pressure_successors(const SequenceState& sequence,
                     combine_checkpoint_and_replica_target(std::move(*drop), std::move(*replica)));
             }
         }
+    }
+    // THE TWO OPPOSITE READINGS OF ONE EMPTY RESULT. `endpoints` is built from the RESIDUAL this call was
+    // given, so an empty list means the residual asked for NOTHING -- there was nothing to relieve, and the
+    // caller questioned this owner for no reason. A non-empty list that produced nothing means the residual
+    // DID ask, and the option builder refused every request. Counting them together is what made 96% empty
+    // read as one fact when it is two.
+    if (successors.empty()) {
+        note_empty_successor(endpoints.empty() ? SuccessorEmptyReason::NoEndpoints
+                                               : SuccessorEmptyReason::AllRefused);
     }
     return successors;
 }
@@ -1354,7 +1527,10 @@ std::optional<detail::PressureTargetProjection> ProgramImpl::evaluate_pressure_t
     std::span<const qwen3_5::detail::PressureDecision> pressure_options,
     std::span<const SharedPrefixHandle* const> shared_pressure_owners,
     std::span<const qwen3_5::detail::PressureDecision> shared_pressure_options,
-    std::vector<HostKVPageReplicaRelease>* released_host_pages) const {
+    std::vector<HostKVPageReplicaRelease>* released_host_pages,
+    // PLAIN releases, split out because a last-reference release is a DIFFERENT thing to the store and
+    // applying the wrong predicate refuses every shared page. See the classification at the push site.
+    std::vector<HostKVPageReplicaRelease>* plain_released_host_pages) const {
     if (pressure_owners.size() != pressure_options.size() ||
         shared_pressure_owners.size() != shared_pressure_options.size()) {
         throw std::invalid_argument("combined pressure selection is not row aligned");
@@ -2000,11 +2176,34 @@ std::optional<detail::PressureTargetProjection> ProgramImpl::evaluate_pressure_t
                 }
             }
             if (host_resident) {
-                released.host.kv_bytes = stride;
-                if (released_host_pages != nullptr) {
-                    released_host_pages->push_back(
-                        HostKVPageReplicaRelease{.pages = &pages, .page = item.page});
+                // ***THE CLASSIFICATION, AND IT IS THE FIX (2026-10-05).*** `item.references` IS the page's
+                // address-reference count -- the guard at the top of this loop `continue`s unless
+                // `address_references(item.page) == item.references`. THE OLD CODE IGNORED IT and pushed
+                // EVERY surviving host page into `released_host_pages`, which the caller passes as
+                // `host_last_reference_releases`. The store then applies the last-reference predicate
+                // (`address_references == 1`) and refuses any shared page -- CORRECTLY, because releasing
+                // that replica would destroy a copy another address still uses.
+                // THE CONSEQUENCE WAS TOTAL: `mark_release` refusing made the whole plan read `Blocked`
+                // with the shortfall UNSET, before the arena was asked, so EVERY preserving plan was
+                // rejected and the engine evicted victims the host arena would have taken. Measured on QA:
+                // 13 of 13 veto refusals were `store_mark_not_sole_reference`.
+                // The classification lives in ONE place (`classify_host_release`, `types.h`) so the fix
+                // and its unit test share the specification rather than agreeing by coincidence.
+                const HostReleaseKind release_kind =
+                    classify_host_release(host_resident, device_resident, item.references);
+                if (release_kind != HostReleaseKind::NotReleased) {
+                    // THE REPLICA IS ACTUALLY DROPPED, so the HOST bytes are freed and the credit is earned.
+                    released.host.kv_bytes = stride;
+                    std::vector<HostKVPageReplicaRelease>* sink =
+                        release_kind == HostReleaseKind::LastReference ? released_host_pages
+                                                                       : plain_released_host_pages;
+                    if (sink != nullptr) {
+                        sink->push_back(HostKVPageReplicaRelease{.pages = &pages, .page = item.page});
+                    }
                 }
+                // OTHERWISE THE PAGE IS HOST-ONLY AND STILL SHARED, so this release would destroy a copy
+                // in use. NOT OFFERED AND NOT CREDITED: the store's refusal is the correct answer, and
+                // crediting bytes the plan does not free would make its feasibility optimistic.
             }
             projection.unique_object_delta.removed =
                 checked_resource_sum(projection.unique_object_delta.removed, released);
@@ -2065,8 +2264,19 @@ bool ProgramImpl::compose_pressure_candidate(
 
     bool pressure_needs_transfer = false;
     std::vector<HostKVPageLayout> host_layouts;
+    // ***FOUR VECTORS, NOT TWO, BECAUSE THE FIT MUST SIMULATE IN EXECUTION ORDER (2026-10-12).***
+    // `materialization.cpp:2569-2594` allocates RESOURCE-major -- `for resource in {State, MainKV,
+    // BackendKV}` with `for_each_pending_pressure` inside, which walks `shared_pressure` then
+    // `pressure` (`materialization.cpp:2555-2562`). So execution asks for every MAIN upgrade before any BACKEND
+    // one, while this file used to append `main` then `backend` per victim. **Both the arena's
+    // `allocate` and `fit`'s simulation are FIRST-FIT over (span, offset), so the order decides which
+    // extent each request gets** -- the fit could therefore report `Pinned` on a placement execution
+    // could not reproduce, and the demote then grew again at execution and could throw `bad_alloc`.
+    // Splitting main from backend lets the assembled `host_requests` below match execution exactly.
     std::vector<HostKVAllocationRequest> private_host_requests;
     std::vector<HostKVAllocationRequest> shared_host_requests;
+    std::vector<HostKVAllocationRequest> private_backend_host_requests;
+    std::vector<HostKVAllocationRequest> shared_backend_host_requests;
     std::vector<HostKVPageReplicaRelease> host_releases;
     std::vector<HostKVPageReplicaRelease> host_last_reference_releases;
     const auto demotion_count = [](const qwen3_5::detail::PressureDecision& option) {
@@ -2167,7 +2377,7 @@ bool ProgramImpl::compose_pressure_candidate(
                 return false;
             }
             append_kv_actions(*backend_kv_addresses, *backend_kv_pages, *pressure_owner.kv->backend,
-                              expected.backend_kv_changes, private_host_requests);
+                              expected.backend_kv_changes, private_backend_host_requests);
         }
     }
 
@@ -2224,13 +2434,13 @@ bool ProgramImpl::compose_pressure_candidate(
                 return false;
             }
             append_kv_actions(*backend_kv_addresses, *backend_kv_pages, *pressure_owner.kv->backend,
-                              expected.backend_kv_changes, shared_host_requests);
+                              expected.backend_kv_changes, shared_backend_host_requests);
         }
     }
 
     const std::optional<detail::PressureTargetProjection> projection = evaluate_pressure_target(
         &*protection, pressure_owners, details.pressure_options, shared_pressure_owners,
-        details.shared_pressure_options, &host_last_reference_releases);
+        details.shared_pressure_options, &host_last_reference_releases, &host_releases);
     if (!projection) { return false; }
     const detail::PhysicalResources& removed = projection->unique_object_delta.removed;
     const detail::PhysicalResources& added   = projection->unique_object_delta.added;
@@ -2348,12 +2558,21 @@ bool ProgramImpl::compose_pressure_candidate(
         }
     }
 
+    // ***EXECUTION ORDER, EXACTLY.*** `materialization` allocates resource-major --
+    // `{State, MainKV, BackendKV}` outer, `shared_pressure` then `pressure` inner (`materialization.cpp:2555-2562`)
+    // -- so every MAIN upgrade is requested before any BACKEND one. The old form interleaved backend next to
+    // its victim's main, and since both `allocate` and this fit are first-fit over (span, offset), the two
+    // orders place a multi-victim plan differently. **The fit must simulate what execution will do, or its
+    // `Pinned` verdict is a claim about a placement nobody performs.** The shared/private split inside each
+    // resource matches `for_each_pending_pressure`'s own order.
     std::vector<HostKVAllocationRequest> host_requests;
-    host_requests.reserve(shared_host_requests.size() + private_host_requests.size());
-    host_requests.insert(host_requests.end(), shared_host_requests.begin(),
-                         shared_host_requests.end());
-    host_requests.insert(host_requests.end(), private_host_requests.begin(),
-                         private_host_requests.end());
+    host_requests.reserve(shared_host_requests.size() + private_host_requests.size() +
+                          shared_backend_host_requests.size() + private_backend_host_requests.size());
+    for (const std::vector<HostKVAllocationRequest>* group :
+         {&shared_host_requests, &private_host_requests, &shared_backend_host_requests,
+          &private_backend_host_requests}) {
+        host_requests.insert(host_requests.end(), group->begin(), group->end());
+    }
     if (!host_requests.empty()) {
         std::size_t requested_bytes = 0;
         for (const HostKVAllocationRequest& request : host_requests) {
@@ -2407,9 +2626,15 @@ bool ProgramImpl::compose_pressure_candidate(
             // a rate over nodes, never as a session count; a review caught the original comment asserting
             // the other unit, which is the direction that makes a zero look like proof.
             if (host_kv_extents != nullptr) {
+                // THE HEADROOM THIS MOMENT HAD, captured beside the verdict rather than read later. The two
+                // were previously compared from `/stats` fields taken at DIFFERENT TIMES -- the largest
+                // shortfall over a window against the CURRENT headroom -- and that comparison decides whether
+                // a `Blocked` verdict was the ceiling or a descriptor guard, so getting it wrong reads a
+                // guard as a capacity limit or the reverse.
+                const std::size_t headroom =
+                    pinned_host_pool != nullptr ? pinned_host_pool->growth_headroom_bytes() : 0U;
                 const HostKVFitResult fit = host_kv_extents->fit_after_page_releases(
-                    host_releases, host_last_reference_releases, host_requests,
-                    pinned_host_pool != nullptr ? pinned_host_pool->growth_headroom_bytes() : 0U);
+                    host_releases, host_last_reference_releases, host_requests, headroom);
                 // **ALL THREE VERDICTS, because counting `Growable` alone makes two opposite facts read the
                 // same.** `host_kv_fit_growable == 0` meant "no node ever saw a growable case" AND "every
                 // failing node was Blocked" -- the absence-is-not-zero trap inside the instrument itself, and
@@ -2418,7 +2643,62 @@ bool ProgramImpl::compose_pressure_candidate(
                 switch (fit.fit) {
                 case HostKVFit::Pinned:   ++host_kv_fit_pinned_;   break;
                 case HostKVFit::Growable: ++host_kv_fit_growable_; break;
-                case HostKVFit::Blocked:  ++host_kv_fit_blocked_;  break;
+                case HostKVFit::Blocked:
+                    ++host_kv_fit_blocked_;
+                    // ***WAS THE ROOM THERE ANYWAY? THIS IS THE COUNTER THAT SEPARATES THE TWO MECHANISMS.***
+                    // The tri-state rule is `Growable` iff `shortfall <= headroom`. So a `Blocked` verdict
+                    // with `shortfall <= headroom` CANNOT be the ceiling: something else refused, and the
+                    // only such paths are the two DESCRIPTOR guards -- the arena's `placement.descriptors_short`
+                    // and the store's table check (`host_kv_store.h:498`), both of which return `Blocked`
+                    // regardless of headroom and NEITHER OF WHICH IS COUNTED ANYWHERE.
+                    // A zero here, beside a non-zero `host_kv_fit_blocked`, means every refusal was the
+                    // ceiling. A non-zero here means the growth path is inert for a reason the plan does not
+                    // state -- and that the descriptor tables, not the byte budget, are what to fix.
+                    if (fit.shortfall_bytes <= headroom) {
+                        ++host_kv_blocked_within_headroom_;
+                        host_kv_blocked_within_headroom_max_bytes_ =
+                            std::max(host_kv_blocked_within_headroom_max_bytes_,
+                                     static_cast<std::uint64_t>(fit.shortfall_bytes));
+                    }
+                    break;
+                }
+                // AND THE MAGNITUDE, WHICH THE RESERVE NEEDS. Method 2 pins this shortfall at seal, so the
+                // plan cannot lose its room between planning and execution. ONLY `Growable` sets it: that
+                // verdict is the one that says the plan is affordable by growing. A `Blocked` plan must stay
+                // blocked -- its shortfall is out of reach, and reserving for it would pin memory for a plan
+                // the arena still cannot serve.
+                if (fit.fit == HostKVFit::Growable) {
+                    details.blocked_host_kv_shortfall_bytes = std::max<std::size_t>(1, fit.shortfall_bytes);
+                    // *** A PLAN AFFORDABLE BY ONE GROWTH IS NOT BLOCKED (2026-10-07). ***
+                    //
+                    // This is the fix the comment above names as the proper removal of the pinned-only
+                    // reversal -- "the planner [sees] capacity PLUS the growth policy's answer without acting
+                    // on it (a pure query)". The pure query is this one, it was already being asked HERE, and
+                    // its verdict was already being thrown away.
+                    //
+                    // WHAT WAS MEASURED: on the repro, `host_kv_fit_growable` ran 1,688-1,787 against
+                    // `host_kv_fit_pinned` 0 and `host_kv_fit_blocked` 0 -- the arena is NEVER ready as it
+                    // stands and NEVER genuinely blocked -- while `blocked_host_allocation_bytes`, set by the
+                    // pinned-only boolean just above, refused 1,698 PRESERVING targets against the evicting
+                    // class's 13. That is why no preserving plan was ever feasible: 20 of 20 evicting requests
+                    // had `feasible_preserving_alternatives == 0` while 174-505 preserving alternatives were
+                    // assessed on each. And every eviction destroyed a victim whose KV fitted the host
+                    // (`evictions_kv_fit_blocked` 0, all `growable`).
+                    //
+                    // WHY THIS IS SAFE, AND WHY THE ORDER MATTERS MORE THAN THE LINE:
+                    // pricing a plan on the growth gate's answer is a RECORDED REGRESSION -- see
+                    // `admission_capacity()`'s note on the `WORKER OOM: std::bad_alloc ... mat=69` of
+                    // 2026-09-28: "a plan priced from it can be executed minutes later against a worse
+                    // reading". An OPTIMISTICALLY ADMITTED plan can lose its room; a RESERVED one cannot.
+                    // So this line does NOT admit on optimism: it removes the compose-time refusal so that a
+                    // demote can be ELECTED, and `blocked_host_kv_shortfall_bytes` -- deliberately left SET
+                    // above -- then makes `reserve_host_kv_for_seal` PIN the room at seal and clear both
+                    // fields itself (`context.cpp:1913-1945`). That reserve exists, runs at both seal sites,
+                    // and had never fired (`host_kv_seal_grows` 0) for exactly this reason: a plan refused at
+                    // compose can never be elected, so a reserve that only runs on an elected plan was
+                    // unreachable. **If the reserve fails the plan is still refused at seal, which is the
+                    // conservative direction and today's behaviour.**
+                    details.blocked_host_allocation_bytes = 0;
                 }
             }
         }
@@ -2430,6 +2710,8 @@ bool ProgramImpl::compose_pressure_candidate(
         checked_resource_sum(details.demand.reservation_added, added);
     details.demand.physical_peak_additional = positive_resource_difference(
         checked_resource_sum(details.demand.physical_peak_additional, added), removed);
+    // THE MODEL, captured where the arithmetic happens rather than at the verdict it produces.
+    note_peak_model(added, removed, details.demand.physical_peak_additional);
     details.demand.final_removed =
         checked_resource_sum(checked_resource_sum(details.demand.final_removed, removed),
                              projection->ownership_transfer_delta.removed);
@@ -2614,7 +2896,8 @@ ProgramImpl::revalidate_materialization(const AdmissionCandidate& plan,
     }
     const std::optional<detail::PressureTargetProjection> projected_pressure =
         evaluate_pressure_target(&*protection, projected_private_owners, details.pressure_options,
-                                 projected_shared_owners, details.shared_pressure_options, nullptr);
+                                 projected_shared_owners, details.shared_pressure_options, nullptr,
+                                 nullptr);
     if (!projected_pressure) { return runtime::PreflightStatus::StalePolicyState; }
 
     const std::uint32_t prompt_tokens = static_cast<std::uint32_t>(prompt.token_ids.size());
@@ -2788,9 +3071,21 @@ qwen3_5::PhysicalUsageSnapshot ProgramImpl::physical_usage() const noexcept {
     return qwen3_5::PhysicalUsageSnapshot{
         .resource_revision       = resource_revision_,
         .device_state_slots      = usage.device.state_slots,
+        .device_state_capacity_slots =
+            state_store != nullptr ? state_store->device_capacity() : 0U,
         .host_state_slots        = usage.host.state_slots,
         .device_main_kv_pages    = usage.device.main_kv_pages,
         .device_backend_kv_pages = usage.device.backend_kv_pages,
+        // Reachable here and nowhere the reader is: the pools are members, and `capacity_pages()` is their own
+        // ceiling in the units the occupancy uses.
+        .device_main_kv_capacity_pages =
+            decoder != nullptr
+                ? static_cast<std::uint32_t>(decoder->text_kv.page_pool().capacity_pages())
+                : 0U,
+        .device_backend_kv_capacity_pages =
+            backend_kv_cache() != nullptr
+                ? static_cast<std::uint32_t>(backend_kv_cache()->page_pool().capacity_pages())
+                : 0U,
         .host_kv_bytes           = usage.host.kv_bytes,
     };
 }

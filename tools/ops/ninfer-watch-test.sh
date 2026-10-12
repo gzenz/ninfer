@@ -40,6 +40,10 @@ cat >"$work/journal" <<'EOF'
 2026-09-26T18:39:12+02:00 Strix systemd[1]: ninfer.service: Main process exited, code=killed, status=9/KILL
 2026-09-26T18:39:16+02:00 Strix systemd[1]: ninfer.service: Scheduled restart job, restart counter is at 1.
 2026-09-26T19:54:37+02:00 Strix bash[766721]: WEDGE (A/B): engine idle with work pending 163s — restarting ninfer (restart #2)
+2026-10-04T11:30:00+02:00 Strix bash[1]: [engine] mat-remove skew: site=gain(before>planned, expected) planned main_kv=1057 backend_kv=0 dev_slots=0 host_slots=0 host_kv=0 | before main_kv=1059 backend_kv=0 dev_slots=0 host_slots=0 host_kv=0 | after main_kv=0 backend_kv=0 dev_slots=0 host_slots=0 host_kv=0 | delta(main_kv=1059 backend_kv=0 dev_slots=0 host_slots=0 host_kv=0) | source_index=0 reuse=1
+2026-10-04T11:30:01+02:00 Strix bash[1]: [engine] fail-all cleanup: shared catalogued=0 released-refused=0 skipped=0 (reserved-capture=0 reserved-replacement=0) continuations-live=3 | host-kv released-bytes=0 retained-referenced=0 retained-pinned=4
+2026-10-04T11:30:02+02:00 Strix bash[1]: [engine] fail-all cleanup: shared catalogued=0 released-refused=0 skipped=0 (reserved-capture=0 reserved-replacement=0) continuations-live=0 | host-kv released-bytes=0 retained-referenced=0 retained-pinned=0
+2026-10-04T11:30:03+02:00 Strix bash[1]: [census] text TOTAL address_reserved_pages=0 pool_reserved_pages=2 unaccounted=2 (POSITIVE: reserved pages no live address claims -- #9's shape; no transaction survives to hold them at this call site)
 EOF
 gawk -v logpath="$work/log" -f ninfer-watch.awk <"$work/journal" >"$work/alerts"
 cat >"$work/expected" <<'EOF'
@@ -57,6 +61,8 @@ cat >"$work/expected" <<'EOF'
 2026-09-26T18:39:12+02:00 Strix systemd[1]: ninfer.service: Main process exited, code=killed, status=9/KILL
 2026-09-26T18:39:16+02:00 Strix systemd[1]: ninfer.service: Scheduled restart job, restart counter is at 1.
 2026-09-26T19:54:37+02:00 Strix bash[766721]: WEDGE (A/B): engine idle with work pending 163s — restarting ninfer (restart #2)
+2026-10-04T11:30:00+02:00 Strix bash[1]: [engine] mat-remove skew: site=gain(before>planned, expected) planned main_kv=1057 backend_kv=0 dev_slots=0 host_slots=0 host_kv=0 | before main_kv=1059 backend_kv=0 dev_slots=0 host_slots=0 host_kv=0 | after main_kv=0 backend_kv=0 dev_slots=0 host_slots=0 host_kv=0 | delta(main_kv=1059 backend_kv=0 dev_slots=0 host_slots=0 host_kv=0) | source_index=0 reuse=1
+2026-10-04T11:30:01+02:00 Strix bash[1]: [engine] fail-all cleanup: shared catalogued=0 released-refused=0 skipped=0 (reserved-capture=0 reserved-replacement=0) continuations-live=3 | host-kv released-bytes=0 retained-referenced=0 retained-pinned=4
 EOF
 total=$(wc -l <"$work/journal")
 rc=0

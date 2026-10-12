@@ -642,6 +642,11 @@ private:
                 // middle of the value, and fails the call, so the whole response falls
                 // back to plain text: the observed "tool markup returned as text" leak.
                 if (tolerant_ && !continues_call_at(close)) {
+                    // #29'S DISCRIMINATOR: this is the ONLY place in the tree that knows the parser's own
+                    // recovery treated a close tag as payload content, and it is exactly the arm whose
+                    // comment above names the leak this fallback produces. Recorded rather than only
+                    // commented, because nothing downstream can reconstruct it from the symptom.
+                    tolerant_content_skipped_ = true;
                     ++depth;  // the tag was content, not structure
                     scan = close + kParamClose.size();
                     continue;
@@ -687,6 +692,13 @@ private:
     std::size_t max_name_length_;
     const Contract& contract_;
     bool tolerant_ = false;
+    // Set by `find_parameter_close`'s content-skip arm (q.v.); MUTABLE because that method and `parse` are
+    // `const` and the flag is a property of the parse's HISTORY, not of the input. Read once, at the point
+    // the reason leaves the parser, where it becomes `AfterTolerantContentSkip`.
+    mutable bool tolerant_content_skipped_ = false;
+
+public:
+    [[nodiscard]] bool tolerant_content_skipped() const noexcept { return tolerant_content_skipped_; }
 };
 
 GeneratedToolCall normalize_raw_tool_call(const RawToolCall& raw, const Contract& contract,
@@ -763,7 +775,16 @@ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
         // A truncated tail after a complete call was discarded; the recovered calls stand.
         out.diagnostics.fallback_reason = failure;
     } else if (failure != FallbackReason::None) {
+        // #29's DISCRIMINATOR, applied at the ONE point the reason leaves the parser. The reason describes
+        // the SYMPTOM, and the parser's own truncation on a literal close tag and a model that emitted bad
+        // markup produce the SAME symptoms -- which is why "parser leak or model output?" was unanswerable.
+        // `tolerant_content_skipped()` is the parser's own record that its recovery arm ran, so this carries
+        // BOTH: the symptom is kept, and the path is added beside it. See `ToolCallParsePath` for the
+        // coexistence-not-causation caveat.
         out.diagnostics.fallback_reason = failure;
+        if (parser.tolerant_content_skipped()) {
+            out.diagnostics.parse_path = ToolCallParsePath::AfterTolerantContentSkip;
+        }
         return fallback(text, out.diagnostics);
     }
 

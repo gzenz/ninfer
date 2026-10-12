@@ -166,6 +166,10 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
                                            StartupProgressUnit::Bytes, host_state_bytes);
         host_state_images =
             std::make_unique<qwen3_5::HostStatePool>(state_images->host_layout(), *pinned_host_pool);
+        // THE CEILING, SET BEFORE THE INITIAL RESERVATION so the reservation itself is subject to it -- setting
+        // it afterwards would let a configured floor exceed the ceiling and then leave the pool above it.
+        // Zero (the default) is unbounded, so nothing changes unless the operator sets the flag.
+        host_state_images->set_max_slots(plan.context_cache.host_state_max_slots);
         // The configured count is a FLOOR and an initial reservation. It is no longer the effective
         // ceiling for demotion: `ensure_host_state_headroom()` grows the pool by one slot when it is FULL,
         // before the planner prices anything (§3 item 6, 2026-09-26), so a demote can be offered where the
@@ -656,6 +660,8 @@ MemorySummary ProgramImpl::memory_summary() const noexcept {
             out.host_kv_grow_refusals = host_kv_arena->growth_refusals();
         }
         out.host_state_occupied_slots = host_state_images->occupied();
+        out.host_state_max_slots              = host_state_images->max_slots();
+        out.host_state_growth_ceiling_refusals = host_state_images->growth_ceiling_refusals();
         out.host_state_pregrow_attempts = host_state_pregrow_attempts_;
         out.host_state_pregrows         = host_state_pregrows_;
         out.host_state_pregrow_refusals = host_state_pregrow_refusals_;
@@ -668,6 +674,20 @@ MemorySummary ProgramImpl::memory_summary() const noexcept {
         out.host_kv_blocked_max_bytes   = host_kv_blocked_max_bytes_;
         out.host_kv_fit_pinned          = host_kv_fit_pinned_;
         out.host_kv_fit_blocked         = host_kv_fit_blocked_;
+        out.host_kv_blocked_within_headroom           = host_kv_blocked_within_headroom_;
+        out.host_kv_blocked_within_headroom_max_bytes = host_kv_blocked_within_headroom_max_bytes_;
+        // THE REFUSAL SPLIT IS SUMMED OVER BOTH LAYERS, and that is required rather than tidy: the store's
+        // wrapper returns `Blocked` at three places BEFORE it calls the arena, so the two sets cannot see
+        // each other's refusals. Measured: the veto fired 18 times and EVERY arena-side reason stayed 0 --
+        // a split reading only the arena would have reported "no reason" for all of them.
+        for (std::size_t reason = 0; reason < k_host_kv_block_reason_count; ++reason) {
+            const auto block_reason = static_cast<HostKVBlockReason>(reason);
+            out.host_kv_block_reasons[reason] =
+                host_kv_arena != nullptr ? host_kv_arena->block_reason_count(block_reason) : 0U;
+            if (host_kv_extents != nullptr) {
+                out.host_kv_block_reasons[reason] += host_kv_extents->block_reason_count(block_reason);
+            }
+        }
     }
     if (host_kv_arena) {
         out.host_kv_capacity_bytes = host_kv_arena->capacity_bytes();

@@ -117,6 +117,18 @@ public:
     [[nodiscard]] std::uint64_t growth_count() const noexcept { return growth_count_; }
     // Growth attempts the pool or the budget refused, so a refusal is not silence either.
     [[nodiscard]] std::uint64_t growth_refusals() const noexcept { return growth_refusals_; }
+    // THE CEILING. Zero is unbounded. Setting it below the CURRENT capacity does not shrink the pool -- it
+    // only stops further growth, because a slot index is a handle and removing live ones would renumber the
+    // rest. `trim_idle_slots` is the separate, explicit way to give room back.
+    void set_max_slots(std::uint32_t max_slots) noexcept { max_slots_ = max_slots; }
+    [[nodiscard]] std::uint32_t max_slots() const noexcept { return max_slots_; }
+    // Growth attempts refused BY THE CEILING, counted apart from `growth_refusals_`, which counts refusals by
+    // the shared pool. The two mean opposite things: the pool refusing says the machine is out of room, while
+    // the ceiling refusing says THIS AXIS gave its room to KV on purpose. Folding them together would make
+    // the trade-off unreadable.
+    [[nodiscard]] std::uint64_t growth_ceiling_refusals() const noexcept {
+        return growth_ceiling_refusals_;
+    }
     [[nodiscard]] bool release(HostStateSlotHandle handle) noexcept;
 
     [[nodiscard]] HostStateImageView writable_view(HostStateSlotHandle handle);
@@ -147,6 +159,17 @@ private:
     std::uint32_t occupied_   = 0;
     std::uint64_t growth_count_    = 0;
     std::uint64_t growth_refusals_ = 0;
+    // ***THE STATE AXIS'S CEILING, AND WHY IT EXISTS (2026-10-05).*** Host KV and host state draw on ONE
+    // pinned pool, and this pool had NO bound of its own: `grow_slot` asked the shared pool and took whatever
+    // it would give. Under load it therefore consumed the pile -- measured, 120 slots (~24 GiB) while the KV
+    // arena held 6 GiB of a 30 GiB pool -- and with the pool at its ceiling the KV side had no growth room
+    // left. `Growable` then cannot be returned, the planner seals on a pinned-only veto, and the engine
+    // evicts a restorable victim whose own KV WOULD have fitted. That is the defect this bound is aimed at.
+    // ZERO MEANS UNBOUNDED, which is today's behaviour, so this changes nothing until it is set. The number
+    // is to be MEASURED, not chosen: raising it costs KV room, lowering it forces state evictions, and only a
+    // soak can say where the balance is. `growth_ceiling_refusals_` is what makes that trade-off visible.
+    std::uint32_t max_slots_ = 0;
+    std::uint64_t growth_ceiling_refusals_ = 0;
 };
 
 struct StateImageDeviceSlotView {

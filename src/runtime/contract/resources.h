@@ -54,6 +54,22 @@ enum class ContextResourceClass : std::uint8_t {
     BackendKV,
 };
 
+// ***THE ORDER PRESSURE TRANSFERS ARE ALLOCATED IN, DEFINED ONCE (2026-10-12).***
+// `materialization.cpp` and `capture.cpp` each allocate host KV inside `for (resource : ...)` with
+// `for_each_pending_pressure` nested inside -- so every MAIN upgrade is requested before any BACKEND one, and
+// shared before private. **`compose_pressure_candidate` must simulate that same order, because both the
+// arena's `allocate` and its fit are FIRST-FIT over (span, offset): a different order places the same plan
+// differently, the fit can then report `Pinned` on a placement execution cannot reproduce, and the demote
+// grows again at execution and can `throw std::bad_alloc` (`WORKER OOM`).**
+// FOUR separate copies of this array used to exist (two in `capture.cpp`, one in `materialization.cpp`, and
+// the assembly order in `pressure.cpp`). Nothing tied them together, so drifting apart was silent. This is
+// the one definition; every site iterates it.
+inline constexpr std::array<ContextResourceClass, 3> k_pressure_allocation_order{
+    ContextResourceClass::State,
+    ContextResourceClass::MainKV,
+    ContextResourceClass::BackendKV,
+};
+
 enum class ContextTransferDirection : std::uint8_t {
     DeviceToHost,
     HostToDevice,

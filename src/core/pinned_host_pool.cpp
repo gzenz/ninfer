@@ -33,7 +33,30 @@ std::size_t PinnedHostPool::largest_free_run() const noexcept {
 }
 
 bool PinnedHostPool::grow(std::size_t bytes) noexcept {
-    const std::size_t wanted = align_up(std::max(bytes, config_.chunk_bytes));
+    // THE GROWTH STEP FLOORED AT A WHOLE CHUNK, AND THAT WAS A WALL. `wanted` was `max(bytes, chunk_bytes)`
+    // and the live `chunk_bytes` is 1024 MiB -- so a 275 MiB state slot asked the policy to pin 1024 MiB, and
+    // with 512 MiB of headroom the policy refused. Measured 2026-10-04 on two windows (16 and 27 minutes):
+    // headroom pegged at exactly 512 MiB, `largest_free_run` 90 MB against a 275 MiB slot, KV pre-grow refused
+    // 98-99.9%, state pre-grow 91-92%, `shortfall_calls` 792 then 1931 -- a pool unable to grow AND unable to
+    // place while holding ~2 GB it could not use. The refusal was never about the request; it was about a step
+    // four times larger than it.
+    //
+    // SO: TAKE THE LARGEST STEP THE HEADROOM CAN PAY, NEVER LESS THAN THE REQUEST. A full chunk is still
+    // preferred whenever the budget can pay for one, so every case that worked before is unchanged -- this
+    // only bites when the headroom is smaller than a chunk, and it bites by ASKING FOR LESS rather than by
+    // refusing. The over-promise direction is safe by construction: `growth_headroom_bytes()` is a claim about
+    // RECLAIMABLE CACHE and can overstate the room, and an overstatement makes `headroom < chunk_bytes` FALSE,
+    // leaving the step at a full chunk. The POLICY still decides; this only sizes what it is asked.
+    // AND WHEN THE HEADROOM CANNOT PAY FOR A CHUNK, THE CHUNK IS THE REQUEST -- not the whole headroom.
+    // Sizing it to `headroom` was the first version of this fix, and the 13 GiB-ceiling window showed what
+    // that costs: one growth consumed the ENTIRE remaining headroom, the pool filled to exactly the ceiling
+    // (13,312 of 13,312 MiB), headroom went to 0 and every later request was refused. `step = 0` makes the
+    // chunk `align_up(bytes)`, which serves the request and LEAVES THE REST for the next one.
+    // A request larger than the headroom still fails, correctly: `wanted` exceeds it and the policy refuses.
+    const std::size_t headroom = growth_headroom_bytes();
+    const std::size_t step =
+        (headroom != 0U && headroom < config_.chunk_bytes) ? 0U : config_.chunk_bytes;
+    const std::size_t wanted = align_up(std::max(bytes, step));
     const bool allowed =
         policy_ ? policy_(wanted)
                 : (config_.max_bytes == 0U || capacity_ + wanted <= config_.max_bytes);

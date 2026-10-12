@@ -477,8 +477,106 @@ std::uint64_t Program::demotable_evictions() const noexcept { return impl_->demo
 std::uint64_t Program::evictions_demote_possible() const noexcept {
     return impl_->evictions_demote_possible();
 }
+
+std::uint64_t Program::demote_refusal_at_eviction(std::size_t bucket) const noexcept {
+    // The cast is safe for every in-range bucket because `state_store.h` asserts
+    // `DemoteRefusal::Count == k_demote_refusal_buckets` (this said "asserted equal below" until 2026-10-04;
+    // no assert is below -- the tie is in the header). An out-of-range
+    // index would be a caller bug, and `impl_`'s accessor indexes the same-sized array the enum sizes.
+    return impl_->demote_refusal_at_eviction(
+        static_cast<detail::StateImageStore::DemoteRefusal>(bucket));
+}
 std::uint64_t Program::evictions_with_victim_room() const noexcept {
     return impl_->evictions_with_victim_room();
+}
+
+std::uint64_t Program::evictions_victim_device_slots() const noexcept {
+    return impl_->evictions_victim_device_slots();
+}
+
+std::uint64_t Program::evictions_victim_host_slots() const noexcept {
+    return impl_->evictions_victim_host_slots();
+}
+std::uint64_t Program::evictions_deficit_device_main_kv() const noexcept {
+    return impl_->evictions_deficit_device_main_kv();
+}
+std::uint64_t Program::evictions_deficit_device_backend_kv() const noexcept {
+    return impl_->evictions_deficit_device_backend_kv();
+}
+std::uint64_t Program::evictions_deficit_device_state() const noexcept {
+    return impl_->evictions_deficit_device_state();
+}
+std::uint64_t Program::evictions_deficit_host_state() const noexcept {
+    return impl_->evictions_deficit_host_state();
+}
+std::uint64_t Program::evictions_deficit_host_kv() const noexcept {
+    return impl_->evictions_deficit_host_kv();
+}
+std::uint64_t Program::evictions_kv_pages() const noexcept {
+    return impl_->evictions_kv_pages();
+}
+std::uint64_t Program::evictions_kv_pages_total() const noexcept {
+    return impl_->evictions_kv_pages_total();
+}
+std::uint64_t Program::evictions_kv_fit_pinned() const noexcept {
+    return impl_->evictions_kv_fit_pinned();
+}
+std::uint64_t Program::evictions_kv_fit_growable() const noexcept {
+    return impl_->evictions_kv_fit_growable();
+}
+std::uint64_t Program::evictions_kv_fit_blocked() const noexcept {
+    return impl_->evictions_kv_fit_blocked();
+}
+std::uint64_t Program::evictions_kv_fit_pinned_pages() const noexcept {
+    return impl_->evictions_kv_fit_pinned_pages();
+}
+std::uint64_t Program::evictions_kv_fit_growable_pages() const noexcept {
+    return impl_->evictions_kv_fit_growable_pages();
+}
+std::uint64_t Program::evictions_kv_fit_blocked_pages() const noexcept {
+    return impl_->evictions_kv_fit_blocked_pages();
+}
+std::uint64_t Program::eviction_kv_records_total() const noexcept {
+    return impl_->eviction_kv_records_total();
+}
+std::uint32_t Program::eviction_kv_record_count() const noexcept {
+    return impl_->eviction_kv_record_count();
+}
+RuntimeStats::EvictionKVRecord Program::eviction_kv_record(std::size_t chronological) const noexcept {
+    return impl_->eviction_kv_record(chronological);
+}
+
+std::uint64_t Program::physical_peak_fits_calls() const noexcept {
+    return impl_->physical_peak_fits_calls();
+}
+std::uint64_t Program::physical_peak_refusals_by_axis(std::size_t axis) const noexcept {
+    return impl_->physical_peak_refusals_by_axis(axis);
+}
+std::uint64_t Program::host_kv_seal_grows() const noexcept { return impl_->host_kv_seal_grows(); }
+std::uint64_t Program::host_kv_seal_refusals() const noexcept { return impl_->host_kv_seal_refusals(); }
+
+std::uint64_t Program::host_state_fit_checks() const noexcept {
+    return impl_->host_state_fit_checks();
+}
+
+std::uint64_t Program::host_state_shortfall_calls() const noexcept {
+    return impl_->host_state_shortfall_calls();
+}
+
+std::uint64_t Program::host_state_shortfall_max_slots() const noexcept {
+    return impl_->host_state_shortfall_max_slots();
+}
+
+std::uint64_t Program::device_main_kv_fit_checks() const noexcept {
+    return impl_->device_main_kv_fit_checks();
+}
+
+std::uint64_t Program::device_main_kv_shortfall_calls() const noexcept {
+    return impl_->device_main_kv_shortfall_calls();
+}
+
+std::uint64_t Program::device_main_kv_shortfall_max_pages() const noexcept {
+    return impl_->device_main_kv_shortfall_max_pages();
 }
 std::uint64_t Program::demotable_eviction_checks() const noexcept {
     return impl_->demotable_eviction_checks();
@@ -518,14 +616,250 @@ std::uint64_t Program::publication_goal_blocked_other() const noexcept {
     return impl_->publication_goal_blocked_other();
 }
 std::uint64_t Program::options_refused_no_kv() const noexcept { return impl_->options_refused_no_kv(); }
-void Program::note_pressure_successor_outcome(bool nonevicting_available) noexcept {
-    impl_->note_pressure_successor_outcome(nonevicting_available);
+void Program::note_pressure_successor_outcome(bool no_nonevicting_option,
+                                              bool evicting_current) noexcept {
+    impl_->note_pressure_successor_outcome(no_nonevicting_option, evicting_current);
+}
+
+std::uint64_t Program::pressure_successor_calls_evicting_current() const noexcept {
+    return impl_->pressure_successor_calls_evicting_current();
+}
+
+std::uint64_t Program::pressure_successor_empty_by_reason(std::size_t reason) const noexcept {
+    return impl_->pressure_successor_empty_by_reason(reason);
+}
+
+std::uint64_t Program::kv_relief_rejected(std::size_t direction, std::size_t clause) const noexcept {
+    return impl_->kv_relief_rejected(direction, clause);
+}
+
+std::uint64_t Program::kv_relief_calls(std::size_t direction) const noexcept {
+    return impl_->kv_relief_calls(direction);
+}
+
+std::uint64_t Program::kv_relief_requested(std::size_t direction) const noexcept {
+    return impl_->kv_relief_requested(direction);
+}
+
+std::uint64_t Program::kv_relief_saturated_asks(std::size_t direction) const noexcept {
+    return impl_->kv_relief_saturated_asks(direction);
+}
+
+std::uint64_t Program::kv_relief_max_ask(std::size_t direction) const noexcept {
+    return impl_->kv_relief_max_ask(direction);
+}
+
+std::uint64_t Program::kv_relief_relieved(std::size_t direction) const noexcept {
+    return impl_->kv_relief_relieved(direction);
+}
+
+std::uint64_t Program::kv_relief_gate_blocks(std::size_t clause) const noexcept {
+    return impl_->kv_relief_gate_blocks(clause);
+}
+
+std::uint64_t Program::peak_refusal_by_preserving(bool preserving, std::size_t axis) const noexcept {
+    return impl_->peak_refusal_by_preserving(preserving, axis);
+}
+
+void Program::note_successor_relief(bool evicting, std::uint32_t main_kv, std::uint32_t backend_kv,
+                                    std::uint32_t state_slots) noexcept {
+    impl_->note_successor_relief(evicting, main_kv, backend_kv, state_slots);
+}
+
+void Program::record_assessed_peak(bool preserving, bool feasible, std::uint32_t peak_main,
+                                   std::uint32_t peak_backend, std::uint8_t refusal_mask,
+                                   std::uint32_t reservation_main,
+                                   std::uint32_t removed_main,
+                                   std::uint32_t evicted_victim_main) const noexcept {
+    impl_->record_assessed_peak(preserving, feasible, peak_main, peak_backend, refusal_mask,
+                                reservation_main, removed_main, evicted_victim_main);
+}
+
+std::uint64_t Program::assessed_agg_count(bool feasible, bool preserving) const noexcept {
+    return impl_->assessed_agg_count(feasible, preserving);
+}
+
+std::uint64_t Program::assessed_axis_shortfall(bool feasible, bool preserving,
+                                               std::size_t axis) const noexcept {
+    return impl_->assessed_axis_shortfall(feasible, preserving, axis);
+}
+
+std::uint64_t Program::assessed_agg_reservation(bool feasible, bool preserving) const noexcept {
+    return impl_->assessed_agg_reservation(feasible, preserving);
+}
+
+std::uint64_t Program::assessed_agg_removed(bool feasible, bool preserving) const noexcept {
+    return impl_->assessed_agg_removed(feasible, preserving);
+}
+
+std::uint64_t Program::assessed_agg_selected(bool feasible, bool preserving) const noexcept {
+    return impl_->assessed_agg_selected(feasible, preserving);
+}
+
+std::uint64_t Program::assessed_agg_evicting(bool feasible, bool preserving) const noexcept {
+    return impl_->assessed_agg_evicting(feasible, preserving);
+}
+
+std::uint64_t Program::assessed_agg_available(bool feasible, bool preserving) const noexcept {
+    return impl_->assessed_agg_available(feasible, preserving);
+}
+
+std::uint64_t Program::assessed_agg_chosen(bool feasible, bool preserving) const noexcept {
+    return impl_->assessed_agg_chosen(feasible, preserving);
+}
+
+std::uint64_t Program::assessed_larger_available(bool feasible, bool preserving) const noexcept {
+    return impl_->assessed_larger_available(feasible, preserving);
+}
+
+std::uint64_t Program::assessed_chose_largest(bool feasible, bool preserving) const noexcept {
+    return impl_->assessed_chose_largest(feasible, preserving);
+}
+
+std::uint64_t Program::assessed_agg_kv_entries(bool feasible, bool preserving) const noexcept {
+    return impl_->assessed_agg_kv_entries(feasible, preserving);
+}
+
+void Program::note_victim_ownership(std::uint64_t release_main, std::uint64_t resident_main) noexcept {
+    impl_->note_victim_ownership(release_main, resident_main);
+}
+
+std::uint64_t Program::victim_ownership_calls() const noexcept { return impl_->victim_ownership_calls(); }
+std::uint64_t Program::victim_ownership_release_sum() const noexcept {
+    return impl_->victim_ownership_release_sum();
+}
+std::uint64_t Program::victim_ownership_resident_sum() const noexcept {
+    return impl_->victim_ownership_resident_sum();
+}
+std::uint64_t Program::victim_ownership_gap_sum() const noexcept {
+    return impl_->victim_ownership_gap_sum();
+}
+std::uint64_t Program::victim_ownership_gap_max() const noexcept {
+    return impl_->victim_ownership_gap_max();
+}
+
+std::uint64_t Program::victim_release_main_kv_pages(std::size_t state_index) const noexcept {
+    return impl_->victim_release_main_kv_pages(state_index);
+}
+
+std::uint64_t Program::victim_resident_main_kv_pages(std::size_t state_index) const noexcept {
+    return impl_->victim_resident_main_kv_pages(state_index);
+}
+
+std::uint64_t Program::assessed_total(bool preserving) const noexcept {
+    return impl_->assessed_total(preserving);
+}
+
+std::uint64_t Program::assessed_feasible(bool preserving) const noexcept {
+    return impl_->assessed_feasible(preserving);
+}
+
+std::uint64_t Program::assessed_refused_host_blocked(bool preserving) const noexcept {
+    return impl_->assessed_refused_host_blocked(preserving);
+}
+
+std::uint64_t Program::assessed_peak_record_total() const noexcept {
+    return impl_->assessed_peak_record_total();
+}
+
+const AssessedPeakRecord& Program::assessed_peak_record(std::size_t chronological) const noexcept {
+    return impl_->assessed_peak_record(chronological);
+}
+
+void Program::note_successor_relief_best_only(std::uint64_t preserving_options_seen) noexcept {
+    impl_->note_successor_relief_best_only(preserving_options_seen);
+}
+
+std::uint64_t Program::successor_relief_preserving_options_seen() const noexcept {
+    return impl_->successor_relief_preserving_options_seen();
+}
+
+std::uint64_t Program::successor_relief_count(bool evicting) const noexcept {
+    return impl_->successor_relief_count(evicting);
+}
+
+std::uint64_t Program::successor_relief_main_kv(bool evicting) const noexcept {
+    return impl_->successor_relief_main_kv(evicting);
+}
+
+std::uint64_t Program::successor_relief_backend_kv(bool evicting) const noexcept {
+    return impl_->successor_relief_backend_kv(evicting);
+}
+
+std::uint64_t Program::successor_relief_state_slots(bool evicting) const noexcept {
+    return impl_->successor_relief_state_slots(evicting);
+}
+
+std::uint64_t Program::entitlement_split_calls() const noexcept { return impl_->entitlement_split_calls(); }
+std::uint64_t Program::entitlement_split_prompt_tokens() const noexcept {
+    return impl_->entitlement_split_prompt_tokens();
+}
+std::uint64_t Program::entitlement_split_output_tokens() const noexcept {
+    return impl_->entitlement_split_output_tokens();
+}
+std::uint64_t Program::entitlement_split_reserved_tokens() const noexcept {
+    return impl_->entitlement_split_reserved_tokens();
+}
+
+std::uint64_t Program::reservation_composition_calls() const noexcept {
+    return impl_->reservation_composition_calls();
+}
+
+std::uint64_t Program::reservation_composition(std::size_t term, std::size_t axis) const noexcept {
+    return impl_->reservation_composition(term, axis);
+}
+
+std::uint64_t Program::victim_entitlement_gap_calls() const noexcept {
+    return impl_->victim_entitlement_gap_calls();
+}
+
+std::uint64_t Program::victim_entitlement_gap_pages_sum() const noexcept {
+    return impl_->victim_entitlement_gap_pages_sum();
+}
+
+std::uint64_t Program::victim_entitlement_gap_pages_max() const noexcept {
+    return impl_->victim_entitlement_gap_pages_max();
+}
+
+std::uint64_t Program::peak_model_calls() const noexcept { return impl_->peak_model_calls(); }
+
+std::uint64_t Program::peak_model_added(std::size_t axis) const noexcept {
+    return impl_->peak_model_added(axis);
+}
+
+std::uint64_t Program::peak_model_removed(std::size_t axis) const noexcept {
+    return impl_->peak_model_removed(axis);
+}
+
+std::uint64_t Program::peak_model_peak_max(std::size_t axis) const noexcept {
+    return impl_->peak_model_peak_max(axis);
+}
+
+std::uint64_t Program::kv_relief_demote_calls_host_req_zero() const noexcept {
+    return impl_->kv_relief_demote_calls_host_req_zero();
+}
+std::uint64_t Program::kv_relief_demote_calls_host_req_nonzero() const noexcept {
+    return impl_->kv_relief_demote_calls_host_req_nonzero();
+}
+std::uint64_t Program::kv_relief_demote_relieved_host_req_zero() const noexcept {
+    return impl_->kv_relief_demote_relieved_host_req_zero();
+}
+std::uint64_t Program::kv_relief_demote_relieved_host_req_nonzero() const noexcept {
+    return impl_->kv_relief_demote_relieved_host_req_nonzero();
+}
+
+std::uint64_t Program::kv_relief_host_blocked_bytes_sum() const noexcept {
+    return impl_->kv_relief_host_blocked_bytes_sum();
+}
+
+std::uint64_t Program::kv_relief_host_blocked_bytes_max() const noexcept {
+    return impl_->kv_relief_host_blocked_bytes_max();
 }
 std::uint64_t Program::pressure_successor_calls() const noexcept {
     return impl_->pressure_successor_calls();
 }
-std::uint64_t Program::pressure_successors_with_option() const noexcept {
-    return impl_->pressure_successors_with_option();
+std::uint64_t Program::pressure_successors_without_option() const noexcept {
+    return impl_->pressure_successors_without_option();
 }
 std::uint64_t Program::demote_option_refused_no_state_deficit() const noexcept {
     return impl_->demote_option_refused_no_state_deficit();
@@ -564,6 +898,30 @@ Program::PrefixSplit Program::prefix_split(const SharedPrefixHandle& owner,
 }
 std::uint64_t Program::publication_cell_losses() const noexcept {
     return impl_->publication_cell_losses();
+}
+
+std::uint64_t Program::shared_prefix_release_attempts() const noexcept {
+    return impl_->shared_prefix_release_attempts();
+}
+
+std::uint64_t Program::shared_prefix_release_refusals_stale_index() const noexcept {
+    return impl_->shared_prefix_release_refusals(
+        detail::ProgramImpl::SharedPrefixReleaseRefusal::StaleGenerationOrIndex);
+}
+
+std::uint64_t Program::shared_prefix_release_refusals_in_flight() const noexcept {
+    return impl_->shared_prefix_release_refusals(
+        detail::ProgramImpl::SharedPrefixReleaseRefusal::TransactionInFlightOrInvalidHandle);
+}
+
+std::uint64_t Program::shared_prefix_release_refusals_not_releasable() const noexcept {
+    return impl_->shared_prefix_release_refusals(
+        detail::ProgramImpl::SharedPrefixReleaseRefusal::StateNotReleasable);
+}
+
+std::uint64_t Program::shared_prefix_release_refusals_check_threw() const noexcept {
+    return impl_->shared_prefix_release_refusals(
+        detail::ProgramImpl::SharedPrefixReleaseRefusal::StateReleasableCheckThrew);
 }
 std::uint64_t Program::publication_cell_probes() const noexcept {
     return impl_->publication_cell_probes();

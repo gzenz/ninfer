@@ -489,6 +489,85 @@ int exercise_host_arena_growth(ninfer::DeviceContext& device, ninfer::HostKVPage
 }
 
 
+// ***THE PRESSURE ALLOCATION ORDER IS PINNED HERE (2026-10-12), AFTER FOUR FAILED FIXTURES.***
+// The property: a feasibility fit computed with the requests in one ORDER must not certify a plan that
+// EXECUTION, allocating in another order, then strands. The order is one definition
+// (`runtime::k_pressure_allocation_order`); a drift between the fit and the placement ends in a demote the
+// planner sealed and `apply_recipe` cannot place.
+//
+// **WHY FOUR EARLIER ATTEMPTS MEASURED NOTHING, WHICH IS THE PART WORTH READING.** `HostKVAllocation`'s
+// destructor releases (`host_kv_arena.cpp:170`). Every attempt wrote `const auto got = arena.allocate(...)`
+// inside the loop body, so each allocation was given back at the end of its own iteration and the next
+// request was placed into a nearly-empty arena. Order cannot matter when nothing is held -- and the two
+// "unexplained" readings that followed (`allocate(8)` appearing to consume 7 pages) were comparisons against
+// a STALE printed `free`, taken before that release. Nothing was wrong with the allocator: `occupied_bytes_`
+// moves by exactly `page_stride * pages` every time. THE FIXTURE MUST HOLD EVERY ALLOCATION LIVE, which is
+// also what a plan does.
+int exercise_host_arena_placement_order(ninfer::DeviceContext& device,
+                                        ninfer::HostKVPageLayout host_layout,
+                                        const std::string& label) {
+    (void)device;
+    int failures = 0;
+    const std::size_t stride                 = host_layout.page_stride;
+    const ninfer::HostKVPageLayout layouts[] = {host_layout};
+
+    struct Outcome {
+        std::size_t shortfall_pages = 0;
+        std::size_t placed          = 0;
+    };
+    // One (fit order, execution order) pair against a FRESH arena: 19 pages resident, growing in 8-page
+    // spans. The arena is grown by whatever shortfall the fit reported, which is exactly what the caller
+    // does, so a fit that under-reports is not rescued here.
+    auto run = [&](const std::array<std::uint32_t, 3>& fit_order,
+                   const std::array<std::uint32_t, 3>& exec_order) {
+        ninfer::PinnedHostPool pool(
+            ninfer::PinnedHostPool::Config{stride * 8U, 256U},
+            [](std::size_t bytes) { return std::malloc(bytes); },
+            [](void* base) { std::free(base); });
+        ninfer::HostKVArena arena(pool, stride * 19U, stride * 8U,
+                                  std::span<const ninfer::HostKVPageLayout>(layouts));
+
+        std::vector<ninfer::HostKVAllocationRequest> requests;
+        for (const std::uint32_t pages : fit_order) {
+            requests.push_back(ninfer::HostKVAllocationRequest{.layout = &host_layout, .pages = pages});
+        }
+        const auto fit = arena.fit_after_suballocation_releases({}, requests, 0U);
+        (void)arena.grow_bytes(fit.shortfall_bytes);
+
+        // HELD FOR THE WHOLE SEQUENCE -- the destructor is the release, so a local inside the loop is a bug.
+        std::vector<ninfer::HostKVAllocation> held;
+        for (const std::uint32_t pages : exec_order) {
+            std::optional<ninfer::HostKVAllocation> got = arena.allocate(host_layout, pages);
+            if (got) { held.push_back(std::move(*got)); }
+        }
+        return Outcome{.shortfall_pages = fit.shortfall_bytes / stride, .placed = held.size()};
+    };
+
+    // The execution order a plan actually places in.
+    const std::array<std::uint32_t, 3> exec{1U, 8U, 18U};
+
+    // THE CONTROL: the fit computed in a DIFFERENT order under-reports what execution needs, and a request
+    // is stranded. This is what makes the test able to fail -- it is the defect, reproduced at the arena
+    // level, not a restatement of the fix.
+    const Outcome mismatched = run({1U, 18U, 8U}, exec);
+    failures += expect(mismatched.shortfall_pages < 18U,
+                       label + " the mismatched-order fit does NOT report the 18 pages execution needs "
+                               "(fixture can discriminate)");
+    failures += expect(mismatched.placed == 2U,
+                       label + " the mismatched order strands a request (the defect this order prevents)");
+
+    // THE FIX: fit in the order execution allocates in, and every request places.
+    const Outcome matched = run(exec, exec);
+    failures += expect_size(matched.shortfall_pages, 18U,
+                            label + " the execution-order fit reports the full shortfall");
+    failures += expect(matched.placed == 3U,
+                       label + " fitting in EXECUTION's order strands nothing (THE PROPERTY)");
+    // The two fits must DIFFER, or the fixture proves nothing about order.
+    failures += expect(matched.shortfall_pages != mismatched.shortfall_pages,
+                       label + " the two fit orders report the SAME shortfall -- the fixture is vacuous");
+    return failures;
+}
+
 // THE THREE-VALUED FIT, which exists because two values cannot say "not affordable from pinned memory,
 // affordable if grown" -- the distinction the pressure planner needs and the source names as the defect
 // (`pressure.cpp`: a plan affordable by growing "reads as blocked and the caller may evict where a demote
@@ -552,6 +631,110 @@ int exercise_host_arena_fit_tristate(ninfer::DeviceContext& device, ninfer::Host
                                                                   generous.shortfall_bytes - 1U);
         failures += expect(stingy.fit == ninfer::HostKVFit::Blocked,
                            label + " headroom one byte short is Blocked");
+    }
+
+    // ***THE SEAL RESERVE'S GROWTH UNIT (2026-10-12), WITH THE FORM IT REPLACED AS ITS OWN NEGATIVE
+    // CONTROL.*** `fit_after_suballocation_releases` charges each UNSATISFIED REQUEST one CONTIGUOUS extent
+    // of `max(request_bytes, span step)` and sums those into `shortfall_bytes`. The reserve at seal bought
+    // that total as `ceil(shortfall/step)` SEPARATE `step`-sized spans, so **a request larger than one step
+    // could never land in any of them** -- yet the reserve still cleared its fields and admitted the plan,
+    // and the demote then threw `bad_alloc` at execution, which is the `WORKER OOM` class the reserve exists
+    // to prevent. The repair is ONE `grow_bytes(shortfall)`, which `grow_span` turns into one fresh,
+    // wholly-free run of at least the shortfall.
+    // THE CASE THAT SEPARATES THEM IS `request > step`, so this fixture asks for 12 pages against the
+    // 8-page span step this arena was built with: one and a half steps. Both forms are run, so the test
+    // fails on the old form and passes on the new one -- a control, not just an expectation.
+    for (const bool one_span_of_the_shortfall : {true, false}) {
+        const std::string form = one_span_of_the_shortfall ? " one span of the shortfall"
+                                                           : " ceil(shortfall/step) spans of step";
+        ninfer::PinnedHostPool fresh_pool(
+            ninfer::PinnedHostPool::Config{host_layout.page_stride * 32U, 256U},
+            [](std::size_t bytes) { return std::malloc(bytes); },
+            [](void* base) { std::free(base); });
+        ninfer::HostKVArena fresh(fresh_pool, host_layout.page_stride * 8,
+                                  host_layout.page_stride * 8,
+                                  std::span<const ninfer::HostKVPageLayout>(layouts));
+        const auto a = fresh.allocate(host_layout, 2);
+        const auto b = fresh.allocate(host_layout, 6);   // fills the initial span exactly
+        failures += expect(a.has_value() && b.has_value(), label + form + " fixture allocation");
+
+        const std::array big{ninfer::HostKVAllocationRequest{.layout = &host_layout, .pages = 12}};
+        const auto before = fresh.fit_after_suballocation_releases({}, big, 0U);
+        failures += expect(before.fit == ninfer::HostKVFit::Blocked,
+                           label + form + " 12 pages against an 8-page step is Blocked with no headroom");
+        failures += expect(before.unsatisfied_spans == 1U,
+                           label + form + " one request, one unsatisfied span");
+        failures += expect(before.shortfall_bytes >= host_layout.page_stride * 12U,
+                           label + form + " the shortfall is at least the request, not one step");
+
+        // The reserve, in the two forms under test.
+        const std::size_t step = fresh.span_step_bytes();
+        if (one_span_of_the_shortfall) {
+            failures += expect(fresh.grow_bytes(before.shortfall_bytes), label + form + " grew");
+        } else {
+            const std::size_t spans = (before.shortfall_bytes + step - 1U) / step;
+            for (std::size_t s = 0; s < spans; ++s) {
+                failures += expect(fresh.grow_bytes(step), label + form + " grew a step");
+            }
+        }
+        // AFTER THE GROWTH, THE REQUEST MUST FIT WITH NO FURTHER HEADROOM -- that is the whole claim.
+        const auto after = fresh.fit_after_suballocation_releases({}, big, 0U);
+        if (one_span_of_the_shortfall) {
+            failures += expect(after.fit == ninfer::HostKVFit::Pinned,
+                               label + form + ": the request fits after the reserve (THE FIX)");
+        } else {
+            failures += expect(after.fit != ninfer::HostKVFit::Pinned,
+                               label + form + ": the old form leaves the request UNFITTABLE (the control)");
+        }
+    }
+
+    // ***THE PRESSURE ALLOCATION ORDER (2026-10-12): PINNED BY `exercise_host_arena_placement_order`.***
+    // The order is ONE definition -- `runtime::k_pressure_allocation_order` (`resources.h`) -- iterated by
+    // both execution loops (`materialization.cpp`, `capture.cpp`) and derived by compose's four-vector
+    // assembly. Before this, five hand-written copies existed and nothing tied them together; a drift ends in
+    // a sealed demote that cannot be placed. The arena-level property is asserted below, INCLUDING its
+    // control: a fit computed in a different order must strand a request, so the case fails when the order
+    // regresses rather than passing on any geometry. Four earlier fixtures measured nothing because the
+    // `HostKVAllocation` destructor released each allocation before the next -- see the note on that test.
+
+    // ***THE REFUSAL REASON SPLIT (2026-10-05), WITH A NEGATIVE CONTROL.*** Every refusal on the
+    // `!valid || descriptors_short` path returns `Blocked` with the SHORTFALL UNSET, so a DESCRIPTOR
+    // SHORTAGE and a MALFORMED RELEASE LIST looked identical -- and the two imply opposite work in
+    // opposite layers. An observed window had 82 of 82 vetoes on that path, which is why the distinction
+    // needed a counter. THE LAST CASE IS THE CONTROL: a GOOD release list must move no reason counter, or
+    // the split is counting every call rather than the refusals.
+    {
+        using Reason = ninfer::HostKVBlockReason;
+        const std::size_t overlap_before =
+            arena.block_reason_count(Reason::ReleasesOverlap);
+        const std::size_t range_before =
+            arena.block_reason_count(Reason::ReleaseRangeExceedsDescriptor);
+        const std::array wanted{ninfer::HostKVAllocationRequest{.layout = &host_layout, .pages = 2}};
+
+        // TWO RELEASES ON ONE ALLOCATION WHOSE RANGES INTERSECT.
+        const ninfer::HostKVSuballocationRelease overlapping[]{
+            ninfer::HostKVSuballocationRelease{.allocation = held->handle(), .begin_page = 0, .page_count = 2},
+            ninfer::HostKVSuballocationRelease{.allocation = held->handle(), .begin_page = 1, .page_count = 1}};
+        const auto overlap_result = arena.fit_after_suballocation_releases(overlapping, wanted, 1U << 30U);
+        failures += expect(overlap_result.fit == ninfer::HostKVFit::Blocked,
+                           label + " overlapping releases are Blocked even with ample headroom");
+        failures += expect(arena.block_reason_count(Reason::ReleasesOverlap) == overlap_before + 1U,
+                           label + " and OVERLAP is the reason named -- the discriminator works");
+
+        // A RANGE THAT RUNS PAST ITS DESCRIPTOR: `held` holds 2 pages, so 3 is one too many.
+        const ninfer::HostKVSuballocationRelease past[]{
+            ninfer::HostKVSuballocationRelease{.allocation = held->handle(), .begin_page = 0, .page_count = 3}};
+        (void)arena.fit_after_suballocation_releases(past, wanted, 1U << 30U);
+        failures += expect(arena.block_reason_count(Reason::ReleaseRangeExceedsDescriptor) == range_before + 1U,
+                           label + " a range past its descriptor names its OWN reason, not the overlap one");
+
+        // AND A GOOD RELEASE LIST MOVES NOTHING: the negative control.
+        const ninfer::HostKVSuballocationRelease good[]{
+            ninfer::HostKVSuballocationRelease{.allocation = held->handle(), .begin_page = 0, .page_count = 2}};
+        (void)arena.fit_after_suballocation_releases(good, wanted, 0U);
+        failures += expect(arena.block_reason_count(Reason::ReleasesOverlap) == overlap_before + 1U &&
+                               arena.block_reason_count(Reason::ReleaseRangeExceedsDescriptor) == range_before + 1U,
+                           label + " a GOOD release list moves no reason counter");
     }
 
     // PURITY: every query above must have acted on nothing.
@@ -786,6 +969,16 @@ int main() {
                              },
                      }),
             "growth");
+        failures += exercise_host_arena_placement_order(
+            context, ninfer::plan_host_kv_page_layout(ninfer::KVPageGeometry{
+                         .device_plane_order = ninfer::PagedKVPlaneOrder::PageMajor,
+                         .planes =
+                             {
+                                 {ninfer::DType::I8, 8, 2, 256},
+                                 {ninfer::DType::FP16, 1, 2, 256},
+                             },
+                     }),
+            "placement-order");
         if (failures != 0) {
             std::cerr << failures << " Paged KV physical-container checks failed\n";
             return 1;

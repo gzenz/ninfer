@@ -592,6 +592,28 @@ void PressurePlanningSessionImpl::populate_options(std::uint32_t selected_candid
             options.victims[victim_index].value_weight = weights[victim_index];
         }
     }
+    // *** THE VICTIM-EXPANSION ORDER: TRIED AND REVERTED (2026-10-07). ***
+    //
+    // A `stable_sort` here put the victims in DESCENDING order of their eviction relief, on the reading that the
+    // expansion walks them in OWNER ID ORDER inside a finite window (`prepare_expansion`,
+    // `[next_expansion_owner, +maximum_owners)`) and so could not reach a large victim in time. **THE READING
+    // WAS RIGHT AND THE REMEDY DID NOTHING.** Measured (arm A30, deployed `c1525d40151a`): evicting requests
+    // with ZERO feasible preserving alternatives stayed at 8 of 8 (pre-fix 20 of 20), evictions stayed at 8 and
+    // demotions at 1; the only movement was the instrument -- `chose_largest` on feasible preserving 9.1% ->
+    // 24.0%, and on REFUSED preserving 25.9% -> 20.2%, i.e. WORSE. **So the enumeration order affects WHICH
+    // victim is chosen and does NOT decide whether the plan fits.** Reverted rather than kept: a change to the
+    // search's behaviour with no outcome benefit. `plan.md` carries the full chain.
+    // ***THIS LINE WAS DISABLED FOR ~2 HOURS ON 2026-10-12 AND NOTHING IN THE GATE COULD SEE IT.***
+    // A strip's text removal joined it onto the end of the comment above, so it became part of the
+    // comment: `options.populated` stayed false forever, the memo guard at `:505` never fired, and every
+    // `populate_options` call re-ran `inspect_*_eviction_option` for every victim and pushed ANOTHER
+    // eviction decision onto `victim.decisions` (`:525`, `:532`), moving `eviction_choice` with it. Six
+    // call sites per planning session, so the vector grew without bound toward the `uint16` throw at
+    // `:534`. **Build, ctest AND the acceptance e2e all passed over it**, because `[planner-latency]`
+    // caps searches at 400 ms against a 500 ms gate and so cannot fail while the cap works.
+    // FOUND BY the brutal-honesty review pass, which counted live `populated = true` with the comments
+    // stripped: HEAD has 1, the broken tree had 0. **A line joined to a `//` comment is invisible to
+    // every check this repo runs; the only guard is to read the region after an edit.**
     options.populated = true;
 }
 
@@ -634,7 +656,56 @@ std::vector<PressureDecision> PressurePlanningSessionImpl::pressure_successors(
     // separates those two, and it is the denominator-free half: if owners routinely HAVE a non-evicting
     // option, the search is the defect; if they routinely do not, the evictions are correct and the whole
     // line of work has been chasing a planner that is behaving properly.
-    program->note_pressure_successor_outcome(successors.empty());
+    // THE SECOND FLAG IS THE ONE THAT MAKES THE FIRST READABLE. `inspect_pressure_successors` returns EMPTY
+    // by construction when the decision being expanded already evicts (`pressure.cpp:953`), so an
+    // "empty successors" count taken alone is a mixture of "no non-evicting option exists" and "this call
+    // was about an eviction". Passing the current decision lets a reader subtract the second population.
+    program->note_pressure_successor_outcome(successors.empty(),
+                                             current != nullptr && current->evicts_continuation);
+    // *** THE VICTIM'S OWN FIGURES AT THE DECISION SITE (2026-10-07). ***
+    // The DECISION-level relief is measured here and the VICTIM-level ownership was measured at the eviction
+    // site (`materialization.cpp`), and comparing the two across RUNS is what kept the 13% decision gap
+    // unattributable. Both now land in one run: the release figure an eviction credits, the resident figure a
+    // demote copies, and their difference -- the entitlement a demote does not credit.
+    if (victim_options.owner_index < owners.size()) {
+        const Owner& victim_owner = owners[victim_options.owner_index];
+        if (!victim_owner.shared && victim_owner.private_handle != nullptr) {
+            const std::size_t state_index =
+                qwen3_5::detail::RuntimeContractAccess::index(*victim_owner.private_handle);
+            program->note_victim_ownership(program->victim_release_main_kv_pages(state_index),
+                                           program->victim_resident_main_kv_pages(state_index));
+        }
+    }
+    // *** THE PLAN-LEVEL RELIEF OF EACH OPTION, FOR THE SAME VICTIM, AT THE SAME MOMENT (2026-10-06). ***
+    // The VICTIM-level figures are EQUAL -- `victim_entitlement_gap` measured 0, so an eviction and a demote
+    // free the same pages for the same victim (arm A13). So if the two plans differ at all, it is HERE: in
+    // what each DECISION records as `removed`. Taken BEFORE the eviction is appended below, so `successors`
+    // is pure non-evicting. **A gap here is a fix (the preserving option's relief accounting); no gap moves
+    // the question back to the cost/feasibility path.**
+    {
+        const detail::PhysicalResources& ev_removed = eviction.effect.removed;
+        program->note_successor_relief(/*evicting=*/true, ev_removed.device.main_kv_pages,
+                                       ev_removed.device.backend_kv_pages,
+                                       ev_removed.device.state_slots);
+        // **THE BEST PRESERVING OPTION FOR THIS VICTIM, NOT THE SUM OVER ALL OF THEM.** The first version
+        // summed every preserving option, and there are ~3 per victim, so the mean included PARTIAL options
+        // and the comparison against the single eviction was not like for like. `max` per victim is the
+        // statistic the question needs: the best relief a preserving plan could have offered THIS victim.
+        std::uint32_t best_main = 0, best_backend = 0, best_state = 0;
+        for (const qwen3_5::detail::PressureDecision& option : successors) {
+            if (option.evicts_continuation) { continue; }
+            const detail::PhysicalResources& rem = option.effect.removed;
+            best_main    = std::max(best_main, rem.device.main_kv_pages);
+            best_backend = std::max(best_backend, rem.device.backend_kv_pages);
+            best_state   = std::max(best_state, rem.device.state_slots);
+        }
+        // One note per victim, so the preserving and evicting counts share a denominator and the means compare.
+        program->note_successor_relief(/*evicting=*/false, best_main, best_backend, best_state);
+        program->note_successor_relief_best_only(
+            static_cast<std::uint64_t>(std::count_if(
+                successors.begin(), successors.end(),
+                [](const qwen3_5::detail::PressureDecision& d) { return !d.evicts_continuation; })));
+    }
     if (std::find(successors.begin(), successors.end(), eviction) == successors.end()) {
         successors.push_back(eviction);
     }
@@ -1104,6 +1175,15 @@ PressurePlanningSessionImpl::assess(qwen3_5::PressureTargetHandle target) {
             selected_private_owner_ids.push_back(owner.id);
             selected_private_decisions.push_back(decision);
         }
+        // ***A DEMOTE HOOK STOOD HERE ON 2026-10-07 AND WAS REMOVED THE SAME EVENING -- DO NOT PUT IT BACK.***
+        // It recorded every ASSESSED demote decision at this site. Arm A43 measured the cost: 4,990,127
+        // "demoted" pages against a true 5,763 in `kv_transfers` -- **~866x, which IS the assessment
+        // multiplicity.** `selected_private_decisions` is cleared and rebuilt per assessed TARGET
+        // (`:1128`, `:1165`), not once per elected plan; and this workload's election demoted NOBODY
+        // (`private_owners_demoted = 0`) while 13 owners' KV reached host through the transaction path.
+        // **The instrument's own control caught it, and its comment here had asserted "election, not
+        // assessment" while sitting in the assessment loop.** The instrument itself was stripped out on
+        // 2026-10-12 as clutter -- the note stays because the ARM measured something worth not re-deriving.
         const std::uint32_t units   = degradation_units(*decision);
         const std::uint32_t dropped = dropped_checkpoint_count(*decision);
         total_degradation =
@@ -1173,10 +1253,158 @@ PressurePlanningSessionImpl::assess(qwen3_5::PressureTargetHandle target) {
         }
         if (composed || composed_capture) {
             status = runtime::MaterializationPhysicalStatus::Infeasible;
-            if (projected->blocked_host_allocation_bytes == 0 &&
-                program->physical_peak_fits(projected->demand.physical_peak_additional)) {
+            std::array<bool, ninfer::k_peak_axis_count> axis_fits{};
+            // WHETHER THIS TARGET EVICTS. `restorable_evictions` is not reachable here (it comes from the
+            // folded cost, computed downstream), so the signal is the target's OWN decisions carrying an
+            // eviction -- named for what it measures, not for the folded quantity it approximates. Hoisted
+            // above the verdict because the per-instance record below needs it too.
+            const auto evicts = [](const qwen3_5::detail::PressureDecision* decision) {
+                return decision != nullptr && decision->evicts_continuation;
+            };
+            const bool target_evicts =
+                std::any_of(selected_private_decisions.begin(), selected_private_decisions.end(), evicts) ||
+                std::any_of(selected_shared_decisions.begin(), selected_shared_decisions.end(), evicts);
+            // ***A PEAK-DRIVEN GROWTH WAS TRIED HERE ON 2026-10-07 AND REVERTED THE SAME EVENING -- DO NOT
+            // RETRY IT IN THIS FORM.*** It pinned the host-KV shortfall at the assessment site and re-priced
+            // the target, on the argument that pinning FIRST satisfies `admission_capacity`'s own escape
+            // ("the only host memory that cannot be taken away is memory ALREADY PINNED"). **The argument is
+            // WRONG, and the arm proved it:** pinning the arena's CAPACITY does not reserve its FREE SPACE,
+            // so another session allocates the newly pinned span between this target's admission and its
+            // execution and the materialization throws. Arm A41: `host_kv_peak_grows = 2` and the host-KV
+            // refusals fell 1,065 -> 2, **and two `WORKER OOM: std::bad_alloc` (`mat=5`, `mat=10`) appeared
+            // where arms A36-A40 recorded ZERO.** That is the same failure the 2026-09-28 growth-priced
+            // attempt produced, and the same reading of it: a plan priced on the arena's capacity is a plan
+            // priced on the FUTURE. The only safe place for the reserve is SEAL, on an ELECTED plan
+            // (`reserve_host_kv_for_seal`), which is where it already is.
+            const bool peak_fits =
+                projected->blocked_host_allocation_bytes == 0 &&
+                program->physical_peak_fits(projected->demand.physical_peak_additional, axis_fits);
+            if (peak_fits) {
                 status = runtime::MaterializationPhysicalStatus::Feasible;
+            } else if (projected->blocked_host_allocation_bytes == 0) {
+                for (std::size_t axis = 0; axis < axis_fits.size(); ++axis) {
+                    if (!axis_fits[axis]) { program->note_peak_refusal_split(!target_evicts, axis); }
+                }
             }
+            // THE PER-INSTANCE EVIDENCE, for refused AND admitted targets alike -- the comparison the means
+            // could not make. Recorded here so `occupied` and the peak are read at ONE moment.
+            std::uint8_t refusal_mask = 0;
+            if (!peak_fits) {
+                for (std::size_t axis = 0; axis < axis_fits.size(); ++axis) {
+                    if (!axis_fits[axis]) { refusal_mask |= static_cast<std::uint8_t>(1U << axis); }
+                }
+                if (projected->blocked_host_allocation_bytes != 0) { refusal_mask |= 0x80U; }
+            }
+            // WHAT THE EVICTING DECISIONS THEMSELVES REMOVE, so `final_removed` can be split rather than
+            // assumed. For an evicting decision `effect.removed` IS the victim's removal.
+            std::uint64_t evicted_victim_main = 0;
+            // **HOW MANY VICTIMS THE PLAN ACTED ON, WHICH IS THE SEARCH QUESTION.** A25 showed admitted plans
+            // free 2,990 pages -- more than one victim's 1,607 -- so a refused row's ~1,400 relief is either
+            // ONE victim freed and no more chosen, or several chosen that are each small. These two separate
+            // those, and they are where the search's stopping point shows up.
+            std::uint32_t evicting_decisions = 0;
+            for (const qwen3_5::detail::PressureDecision* decision : selected_private_decisions) {
+                if (decision != nullptr && decision->evicts_continuation) { ++evicting_decisions; }
+            }
+            for (const qwen3_5::detail::PressureDecision* decision : selected_shared_decisions) {
+                if (decision != nullptr && decision->evicts_continuation) { ++evicting_decisions; }
+            }
+            const std::uint32_t selected_decisions = static_cast<std::uint32_t>(
+                selected_private_decisions.size() + selected_shared_decisions.size());
+            // **WAS A LARGER VICTIM AVAILABLE?** `populate_options` ran at `:771`, so the options for this
+            // candidate are populated. `available` is the best relief ANY victim's ANY decision offers;
+            // `chosen` is the best the plan actually took. This decides RANKING versus RESERVATION.
+            std::uint32_t best_available_main = 0;
+            for (const CandidateVictimOptions& victim : candidate_options[node.candidate_index].victims) {
+                for (const qwen3_5::detail::PressureDecision& decision : victim.decisions) {
+                    best_available_main = std::max(
+                        best_available_main, decision.effect.removed.device.main_kv_pages);
+                }
+            }
+            // The code-read hypothesis for A28's asymmetry: demotion is priced per contiguous RUN.
+            std::uint32_t kv_change_entries = 0;
+            for (const qwen3_5::detail::PressureDecision* decision : selected_private_decisions) {
+                if (decision != nullptr) {
+                    kv_change_entries += static_cast<std::uint32_t>(decision->main_kv_changes.size());
+                }
+            }
+            for (const qwen3_5::detail::PressureDecision* decision : selected_shared_decisions) {
+                if (decision != nullptr) {
+                    kv_change_entries += static_cast<std::uint32_t>(decision->main_kv_changes.size());
+                }
+            }
+            std::uint32_t chosen_best_main = 0;
+            for (const qwen3_5::detail::PressureDecision* decision : selected_private_decisions) {
+                if (decision != nullptr) {
+                    chosen_best_main =
+                        std::max(chosen_best_main, decision->effect.removed.device.main_kv_pages);
+                }
+            }
+            for (const qwen3_5::detail::PressureDecision* decision : selected_shared_decisions) {
+                if (decision != nullptr) {
+                    chosen_best_main =
+                        std::max(chosen_best_main, decision->effect.removed.device.main_kv_pages);
+                }
+            }
+            for (const qwen3_5::detail::PressureDecision* decision : selected_private_decisions) {
+                if (decision != nullptr && decision->evicts_continuation) {
+                    evicted_victim_main += decision->effect.removed.device.main_kv_pages;
+                }
+            }
+            for (const qwen3_5::detail::PressureDecision* decision : selected_shared_decisions) {
+                if (decision != nullptr && decision->evicts_continuation) {
+                    evicted_victim_main += decision->effect.removed.device.main_kv_pages;
+                }
+            }
+            // ***THE SAME PEAK, IN THE CONJUNCTION'S OWN AXIS ORDER, FOR THE PER-AXIS MARGIN (2026-10-07).***
+            // `k_peak_axis_names` order, exactly as `physical_peak_fits` builds its `axis_fits` -- a wrong
+            // order here would attribute a shortfall to the wrong axis and READ PLAUSIBLY, which is why the
+            // record carries the mask beside it for a per-row cross-check.
+            // `std::uint64_t` and not `std::uint32_t`: the host-KV axis is in BYTES, and its capacity is
+            // ~3 GiB, close enough to 2^32 that narrowing here would wrap the one axis the sum already wrapped
+            // once. Nothing narrows until the shortfall itself is clamped.
+            // NAMED FIELDS, NOT FOUR POSITIONAL ARRAYS: all four series are `array<uint64_t, 6>` in the same
+            // order, so four bare arguments would let a shuffled call compile and read plausibly.
+            const detail::PhysicalResources& peak_additional = projected->demand.physical_peak_additional;
+            const detail::PhysicalResources& reservation_added = projected->demand.reservation_added;
+            const detail::PhysicalResources& final_removed     = projected->demand.final_removed;
+            const ninfer::PeakAxisSample axes{
+                .peak =
+                    {
+                        peak_additional.device.active_lanes,
+                        peak_additional.device.state_slots,
+                        peak_additional.device.main_kv_pages,
+                        peak_additional.device.backend_kv_pages,
+                        peak_additional.host.state_slots,
+                        static_cast<std::uint64_t>(peak_additional.host.kv_bytes),
+                    },
+                .reservation =
+                    {
+                        reservation_added.device.active_lanes,
+                        reservation_added.device.state_slots,
+                        reservation_added.device.main_kv_pages,
+                        reservation_added.device.backend_kv_pages,
+                        reservation_added.host.state_slots,
+                        static_cast<std::uint64_t>(reservation_added.host.kv_bytes),
+                    },
+                .removed =
+                    {
+                        final_removed.device.active_lanes,
+                        final_removed.device.state_slots,
+                        final_removed.device.main_kv_pages,
+                        final_removed.device.backend_kv_pages,
+                        final_removed.host.state_slots,
+                        static_cast<std::uint64_t>(final_removed.host.kv_bytes),
+                    },
+            };
+            program->record_assessed_peak(
+                !target_evicts, peak_fits, peak_additional.device.main_kv_pages,
+                peak_additional.device.backend_kv_pages, refusal_mask,
+                projected->demand.reservation_added.device.main_kv_pages,
+                projected->demand.final_removed.device.main_kv_pages,
+                static_cast<std::uint32_t>(std::min<std::uint64_t>(evicted_victim_main, 0xFFFFFFFFULL)),
+                selected_decisions, evicting_decisions, best_available_main, chosen_best_main,
+                kv_change_entries, axes);
         }
     }
     const bool composed_valid = composed.has_value() || composed_capture.has_value();
@@ -1563,7 +1791,26 @@ PressurePlanningSessionImpl::seal(qwen3_5::AssessedPressureTarget&& assessed,
     std::optional<AdmissionCandidate> sealed = std::move(assessed.executable_);
     assessed.reset();
     program->select_shared_captures(*sealed, prompt, intent.shared_capture_frontiers);
-    if (sealed->impl_->blocked_host_allocation_bytes != 0 ||
+    // METHOD 2, THE RESERVE, and it runs AFTER `select_shared_captures` on purpose: that call can change the
+    // plan's host demand, so a growth taken before it could be sized against the wrong peak.
+    // One call is enough: on success it clears the flags, so the check below passes on its own merits; on
+    // failure it leaves them set and counts the refusal, so the check refuses. NO SECOND CHECK SITE HAS TO
+    // KNOW ABOUT THE RESERVE.
+    // ***KEYED ON THE SHORTFALL, NOT ON `blocked_host_allocation_bytes`. THE TWO MUST BE THE SAME FIELD
+    // OR THE RESERVE NEVER RUNS (found 2026-10-12 by the review pass).*** `reserve_host_kv_for_seal` reads
+    // `blocked_host_kv_shortfall_bytes` (`context.cpp:1914`) and returns immediately when it is zero, and on
+    // success it clears BOTH fields. **The compose-time clearance (`pressure.cpp`, the `Growable` branch)
+    // sets `blocked_host_allocation_bytes = 0` while deliberately LEAVING the shortfall set** -- so gating
+    // here on the allocation field meant the reserve was never called, the shortfall was never pinned, and
+    // the plan was admitted on room nobody had reserved. That is the optimistic-admission shape behind the
+    // 2026-09-28 and A41 `WORKER OOM`s. **Measured before the fix: `host_kv_fit_growable` 436 and 951 with
+    // `host_kv_seal_grows = 0` AND `host_kv_seal_refusals = 0` -- zero of both means the body was never
+    // entered.** The post-check below therefore also keys on the shortfall: it is the field that stays set
+    // when the reserve FAILS, which is what this is testing.
+    if (sealed->impl_->blocked_host_kv_shortfall_bytes != 0) {
+        (void)program->reserve_host_kv_for_seal(*sealed->impl_);
+    }
+    if (sealed->impl_->blocked_host_kv_shortfall_bytes != 0 ||
         program->revalidate_materialization(*sealed, prompt) != runtime::PreflightStatus::Ready) {
         return std::nullopt;
     }
@@ -1580,7 +1827,16 @@ PressurePlanningSessionImpl::seal_capture(qwen3_5::AssessedPressureTarget&& asse
     }
     std::optional<CapturePressureCandidate> sealed = std::move(assessed.capture_executable_);
     assessed.reset();
-    if (sealed->impl_->blocked_host_allocation_bytes != 0 ||
+    // METHOD 2, THE RESERVE. See `reserve_host_kv_for_seal`. One call is enough: on success it clears the
+    // flags, so the check below passes on its own merits; on failure it leaves them set and counts the
+    // refusal, so the check refuses. NO SECOND CHECK SITE HAS TO KNOW ABOUT THE RESERVE.
+    // KEYED ON THE SHORTFALL, for the reason written at the `seal` site above: `reserve_host_kv_for_seal`
+    // reads `blocked_host_kv_shortfall_bytes`, so gating on `blocked_host_allocation_bytes` -- which the
+    // compose-time clearance zeroes -- means the reserve is never called.
+    if (sealed->impl_->blocked_host_kv_shortfall_bytes != 0) {
+        (void)program->reserve_host_kv_for_seal(*sealed->impl_);
+    }
+    if (sealed->impl_->blocked_host_kv_shortfall_bytes != 0 ||
         !program->physical_peak_fits(sealed->impl_->demand.physical_peak_additional)) {
         return std::nullopt;
     }

@@ -1408,14 +1408,150 @@ public:
         out.pressure_shared_owners_replaced    = program.shared_replacements();
         out.pressure_private_evictions_demotable = program.demotable_evictions();
         out.pressure_evictions_with_victim_room  = program.evictions_with_victim_room();
+        out.pressure_evictions_victim_device_slots = program.evictions_victim_device_slots();
+        out.pressure_evictions_victim_host_slots   = program.evictions_victim_host_slots();
+        out.pressure_evictions_deficit_device_main_kv = program.evictions_deficit_device_main_kv();
+        out.pressure_evictions_deficit_device_backend_kv = program.evictions_deficit_device_backend_kv();
+        out.pressure_evictions_deficit_device_state = program.evictions_deficit_device_state();
+        out.pressure_evictions_deficit_host_state = program.evictions_deficit_host_state();
+        out.pressure_evictions_deficit_host_kv = program.evictions_deficit_host_kv();
+        out.pressure_evictions_kv_pages        = program.evictions_kv_pages();
+        out.pressure_evictions_kv_pages_total  = program.evictions_kv_pages_total();
+        out.pressure_evictions_kv_fit_pinned   = program.evictions_kv_fit_pinned();
+        out.pressure_evictions_kv_fit_growable = program.evictions_kv_fit_growable();
+        out.pressure_evictions_kv_fit_blocked  = program.evictions_kv_fit_blocked();
+        out.pressure_evictions_kv_fit_pinned_pages   = program.evictions_kv_fit_pinned_pages();
+        out.pressure_evictions_kv_fit_growable_pages = program.evictions_kv_fit_growable_pages();
+        out.pressure_evictions_kv_fit_blocked_pages  = program.evictions_kv_fit_blocked_pages();
+        out.pressure_eviction_kv_records_total = program.eviction_kv_records_total();
+        out.pressure_eviction_kv_record_count  = program.eviction_kv_record_count();
+        for (std::uint32_t record = 0; record < out.pressure_eviction_kv_record_count; ++record) {
+            out.pressure_eviction_kv_records[record] = program.eviction_kv_record(record);
+        }
+        out.pressure_physical_peak_fits_calls       = program.physical_peak_fits_calls();
+        for (std::size_t axis = 0; axis < ninfer::k_peak_axis_count; ++axis) {
+            out.pressure_physical_peak_refusals_by_axis[axis] =
+                program.physical_peak_refusals_by_axis(axis);
+        }
+        out.host_kv_seal_grows    = program.host_kv_seal_grows();
+        out.host_kv_seal_refusals = program.host_kv_seal_refusals();
+        out.pressure_host_state_fit_checks          = program.host_state_fit_checks();
+        out.pressure_host_state_shortfall_calls     = program.host_state_shortfall_calls();
+        out.pressure_host_state_shortfall_max_slots = program.host_state_shortfall_max_slots();
+        out.pressure_device_main_kv_fit_checks          = program.device_main_kv_fit_checks();
+        out.pressure_device_main_kv_shortfall_calls     = program.device_main_kv_shortfall_calls();
+        out.pressure_device_main_kv_shortfall_max_pages = program.device_main_kv_shortfall_max_pages();
         out.pressure_evictions_demote_possible   = program.evictions_demote_possible();
+        for (std::size_t bucket = 0; bucket < k_demote_refusal_buckets; ++bucket) {
+            out.pressure_demote_refusal_at_eviction[bucket] =
+                program.demote_refusal_at_eviction(bucket);
+        }
         out.pressure_private_eviction_checks    = program.demotable_eviction_checks();
         out.pressure_demote_options             = program.demote_options();
         out.pressure_options_refused_no_kv            = program.options_refused_no_kv();
         out.pressure_demote_option_refused_no_state_deficit =
             program.demote_option_refused_no_state_deficit();
         out.pressure_successor_calls        = program.pressure_successor_calls();
-        out.pressure_successors_with_option = program.pressure_successors_with_option();
+        out.pressure_successors_without_option = program.pressure_successors_without_option();
+        out.pressure_successor_calls_evicting_current =
+            program.pressure_successor_calls_evicting_current();
+        for (std::size_t reason = 0; reason < k_successor_empty_reason_count; ++reason) {
+            out.pressure_successor_empty_by_reason[reason] =
+                program.pressure_successor_empty_by_reason(reason);
+        }
+        for (std::size_t clause = 0; clause < k_kv_relief_gate_clause_count; ++clause) {
+            out.pressure_kv_relief_gate_blocks[clause] = program.kv_relief_gate_blocks(clause);
+        }
+        for (std::size_t preserving = 0; preserving < 2; ++preserving) {
+            for (std::size_t axis = 0; axis < k_peak_axis_count; ++axis) {
+                out.pressure_peak_refusals_by_preserving[preserving][axis] =
+                    program.peak_refusal_by_preserving(preserving == 0, axis);
+            }
+        }
+        for (std::size_t bucket = 0; bucket < 4; ++bucket) {
+            const bool feasible   = bucket >= 2;
+            const bool preserving = (bucket % 2) == 1;
+            out.pressure_assessed_agg_count[bucket]       = program.assessed_agg_count(feasible, preserving);
+            out.pressure_assessed_agg_reservation[bucket] = program.assessed_agg_reservation(feasible, preserving);
+            out.pressure_assessed_agg_removed[bucket]     = program.assessed_agg_removed(feasible, preserving);
+            out.pressure_assessed_agg_selected[bucket]    = program.assessed_agg_selected(feasible, preserving);
+            out.pressure_assessed_agg_evicting[bucket]    = program.assessed_agg_evicting(feasible, preserving);
+            out.pressure_assessed_agg_available[bucket]   = program.assessed_agg_available(feasible, preserving);
+            out.pressure_assessed_agg_chosen[bucket]      = program.assessed_agg_chosen(feasible, preserving);
+            out.pressure_assessed_larger_available[bucket] = program.assessed_larger_available(feasible, preserving);
+            out.pressure_assessed_chose_largest[bucket]    = program.assessed_chose_largest(feasible, preserving);
+            out.pressure_assessed_agg_kv_entries[bucket]   = program.assessed_agg_kv_entries(feasible, preserving);
+            // The per-axis shortfall SUM over all assessments in this bucket, in `k_peak_axis_names` order.
+            // Divide by `pressure_assessed_agg_count[bucket]` for the mean; never sum across axes.
+            for (std::size_t axis = 0; axis < ninfer::k_peak_axis_count; ++axis) {
+                out.pressure_assessed_axis_shortfall[bucket][axis] =
+                    program.assessed_axis_shortfall(feasible, preserving, axis);
+            }
+        }
+        for (std::size_t klass = 0; klass < 2; ++klass) {
+            const bool preserving = klass == 1;
+            out.pressure_assessed_total[klass]                = program.assessed_total(preserving);
+            out.pressure_assessed_feasible[klass]             = program.assessed_feasible(preserving);
+            out.pressure_assessed_refused_host_blocked[klass] = program.assessed_refused_host_blocked(preserving);
+        }
+        out.pressure_victim_ownership_calls        = program.victim_ownership_calls();
+        out.pressure_victim_ownership_release_sum  = program.victim_ownership_release_sum();
+        out.pressure_victim_ownership_resident_sum = program.victim_ownership_resident_sum();
+        out.pressure_victim_ownership_gap_sum      = program.victim_ownership_gap_sum();
+        out.pressure_victim_ownership_gap_max      = program.victim_ownership_gap_max();
+        out.pressure_assessed_peak_records_total = program.assessed_peak_record_total();
+        {
+            const std::uint64_t total = out.pressure_assessed_peak_records_total;
+            const std::size_t shown =
+                static_cast<std::size_t>(std::min<std::uint64_t>(total, k_assessed_peak_record_capacity));
+            for (std::size_t index = 0; index < shown; ++index) {
+                out.pressure_assessed_peak_records[index] = program.assessed_peak_record(index);
+            }
+        }
+        out.pressure_successor_relief_preserving_options_seen =
+            program.successor_relief_preserving_options_seen();
+        for (std::size_t evicting = 0; evicting < 2; ++evicting) {
+            out.pressure_successor_relief_count[evicting]       = program.successor_relief_count(evicting == 0);
+            out.pressure_successor_relief_main_kv[evicting]     = program.successor_relief_main_kv(evicting == 0);
+            out.pressure_successor_relief_backend_kv[evicting]  = program.successor_relief_backend_kv(evicting == 0);
+            out.pressure_successor_relief_state_slots[evicting] = program.successor_relief_state_slots(evicting == 0);
+        }
+        out.pressure_entitlement_split_calls           = program.entitlement_split_calls();
+        out.pressure_entitlement_split_prompt_tokens   = program.entitlement_split_prompt_tokens();
+        out.pressure_entitlement_split_output_tokens   = program.entitlement_split_output_tokens();
+        out.pressure_entitlement_split_reserved_tokens = program.entitlement_split_reserved_tokens();
+        out.pressure_reservation_composition_calls = program.reservation_composition_calls();
+        for (std::size_t term = 0; term < 3; ++term) {
+            for (std::size_t axis = 0; axis < 2; ++axis) {
+                out.pressure_reservation_composition[term][axis] = program.reservation_composition(term, axis);
+            }
+        }
+        out.pressure_victim_entitlement_gap_calls     = program.victim_entitlement_gap_calls();
+        out.pressure_victim_entitlement_gap_pages_sum = program.victim_entitlement_gap_pages_sum();
+        out.pressure_victim_entitlement_gap_pages_max = program.victim_entitlement_gap_pages_max();
+        out.pressure_peak_model_calls = program.peak_model_calls();
+        for (std::size_t axis = 0; axis < k_peak_axis_count; ++axis) {
+            out.pressure_peak_model_added[axis]    = program.peak_model_added(axis);
+            out.pressure_peak_model_removed[axis]  = program.peak_model_removed(axis);
+            out.pressure_peak_model_peak_max[axis] = program.peak_model_peak_max(axis);
+        }
+        out.pressure_kv_relief_demote_calls_host_req_zero       = program.kv_relief_demote_calls_host_req_zero();
+        out.pressure_kv_relief_demote_calls_host_req_nonzero    = program.kv_relief_demote_calls_host_req_nonzero();
+        out.pressure_kv_relief_demote_relieved_host_req_zero    = program.kv_relief_demote_relieved_host_req_zero();
+        out.pressure_kv_relief_demote_relieved_host_req_nonzero = program.kv_relief_demote_relieved_host_req_nonzero();
+        out.pressure_kv_relief_host_blocked_bytes_sum = program.kv_relief_host_blocked_bytes_sum();
+        out.pressure_kv_relief_host_blocked_bytes_max = program.kv_relief_host_blocked_bytes_max();
+        for (std::size_t direction = 0; direction < k_kv_relief_direction_count; ++direction) {
+            for (std::size_t clause = 0; clause < k_kv_relief_clause_count; ++clause) {
+                out.pressure_kv_relief_rejected[direction][clause] =
+                    program.kv_relief_rejected(direction, clause);
+            }
+            out.pressure_kv_relief_calls[direction]          = program.kv_relief_calls(direction);
+            out.pressure_kv_relief_requested[direction]      = program.kv_relief_requested(direction);
+            out.pressure_kv_relief_saturated_asks[direction] = program.kv_relief_saturated_asks(direction);
+            out.pressure_kv_relief_max_ask[direction]        = program.kv_relief_max_ask(direction);
+            out.pressure_kv_relief_relieved[direction]  = program.kv_relief_relieved(direction);
+        }
         out.pressure_demote_option_refused_precondition =
             program.demote_option_refused_precondition();
         out.pressure_options_refused_active_lanes     = program.options_refused_active_lanes();
@@ -1468,8 +1604,11 @@ public:
         // this key resolves to, or an active lane edge. A checkpoint is a proxy for a slot, not a slot count:
         // the per-victim tallies showed 2-3 per victim (endpoint + rewrite + anchors), which is this number.
         {
-            std::uint32_t reachable = 0;
-            std::uint32_t orphaned  = 0;
+            // NAMED FOR WHAT THEY COUNT: whether the SLOT has a holder. They were `reachable`/`orphaned`
+            // until 2026-10-04, and `orphaned` read as "no ANCHOR" while `long_anchors` count INTO the
+            // number -- a mislabel that cost time on a soak before anyone checked the code.
+            std::uint32_t held_count = 0;
+            std::uint32_t unheld_count = 0;
             // Generic, because the checkpoint type is a ModelContract alias and naming it here would couple
             // this model-agnostic file to one model's names.
             const auto hosts = [](const auto& summary) -> std::uint32_t {
@@ -1494,12 +1633,20 @@ public:
                             session_index_[cell].slot == slot) { held = true; break; }
                     }
                 }
-                (held ? reachable : orphaned) += n;
+                (held ? held_count : unheld_count) += n;
             }
-            out.host_state_checkpoints_reachable = reachable;
-            out.host_state_checkpoints_unanchored  = orphaned;
+            out.host_state_checkpoints_held   = held_count;
+            out.host_state_checkpoints_unheld = unheld_count;
         }
         out.pressure_publication_cell_losses    = program.publication_cell_losses();
+        // The always-on replacement for the env-gated `[release-probe]`: a refusal is `noexcept` and silent by
+        // construction, so without these four the release path could refuse forever and read as clean.
+        // The denominator first: with `attempts == 0` the four refusal readings below are unmeasured.
+        out.shared_prefix_release_attempts                 = program.shared_prefix_release_attempts();
+        out.shared_prefix_release_refusals_stale_index     = program.shared_prefix_release_refusals_stale_index();
+        out.shared_prefix_release_refusals_in_flight       = program.shared_prefix_release_refusals_in_flight();
+        out.shared_prefix_release_refusals_not_releasable  = program.shared_prefix_release_refusals_not_releasable();
+        out.shared_prefix_release_refusals_check_threw     = program.shared_prefix_release_refusals_check_threw();
         out.pressure_publication_cell_probes    = program.publication_cell_probes();
         // FROM THE MANAGER'S OWN COUNTERS. The first version read `program.demand_bits_*()`, which only
         // `add_demand_bits()` fills -- and nothing called it, so the tally incremented one set of counters
@@ -1525,8 +1672,11 @@ public:
 
         const auto usage                     = program.physical_usage();
         out.device_state_occupied_slots      = usage.device_state_slots;
+        out.device_state_capacity_slots      = usage.device_state_capacity_slots;
         out.host_state_occupied_slots        = usage.host_state_slots;
         out.device_main_kv_occupied_pages    = usage.device_main_kv_pages;
+        out.device_main_kv_capacity_pages    = usage.device_main_kv_capacity_pages;
+        out.device_backend_kv_capacity_pages = usage.device_backend_kv_capacity_pages;
         out.device_backend_kv_occupied_pages = usage.device_backend_kv_pages;
         out.host_kv_occupied_bytes           = usage.host_kv_bytes;
         std::uint64_t shared_references      = 0;

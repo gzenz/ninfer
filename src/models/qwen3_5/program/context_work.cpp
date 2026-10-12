@@ -247,16 +247,32 @@ namespace {
 }
 } // namespace
 
+// THE ONE SPECIFICATION OF "THIS SUBTRACTION WOULD UNDERFLOW". `checked_resource_difference` throws on it and
+// callers ask it in advance; a second copy of the six comparisons is how the two would come to disagree.
+bool resource_subtraction_underflows(const detail::PhysicalResources& value,
+                                     const detail::PhysicalResources& removed) noexcept {
+    return removed.device.active_lanes > value.device.active_lanes ||
+           removed.device.state_slots > value.device.state_slots ||
+           removed.device.main_kv_pages > value.device.main_kv_pages ||
+           removed.device.backend_kv_pages > value.device.backend_kv_pages ||
+           removed.host.state_slots > value.host.state_slots ||
+           removed.host.kv_bytes > value.host.kv_bytes;
+}
+
 detail::PhysicalResources checked_resource_difference(detail::PhysicalResources value,
                                                       detail::PhysicalResources removed) {
-    if (removed.device.active_lanes > value.device.active_lanes ||
-        removed.device.state_slots > value.device.state_slots ||
-        removed.device.main_kv_pages > value.device.main_kv_pages ||
-        removed.device.backend_kv_pages > value.device.backend_kv_pages ||
-        removed.host.state_slots > value.host.state_slots ||
-        removed.host.kv_bytes > value.host.kv_bytes) {
+    if (resource_subtraction_underflows(value, removed)) {
+        const std::string detail = resource_underflow_detail(value, removed);
+        // `resource_underflow_detail` IS A SECOND COPY of the six comparisons -- it has to be, since its job is
+        // to say WHICH axis fired rather than merely that one did. A drift between the two is therefore
+        // possible, and its symptom would be the worst kind: the throw fires correctly while the message reads
+        // "none", i.e. it would look like an underflow with no axis at all. Name the disagreement instead.
         throw std::logic_error("Qwen3.5 resource subtraction underflow [" +
-                               resource_underflow_detail(value, removed) + "]");
+                               (detail == "none"
+                                    ? std::string("UNNAMED axis: the predicate found an underflow that the "
+                                                  "detail function does not name -- the two copies have drifted")
+                                    : detail) +
+                               "]");
     }
     return detail::PhysicalResources{
         .device =

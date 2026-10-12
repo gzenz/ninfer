@@ -42,12 +42,17 @@ fi
 echo "ok 2: no source newer than the binary   <-- this does NOT catch a source edited DURING the build"
 
 if [ "$#" -ge 1 ]; then
-  n="$(grep -ac -- "$1" "/proc/$PID/exe" 2>/dev/null || echo 0)"
+  # `|| echo 0` DUPLICATED THE COUNT. `grep -c` prints "0" AND exits non-zero when it finds nothing, so the
+  # fallback appended a SECOND "0": the value became the two-line string "0\n0", `[ "$n" -ge 1 ]` died on
+  # "integer expression expected", and the FAIL message blamed the binary for a string the test never got to
+  # check. (The verdict was still right when the string was genuinely absent -- but wrong-by-accident is not a
+  # check, and it also means ANY absent string produced that same misleading message.) Default the VARIABLE.
+  n="$(grep -ac -- "$1" "/proc/$PID/exe" 2>/dev/null)"; n="${n:-0}"
   echo "grep '$1' in the running exe: $n"
   [ "$n" -ge 1 ] || { echo "FAIL 3: the running exe does not contain '$1' -- it is not this change"; exit 1; }
   echo "ok 3: the change's string is IN the running binary"
   if [ "$#" -ge 2 ]; then
-    o="$(grep -ac -- "$2" "/proc/$PID/exe" 2>/dev/null || echo 0)"
+    o="$(grep -ac -- "$2" "/proc/$PID/exe" 2>/dev/null)"; o="${o:-0}"
     echo "control '$2' (expected absent): $o"
     [ "$o" -eq 0 ] || echo "NOTE: the control string is still present -- it may be a legitimate old string"
   fi

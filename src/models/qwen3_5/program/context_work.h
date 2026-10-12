@@ -57,6 +57,12 @@ detail::PhysicalResources checked_resource_sum(detail::PhysicalResources left,
 detail::PhysicalResources checked_resource_difference(detail::PhysicalResources value,
                                                       detail::PhysicalResources removed);
 
+// WOULD `checked_resource_difference` REFUSE THIS SUBTRACTION? Exported so a caller can ask BEFORE performing
+// it -- the throw itself is too late to print anything, which is how an occurrence went unattributed. The
+// predicate and the throw share one body, so they cannot drift into disagreeing about which axes are tested.
+[[nodiscard]] bool resource_subtraction_underflows(const detail::PhysicalResources& value,
+                                                   const detail::PhysicalResources& removed) noexcept;
+
 detail::PhysicalResources positive_resource_difference(detail::PhysicalResources value,
                                                        detail::PhysicalResources removed) noexcept;
 

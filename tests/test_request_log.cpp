@@ -672,12 +672,40 @@ int main() {
                           fallback_done.at("result").at("tool_call_parse").at("fallback_reason") ==
                               "duplicate_parameter",
                       "tool-call text fallback diagnostics missing from JSONL");
+    // #29: the PATH is serialized beside the reason, and `unset` must be PRESENT rather than omitted --
+    // a missing key and "the parser's recovery arm did not run" are different facts and only one of them
+    // is a reading. Asserted here because the request log is the per-request record a rate is computed
+    // from, so a field that never reached it would make the rate unanswerable at any sample size.
+    failures += check(fallback_done.at("result").at("tool_call_parse").at("parse_path") == "unset",
+                      "tool-call fallback did not record the parse path in JSONL (#29)");
     const std::optional<OperationalRecord> fallback_warning =
         render_tool_call_fallback(context, fallback_outcome);
+    // THE MESSAGE CARRIES THE PATH TOO, and this assertion is updated rather than relaxed: the contract
+    // changed when #29's discriminator landed, and a test asserting the old string is the control working,
+    // not an obstacle. It failed exactly once -- on the change that added the suffix -- which is the point.
     failures += check(
         fallback_warning && fallback_warning->severity == OperationalSeverity::Warning &&
-            fallback_warning->message == "req#7 tool markup returned as text | duplicate parameter",
+            fallback_warning->message ==
+                "req#7 tool markup returned as text | duplicate parameter | path=unset",
         "tool-call text fallback warning is absent or exposes raw content");
+
+    // AND THE SET CASE, so the field is not merely carried but DISTINGUISHING: the same fallback with the
+    // parser's content-skip arm recorded must read differently in BOTH the JSONL and the warning. Without
+    // this arm the test would pass on a serializer that hard-coded `unset`.
+    GenerationOutcome skipped_outcome = fallback_outcome;
+    skipped_outcome.tool_call_parse.parse_path = ninfer::ToolCallParsePath::AfterTolerantContentSkip;
+    const Json skipped_done =
+        Json::parse(format_request_done_json("serve-test", 3004, context, skipped_outcome));
+    failures += check(skipped_done.at("result").at("tool_call_parse").at("parse_path") ==
+                          "after_tolerant_content_skip",
+                      "the parse path that WAS set did not reach the JSONL (#29 control)");
+    const std::optional<OperationalRecord> skipped_warning =
+        render_tool_call_fallback(context, skipped_outcome);
+    failures += check(skipped_warning &&
+                          skipped_warning->message ==
+                              "req#7 tool markup returned as text | duplicate parameter | "
+                              "path=after tolerant content skip",
+                      "the parse path that WAS set did not reach the warning (#29 control)");
 
     const Json error =
         Json::parse(format_request_error_json("serve-test", 4000, context, "generation failed"));

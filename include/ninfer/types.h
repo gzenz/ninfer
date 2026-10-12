@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -14,6 +15,260 @@
 #include <vector>
 
 namespace ninfer {
+
+// The per-victim eviction record is a RING; this is its capacity. Sized to cover a whole e2e window's
+// eviction population (measured 61-85 evictions, 31-49 of them KV-bearing, 2026-10-04) so that a normal
+// window does NOT wrap and `records_total == record_count` is the common case -- when it does wrap the two
+// diverge and the reader is told rather than silently shown a suffix.
+inline constexpr std::size_t k_eviction_kv_record_capacity = 128;
+
+// ***THE SIX AXES THE FEASIBILITY CONJUNCTION ANDS, NAMED ONCE (declared here, above its first use).***
+// The order is load-bearing: it indexes `axis_fits`, `refusal_mask`'s bits, the per-axis refusal counters and
+// `AssessedPeakRecord::axis_shortfall`. The gate itself (`context.cpp`, `physical_peak_fits`) builds its
+// `axis_fits` array in exactly this order and derives its return from it, so the two cannot drift.
+inline constexpr std::size_t k_peak_axis_count = 6;
+
+
+// ***ONE ASSESSMENT'S PER-AXIS ARITHMETIC, AS NAMED FIELDS (2026-10-07).***
+// These four series are all `std::array<std::uint64_t, k_peak_axis_count>` in `k_peak_axis_names` order, so
+// passed as four separate arguments a shuffled call would COMPILE and read plausibly -- which is exactly the
+// argument-order defect this tree has already paid for once (`note_kv_relief`, arm A33). Grouping them makes
+// the assignment positional no longer: the fields are named at the call site.
+//   peak          -- `physical_peak_additional`, the plan's own demand
+//   reservation   -- `reservation_added`, the plan's entitlement
+//   removed       -- `final_removed`, what the plan takes away
+struct PeakAxisSample {
+    std::array<std::uint64_t, k_peak_axis_count> peak{};
+    std::array<std::uint64_t, k_peak_axis_count> reservation{};
+    std::array<std::uint64_t, k_peak_axis_count> removed{};
+};
+
+// ONE FEASIBILITY ASSESSMENT, AS IT ACTUALLY WAS. **The averages could not decide #6**: the MEAN reservation
+// makes an EVICTION's own arithmetic fail too (`occupied 4095 + (2296 - 2041) > 4096`) while evictions ARE
+// admitted -- so the mean is the wrong quantity and the individual triple is the right one. This records, per
+// assessment: what the plan asked for (`peak_*`), what the pool held (`occupied_*`) and its ceiling, whether
+// the target evicts, and whether it was admitted. Read it as evidence, per instance, not as a rate.
+struct AssessedPeakRecord {
+    std::uint32_t peak_main_kv       = 0;
+    std::uint32_t peak_backend_kv    = 0;
+    std::uint32_t occupied_main_kv   = 0;
+    std::uint32_t occupied_backend_kv = 0;
+    std::uint32_t capacity_main_kv   = 0;
+    std::uint8_t  preserving         = 0;   // the target's own decisions carry no eviction
+    std::uint8_t  feasible           = 0;
+    // **WHY IT WAS REFUSED, WHICH FINDING 3 OF ARM A18 SHOWED WAS MISSING.** Several rows were refused with a
+    // peak that FITS on main KV (7 against a slack of 7), so the refusal came from somewhere the record did
+    // not name. Bits 0..(k_peak_axis_count-1) = the peak axes that failed; bit 7 = the host-allocation gate
+    // (`blocked_host_allocation_bytes != 0`). Zero on an admitted row.
+    std::uint8_t  refusal_mask       = 0;
+    // **THE OTHER TWO TERMS OF THE ARITHMETIC, so `peak == max(0, reservation - removed)` is CHECKABLE per
+    // instance.** Without them the ring showed that admitted plans have peak 7 and refused ones 2,490 but not
+    // WHY -- a peak that is not the difference of these two would mean the model is wrong rather than the plan.
+    std::uint32_t reservation_main_kv = 0;
+    std::uint32_t removed_main_kv     = 0;
+    // **HOW MUCH OF `removed` IS THE EVICTED VICTIM.** `final_removed` is seeded from the plan's SOURCE and
+    // accumulates per step, so a total of 1,610 cannot be read as "the victim's pages" until the evicting
+    // decisions' OWN `effect.removed` is summed out of it. That sum is this field: for an evicting decision,
+    // `effect.removed` IS the victim's removal. Read it AGAINST `removed_main_kv`.
+    std::uint32_t evicted_victim_main_kv = 0;
+    // **HOW MANY VICTIMS THE PLAN ACTED ON, WHICH IS THE SEARCH QUESTION.** A25 showed admitted plans free
+    // 2,990 pages -- more than one victim's 1,607 -- so the refused rows' ~1,400 relief is either ONE victim
+    // freed and no more chosen, or several chosen that are each small. `selected_decisions` and
+    // `evicting_decisions` separate those two, and they are the numbers the search's stopping point shows up in.
+    std::uint32_t selected_decisions = 0;
+    std::uint32_t evicting_decisions = 0;
+    // **WAS A LARGER VICTIM AVAILABLE?** The plan's best CHOSEN relief against the best relief available in
+    // `CandidateVictimOptions`. This is the last question before a change to the search: if `available` beats
+    // `chosen` on the refused rows, the search had a victim that would have closed the deficit and did not
+    // take it -- the remedy is the RANKING. If not, the largest victim available was still too small and the
+    // remedy is the reservation or the pool.
+    std::uint32_t best_available_main_kv = 0;
+    std::uint32_t chosen_best_main_kv    = 0;
+    // **IS A DEMOTE PRICED PER RUN?** `degradation_units` charges `decision.main_kv_changes.size()`, and
+    // `add_kv` pushes ONE ENTRY PER CONTIGUOUS RUN -- so a large victim's demote would cost more degradation
+    // units than a small one's, while an eviction carries no KV changes at all. That is the code-read
+    // hypothesis for A28's asymmetry, and this is the measurement that settles it: change ENTRIES per row
+    // against the pages those entries move.
+    std::uint32_t selected_kv_change_entries = 0;
+    // *** HOW FAR SHORT, ON EACH AXIS -- THE PER-AXIS MARGIN (2026-10-07). ***
+    // `refusal_mask` says WHICH of the six axes killed a target, and `peak_main_kv` gives the magnitude on one
+    // of them. Neither answers the question #6 ends on: at `slack = 0` admission needs `removed >=
+    // reservation` on EVERY axis, so a preserving plan can be refused by an axis nobody measured while the
+    // main-KV row looks healthy. This is, per axis and in the SAME ORDER the conjunction uses
+    // (`k_peak_axis_names`),
+    //     shortfall[axis] = max(0, occupied[axis] + peak[axis] - capacity[axis])
+    // -- the number of units the axis misses by, which is the margin `peak_main_kv` gave for one axis only.
+    // **IT IS CHECKABLE PER ROW AND THAT IS THE POINT:** `shortfall[a] > 0` must hold for exactly the axes
+    // whose bit is set in `refusal_mask`, on a refused row, and all six must be zero on an admitted one. A row
+    // that disagrees is an instrument defect, not a finding -- the failure this file has recorded three times.
+    std::array<std::uint32_t, k_peak_axis_count> axis_shortfall{};
+};
+inline constexpr std::size_t k_assessed_peak_record_capacity = 64;
+
+// ***WHY A PLACEMENT WAS REFUSED, NAMED ONE BY ONE (2026-10-05).*** `fit_after_suballocation_releases`
+// returns `Blocked` with the SHORTFALL UNSET for both `!valid` and `descriptors_short`, so every such
+// refusal looked identical and nothing could tell a DESCRIPTOR SHORTAGE (fix: grow the tables) from a
+// MALFORMED RELEASE LIST (fix: the planner -- and no capacity setting can touch it). An observed window had
+// 82 of 82 vetoes on this path, which is why the distinction was worth a counter: the two causes imply
+// opposite work in opposite layers. FIVE returns produce it, and THREE are about the release list.
+enum class HostKVBlockReason : std::uint8_t {
+    None,                            // not a refusal (the empty case, or a normal end)
+    ReleaseHandleInvalid,            // `!valid_handle || page_count == 0`      -- RELEASE list
+    ReleaseRangeExceedsDescriptor,   // the range runs past its descriptor      -- RELEASE list
+    ReleasesOverlap,                 // two releases overlap                    -- RELEASE list
+    RequestLayoutMissing,            // `layout == nullptr || pages == 0`
+    RequestLayoutUnknown,            // an unknown layout, or a stride overflow
+    DescriptorsShort,                // the table cannot describe the placement
+    // ***THE STORE'S THREE, AND THEY ARE THE ONES THAT ACTUALLY FIRE.*** `HostKVExtentStore::
+    // fit_after_page_releases` returns `Blocked` with the shortfall UNSET at three places BEFORE it calls
+    // the arena at all, so a split taken only in the arena counts NOTHING for them -- measured: the veto
+    // fired 12 times and every arena-side reason stayed 0. BOTH are about the RELEASE LIST the planner
+    // builds, and neither is reachable by a capacity setting.
+    StoreReleasePagesNull,           // `release.pages == nullptr`
+    StoreReleaseExtentUnallocated,   // the replica's extent has no allocation
+    // ***`mark_release`'s EIGHT PREDICATES, SPLIT APART (2026-10-05).*** The single counter this replaces
+    // was named `store_release_already_marked` AND COUNTED ALL EIGHT -- a name that claims one cause while
+    // counting eight is worse than no counter, because a reader acts on the name. Every one of these means
+    // `mark_release` refused the release, and which one refuses is the question.
+    StoreMarkPageNotHostResident,    // `!pages.valid(page) || !pages.host_resident(page)`
+    StoreMarkSourcePinned,           // `pages.source_pins(page) != 0`
+    StoreMarkNotSoleReference,       // `pages.address_references(page) != 1` (last-reference path)
+    StoreMarkCannotReleaseReplica,   // `!can_release_page_replica(pages, page)`
+    StoreMarkReplicaInvalid,         // `!valid(replica.extent) || membership_node out of range`
+    StoreMarkMembershipMismatch,     // the membership's page/extent/offset/store does not match the replica
+    StoreMarkAlreadyMarked,          // the stamp: the SAME PAGE WAS ALREADY MARKED IN THIS CALL
+    Count,
+};
+inline constexpr std::size_t k_host_kv_block_reason_count =
+    static_cast<std::size_t>(HostKVBlockReason::Count);
+
+[[nodiscard]] inline constexpr const char* host_kv_block_reason_name(HostKVBlockReason reason) noexcept {
+    switch (reason) {
+    case HostKVBlockReason::None:                          return "none";
+    case HostKVBlockReason::ReleaseHandleInvalid:          return "release_handle_invalid";
+    case HostKVBlockReason::ReleaseRangeExceedsDescriptor: return "release_range_exceeds_descriptor";
+    case HostKVBlockReason::ReleasesOverlap:               return "releases_overlap";
+    case HostKVBlockReason::RequestLayoutMissing:          return "request_layout_missing";
+    case HostKVBlockReason::RequestLayoutUnknown:          return "request_layout_unknown";
+    case HostKVBlockReason::DescriptorsShort:              return "descriptors_short";
+    case HostKVBlockReason::StoreReleasePagesNull:         return "store_release_pages_null";
+    case HostKVBlockReason::StoreMarkPageNotHostResident:  return "store_mark_page_not_host_resident";
+    case HostKVBlockReason::StoreMarkSourcePinned:         return "store_mark_source_pinned";
+    case HostKVBlockReason::StoreMarkNotSoleReference:     return "store_mark_not_sole_reference";
+    case HostKVBlockReason::StoreMarkCannotReleaseReplica: return "store_mark_cannot_release_replica";
+    case HostKVBlockReason::StoreMarkReplicaInvalid:       return "store_mark_replica_invalid";
+    case HostKVBlockReason::StoreMarkMembershipMismatch:   return "store_mark_membership_mismatch";
+    case HostKVBlockReason::StoreMarkAlreadyMarked:        return "store_mark_already_marked";
+    case HostKVBlockReason::StoreReleaseExtentUnallocated: return "store_release_extent_unallocated";
+    case HostKVBlockReason::Count:                         break;
+    }
+    return "none";
+}
+
+// ***WHICH HOST-RELEASE LIST A PAGE BELONGS IN, AND THE STORE'S PREDICATES ARE THE SPECIFICATION.***
+// `HostKVExtentStore::fit_after_page_releases` applies a DIFFERENT predicate to each list:
+//   PLAIN           -- `can_release_page_replica`: `device_resident || address_references == 0`
+//                      i.e. a device copy remains, so dropping the host replica is safe;
+//   LAST REFERENCE  -- `mark_release(..., last_reference = true)`: `address_references == 1`
+//                      i.e. this release removes the ONLY address that used the page.
+// A page that is HOST-ONLY and still SHARED satisfies NEITHER, and the store REFUSES it -- correctly,
+// because releasing that replica would destroy a copy another address still uses.
+//
+// **THE DEFECT THIS EXISTS TO PREVENT (2026-10-05).** The planner pushed EVERY released host page into the
+// last-reference list, so the store refused every shared page, `mark_release` failing made the WHOLE plan
+// read `Blocked` with the shortfall UNSET -- before the arena was asked -- and EVERY preserving plan was
+// rejected. The engine then evicted victims whose own KV the host arena would have taken. Measured on QA:
+// 13 of 13 veto refusals were `store_mark_not_sole_reference`.
+//
+// DEVICE-RESIDENT WINS OVER THE REFERENCE COUNT when both predicates would accept: the true situation is
+// "the host replica drops and a device copy remains", which is what PLAIN means.
+enum class HostReleaseKind : std::uint8_t {
+    NotReleased,    // host-only and still shared: NOT safe to offer, and no host bytes are freed
+    Plain,          // a device copy remains
+    LastReference,  // this release takes the page's only address reference
+};
+
+[[nodiscard]] constexpr HostReleaseKind classify_host_release(bool host_resident, bool device_resident,
+                                                              std::uint32_t address_references) noexcept {
+    if (!host_resident) { return HostReleaseKind::NotReleased; }
+    if (device_resident) { return HostReleaseKind::Plain; }
+    if (address_references == 1U) { return HostReleaseKind::LastReference; }
+    return HostReleaseKind::NotReleased;
+}
+
+// THE SIX AXES `physical_peak_fits` ANDs, in the order that function checks them. Named here as the ONE
+// source for both the counter array and the `/stats` keys, so a key cannot drift from the axis it counts --
+// the same derivation `k_demote_refusal_names` uses. The order is load-bearing: `physical_peak_fits` builds
+// its per-axis array in THIS order and derives its boolean from that array, so a reordering here silently
+// renames every count. **No test asserts the order** (said plainly rather than implied) -- the guard is that
+// the array and the boolean are the same object, so a mismatch would have to be introduced deliberately in
+// two places at once.
+// WHY A DEVICE-KV PAGE WAS REJECTED AS A RELIEF CANDIDATE, in the ORDER the eligibility test evaluates them.
+// The order is load-bearing for the same reason `k_peak_axis_names`' is: the enum indexes the array, and the
+// test short-circuits, so the FIRST failing clause is the one that blocks that page.
+//
+// **THIS EXISTS FOR #6's LAST QUESTION.** `select_kv_pressure_actions` builds a device-KV relief by scanning
+// pages and rejecting the ineligible ones, and the relief available to a PRESERVING plan (a demote to host)
+// differs from an eviction's, because the demote path refuses any page with an active address reference. One
+// undifferentiated count cannot say which clause blocks which relief, and the candidate mechanism -- that
+// `active_reference` is what makes every preserving plan infeasible on the device axes -- is exactly a claim
+// about ONE of these clauses.
+inline constexpr std::size_t k_kv_relief_clause_count = 7;
+inline constexpr const char* k_kv_relief_clause_names[k_kv_relief_clause_count] = {
+    "already_selected",
+    "not_device_resident",
+    "writer_references",
+    "source_pins",
+    "not_replica_safe",
+    "active_reference",
+    "protected",
+};
+// The two directions, in the order of the `rejected_by_clause` array's first index. A DROP keeps a host
+// replica and therefore needs one to exist; a DEMOTE needs the page NOT host-resident. Different
+// preconditions, so they are counted apart.
+inline constexpr std::size_t k_kv_relief_direction_count = 2;
+inline constexpr const char* k_kv_relief_direction_names[k_kv_relief_direction_count] = {
+    "demote",
+    "drop",
+};
+// WHY THE DEMOTE PASS DID NOT RUN, in the gate's own order (`select_kv_pressure_actions`). A demote that
+// never ran is not a demote that found nothing, and the rejection histogram reads identically for the two.
+//
+// **`demand_already_zero` WAS NAMED `drop_satisfied_demand` FOR ONE RUN, AND THE SAME RUN REFUTED THE NAME:**
+// it buckets the case where `device_remaining == 0` at the gate, and on arm A8 the DROP direction relieved
+// **0** pages across 11,518 calls -- so the drop cannot have satisfied anything. What the bucket actually
+// measures is "this call asked for no device relief", which is why it is named for its condition and not for
+// a cause. The two are told apart by reading `kv_relief_relieved_drop` beside it.
+inline constexpr std::size_t k_kv_relief_gate_clause_count = 3;
+inline constexpr const char* k_kv_relief_gate_clause_names[k_kv_relief_gate_clause_count] = {
+    "demand_already_zero",
+    "host_bytes_short",
+    "no_host_allocation",
+};
+
+// THE CLAUSES THAT CAN EMPTY A SUCCESSOR SET, in `SuccessorEmptyReason` order, named here as the ONE source
+// for both the counter array and the `/stats` keys (the derivation `k_peak_axis_names` uses). The order is
+// load-bearing for the same reason: the enum indexes the array. The first two are STRUCTURAL (no KV to act
+// on; the current decision already evicts) and were 0 of 1609 on the #6 repro; the last two are the pair that
+// must never be read as one number -- `no_endpoints` means the residual asked for NOTHING, `all_refused`
+// means it asked and the option builder said no.
+inline constexpr std::size_t k_successor_empty_reason_count = 5;
+inline constexpr const char* k_successor_empty_reason_names[k_successor_empty_reason_count] = {
+    "no_kv",
+    "evicting_current",
+    "unretained",
+    "no_endpoints",
+    "all_refused",
+};
+
+inline constexpr const char* k_peak_axis_names[k_peak_axis_count] = {
+    "device_active_lanes",
+    "device_state_slots",
+    "device_main_kv_pages",
+    "device_backend_kv_pages",
+    "host_state_slots",
+    "host_kv_bytes",
+};
 
 using TokenId = std::int32_t;
 
@@ -173,6 +428,14 @@ struct ContextCacheOptions {
     std::size_t host_pinned_chunk_bytes   = kDefaultHostPinnedChunkBytes;
     // (Was: "Host StateImages and Host KV bytes are independently configured pinned-memory capacities.")
     std::uint32_t host_state_slots     = kDefaultHostStateSlots;
+    // THE STATE AXIS'S CEILING (2026-10-05). Host KV and host state share one pinned pool, and the state
+    // pool had no bound of its own: it grew until the pool was full, leaving the KV side no growth room, so
+    // `Growable` could not be returned and the planner evicted restorable victims whose KV would have fitted.
+    // ZERO MEANS UNBOUNDED -- today's behaviour -- so this changes nothing until it is set.
+    // SET IT AT OR ABOVE `host_state_slots`, or the initial reservation itself is refused and the pool starts
+    // smaller than configured. The right value is MEASURED: raising it costs KV room, lowering it forces
+    // state evictions, and `host_state_growth_ceiling_refusals` is what makes that trade-off readable.
+    std::uint32_t host_state_max_slots = 0;
     std::size_t host_kv_capacity_bytes = kDefaultHostKvCapacityBytes;
     // Bounded private/shared logical catalogs and per-continuation long-anchor count.
     std::optional<std::uint32_t> max_private_continuations;
@@ -358,6 +621,36 @@ enum class ToolCallParseFallbackReason : std::uint8_t {
     TruncatedTail,
 };
 
+// #29'S DISCRIMINATOR, and it is a FIELD RATHER THAN A REASON VALUE ON PURPOSE. The values above describe
+// the SYMPTOM, and the parser's own truncation on a literal close tag and a model that emitted bad markup
+// produce the SAME ones -- so "is this a parser leak or the model's own output?" could not be answered from
+// the log at all. Replacing the reason with the path would lose the symptom to gain the path; carrying both
+// answers the question without destroying what was already known. Only ONE place in the tree can set this:
+// `tool_call_parser.cpp`'s `find_parameter_close`, the arm that treats a close tag as payload content -- the
+// arm whose own comment names the leak this fallback produces.
+//
+// IT REPORTS COEXISTENCE, NOT CAUSATION, and the distinction is deliberate: the recovery arm may have run in
+// a value the parse then recovered past, leaving the fallback caused by something else. It means "the
+// parser's recovery path was involved in this response", which is what #29 needs to know -- not "the parser
+// caused it", which this cannot show.
+enum class ToolCallParsePath : std::uint8_t {
+    // Not established: no fallback occurred, or it occurred before the recovery arm could run.
+    Unset,
+    // The fallback was raised with the tolerant content-skip arm having already run on this response.
+    AfterTolerantContentSkip,
+};
+
+[[nodiscard]] inline constexpr const char*
+tool_call_parse_path_name(ToolCallParsePath path) noexcept {
+    switch (path) {
+    case ToolCallParsePath::Unset:
+        return "unset";
+    case ToolCallParsePath::AfterTolerantContentSkip:
+        return "after_tolerant_content_skip";
+    }
+    return "unset";
+}
+
 [[nodiscard]] inline constexpr const char*
 tool_call_parse_fallback_reason_name(ToolCallParseFallbackReason reason) noexcept {
     switch (reason) {
@@ -385,6 +678,9 @@ struct ToolCallParseDiagnostics {
     std::uint32_t empty_arguments_omitted       = 0;
     std::uint32_t schema_mismatch_arguments     = 0;
     ToolCallParseFallbackReason fallback_reason = ToolCallParseFallbackReason::None;
+    // WHICH PATH RAISED THE FALLBACK (#29). See `ToolCallParsePath` for why this is a field beside the
+    // reason rather than a reason value, and for what it does and does not claim.
+    ToolCallParsePath parse_path = ToolCallParsePath::Unset;
 
     [[nodiscard]] friend constexpr bool
     operator==(const ToolCallParseDiagnostics&, const ToolCallParseDiagnostics&) noexcept = default;
@@ -1247,6 +1543,12 @@ struct MemorySummary {
     std::size_t cuda_graph_allowance_bytes        = 0;
     std::size_t kv_payload_bytes                  = 0;
     std::uint32_t host_state_capacity_slots       = 0;
+    // THE STATE AXIS'S CEILING AND ITS REFUSALS. `max` is 0 when unbounded. `ceiling_refusals` counts growth
+    // refused BY THAT CEILING, apart from refusals by the shared pool -- the two mean opposite things, and
+    // folding them together would make the trade-off unreadable. Read `ceiling_refusals` against
+    // `host_state_pregrow_refusals` to see whether bounding this axis actually forces state evictions.
+    std::uint32_t host_state_max_slots            = 0;
+    std::uint64_t host_state_growth_ceiling_refusals = 0;
     std::uint32_t host_state_occupied_slots       = 0;
     std::size_t host_kv_capacity_bytes            = 0;
     // THE SHARED PINNED POOL (2026-09-26). `host_state_capacity_slots` above is now LIVE (it follows the
@@ -1329,14 +1631,6 @@ struct MemorySummary {
     std::uint64_t host_kv_pregrows            = 0;
     std::uint64_t host_kv_pregrow_refusals    = 0;
     std::uint64_t host_kv_pregrow_fragmented  = 0;
-    // ASSESSED SEARCH NODES where a blocked KV demote was one growth away (the pure fit said `Growable`).
-    // NOT planning runs, and the difference is not cosmetic: the increment sits in
-    // `ProgramImpl::compose_pressure_candidate` (`planning/pressure.cpp:2338`), which `pressure_planner`
-    // calls once per assessed search NODE (`pressure_planner.cpp:1144`/`:1154`), so a single planning run
-    // can add thousands. This comment said "Planning runs" until a review checked the call sites -- a
-    // denominator error in the direction that makes a zero look like proof and a small number look small.
-    // 0 remains the goal (the narrowing never had a growth-away case in front of it), but it means
-    // "no node ever saw one", which is a weaker statement than "no session ever had one".
     std::uint64_t host_kv_fit_growable         = 0;
     // THE VETO'S DENOMINATOR AND ITS OTHER TWO VERDICTS. `blocked_checks` counts nodes that took the
     // pinned-capacity failure path at all; `pinned`/`growable`/`blocked` are the tri-state's answer. Without
@@ -1359,6 +1653,25 @@ struct MemorySummary {
     std::uint64_t host_kv_blocked_max_bytes    = 0;
     std::uint64_t host_kv_fit_pinned           = 0;
     std::uint64_t host_kv_fit_blocked          = 0;
+    // ***THE HEADROOM-AT-VETO DISCRIMINATOR.*** `blocked_within_headroom` counts `Blocked` verdicts whose
+    // shortfall FITTED the headroom that existed AT THAT MOMENT. The rule is `Growable` iff
+    // `shortfall <= headroom`, so such a verdict contradicts the rule and cannot be the pool's ceiling --
+    // something else refused, and the only such paths are the two DESCRIPTOR guards (the arena's
+    // `placement.descriptors_short`, the store's table check), NEITHER OF WHICH IS COUNTED ELSEWHERE.
+    // READ IT AGAINST `host_kv_fit_blocked`, its denominator. Zero there = every refusal was the ceiling.
+    // Non-zero = the growth path is inert for a reason the plan does not state, and the descriptor TABLES
+    // rather than the byte budget are what to fix. `_max_bytes` gives the scale.
+    std::uint64_t host_kv_blocked_within_headroom           = 0;
+    std::uint64_t host_kv_blocked_within_headroom_max_bytes = 0;
+    // ***THE REFUSAL REASON SPLIT, and it is the discriminator the `within_headroom` pair could not be.**
+    // `fit_after_suballocation_releases` returns `Blocked` with the SHORTFALL UNSET for both `!valid` and
+    // `descriptors_short`, so every such refusal has one shape. These split them by cause, indexed by
+    // `HostKVBlockReason`, and THREE of the causes are about the RELEASE LIST THE PLANNER BUILDS -- which
+    // is the difference between "grow the descriptor tables" and "the planner is passing bad input", two
+    // findings in different layers with no capacity setting between them.
+    // DENOMINATOR: `host_kv_blocked_checks` (the veto's own count), because the split is taken in the
+    // tri-state call the veto makes, not in the simulation both queries share.
+    std::uint64_t host_kv_block_reasons[k_host_kv_block_reason_count] = {};
     // KV's own growth, so a host-KV span added on demand is visible and not only inferable from total
     // capacity. With these three -- grew, could not grow, and the existing `maximal_fallback_selections`
     // (evicted everything) -- the three outcomes a full host tier can produce are DISTINGUISHABLE, which
@@ -1406,6 +1719,18 @@ struct RuntimeHostWorkStats {
 
 // Monotonic execution counters, boundary-consistent current gauges, and explicitly named last
 // decision observations. Consumers derive interval counters by subtracting two snapshots.
+// THE SINGLE SOURCE OF THE `DemoteRefusal` CLAUSE NAMES, in the enum's own declaration order
+// (`StateImageStore::DemoteRefusal`, `storage/state_store.h`). It lives HERE rather than beside the enum
+// because `/stats` must label a bucket and the serve layer cannot see the state store; the enum's
+// `demote_refusal_name` reads THIS table, so the journal's `demote_refusal=` token and the `/stats` key
+// cannot disagree about what a clause is called. Hyphens are kept because that token is a documented alert
+// string (`demote_refusal=already-on-host`); the `/stats` key substitutes `_` for `-`.
+inline constexpr const char* k_demote_refusal_names[] = {
+    "none",          "host-tier-disabled", "invalid-handle",   "stale-generation", "not-immutable-checkpoint",
+    "not-device-resident", "already-on-host", "pending-replica", "pin-saturated",   "no-host-capacity"};
+inline constexpr std::size_t k_demote_refusal_buckets =
+    sizeof(k_demote_refusal_names) / sizeof(k_demote_refusal_names[0]);
+
 struct RuntimeStats {
     RuntimeHostWorkStats host_work;
     // Actual prompt tokens evaluated by prefill; reused checkpoint-prefix tokens are excluded.
@@ -1469,8 +1794,15 @@ struct RuntimeStats {
     std::uint64_t pressure_spill_pages                 = 0;
     std::uint64_t partial_tail_cow_pages               = 0;
     std::uint32_t device_state_occupied_slots          = 0;
+    // The device state pool's CEILING. `occupied` alone cannot say whether the pool is full, and the
+    // absence of this number is what let a saturation check compare against 0 forever -- see
+    // `PhysicalUsageSnapshot::device_state_capacity_slots`.
+    std::uint32_t device_state_capacity_slots          = 0;
     std::uint32_t host_state_occupied_slots            = 0;
     std::uint32_t device_main_kv_occupied_pages        = 0;
+    // The device KV pool's ceiling, in PAGES, so the occupancy above is readable as a fraction.
+    std::uint32_t device_main_kv_capacity_pages        = 0;
+    std::uint32_t device_backend_kv_capacity_pages     = 0;
     std::uint32_t device_backend_kv_occupied_pages     = 0;
     std::size_t host_kv_occupied_bytes                 = 0;
     // THE PRIVATE-CONTINUATION CATALOG (`--max-private-continuations`, 18 -> 32 on 2026-09-27). This is the
@@ -1521,8 +1853,17 @@ struct RuntimeStats {
     // lane edge ANCHORS them. NOT a reclaim population: an unanchored entry is still matchable by any future
     // request whose prefix it shares (measured: 76 request-log records reused a private entry that was not
     // their own cell), so reclaiming one costs a rebuild rather than freeing something unused.
-    std::uint32_t host_state_checkpoints_reachable      = 0;
-    std::uint32_t host_state_checkpoints_unanchored       = 0;
+    // RENAMED 2026-10-04 to match the code's own term. These were `reachable` / `unanchored`, and the
+    // second was MISLEADING IN A WAY THAT COST TIME: it reads as "checkpoints with no ANCHOR", but
+    // `long_anchors` are counted INTO the number, so an anchored checkpoint in a holderless slot is
+    // included. What is actually counted is whether the SLOT has a holder -- an active edge from a private
+    // owner, or an occupied session-index cell -- so the pair is now `held` / `unheld`.
+    //
+    // Read them as a load-tracking PAIR, never as a leak on their own: `unheld` rises under load and drains
+    // when the load stops (measured 23->4 and 26->7 within single processes, 2026-10-04). A rise alone is
+    // not evidence of anything; the drain is what says they are a queue rather than an accumulation.
+    std::uint32_t host_state_checkpoints_held            = 0;
+    std::uint32_t host_state_checkpoints_unheld          = 0;
     std::uint32_t private_catalog_occupied_cells       = 0;
     std::uint64_t pressure_private_owners_degraded     = 0;
     std::uint64_t pressure_private_owners_demoted      = 0;
@@ -1553,11 +1894,119 @@ struct RuntimeStats {
     // reports room this victim's own footprint may not fit -- the three post-fix prod evictions were all
     // `demotable=1` at 17/18 slots with host KV 94% full.
     std::uint64_t pressure_evictions_with_victim_room = 0;
-    // THE #6 POPULATION: `victim_room && demote_possible` -- a demote fully available, the victim's own
-    // slots fitting, and the victim evicted anyway. `demote_refusal` is PRINTED but never counted, and the
-    // print is rate-limited (8 of 57 evictions on 2026-10-02, 7 of them benignly `already-on-host`), so
-    // without this the defect's size could only be sampled.
+    // WHICH AXIS EACH EVICTION RELIEVED, over the whole population rather than the rate-limited print.
+    // `device` counts victims that held at least one DEVICE state slot (evicting frees device slots);
+    // `host` counts victims that held at least one HOST state slot. A victim can hold both, so the two do
+    // NOT sum to the eviction count -- read them beside `pressure_private_eviction_checks`, not against it.
+    std::uint64_t pressure_evictions_victim_device_slots = 0;
+    std::uint64_t pressure_evictions_victim_host_slots   = 0;
+    // THE NEEDED AXIS at each eviction: which axis the PLAN asked for, against `evictions_victim_*` which
+    // reports the axis the eviction RELIEVED. An eviction whose relief misses the axis the plan needed is
+    // incoherent, and that case is invisible with only one of the two. A plan may need several at once, so
+    // these do NOT sum to `private_eviction_checks`, which is their denominator.
+    std::uint64_t pressure_evictions_deficit_device_main_kv = 0;
+    std::uint64_t pressure_evictions_deficit_device_backend_kv = 0;
+    std::uint64_t pressure_evictions_deficit_device_state = 0;
+    std::uint64_t pressure_evictions_deficit_host_state = 0;
+    std::uint64_t pressure_evictions_deficit_host_kv = 0;
+    // THE PER-VICTIM KV HALF: was this victim's OWN device KV demotable to host when it was evicted?
+    // `pages` is the denominator (evictions whose victim held device KV pages); `pages_total` is the
+    // magnitude destroyed (summed pages). The tri-state splits the denominator by the host KV arena's own
+    // answer for exactly those pages: `pinned` = they fit the arena AS IT IS (KV destroyed with host room --
+    // the operator's defect), `growable` = they fit only after a growth the planner's pinned-only
+    // feasibility site cannot see (`pressure.cpp:2385` -- the plan's own stated failure mode), `blocked` =
+    // neither. THE THREE MUST BE READ TOGETHER: `pinned == 0` means "none fitted as-is" only when the other
+    // two are non-zero; with all three zero the path was not reached at all, which is what `pages` shows.
+    std::uint64_t pressure_evictions_kv_pages       = 0;
+    std::uint64_t pressure_evictions_kv_pages_total = 0;
+    std::uint64_t pressure_evictions_kv_fit_pinned   = 0;
+    std::uint64_t pressure_evictions_kv_fit_growable = 0;
+    std::uint64_t pressure_evictions_kv_fit_blocked  = 0;
+    // THE MAGNITUDE PER VERDICT. The first real window read `fit_pinned=20` of `pages=45` -- a high defect
+    // RATE -- while the victims that fitted were the tiny ones, so the page counts run the other way. Read
+    // the two together; a rate quoted alone misstates which direction the defect runs. These sum to
+    // `pressure_evictions_kv_pages_total`.
+    std::uint64_t pressure_evictions_kv_fit_pinned_pages   = 0;
+    std::uint64_t pressure_evictions_kv_fit_growable_pages = 0;
+    std::uint64_t pressure_evictions_kv_fit_blocked_pages  = 0;
+    // THE PER-VICTIM RECORD. The counters above give a window's TOTALS; two windows of the same suite on the
+    // same binary then disagreed by 5.8x on `fit_pinned_pages` (2026-10-04), and a total cannot say WHY --
+    // whether one huge victim or many small ones moved it. A per-victim record can: it makes the window a
+    // DISTRIBUTION, so the spread is explained rather than merely observed, and a reader can join a victim's
+    // size to its verdict instead of inferring size from an aggregate.
+    //
+    // WHAT IT IS NOT: it is not a replacement for the counters and it is not a window total at a glance. It is
+    // a RING of the most recent records, so it never has the "first screenful" bias the rate-limited journal
+    // line has; `pressure_eviction_kv_records_total` is how many were ever recorded, so a reader can tell a
+    // partial ring from a whole window.
+    struct EvictionKVRecord {
+        std::uint32_t pages      = 0;  // the victim's RESIDENT owned device KV pages (what a demote would copy)
+        std::uint32_t frontier   = 0;  // execution frontier in tokens -- the size proxy a reader joins on
+        std::uint8_t  fit        = 0;  // HostKVFit: 0 pinned, 1 growable, 2 blocked (see host_kv_fit_name)
+        std::uint8_t  restorable = 0;  // held a complete state image, i.e. a demote would have preserved work
+        std::uint8_t  evicted_   = 0;  // reserved; 1 for the shape the rest of the fields describe
+    };
+    std::array<EvictionKVRecord, k_eviction_kv_record_capacity> pressure_eviction_kv_records{};
+    std::uint32_t pressure_eviction_kv_record_count = 0;  // valid entries, oldest first
+    std::uint64_t pressure_eviction_kv_records_total = 0;  // ever recorded; > count means the ring wrapped
+    // WHICH AXIS REFUSED A PLAN, per axis, out of `physical_peak_fits`'s six-way conjunction. This is the
+    // instrument that makes "the host had no room for this victim's share" separable from "the plan was short
+    // on a different axis" -- two readings that were IDENTICAL before it and imply opposite fixes. A peak can
+    // exceed several capacities at once, so these do NOT sum to the refusal count; the denominator is
+    // `pressure_physical_peak_fits_calls`, which is taken before any axis filter.
+    std::uint64_t pressure_physical_peak_refusals_by_axis[k_peak_axis_count] = {};
+    // METHOD 2's DECISION COUNTERS. `grows` counts seals that pinned the room a `Growable` plan needed;
+    // `refusals` counts seals where the pin failed, so the plan fell back to today's behaviour.
+    // READ THE PAIR: a `grow` for a plan the search then does not adopt pins memory for nothing, and a
+    // `refusal` says admission alone cannot carry the fix. Either one alone is not a verdict.
+    std::uint64_t host_kv_seal_grows    = 0;
+    std::uint64_t host_kv_seal_refusals = 0;
+    // THE HOST-STATE SHORTFALL out of `physical_peak_fits`, which ANDs six axes and so could not say which
+    // failed. `fit_checks` is the DENOMINATOR -- calls where the plan asked for host state room at all -- so
+    // `shortfall_calls == 0` can be told from "never asked". `shortfall_max_slots` is the worst shortfall IN
+    // SLOTS, and it is the number that decides the hypothesis: the only pre-planning growth is ONE slot
+    // (`HOST_STATE_PREGROW_SLOTS`), so a maximum above 1 means plans needed more than the pre-grow supplied.
+    // Compare it against `memory.host_pinned_growth_headroom_bytes` divided by the slot size to tell "one
+    // growth away" from "genuinely capped".
+    // EVERY call to the query, before its axis filter. `fit_checks == 0` alone cannot distinguish "host state
+    // was never demanded" from "the query never ran"; this separates them, so a quiet reading is attributable.
+    std::uint64_t pressure_physical_peak_fits_calls       = 0;
+    std::uint64_t pressure_host_state_fit_checks          = 0;
+    std::uint64_t pressure_host_state_shortfall_calls     = 0;
+    std::uint64_t pressure_host_state_shortfall_max_slots = 0;
+    // The device-KV axis's counterparts, same reading rule: denominator, refusals, then the worst shortfall
+    // IN PAGES. This axis carries most of the eviction deficit, and its live occupancy reads half empty, so
+    // the magnitude is what says whether the peak misses by a little or by a factor.
+    std::uint64_t pressure_device_main_kv_fit_checks          = 0;
+    std::uint64_t pressure_device_main_kv_shortfall_calls     = 0;
+    std::uint64_t pressure_device_main_kv_shortfall_max_pages = 0;
+    // THE #6 POPULATION CANDIDATE: `victim_room && demote_possible`. TWO CORRECTIONS FROM THE LOAD'S OWN
+    // DATA govern how this reads, both recorded below rather than left in the history that produced them:
+    //   * **`already-on-host` is NOT benign.** The rate-limited print shows 7-of-8 of that clause, and an
+    //     earlier reading of this file took that to mean 7-of-8 harmless. It does not: state on host +
+    //     evicted = the host slots are freed and the copy is DESTROYED, and `restorable=1` means a checkpoint
+    //     died. What is moot is the DEMOTE, not the loss.
+    //   * **`victim_room` is PER-VICTIM and the plan's need is AGGREGATE.** A burst evicted eight victims at
+    //     `host_state_slots` 108/110 to free ~26 slots while each read `victim_room=1` individually. So
+    //     `victim_room=1` does NOT mean the eviction was avoidable. This counter is a POPULATION, not the
+    //     defect count; the plan-level question it gestures at is UNINSTRUMENTED.
     std::uint64_t pressure_evictions_demote_possible  = 0;
+    // THE REFUSAL REASON AT EACH **PRIVATE, MATERIALIZATION-PATH** EVICTION, one bucket per clause of
+    // `k_demote_refusal_names` (same order). SCOPE CORRECTED 2026-10-04: this said "every eviction", and it
+    // is not -- `capture.cpp` releases private victims through `release_continuation_slot_strict` without
+    // touching this counter, and shared evictions are not counted here either. **The sum invariant therefore
+    // holds BY CONSTRUCTION against `private_eviction_checks`** (both increment at
+    // `materialization.cpp:2334-2335`), which makes it a consistency check on this path and NOT a claim
+    // about all evictions.
+    // The `demote_refusal=` field was PRINTED and never counted, and that print is rate-limited to the first
+    // 8 then every 512th -- so a 59-eviction window yields exactly 8 lines and they are the window's FIRST 8
+    // evictions, measured 2026-10-02 as 7-of-8 `already-on-host`. The sample is biased to the start of the
+    // window BY CONSTRUCTION; a counter cannot be sampled away.
+    // NOTE: the #6 population is NOT attributable here and cannot be -- `demote_possible` IS
+    // `demote_refusal == None`, so those evictions are `None` by construction. What this attributes is the
+    // OTHER population: the evictions where a demote was NOT available, which is what a fix can be aimed at.
+    // DENOMINATOR: `pressure_private_eviction_checks` (every eviction increments exactly one bucket).
+    std::uint64_t pressure_demote_refusal_at_eviction[k_demote_refusal_buckets] = {};
     // The OTHER half of #6, and the one that had no signal at all: REQUESTS that lost reuse to the private
     // catalog. A plan takes its publication cell from its own consumed private source, a `Vacant` cell, or a
     // victim it evicts; when every cell is catalogued and no victim is evictable, a candidate that could
@@ -1597,15 +2046,144 @@ struct RuntimeStats {
     // carried no state slots, so the relief wanted is a KV demote -- a different fix from the other six
     // conditions, which say no demote exists and the eviction is correct.
     std::uint64_t pressure_demote_option_refused_no_state_deficit = 0;
-    // THE PRESERVATION PROBE: an owner whose successor set was EMPTY had no non-evicting option, so its
-    // checkpoint's destruction was unavoidable. `calls` is the denominator -- without it, "none lacked an
-    // option" and "none was examined" read the same.
+    // THE PRESERVATION PROBE. `calls` is the denominator: without it, "no owner lacked an option" and "no
+    // owner was examined" read the same.
+    //
+    // **`pressure_successors_without_option` COUNTS THE EMPTY RESULTS -- the owners that HAD NO non-evicting
+    // successor. Its published key was named `successors_with_option` until 2026-10-06, which said the exact
+    // OPPOSITE of what it counted, and `plan.md` recorded a wrong reading from it before the inversion was
+    // caught.** So the owners that DID have a preserving alternative are
+    // `pressure_successor_calls - pressure_successors_without_option`.
     std::uint64_t pressure_successor_calls         = 0;
-    std::uint64_t pressure_successors_with_option  = 0;
+    std::uint64_t pressure_successors_without_option  = 0;
+    // The calls whose successor set was empty BY CONSTRUCTION -- the current decision already evicts
+    // (`pressure.cpp:953`). 0 of 1609-1776 on the #6 repro, so it needs no subtraction there; it is carried
+    // because on a workload that expands FROM an eviction it would, and the two populations cannot be told
+    // apart from `calls` alone.
+    std::uint64_t pressure_successor_calls_evicting_current = 0;
+    // WHY an empty successor set was empty, one bucket per clause in `k_successor_empty_reason_names` order.
+    // **The sum MUST equal `pressure_successors_without_option`; a mismatch means the split is incomplete or a
+    // count is misplaced -- which is how the inverted name above was caught** (the buckets summed to 58 while
+    // the empty count read 1718, and 58 was the old `with_option`). `no_endpoints` vs `all_refused` are
+    // opposite findings about the same population.
+    std::uint64_t pressure_successor_empty_by_reason[k_successor_empty_reason_count] = {};
+    // #6's LAST QUESTION, QUANTIFIED: pages EXAMINED and rejected as a device-KV relief candidate, by clause
+    // and by direction ([0] demote, [1] drop). Not pages relieved -- rejected candidacies, so the number is a
+    // function of how much the plan asked for as well as what was available. Read the DEMOTE row against its
+    // own total: `active_reference` dominating it is the mechanism `plan.md` names (a demote cannot touch an
+    // active victim's KV, so a preserving plan cannot relieve the axis it is short on).
+    std::uint64_t pressure_kv_relief_rejected[k_kv_relief_direction_count][k_kv_relief_clause_count] = {};
+    // WHAT REACHED THE PEAK. `requested` is the device-KV demand the direction was asked to satisfy; the two
+    // directions SHARE ONE BUDGET and run IN ORDER (drop first, then demote on the remainder), so `relieved`
+    // against `requested` says whether the demote was ASKED for too little or FOUND too little.
+    std::uint64_t pressure_kv_relief_calls[k_kv_relief_direction_count]          = {};
+    std::uint64_t pressure_kv_relief_requested[k_kv_relief_direction_count]      = {};
+    std::uint64_t pressure_kv_relief_saturated_asks[k_kv_relief_direction_count] = {};
+    std::uint64_t pressure_kv_relief_max_ask[k_kv_relief_direction_count]        = {};
+    std::uint64_t pressure_kv_relief_relieved[k_kv_relief_direction_count]  = {};
+    std::uint64_t pressure_kv_relief_gate_blocks[k_kv_relief_gate_clause_count] = {};
+    // THE HOST DEFICIT THAT BLOCKED THE DEMOTE PASS, in bytes. Read beside the veto's `host_kv_fit_*` trio:
+    // those read a different quantity, so "the host was never blocked" and "the demote was refused for host
+    // bytes" can both be true and are NOT comparable from what is exported.
+    // WHICH AXIS KILLED A TARGET, split by whether the target evicts ([0] preserving, [1] evicting). The
+    // global `pressure_physical_peak_refusals_by_axis` cannot give this: it sums over every call site, so it
+    // cannot say whether the axis that refuses is refusing PRESERVING plans or evicting ones.
+    std::uint64_t pressure_peak_refusals_by_preserving[2][k_peak_axis_count] = {};
+    // THE PEAK ARITHMETIC, summed over compose steps: `peak = max(0, peak + added - removed)` per axis.
+    // `added` is what each step DEMANDS, `removed` what it FREES, `peak_max` the largest resulting peak. The
+    // two halves are the model -- an axis that refuses because `added` dwarfs `removed` is a different defect
+    // from one where both are large.
+    // THE ENTITLEMENT A DEMOTE LEAVES STANDING: the victim's RELEASE figure minus its RESIDENT figure, i.e.
+    // the pages an eviction frees that a demote does not. It is the quantity that separates #6's two
+    // candidate remedies (the demote's relief vs the reservation itself), so it is reported apart.
+    // THE RESERVATION'S COMPOSITION: [term][axis], term 0 = the request's own exclusive entitlement (the
+    // BASE), 1 = shared replica additions, 2 = transient source restores; axis 0 = main KV, 1 = backend KV.
+    // The peak `physical_peak_fits` judges a plan on IS this reservation, so which TERM dominates decides
+    // which remedy is even aimed at the right thing.
+    // THE ENTITLEMENT'S OWN SPLIT. `reserved_tokens` IS `prompt_tokens + (output_tokens - 1)`, so these
+    // three settle whether the reservation is the prompt, the output budget, or both.
+    // THE PLAN-LEVEL RELIEF OF EACH OPTION, same victim, same moment: [0] evicting, [1] preserving. The
+    // VICTIM-level figures are equal (gap = 0), so any difference between the plans is HERE.
+    // THE PER-INSTANCE EVIDENCE for #6's remaining question, oldest first; `_total` is its denominator and
+    // says when the ring wrapped.
+    // THE AGGREGATE over ALL assessments, split by class: total, admitted, and refused BY THE HOST-ALLOCATION
+    // GATE. The remainder (`total - feasible - host_blocked`) is what the PEAK axes account for; a non-zero
+    // remainder that the axis histogram does not cover is an unaccounted refusal.
+    // [feasible][preserving]: what AN ADMITTED plan has that a refused one does not -- a bigger relief or a
+    // smaller reservation. That is the measurement that separates #6's two remaining candidates.
+    std::uint64_t pressure_assessed_agg_count[4]       = {};
+    std::uint64_t pressure_assessed_agg_reservation[4] = {};
+    std::uint64_t pressure_assessed_agg_removed[4]     = {};
+    std::uint64_t pressure_assessed_agg_selected[4]    = {};
+    std::uint64_t pressure_assessed_agg_evicting[4]    = {};
+    std::uint64_t pressure_assessed_agg_available[4]   = {};
+    std::uint64_t pressure_assessed_agg_chosen[4]      = {};
+    std::uint64_t pressure_assessed_larger_available[4] = {};
+    std::uint64_t pressure_assessed_chose_largest[4]    = {};
+    std::uint64_t pressure_assessed_agg_kv_entries[4]   = {};
+    // *** THE PER-AXIS SHORTFALL, SUMMED OVER ALL ASSESSMENTS -- NOT THE RING (2026-10-07). ***
+    // `pressure_assessed_peak_records` carries the same figure PER ROW, and it is a 64-row WINDOW: arm A35
+    // made 5,912 assessments, and the ring read the host axis at 1.51 GiB mid-run and 184 MiB at the end while
+    // the population barely changed size. **A magnitude is quoted from HERE**, divided by the matching
+    // `pressure_assessed_agg_count[bucket]`; the ring keeps its per-row cross-check against `refusal_mask` and
+    // nothing else. `k_peak_axis_names` order -- the axes are PAGES and BYTES, so add nothing across them.
+    std::array<std::array<std::uint64_t, k_peak_axis_count>, 4> pressure_assessed_axis_shortfall{};
+    // THE VICTIM'S OWN FIGURES AT THE DECISION SITE: the release figure an eviction credits, the resident
+    // figure a demote copies, and their difference -- the entitlement a demote does not credit.
+    std::uint64_t pressure_victim_ownership_calls        = 0;
+    std::uint64_t pressure_victim_ownership_release_sum  = 0;
+    std::uint64_t pressure_victim_ownership_resident_sum = 0;
+    std::uint64_t pressure_victim_ownership_gap_sum      = 0;
+    std::uint64_t pressure_victim_ownership_gap_max      = 0;
+    std::uint64_t pressure_assessed_total[2]                = {};
+    std::uint64_t pressure_assessed_feasible[2]             = {};
+    std::uint64_t pressure_assessed_refused_host_blocked[2] = {};
+    std::uint64_t pressure_assessed_peak_records_total = 0;
+    std::array<AssessedPeakRecord, k_assessed_peak_record_capacity> pressure_assessed_peak_records{};
+    std::uint64_t pressure_successor_relief_preserving_options_seen = 0;
+    std::uint64_t pressure_successor_relief_count[2]       = {};
+    std::uint64_t pressure_successor_relief_main_kv[2]     = {};
+    std::uint64_t pressure_successor_relief_backend_kv[2]  = {};
+    std::uint64_t pressure_successor_relief_state_slots[2] = {};
+    std::uint64_t pressure_entitlement_split_calls           = 0;
+    std::uint64_t pressure_entitlement_split_prompt_tokens   = 0;
+    std::uint64_t pressure_entitlement_split_output_tokens   = 0;
+    std::uint64_t pressure_entitlement_split_reserved_tokens = 0;
+    std::uint64_t pressure_reservation_composition_calls = 0;
+    std::uint64_t pressure_reservation_composition[3][2] = {};
+    std::uint64_t pressure_victim_entitlement_gap_calls     = 0;
+    std::uint64_t pressure_victim_entitlement_gap_pages_sum = 0;
+    std::uint64_t pressure_victim_entitlement_gap_pages_max = 0;
+    std::uint64_t pressure_peak_model_calls          = 0;
+    std::uint64_t pressure_peak_model_added[k_peak_axis_count]    = {};
+    std::uint64_t pressure_peak_model_removed[k_peak_axis_count]  = {};
+    std::uint64_t pressure_peak_model_peak_max[k_peak_axis_count] = {};
+    // THE TEST OF THE READ MECHANISM: is the DEMOTE's relief shorter when the plan had a non-zero host
+    // request? PASS 1 (host-duplicate drop) and PASS 2 (device-duplicate drop) require the SAME clause and
+    // share one `selected[]`, so PASS 1 should starve PASS 2 -- and the demote's take is the measure.
+    std::uint64_t pressure_kv_relief_demote_calls_host_req_zero       = 0;
+    std::uint64_t pressure_kv_relief_demote_calls_host_req_nonzero    = 0;
+    std::uint64_t pressure_kv_relief_demote_relieved_host_req_zero    = 0;
+    std::uint64_t pressure_kv_relief_demote_relieved_host_req_nonzero = 0;
+    std::uint64_t pressure_kv_relief_host_blocked_bytes_sum = 0;
+    std::uint64_t pressure_kv_relief_host_blocked_bytes_max = 0;
     std::uint64_t pressure_demote_option_refused_precondition     = 0;
     std::uint64_t pressure_options_refused_active_lanes      = 0;
     std::uint64_t pressure_options_refused_evicting_current  = 0;
     std::uint64_t pressure_publication_cell_losses     = 0;
+
+    // SHARED-PREFIX RELEASE REFUSALS, PER CLAUSE. `release_shared_prefix` is `noexcept` and returns early on
+    // four grounds, so a refusal kept its occupancy with nobody learning why; the probe that named the reason
+    // was behind `NINFER_RELEASE_PROBE`, set in no recorded run. These are the always-on replacement: four
+    // counters, read here, with no gate to forget and no rate limit. Zero on each is a RESULT only if the
+    // release path ran at all -- these are counters, so unlike a print their zero is a number, not a silence.
+    // THE DENOMINATOR. Read it with the four refusals: `attempts == 0` means the release path never ran, so
+    // their zeros are UNMEASURED rather than clean -- the same rule as `publication_cell_probes`.
+    std::uint64_t shared_prefix_release_attempts                 = 0;
+    std::uint64_t shared_prefix_release_refusals_stale_index = 0;
+    std::uint64_t shared_prefix_release_refusals_in_flight   = 0;
+    std::uint64_t shared_prefix_release_refusals_not_releasable = 0;
+    std::uint64_t shared_prefix_release_refusals_check_threw = 0;
     // The DENOMINATOR. Raw goal-probe calls, one or two orders of magnitude larger than any plausible loss
     // count, kept only so that `losses == 0` can be told from a planner that stopped probing. Never read it
     // as the loss: it is search pressure, not an outcome.

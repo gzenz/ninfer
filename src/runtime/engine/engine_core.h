@@ -2230,7 +2230,19 @@ private:
 
     // The worker holds execution_mutex_ across the failing operation and this cleanup, so no
     // Program introspection can observe a partially cleared physical state.
-    void fail_all_locked(std::exception_ptr error) noexcept {
+    // WHY THIS RAN, NAMED BY THE CALLER. `fail_all_locked` is reached from FOUR places and every one of them
+    // used to print the identical `fail-all cleanup` + `post-recovery residual (fail-all)` pair, so a CLEAN
+    // STOP and a FATAL were indistinguishable in the journal. That is not a theoretical confusion: 19
+    // zero-residual lines were once read here as "19 healthy recoveries" when every one was a QA stop.
+    //
+    // The residual's AMOUNT cannot separate them -- both are all-zero for an empty engine -- so the reason has
+    // to be carried. It rides in the residual's existing prefix (`(fail-all:<reason>)`), extending the
+    // discriminator the line already has rather than adding a second line to correlate by hand:
+    //   shutdown                  -- `stopping_`, a clean stop. NO throw, so no other line names it.
+    //   recovery-exhausted-oom    -- the OOM path gave up (preceded by `WORKER OOM: N consecutive recoveries`)
+    //   recovery-exhausted-logic  -- the logic path gave up (preceded by `WORKER: N consecutive recoveries`)
+    //   fatal                     -- after `WORKER CRASH: <what()>`
+    void fail_all_locked(std::exception_ptr error, const char* reason) noexcept {
         std::deque<std::shared_ptr<Request>> pending;
         {
             std::lock_guard lock(queue_mutex_);
@@ -2255,7 +2267,13 @@ private:
         }
         for (const auto& request : pending) { force_complete_error(request, error); }
         try { publish_runtime_stats(); } catch (...) {}
-        report_recovery_residual("fail-all");
+        // The reason rides in the prefix: `(fail-all:shutdown)` cannot be read as a recovery, which is the
+        // whole point -- and the awk's zero-residual test keys on the FIELDS, not the prefix, so extending it
+        // changes nothing about how the line is classified.
+        char fail_all_tag[64];
+        std::snprintf(fail_all_tag, sizeof fail_all_tag, "fail-all:%s",
+                      reason != nullptr ? reason : "unknown");
+        report_recovery_residual(fail_all_tag);
     }
 
     void worker_loop() noexcept {
@@ -2277,7 +2295,7 @@ private:
                     const auto error = std::make_exception_ptr(RequestError(
                         RequestErrorKind::Unavailable, "inference engine is shutting down"));
                     std::scoped_lock execution_lock(execution_mutex_);
-                    fail_all_locked(error);
+                    fail_all_locked(error, "shutdown");
                     return;
                 }
             }
@@ -2392,7 +2410,7 @@ private:
                                  "pending\n",
                                  oom_recovery_count_ - 1);
                     const std::exception_ptr fatal_error = oom_fallback_error_;
-                    fail_all_locked(fatal_error);
+                    fail_all_locked(fatal_error, "recovery-exhausted-oom");
                     return;
                 }
                 std::exception_ptr oom_error;
@@ -2414,7 +2432,7 @@ private:
                     std::fprintf(stderr,
                                  "[engine] WORKER: %u consecutive recoveries — failing all\n",
                                  oom_recovery_count_ - 1);
-                    fail_all_locked(std::current_exception());
+                    fail_all_locked(std::current_exception(), "recovery-exhausted-logic");
                     return;
                 }
                 HostPhaseMeasurement cleanup = begin_host_phase();
@@ -2433,7 +2451,7 @@ private:
                     std::fprintf(stderr, "[engine] WORKER CRASH: unknown exception\n");
                 }
                 HostPhaseMeasurement cleanup = begin_host_phase();
-                fail_all_locked(error);
+                fail_all_locked(error, "fatal");
                 finish_engine_phase(cleanup, EngineHostPhase::Maintenance);
                 try {
                     publish_runtime_stats();

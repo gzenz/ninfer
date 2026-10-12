@@ -26,6 +26,14 @@ ninfer_add_test(ninfer_qwen3_5_runtime_mechanisms_test
 ninfer_add_test(ninfer_qwen3_5_kv_row_binding_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_kv_row_binding.cpp")
 
+# The #13 underflow: the predicate a diagnostic asks BEFORE the subtraction, and the throw it must agree with.
+# Per-axis, so a predicate that checked only the axis the incident named fails here. No device.
+# `ninfer::json` is required by the header chain, not by the test: `context_work.h` includes `program_impl.h`,
+# which reaches `artifact/schema.h` and `nlohmann/json.hpp`.
+ninfer_add_test(ninfer_qwen3_5_context_work_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_context_work.cpp"
+  LIBRARIES ninfer_engine ninfer_core ninfer::json)
+
 ninfer_add_test(ninfer_qwen3_5_state_image_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_state_image.cpp"
   LIBRARIES ninfer_engine ninfer_core)

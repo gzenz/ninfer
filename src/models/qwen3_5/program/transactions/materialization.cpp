@@ -122,6 +122,7 @@ ProgramImpl::reserve_materialization(AdmissionCandidate&& plan, PreparedPromptDa
             continuation_states[index].long_anchors.size());
         transaction.pressure.push_back(MaterializationTransaction::PressureWork{
             .option                  = details.pressure_options[victim],
+            .planned_deficit         = details.demand.physical_peak_additional,
             .continuation_index      = index,
             .continuation_generation = generation,
         });
@@ -147,6 +148,7 @@ ProgramImpl::reserve_materialization(AdmissionCandidate&& plan, PreparedPromptDa
             details.shared_pressure_owner_ids[victim];
         transaction.shared_pressure.push_back(MaterializationTransaction::PressureWork{
             .option                  = details.shared_pressure_options[victim],
+            .planned_deficit         = details.demand.physical_peak_additional,
             .continuation_index      = index,
             .continuation_generation = generation,
             .shared_owner            = true,
@@ -630,33 +632,61 @@ void ProgramImpl::prepare_consumed_source(MaterializationTransaction& transactio
         throw std::bad_alloc();
     }
 
-    const detail::PhysicalResources after   = owner_exclusive_resources(source);
-    const detail::PhysicalResources removed = checked_resource_difference(before, after);
-    // NAME THE MECHANISM BEFORE THE THROW, because two OPPOSITE fixes follow from two candidates and the
-    // message cannot tell them apart. `details.demand.final_removed` is `owner_exclusive_resources(source)`
-    // sampled at PLAN TIME (`request_plan.cpp:1013-1014`), while `before`/`after` are sampled HERE -- so the
-    // check is only sound while the source's exclusive counts are unchanged in between. The candidates:
-    //   (a) the source legitimately GAINED exclusivity (a lane sharing it was released between plan and
-    //       execution), so `before` exceeds the plan's snapshot and the delta is CORRECT -- the assertion is
-    //       comparing two instants, and relaxing it is the fix;
-    //   (b) the removal OVER-COUNTS (pages attributed to this source that it does not exclusively own), which
-    //       is a real accounting fault and the opposite fix.
-    // `before` beside `planned` separates them: (a) shows before > planned with before - after == the excess;
-    // (b) shows before <= planned while the delta still exceeds it. Printed UNCAPPED and unconditionally on
-    // the skew, since this event is rare by nature -- a capped print would hide the very occurrences the
-    // instrument exists for.
-    if (removed.device.main_kv_pages > details.demand.final_removed.device.main_kv_pages ||
-        removed.device.backend_kv_pages > details.demand.final_removed.device.backend_kv_pages ||
-        removed.device.state_slots > details.demand.final_removed.device.state_slots ||
-        removed.host.kv_bytes > details.demand.final_removed.host.kv_bytes ||
-        removed.host.state_slots > details.demand.final_removed.host.state_slots) {
+    const detail::PhysicalResources after = owner_exclusive_resources(source);
+
+    // THE DIAGNOSTIC PRECEDES THE SUBTRACTION, BECAUSE THE SUBTRACTION THROWS.
+    //
+    // There USED TO BE two sites that raised the underflow: `checked_resource_difference(before, after)`
+    // immediately below, and a planned-vs-actual check at the end of this function -- removed by the #13 fix
+    // (see its derivation below, where the check itself was). The print lived BETWEEN them, so an occurrence
+    // at the FIRST site produced no attribution at all: `checked_resource_difference` throws, so control never
+    // reached the print. That is not hypothetical -- the 2026-10-02 12:06:42 occurrence is unattributable for
+    // exactly this reason, and its journal was read as evidence anyway, in plan.md.
+    //
+    // ONE SITE REMAINS, and it is still ahead of the print's successor. `resource_subtraction_underflows` is
+    // the same predicate the throw uses, so this cannot disagree with it about which axes are checked; and
+    // `positive_resource_difference` saturates, so the delta is safe to compute and print even when the
+    // subtraction is the thing that would throw. The `exceeds_plan` arm below is now a RECORD rather than an
+    // imminence test, kept because the skew line is the only evidence a state-dependent over-count would leave.
+    const bool subtraction_underflows = detail::resource_subtraction_underflows(before, after);
+    const detail::PhysicalResources delta =
+        subtraction_underflows ? detail::PhysicalResources{}
+                               : detail::positive_resource_difference(before, after);
+    // THE PLANNED-VS-ACTUAL COMPARISON IS NOT AN INVARIANT, AND AS OF THE #13 FIX IT IS NO LONGER A THROW.
+    //
+    // `removed` is `before - after`, and the subtraction check below already refuses `after > before`, so
+    // `removed <= before` on EVERY axis. Therefore `removed > planned` IMPLIES `before > planned`: this
+    // comparison can fire ONLY when the source held MORE at execution than the plan sampled -- which is
+    // exactly the legitimate case. A share released between plan and execution makes a page exclusive to this
+    // source (`owner_exclusive_resources` skips any page with `address_references > 1`), so `before` rises
+    // above the plan-time snapshot and the LARGER removal is correct.
+    //
+    // The other candidate -- an over-count in `owner_exclusive_resources` -- mostly cannot produce it either.
+    // NOT because `planned` is "the same value", which is what this comment claimed until a review pass checked
+    // it: `final_removed` is `source_resources` (`request_plan.cpp:1423`) ACCUMULATED WITH the pressure-victim
+    // removals and `ownership_transfer_delta.removed` (`pressure.cpp:2433-2434`), so `planned` is NOT the same
+    // quantity sampled twice -- it is a SUM, and the comparison is looser than "same function" implies. What
+    // still holds is the cancellation: a SYSTEMATIC over-count inflates both of `owner_exclusive_resources`'s
+    // samples equally and they agree. A STATE-DEPENDENT one could differ, and that residual case is precisely
+    // what the skew line below separates, since it prints `planned` / `before` / `after` -- so it stays
+    // COUNTABLE rather than merely unrefuted.
+    // What the throw could not do was tell the two apart: it killed the request on both, turning a correct
+    // state into `WORKER RECOVER` + HTTP 500 + occupancy owned by nothing (#9's stage one, reproduced at
+    // 1060 pages / 1 slot / 1.24 GB on 2026-10-02). It is RECORDED here instead, and the removal proceeds.
+    const bool exceeds_plan =
+        !subtraction_underflows &&
+        detail::resource_subtraction_underflows(details.demand.final_removed, delta);
+    if (subtraction_underflows || exceeds_plan) {
+        // UNCAPPED, and on the event rather than on a schedule: it is rare by nature, and a capped or
+        // sampled print would hide the very occurrences the instrument exists for.
         std::fprintf(
             stderr,
-            "[engine] mat-remove skew: planned main_kv=%u backend_kv=%u dev_slots=%u host_slots=%u "
+            "[engine] mat-remove skew: site=%s planned main_kv=%u backend_kv=%u dev_slots=%u host_slots=%u "
             "host_kv=%zu | before main_kv=%u backend_kv=%u dev_slots=%u host_slots=%u host_kv=%zu "
             "| after main_kv=%u backend_kv=%u dev_slots=%u host_slots=%u host_kv=%zu "
-            "| removed main_kv=%u backend_kv=%u dev_slots=%u host_slots=%u host_kv=%zu "
+            "| delta(main_kv=%u backend_kv=%u dev_slots=%u host_slots=%u host_kv=%zu) "
             "| source_index=%u reuse=%d\n",
+            subtraction_underflows ? "subtraction(after>before)" : "gain(before>planned, expected)",
             details.demand.final_removed.device.main_kv_pages,
             details.demand.final_removed.device.backend_kv_pages,
             details.demand.final_removed.device.state_slots,
@@ -666,12 +696,26 @@ void ProgramImpl::prepare_consumed_source(MaterializationTransaction& transactio
             before.host.state_slots, before.host.kv_bytes,
             after.device.main_kv_pages, after.device.backend_kv_pages, after.device.state_slots,
             after.host.state_slots, after.host.kv_bytes,
-            removed.device.main_kv_pages, removed.device.backend_kv_pages, removed.device.state_slots,
-            removed.host.state_slots, removed.host.kv_bytes,
+            delta.device.main_kv_pages, delta.device.backend_kv_pages, delta.device.state_slots,
+            delta.host.state_slots, delta.host.kv_bytes,
             transaction.source_index, static_cast<int>(details.reuse));
         std::fflush(stderr);
     }
-    (void)checked_resource_difference(details.demand.final_removed, removed);
+
+    // THE SUBTRACTION STILL THROWS, and it is the one that can. `after > before` means the source's exclusive
+    // counts ROSE while the worker held the engine's execution mutex (`engine_core.h`, the `execution_lock` in
+    // the worker loop -- cited by SYMBOL, because the line number this comment used to name had drifted), so
+    // nothing else can have released a share: that really is an accounting fault, and it is the assertion worth
+    // keeping.
+    //
+    // **IT IS NOT REACHED "BEFORE THE REMOVAL IS APPLIED", which is what this said until a review pass checked
+    // it.** The destructive truncation, the state releases and `release_unreferenced` all run ABOVE this point
+    // (`:596-611`), so a throw here unwinds from the HALF-APPLIED state -- which is precisely the state #9 is
+    // about, not a safe one. Saying it was safe inverted the risk this line carries.
+    //
+    // The planned-vs-actual check that used to follow is gone (see the derivation above): its own reachable
+    // condition is a correct state, so it could only ever convert a correct state into a recovery.
+    (void)checked_resource_difference(before, after);
 }
 
 void ProgramImpl::prepare_materialization(MaterializationTransaction& transaction) {
@@ -2241,10 +2285,148 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
                     // would silently move the semantics of every past reading -- and this is reported
                     // beside it.
                     //
-                    // The KV half stays pool-level ON PURPOSE, and the reason is stated rather than
-                    // implied: no per-sequence host-KV byte figure is reachable at this site (the tally
-                    // below covers state slots only), so a per-victim KV test would have to be invented,
-                    // and an invented number is worse than a labelled pool one.
+                    // The KV half, ASKED PER VICTIM (2026-10-04). **This comment used to say the opposite and
+                    // it was FALSE:** it claimed "no per-sequence host-KV byte figure is reachable at this
+                    // site (the tally below covers state slots only), so a per-victim KV test would have to be
+                    // invented." `owner_exclusive_resources(victim)` computes exactly that figure -- device
+                    // KV pages per axis, and host KV bytes -- and the site's own `release_materialization_victim`
+                    // already calls it two hundred lines down (`out.delta.removed = owner_exclusive_resources
+                    // (continuation_states[index])`, `:2014`). Nothing had to be invented; the two halves were
+                    // simply not both asked. The operator's framing is why it matters: the defect is not
+                    // exhaustion but that KV is DESTROYED where a host copy was possible, and a pool-level
+                    // comparison cannot tell "this victim's pages had room" from "the pool had some room".
+                    //
+                    // `demote_possible` (the state half, above) asks `can_demote_to_host`, the demote path's
+                    // own precondition. THE KV HALF HAS NO SUCH PREDICATE -- `can_demote_to_host` exists only
+                    // for state images -- but it does not need one: a `PressureKVDecisionKind::DemoteToHost`
+                    // on this victim's bundle is constructible whenever its pages fit the host arena (that is
+                    // what `prepare_pressure_bookkeeping` builds for a RETAIN work, `:1631`). So for KV the
+                    // room question IS the eligibility question, and it is asked with the arena's own query,
+                    // the same one the planner's feasibility site uses (`pressure.cpp:2410`).
+                    //
+                    // PURE: `fit_after_page_releases` is `const` and simulates on a copy, and the headroom is
+                    // the pool's cached-reading query -- no `allow()`, no pinning, no mutation.
+                    //
+                    // **THE UNIT IS `ResidentData`, CORRECTED 2026-10-04, AND IT WAS WRONG BY DEFAULT.** The
+                    // first version called `owner_exclusive_resources(victim)` -- the RELEASE figure, which
+                    // for an ACTIVE address adds the entitlement reservation (`entitlement - mapped`, the
+                    // whole output budget's page room). A demote copies pages and a reservation holds none, so
+                    // that figure asked the host arena for far more than a demote needs, biasing every verdict
+                    // toward `blocked`; and since `active()` is set by `bind_sequence_kv`, the SAME victim
+                    // reported different counts at different moments -- the recorded 34-vs-237 pair on one
+                    // victim, and the 4.6x spread between two runs of the same suite. `ResidentData` counts
+                    // the exclusive device-resident pages only, which is what a demote would copy.
+                    // NOTE THE ASYMMETRY WITH THE EVICTION'S OWN RELIEF, stated rather than hidden: the
+                    // eviction frees the RELEASE figure (reservation included), so for an active victim the
+                    // pages this instrument asks about are FEWER than the pages the eviction relieved. That is
+                    // the intended reading -- "the KV data could have been copied" is about data.
+                    const detail::PhysicalResources victim_owned =
+                        victim.kv ? owner_exclusive_resources(victim, KVOwnershipCount::ResidentData)
+                                  : detail::PhysicalResources{};
+                    const std::uint32_t victim_kv_pages =
+                        victim_owned.device.main_kv_pages + victim_owned.device.backend_kv_pages;
+                    // *** THE ENTITLEMENT A DEMOTE LEAVES STANDING (2026-10-06). ***
+                    // This is the ONE quantity that separates #6's two candidate remedies, and it is
+                    // measurable here because BOTH figures come from the same call, on the same victim, at
+                    // the same moment. An eviction frees `TransitionEffect`, which for an ACTIVE address ADDS
+                    // the entitlement reservation (`entitlement - mapped`, pages the request may use but has
+                    // never materialised); a demote copies `ResidentData` and LEAVES that reservation
+                    // standing. So the difference is exactly what a demote does not relieve -- and #6's
+                    // mechanism says a demote loses because its relief (resident only) is under the
+                    // reservation it must offset.
+                    // READ IT AS: gap near the reservation-minus-relief margin -> the demote's RELIEF is the
+                    // lever; gap near 0 -> the release adds nothing beyond resident pages, the relief is
+                    // already fully counted, and only the RESERVATION itself remains; a negative or absurd gap
+                    // -> an accounting error in the figures, not a mechanism.
+                    const detail::PhysicalResources victim_release =
+                        victim.kv ? owner_exclusive_resources(victim, KVOwnershipCount::TransitionEffect)
+                                  : detail::PhysicalResources{};
+                    const std::uint64_t victim_release_pages =
+                        static_cast<std::uint64_t>(victim_release.device.main_kv_pages) +
+                        victim_release.device.backend_kv_pages;
+                    const std::uint64_t victim_gap_pages =
+                        victim_release_pages > victim_kv_pages ? victim_release_pages - victim_kv_pages : 0U;
+                    record_victim_entitlement_gap(victim_gap_pages);
+                    HostKVFit victim_kv_fit = HostKVFit::Blocked;
+                    // `!` IS "NOT ASKED", NOT A VERDICT. With `victim_kv_pages == 0` the query never runs and
+                    // `victim_kv_fit` keeps its initialiser, so printing `blocked` there would read as a
+                    // MEASUREMENT of a blocked demote when nothing was measured at all -- the same
+                    // absence-is-not-zero trap the counters above exist to avoid, inside the print. Found by
+                    // reading the first real lines (2026-10-04, e2e window): `victim_kv_pages=0
+                    // victim_kv_fit=blocked` appeared twice and meant "no KV to demote".
+                    const char* victim_kv_fit_label = "!";
+                    if (victim_kv_pages != 0U) {
+                        ++evictions_kv_pages_;
+                        evictions_kv_pages_total_ += victim_kv_pages;                        // THE REQUEST SET MUST COVER EVERY PAGE, and the two null checks below CANNOT fire:
+                        // `owner_exclusive_resources` already threw (`missing Backend KV stores`,
+                        // `sequence owner resources have no physical stores`) before returning a non-zero
+                        // count for the axis it guards. They are kept as belt-and-braces, and this note is
+                        // here because a guard that *could* silently drop a request would make the fit
+                        // look OPTIMISTIC -- an instrument that under-asks the arena is the exact defect
+                        // class this investigation keeps meeting.
+                        // THE REMAINING `blocked` CASE IS REAL AND DIFFERENT: with the host tier disabled
+                        // (`host_kv_extents == nullptr`, `--host-kv-mib 0`) a demote is genuinely impossible,
+                        // so `blocked` is the honest answer there too, not an artifact.
+                        if (host_kv_extents != nullptr && text_kv_pages != nullptr) {
+                            // Two axes, one arena: text and backend Host replicas share `host_kv_extents`
+                            // (`owner_exclusive_resources` uses it for both), so one query covers both, but
+                            // each axis needs ITS OWN layout -- their strides differ.
+                            HostKVPageLayout axis_layouts[2];
+                            HostKVAllocationRequest requests[2];
+                            std::size_t request_count = 0;
+                            if (victim_owned.device.main_kv_pages != 0U) {
+                                axis_layouts[request_count] =
+                                    plan_host_kv_page_layout(text_kv_pages->physical_pool().geometry());
+                                requests[request_count] = HostKVAllocationRequest{
+                                    .layout = &axis_layouts[request_count],
+                                    .pages  = victim_owned.device.main_kv_pages,
+                                };
+                                ++request_count;
+                            }
+                            if (victim_owned.device.backend_kv_pages != 0U && backend_kv_pages != nullptr) {
+                                axis_layouts[request_count] =
+                                    plan_host_kv_page_layout(backend_kv_pages->physical_pool().geometry());
+                                requests[request_count] = HostKVAllocationRequest{
+                                    .layout = &axis_layouts[request_count],
+                                    .pages  = victim_owned.device.backend_kv_pages,
+                                };
+                                ++request_count;
+                            }
+                            const HostKVFitResult fit = host_kv_extents->fit_after_page_releases(
+                                {}, {},
+                                std::span<const HostKVAllocationRequest>(requests, request_count),
+                                pinned_host_pool != nullptr
+                                    ? pinned_host_pool->growth_headroom_bytes()
+                                    : 0U);
+                            victim_kv_fit = fit.fit;
+                        }
+                        switch (victim_kv_fit) {
+                        case HostKVFit::Pinned:
+                            ++evictions_kv_fit_pinned_;
+                            evictions_kv_fit_pinned_pages_ += victim_kv_pages;
+                            break;
+                        case HostKVFit::Growable:
+                            ++evictions_kv_fit_growable_;
+                            evictions_kv_fit_growable_pages_ += victim_kv_pages;
+                            break;
+                        case HostKVFit::Blocked:
+                            ++evictions_kv_fit_blocked_;
+                            evictions_kv_fit_blocked_pages_ += victim_kv_pages;
+                            break;
+                        }
+                        victim_kv_fit_label = host_kv_fit_name(victim_kv_fit);
+                        // THE PER-VICTIM RECORD. The window TOTALS above could not say WHY two identical
+                        // runs differed by 5.8x on `fit_pinned_pages` -- one huge victim and many small ones
+                        // move a total the same way, and that difference is the whole question (a
+                        // 3,000-page victim that could have been preserved is not the same defect as
+                        // fifty 1-page ones). Recording each victim with its SIZE (frontier, and its own
+                        // resident pages) makes the window a distribution, so the spread is explained
+                        // rather than merely observed -- and `restorable` is carried because a victim that
+                        // could not have been demoted anyway is a different case, which is the distinction
+                        // `demotable`/`demote_possible` already draw at this site.
+                        record_eviction_kv(victim_kv_pages, victim.execution_frontier, state_restorable,
+                                           victim_kv_fit);
+                    }
                     // WOULD A DEMOTE OF THIS VICTIM HAVE BEEN CONSTRUCTIBLE? The pool-level `demotable`
                     // above cannot say -- it compares pool totals, so it reports room a victim's own
                     // footprint may not fit, and it says nothing about the state's eligibility. This asks
@@ -2270,6 +2452,24 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
                     // against the denominator printed on the line itself, never across the change.
                     if (demotable) { ++demotable_evictions_; }
                     if (victim_room && state_restorable) { ++evictions_with_victim_room_; }
+                    // THE AXIS THE EVICTION RELIEVES. `victim_dev_slots`/`victim_host_slots` are what the
+                    // victim held (the tally above); evicting frees exactly that. Counted here because the
+                    // print below is rate-limited and the population is what the axis question needs.
+                    if (victim_device_slots != 0) { ++evictions_victim_device_slots_; }
+                    if (victim_host_slots != 0) { ++evictions_victim_host_slots_; }
+                    // THE NEEDED AXIS, beside the RELIEVED one just above -- and this is the pair the eviction
+                    // site could not form until 2026-10-04. `physical_peak_additional` lives on the PLAN, so
+                    // the deficit had to be plumbed onto the transaction (`PressureWork::planned_deficit`).
+                    // NEITHER HALF IS DECISIVE ALONE: an eviction relieving host-state slots while the plan
+                    // needed DEVICE KV is incoherent, and with only the relief side that case is invisible --
+                    // which is how a fullness hypothesis survived a window that actually refutes it.
+                    // A plan can need several axes at once, so these do NOT sum to the eviction count.
+                    const detail::PhysicalResources& deficit = work.planned_deficit;
+                    if (deficit.device.main_kv_pages != 0U)    { ++evictions_deficit_device_main_kv_; }
+                    if (deficit.device.backend_kv_pages != 0U) { ++evictions_deficit_device_backend_kv_; }
+                    if (deficit.device.state_slots != 0U)      { ++evictions_deficit_device_state_; }
+                    if (deficit.host.state_slots != 0U)        { ++evictions_deficit_host_state_; }
+                    if (deficit.host.kv_bytes != 0U)           { ++evictions_deficit_host_kv_; }
                     // **THE #6 POPULATION, EXACTLY.** `victim_room` says the victim's OWN slots fitted;
                     // `demote_possible` says the store's demote preconditions were all met
                     // (`demote_refusal == None`). Together they are "a demote was fully available and the
@@ -2277,16 +2477,24 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
                     // already reported (`evictions_with_victim_room`, and `demote_possible` on the printed
                     // line) but their CONJUNCTION was not, and the print is rate-limited to the first 8 then
                     // every 512th: measured 2026-10-02, 57 evictions produced 8 lines, and 7 of those 8 were
-                    // `already-on-host` -- a refusal that is CORRECT, so the printed sample overstated the
-                    // defect by 7x. This counter cannot be sampled away.
+                    // `already-on-host`. **This comment used to call that refusal CORRECT, and 2026-10-04
+                    // corrected it in place: it is not benign.** State on host + evicted = the host slots are
+                    // freed and the copy is DESTROYED, and `restorable=1` means a checkpoint died; what is
+                    // moot is the DEMOTE, not the loss. The printed sample is still biased to the window's
+                    // start, but it does not overstate the defect in the direction claimed here.
                     if (victim_room && demote_possible) { ++evictions_demote_possible_; }
+                    // EVERY eviction's refusal reason, per clause. The `demote_refusal=` field below is
+                    // rate-limited and its first 8 lines are the window's FIRST 8 evictions, so the printed
+                    // distribution is biased to the start of the window; this one is the whole population.
+                    // Denominator: `demotable_eviction_checks_`, incremented on the next line.
+                    ++demote_refusal_at_eviction_[static_cast<std::size_t>(demote_refusal)];
                     ++demotable_eviction_checks_;
                     if (demotable_eviction_checks_ <= 8ULL ||
                         demotable_eviction_checks_ % 512ULL == 0ULL) {
                         std::fprintf(stderr,
                                      "[engine] private victim evicted: demotable=%d restorable=%d "
                                      "session=%016llx cont=%u frontier=%u endpoint=%d rewrite=%d "
-                                     "anchors=%zu victim_host_slots=%u victim_dev_slots=%u host_state_slots=%u/%llu host_kv=%zu/%llu "
+                                     "anchors=%zu victim_host_slots=%u victim_dev_slots=%u victim_kv_pages=%u victim_kv_fit=%s host_state_slots=%u/%llu host_kv=%zu/%llu "
                                      "victim_room=%d demote_possible=%d demote_refusal=%s "
                                      "checked=%llu demotable_total=%llu\n",
                                      static_cast<int>(demotable),
@@ -2296,6 +2504,7 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
                                      static_cast<int>(victim.endpoint_valid),
                                      static_cast<int>(victim.rewrite_checkpoint.valid),
                                      victim.long_anchors.size(), victim_host_slots, victim_device_slots,
+                                     victim_kv_pages, victim_kv_fit_label,
                                      usage.host_state_slots,
                                      static_cast<unsigned long long>(room.host.state_slots),
                                      usage.host_kv_bytes,
@@ -2358,11 +2567,7 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
             return out;
         }
 
-        constexpr std::array pressure_resources{
-            runtime::ContextResourceClass::State,
-            runtime::ContextResourceClass::MainKV,
-            runtime::ContextResourceClass::BackendKV,
-        };
+        const auto& pressure_resources = runtime::k_pressure_allocation_order;
         try {
             for (const runtime::ContextResourceClass resource : pressure_resources) {
                 bool has_copy = false;
@@ -2498,11 +2703,7 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
         }
         transaction.pressure_cursor = transaction.pressure.size();
 
-        constexpr std::array pressure_resources{
-            runtime::ContextResourceClass::State,
-            runtime::ContextResourceClass::MainKV,
-            runtime::ContextResourceClass::BackendKV,
-        };
+        const auto& pressure_resources = runtime::k_pressure_allocation_order;
         for (const runtime::ContextResourceClass resource : pressure_resources) {
             const std::size_t index = context_resource_index(resource);
             const std::uint8_t bit  = static_cast<std::uint8_t>(1U << index);

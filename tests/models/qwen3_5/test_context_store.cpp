@@ -13,7 +13,10 @@
 #include <exception>
 #include <iostream>
 #include <new>
+#include <cstdio>
+#include <string>
 #include <string_view>
+#include <unistd.h>
 #include <vector>
 
 namespace {
@@ -22,6 +25,31 @@ namespace q36   = ninfer::models::qwen3_5;
 namespace store = ninfer::models::qwen3_5::detail;
 
 int failures = 0;
+
+// THE CENSUS VERDICT IS A PRINT, SO THE TEST HAS TO READ STDERR. A line nobody reads is the defect this whole
+// instrument exists to avoid: `[census] ... TOTAL address_reserved_pages=... unaccounted=...` has no return
+// value, so without this a case asserting on it would pass by measuring nothing at all.
+std::string capture_census(store::KVAddressSpaceStore& addresses, const char* label) {
+    const int saved = dup(STDERR_FILENO);
+    FILE* sink = std::tmpfile();
+    if (saved < 0 || sink == nullptr) {
+        if (sink != nullptr) { std::fclose(sink); }
+        if (saved >= 0) { close(saved); }
+        return {};
+    }
+    (void)std::fflush(stderr);
+    dup2(fileno(sink), STDERR_FILENO);
+    addresses.census(label);
+    (void)std::fflush(stderr);
+    dup2(saved, STDERR_FILENO);
+    close(saved);
+    std::rewind(sink);
+    std::string out;
+    char buffer[512];
+    while (std::fgets(buffer, sizeof buffer, sink) != nullptr) { out += buffer; }
+    std::fclose(sink);
+    return out;
+}
 
 void expect(bool condition, std::string_view message) {
     if (condition) { return; }
@@ -415,6 +443,70 @@ void test_kv_store(ninfer::DeviceContext& device) {
             !extents.can_allocate_after_page_releases({}, last_reference_release,
                                                       eight_page_request),
         "last address-reference release contributes exact Host allocation credit");
+
+    // ***THE STORE-SIDE REFUSAL SPLIT (2026-10-05), AND THE CONTROL IS THE POINT.*** These returns happen
+    // BEFORE the arena is asked, so an ARENA-side split counts nothing for them -- measured on QA: the veto
+    // fired 18 times and EVERY arena-side reason stayed 0, which is how the instrument was found to be in the
+    // wrong layer.
+    //
+    // **THIS CONTROL WAS WRONG TWICE BEFORE IT WAS RIGHT, and both errors were mine, not the engine's:**
+    //   1. I put this page in the PLAIN-release slot. It is HOST-ONLY and still address-referenced, so
+    //      `can_release_page_replica` refuses it CORRECTLY -- releasing it would destroy the last copy. The
+    //      right slot is the LAST-REFERENCE list, which is what the planner uses for such a page.
+    //   2. I then assumed the refusal was `already_marked` (the stamp), then that it was an engine bug. The
+    //      probe said `store_mark_cannot_release_replica` -- a THIRD cause, and the correct one.
+    // So the control below asserts the TRUE two-directional behaviour, and it is what pins the split.
+    {
+        using Reason = ninfer::HostKVBlockReason;
+        const std::uint64_t cannot_before =
+            extents.block_reason_count(Reason::StoreMarkCannotReleaseReplica);
+        const std::array plain_release{store::HostKVPageReplicaRelease{
+            .pages = &pages,
+            .page  = logical_pages[1],
+        }};
+
+        // WRONG SLOT: a host-only, still-referenced page as a PLAIN release is refused -- correctly.
+        const auto wrong_slot =
+            extents.fit_after_page_releases(plain_release, {}, seven_page_request, 1U << 30U);
+        expect(wrong_slot.fit == ninfer::HostKVFit::Blocked,
+               "a host-only referenced page as a PLAIN release is Blocked");
+        expect(extents.block_reason_count(Reason::StoreMarkCannotReleaseReplica) == cannot_before + 1U,
+               "and store_mark_cannot_release_replica names it -- the predicate, not a catch-all");
+
+        // RIGHT SLOT: the same page in the LAST-REFERENCE list is accepted, so the split is not simply
+        // counting every call.
+        const std::uint64_t cannot_after = extents.block_reason_count(Reason::StoreMarkCannotReleaseReplica);
+        (void)extents.fit_after_page_releases({}, plain_release, seven_page_request, 1U << 30U);
+        expect(extents.block_reason_count(Reason::StoreMarkCannotReleaseReplica) == cannot_after,
+               "the SAME page in the LAST-REFERENCE slot adds no refusal -- the split distinguishes them");
+    }
+
+    // ***THE CLASSIFIER TABLE (2026-10-05), and this is the unit test for the FIX ITSELF.*** The planner
+    // pushed EVERY released host page into the last-reference list; the store refuses any shared page there
+    // (correctly), and that refusal made every preserving plan read `Blocked` -- 13 of 13 veto refusals
+    // measured as `store_mark_not_sole_reference`. The classification now lives in ONE function so this
+    // table and the planner share the specification. THE FOURTH ROW IS THE BUG CASE: a host-only page with
+    // more than one reference must NOT be offered at all.
+    {
+        using ninfer::HostReleaseKind;
+        const auto kind = [](bool host, bool device, std::uint32_t refs) {
+            return ninfer::classify_host_release(host, device, refs);
+        };
+        expect(kind(true, true, 1U) == HostReleaseKind::Plain,
+               "classifier: a DEVICE-RESIDENT page is a PLAIN release even at one reference (device wins)");
+        expect(kind(true, true, 3U) == HostReleaseKind::Plain,
+               "classifier: a device-resident shared page is still a PLAIN release");
+        expect(kind(true, false, 1U) == HostReleaseKind::LastReference,
+               "classifier: a host-only page at ONE reference is a LAST-REFERENCE release");
+        expect(kind(true, false, 3U) == HostReleaseKind::NotReleased,
+               "classifier: a HOST-ONLY SHARED page is NOT offered -- THE BUG CASE, refused by the store");
+        expect(kind(true, false, 0U) == HostReleaseKind::NotReleased,
+               "classifier: a host-only page with no references is not a last reference either");
+        expect(kind(false, true, 1U) == HostReleaseKind::NotReleased,
+               "classifier: a page with no host replica is never a host release");
+        expect(kind(false, false, 0U) == HostReleaseKind::NotReleased,
+               "classifier: and neither is one with nothing resident");
+    }
     auto restore_reservation = physical_pages.reserve(2);
     expect(restore_reservation.has_value(), "KV Host restore Device reservation");
     const std::array restore_destinations{
@@ -449,13 +541,65 @@ void test_kv_store(ninfer::DeviceContext& device) {
                                 device.transfer_stream);
     CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
     (void)extents.publish(std::move(*final_host_backup));
+    // THE NON-ZERO CASE -- THE ONE THAT MAKES EVERY OTHER CENSUS ASSERTION MEAN SOMETHING. All the others
+    // expect zero, and a counter hard-coded to zero satisfies every one of them. The state it needs is "no
+    // address reference, but a surviving source pin" -- which is #9's second candidate exactly: a pin that
+    // outlived its owner, holding host KV nothing else refers to.
+    //
+    // PIN **AFTER** THE RELEASE, and the first version of this case did it the other way round: `addresses.
+    // release` REFUSES while a source pin is held (the pin is precisely what stops the release), so pinning
+    // first made the RELEASE fail and cascaded eleven downstream cases with it. The handle is captured before
+    // the release only because `logical_page` needs a valid address; the page itself outlives the address.
+    const auto pinned_page = addresses.logical_page(*address, 0);
     expect(addresses.release(*address), "catalogued KV address releases");
-    expect(extents.release_unreferenced() == host_layout.page_stride &&
+    pages.pin_source(pinned_page);
+    const auto with_pin = extents.release_unreferenced();
+    expect(with_pin.released_bytes == 0 && with_pin.retained_pinned == 1 &&
+               with_pin.retained_referenced == 0,
+           "a source pin retains its Host extent, and the census counts it as PINNED not as referenced");
+
+    // ...and dropping the pin must release the SAME extent, so the pair distinguishes the two states instead
+    // of asserting one of them. BOTH HALVES OF THE CENSUS, where the assertion used to be only the first:
+    // `released_bytes` says what went, the retained counts say what STAYED, and the latter were not observable
+    // at all until this change -- a page kept by a live address, or by a pin that outlived its owner, stranded
+    // host KV silently (#9).
+    pages.unpin_source(pinned_page);
+    const auto teardown = extents.release_unreferenced();
+    expect(teardown.released_bytes == host_layout.page_stride &&
+               teardown.retained_referenced == 0 && teardown.retained_pinned == 0 &&
                host_arena.occupied_bytes() == 0,
-           "address teardown reclaims its zero-reference Host extent");
+           "address teardown reclaims its zero-reference Host extent and retains nothing");
     expect(!addresses.valid(*address) && pages.occupied() == 0 &&
                physical_pages.allocated_pages() == 0 && physical_pages.reserved_pages() == 0,
            "KV release invalidates generations and closes physical ownership");
+
+    // THE POSITIVE BRANCH -- the reading that MATTERS, and the one no production path can produce.
+    //
+    // At the census's real call site `fail_all_cleanup` has already destroyed the transaction and with it every
+    // non-address holder, so a positive reading there IS the leak (#9), not an expectation. That state cannot
+    // be staged in production, so it is staged HERE, where the pool is EMPTY: hold a reservation in a LOCAL,
+    // which no address owns, and require the census to call it what it is. Without this, the branch is only
+    // asserted to be unreachable -- a claim that reads as verified while nothing checks it.
+    {
+        auto held = physical_pages.reserve(2);
+        expect(held.has_value(), "could not reserve the device pages the positive census case needs");
+        const std::string with_orphan = capture_census(addresses, "text");
+        const std::string::size_type at = with_orphan.find("TOTAL");
+        const std::string said =
+            at == std::string::npos ? std::string("<no TOTAL line>") : with_orphan.substr(at);
+        expect(with_orphan.find("(POSITIVE:") != std::string::npos,
+               std::string("the census does not call reserved pages with no owner a FINDING -- the one reading "
+                           "it exists for; it said: ") + said);
+        expect(with_orphan.find("(exact:") == std::string::npos,
+               std::string("a reservation no address owns was reported as accounted; it said: ") + said);
+        // `held` dies at the end of this block, so the next read must return to exact -- the pair distinguishes
+        // the two states instead of asserting one of them.
+    }
+    {
+        const std::string after = capture_census(addresses, "text");
+        expect(after.find("(exact:") != std::string::npos,
+               "the census does not return to 'exact' once the unowned reservation is released");
+    }
 
     // Verify crosses a page boundary, but the terminal commit consumes only its first column.
     const auto terminal = addresses.create_active(3, 0);
@@ -748,10 +892,45 @@ void test_kv_store(ninfer::DeviceContext& device) {
                physical_pages.allocated_pages() == 6 && physical_pages.reserved_pages() == 2,
            "staged retained fork transfers the old tail capacity to the active entitlement");
 
+    // THE RESERVATION CENSUS, PINNED TO WHAT IT ACTUALLY PRINTS. Observed at this point, not assumed:
+    // `[census] text TOTAL address_reserved_pages=2 pool_reserved_pages=2 unaccounted=0 (exact: ...)`.
+    //
+    // WHY HERE, AND WHY IT MATTERS THAT THE SUM IS NON-ZERO: the pool holds 2 reserved pages at this line, so
+    // `unaccounted` has a non-zero counterparty and the mutation control -- over-count the sum -- can actually
+    // flip it NEGATIVE. At a point where 0 == 0, doubling the sum would still read `exact` and the control
+    // would prove nothing while appearing to pass.
+    {
+        const std::string census = capture_census(addresses, "text");
+        // THE VERDICT GOES INTO THE MESSAGE, because a failure that says only "did not match" cannot tell a
+        // reader whether the line changed its answer or stopped printing at all -- and the mutation control
+        // depends on seeing which.
+        const std::string::size_type total = census.find("TOTAL");
+        const std::string verdict =
+            total == std::string::npos ? std::string("<no TOTAL line: the census did not print>")
+                                       : census.substr(total);
+        expect(census.find("TOTAL address_reserved_pages=2 pool_reserved_pages=2 unaccounted=0") !=
+                   std::string::npos,
+               std::string("the reservation census does not account for exactly the 2 reserved pages the "
+                           "pool holds; it said: ") + verdict);
+        expect(census.find("(exact:") != std::string::npos,
+               std::string("the census does not report 'exact' where every reserved page belongs to a live "
+                           "address; it said: ") + verdict);
+
+        // (The POSITIVE case is staged further down, once the pool is EMPTY: reserving here fails, because the
+        // pool is full at this point -- allocated 6 + reserved 2 -- and a case that cannot obtain its own
+        // reservation measures nothing while reporting a failure about the census.)
+    }
+
     addresses.deactivate(*staged_destination);
-    expect(addresses.release(*staged_destination) && addresses.release(*retained) &&
-               addresses.release(*filler) &&
-               extents.release_unreferenced() == host_layout.page_stride && pages.occupied() == 0 &&
+    const bool released = addresses.release(*staged_destination) && addresses.release(*retained) &&
+                          addresses.release(*filler);
+    // The retained side is asserted here too: this case is named "closes ownership without leaks", and until
+    // the census existed the only way to read that was `released_bytes` on its own -- which cannot distinguish
+    // "released everything" from "released some and kept the rest pinned".
+    const auto fork_teardown = extents.release_unreferenced();
+    expect(released && fork_teardown.released_bytes == host_layout.page_stride &&
+               fork_teardown.retained_referenced == 0 && fork_teardown.retained_pinned == 0 &&
+               pages.occupied() == 0 &&
                physical_pages.allocated_pages() == 0 && physical_pages.reserved_pages() == 0,
            "staged retained fork closes Device and Host ownership without leaks");
 }

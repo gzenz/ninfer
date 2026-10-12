@@ -10,6 +10,29 @@ semantics: `plan.md` → **Current state** (actionable: what is fixed and its ev
 instruments with their validation, the open-claims list). Each `tools/ops` script's header records the
 failure it prevents.
 
+## The loop — the order an issue is worked in
+
+**One issue at a time, and the question for each is NOT "is this done" but "how much analysis does this one
+need before a fix can be written".** Analysis means tests or a soak; which, and how much, is decided **case by
+case from what the issue is** — never by default, and never the same for two issues. The dividing line is
+whether the MECHANISM is known:
+
+- **Mechanism unknown → the analysis is what names it**, and no fix is written before that. A fix chosen
+  before the mechanism is named is a guess, and the two candidates usually imply OPPOSITE fixes.
+- **Mechanism known → analysis only has to show the fix addresses it.**
+
+Then, in order:
+
+1. **Implement the fix.**
+2. **Soak it, to see whether the situation MOVED.** The soak measures the fix; it does not celebrate it. A
+   fix that moves nothing measurable is a RESULT, recorded as one.
+3. **Only then choose:** commit it, or move to the next issue — the latter when the change did not move
+   quality much, or when it uncovered new issues. Both are legitimate outcomes. What is not legitimate is
+   committing without the measurement, or holding a measured fix out of the queue indefinitely.
+
+**Committing is a decision taken at step 3, not a step in its own right** — it is never what "continue" means,
+and a change being finished is not authorization to commit it.
+
 ## Instruments — run these; do not re-derive them by hand
 
 | when | run | it answers |
@@ -18,6 +41,7 @@ failure it prevents.
 | before believing a deploy | `bash tools/ops/verify-deploy.sh ['new string']` | running == built, built == tree, and (with a string) that the change is IN the running exe. It says which of the three it could not check. |
 | after a killed swap, or any time QA+monitor look wrong | `bash tools/ops/recover-after-killed-swap.sh` | the orphaned test server, QA, and **the sentinel** — the one that is silent when missing. |
 | when arming a monitor | `bash tools/ops/watcher-token-reachability.sh` | **can every alert token still fire?** A token that matches nothing reads exactly like a quiet system. |
+| **on every commit** (run by the gate, beside the token check) | `bash tools/ops/sentinel-pattern-test.sh` | **do the wedge sentinel's journal patterns still match a real line?** Theirs matched nothing for their whole life and restarted a healthy engine mid-load (2026-10-04). |
 | after touching a startup path or a config flag | `bash tools/e2e/startup-smoke.sh` (GPU window) | do YaRN and `--vision-cpu` still START. No other gate covers them; e2e, ctest and the soak all passed over a tree where they were broken. |
 | before citing a test binary | `bash tools/ops/check-test-binaries.sh` | is that executable built from the source you think? |
 | to pin a hook in a fresh clone | `git config core.hooksPath tools/hooks` | `.git/hooks` is IGNORED when `core.hooksPath` is set, so symlinking there does nothing. |

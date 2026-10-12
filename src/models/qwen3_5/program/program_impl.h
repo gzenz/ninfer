@@ -213,6 +213,13 @@ struct ResourceCandidateState {
     // aggregate free bytes are sufficient. Keep the blocked allocation work explicit so a child
     // target can release Host replicas instead of being mistaken for a structurally invalid node.
     std::size_t blocked_host_allocation_bytes = 0;
+    // THE MEASURED SHORTFALL, for the seal-time reserve (method 2). `blocked_host_allocation_bytes` holds
+    // the plan's REQUEST. That is not the same number. The shortfall is what the arena cannot place after
+    // the planned releases. The reserve must cover the shortfall, so it needs the shortfall.
+    // ZERO IS NOT "NO SHORTFALL": zero means the KV tri-state was not asked, or it answered `Pinned` or
+    // `Blocked`. Only `Growable` sets this field, because only that verdict says the plan is affordable by
+    // growing -- and only such a plan may be reserved for. The seal MUST NOT grow for `Blocked`.
+    std::size_t blocked_host_kv_shortfall_bytes = 0;
     detail::PhysicalDemand demand;
     // Resources released by consuming this private owner alone. Shared aliases are intentionally
     // absent; complete pressure targets settle their joint reference graph separately.
@@ -654,26 +661,617 @@ public:
     [[nodiscard]] std::uint64_t evictions_with_victim_room() const noexcept {
         return evictions_with_victim_room_;
     }
+    [[nodiscard]] std::uint64_t evictions_victim_device_slots() const noexcept {
+        return evictions_victim_device_slots_;
+    }
+    [[nodiscard]] std::uint64_t evictions_victim_host_slots() const noexcept {
+        return evictions_victim_host_slots_;
+    }
+    // The NEEDED axis (the plan's deficit), paired with the victim-axis accessors above.
+    [[nodiscard]] std::uint64_t evictions_deficit_device_main_kv() const noexcept {
+        return evictions_deficit_device_main_kv_;
+    }
+    [[nodiscard]] std::uint64_t evictions_deficit_device_backend_kv() const noexcept {
+        return evictions_deficit_device_backend_kv_;
+    }
+    [[nodiscard]] std::uint64_t evictions_deficit_device_state() const noexcept {
+        return evictions_deficit_device_state_;
+    }
+    [[nodiscard]] std::uint64_t evictions_deficit_host_state() const noexcept {
+        return evictions_deficit_host_state_;
+    }
+    [[nodiscard]] std::uint64_t evictions_deficit_host_kv() const noexcept {
+        return evictions_deficit_host_kv_;
+    }
+    // THE PER-VICTIM KV HALF: was THIS victim's own device KV demotable to host when it was evicted?
+    // `evictions_kv_pages_` is the denominator (evictions whose victim held device KV pages at all);
+    // `pages_total_` is the magnitude destroyed. The tri-state is the whole point: `pinned` means the host
+    // KV arena could take those pages AS IT IS, which is the operator's defect; `growable` means they fitted
+    // only after a growth the planner's pinned-only feasibility site (`pressure.cpp:2385`) does not see --
+    // i.e. the plan's own stated failure mode, counted rather than argued.
+    [[nodiscard]] std::uint64_t evictions_kv_pages() const noexcept { return evictions_kv_pages_; }
+    [[nodiscard]] std::uint64_t evictions_kv_pages_total() const noexcept {
+        return evictions_kv_pages_total_;
+    }
+    [[nodiscard]] std::uint64_t evictions_kv_fit_pinned() const noexcept {
+        return evictions_kv_fit_pinned_;
+    }
+    [[nodiscard]] std::uint64_t evictions_kv_fit_growable() const noexcept {
+        return evictions_kv_fit_growable_;
+    }
+    [[nodiscard]] std::uint64_t evictions_kv_fit_blocked() const noexcept {
+        return evictions_kv_fit_blocked_;
+    }
+    // The same tri-state in PAGES rather than events -- the rate and the magnitude disagree, and only
+    // reading both says which direction the defect actually runs. They sum to `evictions_kv_pages_total()`.
+    [[nodiscard]] std::uint64_t evictions_kv_fit_pinned_pages() const noexcept {
+        return evictions_kv_fit_pinned_pages_;
+    }
+    [[nodiscard]] std::uint64_t evictions_kv_fit_growable_pages() const noexcept {
+        return evictions_kv_fit_growable_pages_;
+    }
+    [[nodiscard]] std::uint64_t evictions_kv_fit_blocked_pages() const noexcept {
+        return evictions_kv_fit_blocked_pages_;
+    }
+    // The per-victim record ring's accessors are defined beside the ring itself, above, so the cursor
+    // arithmetic lives in one place.
+    [[nodiscard]] std::uint64_t eviction_kv_records_total() const noexcept {
+        return eviction_kv_record_total_;
+    }
+    [[nodiscard]] std::uint32_t eviction_kv_record_count() const noexcept {
+        return static_cast<std::uint32_t>(
+            std::min<std::uint64_t>(eviction_kv_record_total_, ninfer::k_eviction_kv_record_capacity));
+    }
+    // CHRONOLOGICAL: 0 is the OLDEST record still held, so a reader sums forward in time without knowing the
+    // ring's cursor. Out-of-range returns a default record rather than throwing -- this feeds a diagnostic
+    // endpoint, and a stats read must never be able to take the server down.
+    [[nodiscard]] ninfer::RuntimeStats::EvictionKVRecord
+    eviction_kv_record(std::size_t chronological) const noexcept {
+        const std::uint32_t count = eviction_kv_record_count();
+        if (chronological >= count) { return ninfer::RuntimeStats::EvictionKVRecord{}; }
+        const std::size_t oldest =
+            (eviction_kv_record_next_ + ninfer::k_eviction_kv_record_capacity - count) %
+            ninfer::k_eviction_kv_record_capacity;
+        return eviction_kv_records_[(oldest + chronological) % ninfer::k_eviction_kv_record_capacity];
+    }
+    // EVERY call to the query, taken BEFORE its axis filter -- the denominator for the denominator. A zero
+    // `host_state_fit_checks_` is ambiguous on its own: it reads the same whether the axis is genuinely never
+    // demanded or the query never ran at all on this workload. This one separates those two.
+    [[nodiscard]] std::uint64_t physical_peak_fits_calls() const noexcept {
+        return physical_peak_fits_calls_;
+    }
+    // WHICH AXIS REFUSED A PLAN, per axis. Read with `physical_peak_fits_calls()` as the denominator; the
+    // axes do NOT sum to the refusals, because a peak can exceed several capacities at once.
+    [[nodiscard]] std::uint64_t physical_peak_refusals_by_axis(std::size_t axis) const noexcept {
+        return axis < ninfer::k_peak_axis_count ? physical_peak_refusals_by_axis_[axis] : 0U;
+    }
+    // METHOD 2: PIN THE ROOM A `Growable` PLAN NEEDS, at SEAL, so execution cannot lose it.
+    //
+    // The planner vetoes and seals on a pinned-only boolean. A plan inside the growth headroom therefore
+    // reads as blocked, and the engine evicts where a demote was possible. This method closes that gap by
+    // taking the room at the last moment the plan can still be refused for free.
+    //
+    // WHY SEAL AND NOT COMPOSE: `compose_pressure_candidate` runs for EVERY assessed node. Pinning there
+    // costs about 1 s/GiB on the engine thread, for candidates that the search never selects. The seal runs
+    // on the incumbent and the root -- about one or two times per request. `plan.md` records that reasoning.
+    //
+    // THE HAZARD THIS AVOIDS, quoted from `pressure.cpp`: "Treating it as `Pinned` anywhere that seals a
+    // plan is the mistake recorded at `pressure.cpp:2572-2588` (pricing both host axes from the growth
+    // gate's answer produced a `WORKER OOM` within minutes, because the plan executed later against a worse
+    // reading)". A RESERVE cannot lose its room. An optimistically-admitted plan can.
+    //
+    // It returns TRUE only when the room is pinned AND the flags are cleared, so the caller's existing
+    // check then passes on its own merits. It returns FALSE when the growth fails; the caller MUST then
+    // refuse the plan, which is today's behaviour and is safe.
+    [[nodiscard]] bool reserve_host_kv_for_seal(ResourceCandidateState& candidate) noexcept;
+    // The two counters that decide whether the reserve stays. `grows` counts seals that pinned the room a
+    // `Growable` plan needed; `refusals` counts those where the pin failed. Read as a PAIR: a grow for a plan
+    // the search then does not adopt pins memory for nothing; a refusal says admission alone cannot carry it.
+    [[nodiscard]] std::uint64_t host_kv_seal_grows() const noexcept { return host_kv_seal_grows_; }
+    [[nodiscard]] std::uint64_t host_kv_seal_refusals() const noexcept { return host_kv_seal_refusals_; }
+    [[nodiscard]] std::uint64_t host_state_fit_checks() const noexcept {
+        return host_state_fit_checks_;
+    }
+    [[nodiscard]] std::uint64_t host_state_shortfall_calls() const noexcept {
+        return host_state_shortfall_calls_;
+    }
+    [[nodiscard]] std::uint64_t host_state_shortfall_max_slots() const noexcept {
+        return host_state_shortfall_max_slots_;
+    }
+    // The device-KV axis's counterparts. Same reading rule: the denominator first, then the refusals, then
+    // the worst shortfall. `max_pages` is the one that decides the fix -- a peak that misses by a few pages
+    // is a scheduling problem, and one that misses by a factor is a capacity problem.
+    [[nodiscard]] std::uint64_t device_main_kv_fit_checks() const noexcept {
+        return device_main_kv_fit_checks_;
+    }
+    [[nodiscard]] std::uint64_t device_main_kv_shortfall_calls() const noexcept {
+        return device_main_kv_shortfall_calls_;
+    }
+    [[nodiscard]] std::uint64_t device_main_kv_shortfall_max_pages() const noexcept {
+        return device_main_kv_shortfall_max_pages_;
+    }
     [[nodiscard]] std::uint64_t evictions_demote_possible() const noexcept {
         return evictions_demote_possible_;
+    }
+    // THE REFUSAL REASON AT EACH PRIVATE, MATERIALIZATION-PATH EVICTION, one bucket per `DemoteRefusal`
+    // clause. Scope corrected 2026-10-04: `capture.cpp` releases and shared evictions never reach here, so
+    // summing to `private_eviction_checks` is a consistency check on one path, not a census of evictions.
+    // The reason was PRINTED and never counted, and the print is rate-limited to the first 8 then every
+    // 512th -- so a 59-eviction window yields exactly 8 lines and they are the FIRST 8, measured as 7-of-8
+    // `already-on-host`. That clause is NOT benign (state on host + evicted destroys the copy), and the
+    // sample is biased to the start of the window by construction; a counter cannot be sampled away.
+    // NOTE, and it is why this is not the counter the #6 task first asked for: the #6 population is NOT
+    // attributable here and cannot be, because `demote_possible` IS `demote_refusal == None`, so those
+    // evictions are `None` by construction. What this attributes is the OTHER population -- the evictions
+    // where a demote was NOT available -- which is the half a fix could be aimed at.
+    [[nodiscard]] std::uint64_t demote_refusal_at_eviction(
+        StateImageStore::DemoteRefusal reason) const noexcept {
+        return demote_refusal_at_eviction_[static_cast<std::size_t>(reason)];
     }
     [[nodiscard]] std::uint64_t demotable_eviction_checks() const noexcept {
         return demotable_eviction_checks_;
     }
     [[nodiscard]] std::uint64_t pressure_options() const noexcept { return pressure_options_; }
-    // THE PRESERVATION PROBE'S EXONERATING HALF. See the site: an owner whose `pressure_successors` came
-    // back EMPTY had no non-evicting option, so destroying its checkpoint was unavoidable. Reported with its
-    // denominator, because "no owner lacked a non-evicting option" and "no owner was examined" are the same
-    // reading otherwise.
-    void note_pressure_successor_outcome(bool nonevicting_available) noexcept {
+    // THE PRESERVATION PROBE, and the counter that carried an INVERTED NAME until 2026-10-06.
+    //
+    // `note_pressure_successor_outcome` is called with the owner's NON-EVICTING successors, before the eviction
+    // is appended, so its first argument `successors.empty()` means "NO non-evicting option was available".
+    // **The parameter was NAMED `nonevicting_available` and the published key was NAMED
+    // `successors_with_option`, so the name said the OPPOSITE of what the counter counted** -- the
+    // `fragmented_skipped` defect a second time, and this one had already produced a wrong reading in
+    // `plan.md` before it was caught. The counter was right; the name was the defect. Renamed here to
+    // `successors_without_option`, with every copy corrected.
+    //
+    // **HOW IT WAS CAUGHT, because the route is the generalisable part: the EMPTY-SUCCESSOR SPLIT built for
+    // this same question summed to 58 while the empty count read 1718 -- and 58 was exactly the old
+    // `with_option`. Two counters, one written for the empty case, disagreeing by inversion: the arithmetic
+    // was the tell, not a reading.**
+    //
+    // READ IT AS: `successor_calls` = owner examinations;
+    // **`successors_without_option` = those with NO non-evicting successor**; so the owners that DID have one
+    // are `successor_calls - successors_without_option` -- 1718 of 1776 on the #6 repro, i.e. **~97% had a
+    // preserving alternative and the planner evicted anyway.** That dissolves the apparent conflict with the
+    // execution site (`demote_refusal = none` for every victim): generation is NOT the bottleneck.
+    // `successor_calls_evicting_current` is 0 on this workload, so no subtraction is needed for it yet.
+    // WHICH CLAUSE EMPTIED THE SUCCESSOR SET. `inspect_pressure_successors` returns empty from four distinct
+    // places (plus the structural early return), and their SUM must equal `successors_without_option` -- if it
+    // does not, the split is incomplete, which is how the inversion above was found. NoKv, EvictingCurrent and
+    // Unretained were 0 on the repro; **NoEndpoints means the RESIDUAL asked for nothing, so there was nothing
+    // to relieve -- while AllRefused means the residual asked for room and the OPTION BUILDER refused it.**
+    // On the repro these were 32 and 26 of the 58, so the few owners genuinely lacking an option lacked it for
+    // BOTH reasons in comparable measure.
+    enum class SuccessorEmptyReason : std::uint8_t { NoKv, EvictingCurrent, Unretained, NoEndpoints, AllRefused, Count };
+    void note_empty_successor(SuccessorEmptyReason reason) const noexcept {
+        const auto index = static_cast<std::size_t>(reason);
+        if (index < static_cast<std::size_t>(SuccessorEmptyReason::Count)) {
+            ++pressure_successor_empty_by_reason_[index];
+        }
+    }
+    [[nodiscard]] std::uint64_t pressure_successor_empty_by_reason(std::size_t reason) const noexcept {
+        return reason < static_cast<std::size_t>(SuccessorEmptyReason::Count)
+                   ? pressure_successor_empty_by_reason_[reason]
+                   : 0U;
+    }
+    // #6's LAST QUESTION, QUANTIFIED. `select_kv_pressure_actions` is a FREE FUNCTION, so its histogram is
+    // carried on the selection it returns and accumulated here -- the two call sites already forward every
+    // other `selection.*` field the same way.
+    void note_kv_relief(
+        const std::uint64_t (&rejected)[ninfer::k_kv_relief_direction_count]
+                                       [ninfer::k_kv_relief_clause_count],
+        const std::uint64_t (&calls)[ninfer::k_kv_relief_direction_count],
+        const std::uint64_t (&requested)[ninfer::k_kv_relief_direction_count],
+        const std::uint64_t (&saturated)[ninfer::k_kv_relief_direction_count],
+        const std::uint64_t (&max_ask)[ninfer::k_kv_relief_direction_count],
+        const std::uint64_t (&relieved)[ninfer::k_kv_relief_direction_count],
+        const std::uint64_t (&gate_blocks)[ninfer::k_kv_relief_gate_clause_count],
+        std::uint64_t host_blocked_bytes_sum, std::uint64_t host_blocked_bytes_max,
+        std::uint64_t demote_calls_host_req_zero, std::uint64_t demote_calls_host_req_nonzero,
+        std::uint64_t demote_relieved_host_req_zero,
+        std::uint64_t demote_relieved_host_req_nonzero) const noexcept {
+        for (std::size_t direction = 0; direction < ninfer::k_kv_relief_direction_count; ++direction) {
+            kv_relief_calls_[direction] += calls[direction];
+            kv_relief_requested_[direction] += requested[direction];
+            kv_relief_saturated_asks_[direction] += saturated[direction];
+            kv_relief_max_ask_[direction] =
+                std::max(kv_relief_max_ask_[direction], max_ask[direction]);
+            kv_relief_relieved_[direction] += relieved[direction];
+            for (std::size_t clause = 0; clause < ninfer::k_kv_relief_clause_count; ++clause) {
+                kv_relief_rejected_[direction][clause] += rejected[direction][clause];
+            }
+        }
+        for (std::size_t clause = 0; clause < ninfer::k_kv_relief_gate_clause_count; ++clause) {
+            kv_relief_gate_blocks_[clause] += gate_blocks[clause];
+        }
+        kv_relief_host_blocked_bytes_sum_ += host_blocked_bytes_sum;
+        kv_relief_demote_calls_host_req_zero_       += demote_calls_host_req_zero;
+        kv_relief_demote_calls_host_req_nonzero_    += demote_calls_host_req_nonzero;
+        kv_relief_demote_relieved_host_req_zero_    += demote_relieved_host_req_zero;
+        kv_relief_demote_relieved_host_req_nonzero_ += demote_relieved_host_req_nonzero;
+        kv_relief_host_blocked_bytes_max_ =
+            std::max(kv_relief_host_blocked_bytes_max_, host_blocked_bytes_max);
+    }
+    [[nodiscard]] std::uint64_t kv_relief_calls(std::size_t direction) const noexcept {
+        return direction < ninfer::k_kv_relief_direction_count ? kv_relief_calls_[direction] : 0U;
+    }
+    [[nodiscard]] std::uint64_t kv_relief_requested(std::size_t direction) const noexcept {
+        return direction < ninfer::k_kv_relief_direction_count ? kv_relief_requested_[direction] : 0U;
+    }
+    [[nodiscard]] std::uint64_t kv_relief_saturated_asks(std::size_t direction) const noexcept {
+        return direction < ninfer::k_kv_relief_direction_count ? kv_relief_saturated_asks_[direction] : 0U;
+    }
+    [[nodiscard]] std::uint64_t kv_relief_max_ask(std::size_t direction) const noexcept {
+        return direction < ninfer::k_kv_relief_direction_count ? kv_relief_max_ask_[direction] : 0U;
+    }
+    [[nodiscard]] std::uint64_t kv_relief_relieved(std::size_t direction) const noexcept {
+        return direction < ninfer::k_kv_relief_direction_count ? kv_relief_relieved_[direction] : 0U;
+    }
+    // THE PEAK ARITHMETIC, for ONE compose step: `peak = max(0, peak + added - removed)` per axis
+    // (`pressure.cpp:2601`). Counting which axis REFUSES said nothing about WHY a preserving plan loses
+    // (arm A11: both classes refused alike), so the model records the two halves that produce the peak --
+    // `added` is what the step demands, `removed` is what it frees, and the ratio is the whole question.
+    void note_peak_model(const detail::PhysicalResources& added,
+                         const detail::PhysicalResources& removed,
+                         const detail::PhysicalResources& peak) const noexcept {
+        ++peak_model_calls_;
+        const std::uint64_t a[ninfer::k_peak_axis_count] = {
+            added.device.active_lanes, added.device.state_slots, added.device.main_kv_pages,
+            added.device.backend_kv_pages, added.host.state_slots,
+            static_cast<std::uint64_t>(added.host.kv_bytes)};
+        const std::uint64_t r[ninfer::k_peak_axis_count] = {
+            removed.device.active_lanes, removed.device.state_slots, removed.device.main_kv_pages,
+            removed.device.backend_kv_pages, removed.host.state_slots,
+            static_cast<std::uint64_t>(removed.host.kv_bytes)};
+        const std::uint64_t k[ninfer::k_peak_axis_count] = {
+            peak.device.active_lanes, peak.device.state_slots, peak.device.main_kv_pages,
+            peak.device.backend_kv_pages, peak.host.state_slots,
+            static_cast<std::uint64_t>(peak.host.kv_bytes)};
+        for (std::size_t axis = 0; axis < ninfer::k_peak_axis_count; ++axis) {
+            peak_model_added_[axis] += a[axis];
+            peak_model_removed_[axis] += r[axis];
+            peak_model_peak_max_[axis] = std::max(peak_model_peak_max_[axis], k[axis]);
+        }
+    }
+    [[nodiscard]] std::uint64_t peak_model_calls() const noexcept { return peak_model_calls_; }
+    [[nodiscard]] std::uint64_t peak_model_added(std::size_t axis) const noexcept {
+        return axis < ninfer::k_peak_axis_count ? peak_model_added_[axis] : 0U;
+    }
+    [[nodiscard]] std::uint64_t peak_model_removed(std::size_t axis) const noexcept {
+        return axis < ninfer::k_peak_axis_count ? peak_model_removed_[axis] : 0U;
+    }
+    [[nodiscard]] std::uint64_t peak_model_peak_max(std::size_t axis) const noexcept {
+        return axis < ninfer::k_peak_axis_count ? peak_model_peak_max_[axis] : 0U;
+    }
+    // [term][axis]: term 0 = the request's own exclusive entitlement (the base), 1 = shared replica
+    // additions, 2 = transient source restores; axis 0 = main KV, 1 = backend KV.
+    void note_reservation_composition(std::uint32_t base_main, std::uint32_t base_backend,
+                                      std::uint32_t shared_main, std::uint32_t shared_backend,
+                                      std::uint32_t restore_main, std::uint32_t restore_backend) const noexcept {
+        ++reservation_composition_calls_;
+        reservation_composition_[0][0] += base_main;
+        reservation_composition_[0][1] += base_backend;
+        reservation_composition_[1][0] += shared_main;
+        reservation_composition_[1][1] += shared_backend;
+        reservation_composition_[2][0] += restore_main;
+        reservation_composition_[2][1] += restore_backend;
+    }
+    [[nodiscard]] std::uint64_t reservation_composition_calls() const noexcept {
+        return reservation_composition_calls_;
+    }
+    [[nodiscard]] std::uint64_t reservation_composition(std::size_t term, std::size_t axis) const noexcept {
+        return term < 3U && axis < 2U ? reservation_composition_[term][axis] : 0U;
+    }
+    // `prompt + output` IS the entitlement, so these three settle its composition. Both the TOKEN shares and
+    // the PAGE shares are derivable -- and they differ, because `pages_for_tokens` rounds per term.
+    void note_entitlement_split(std::uint64_t prompt_tokens, std::uint64_t output_tokens,
+                                std::uint64_t reserved_tokens) const noexcept {
+        ++entitlement_split_calls_;
+        entitlement_split_prompt_tokens_ += prompt_tokens;
+        entitlement_split_output_tokens_ += output_tokens;
+        entitlement_split_reserved_tokens_ += reserved_tokens;
+    }
+    [[nodiscard]] std::uint64_t entitlement_split_calls() const noexcept {
+        return entitlement_split_calls_;
+    }
+    [[nodiscard]] std::uint64_t entitlement_split_prompt_tokens() const noexcept {
+        return entitlement_split_prompt_tokens_;
+    }
+    [[nodiscard]] std::uint64_t entitlement_split_output_tokens() const noexcept {
+        return entitlement_split_output_tokens_;
+    }
+    [[nodiscard]] std::uint64_t entitlement_split_reserved_tokens() const noexcept {
+        return entitlement_split_reserved_tokens_;
+    }
+    void record_victim_entitlement_gap(std::uint64_t gap_pages) const noexcept {
+        ++victim_entitlement_gap_calls_;
+        victim_entitlement_gap_pages_sum_ += gap_pages;
+        victim_entitlement_gap_pages_max_ =
+            std::max(victim_entitlement_gap_pages_max_, gap_pages);
+    }
+    [[nodiscard]] std::uint64_t victim_entitlement_gap_calls() const noexcept {
+        return victim_entitlement_gap_calls_;
+    }
+    [[nodiscard]] std::uint64_t victim_entitlement_gap_pages_sum() const noexcept {
+        return victim_entitlement_gap_pages_sum_;
+    }
+    [[nodiscard]] std::uint64_t victim_entitlement_gap_pages_max() const noexcept {
+        return victim_entitlement_gap_pages_max_;
+    }
+    // [0] evicting, [1] preserving; the axes that decide a plan's feasibility.
+    void note_successor_relief(bool evicting, std::uint32_t main_kv, std::uint32_t backend_kv,
+                               std::uint32_t state_slots) const noexcept {
+        const std::size_t slot = evicting ? 0U : 1U;
+        ++successor_relief_count_[slot];
+        successor_relief_main_kv_[slot] += main_kv;
+        successor_relief_backend_kv_[slot] += backend_kv;
+        successor_relief_state_slots_[slot] += state_slots;
+    }
+    // Recorded ONCE per victim (a `pressure_successors` call), so the preserving count and the evicting count
+    // share a denominator and the two means compare. This says how many preserving options were seen before
+    // the max was taken -- read it to see how much per-victim choice existed.
+    // The occupancy and the ceiling are taken HERE, at the same moment as the peak, rather than read later
+    // from `/stats` -- a comparison across two moments is what made an earlier instrument unreadable.
+    void record_assessed_peak(bool preserving, bool feasible, std::uint32_t peak_main,
+                              std::uint32_t peak_backend, std::uint8_t refusal_mask = 0U,
+                              std::uint32_t reservation_main = 0U,
+                              std::uint32_t removed_main = 0U,
+                              std::uint32_t evicted_victim_main = 0U,
+                              std::uint32_t selected_decisions = 0U,
+                              std::uint32_t evicting_decisions = 0U,
+                              std::uint32_t best_available_main = 0U,
+                              std::uint32_t chosen_best_main = 0U,
+                              std::uint32_t kv_change_entries = 0U,
+                              const ninfer::PeakAxisSample& axes = {}) const noexcept {
+        const detail::PhysicalResources occupied = physical_occupancy();
+        const detail::PhysicalResources ceiling  = admission_capacity();
+        // *** THE PER-AXIS MARGIN, COMPUTED WHERE BOTH TERMS ALREADY ARE (2026-10-07). ***
+        // `peak_by_axis` is the plan's own `physical_peak_additional` mapped into `k_peak_axis_names` order,
+        // the SAME order the conjunction in `physical_peak_fits` builds its `axis_fits` in. The shortfall is
+        // the number of units by which `occupied + peak` misses `capacity` -- i.e. exactly `slack - peak` when
+        // slack is positive, and the whole miss when it is not. Computed HERE rather than at the call site so
+        // that `occupied` and `ceiling` come from the one source `physical_peak_fits` itself reads; a caller
+        // that fetched its own copy could disagree with the verdict it is explaining.
+        // It is derived from the same three quantities as `refusal_mask`, so `shortfall[a] > 0` iff bit `a` of
+        // the mask is set -- a per-row cross-check the reader can make, and one a wrong axis order fails.
+        const auto missing = [](std::uint64_t used, std::uint64_t added,
+                                std::uint64_t capacity) -> std::uint32_t {
+            const std::uint64_t need = used + added;
+            if (need <= capacity) { return 0U; }
+            return static_cast<std::uint32_t>(std::min<std::uint64_t>(need - capacity, 0xFFFFFFFFULL));
+        };
+        const std::array<std::uint32_t, ninfer::k_peak_axis_count> axis_shortfall{
+            missing(occupied.device.active_lanes, axes.peak[0], ceiling.device.active_lanes),
+            missing(occupied.device.state_slots, axes.peak[1], ceiling.device.state_slots),
+            missing(occupied.device.main_kv_pages, axes.peak[2], ceiling.device.main_kv_pages),
+            missing(occupied.device.backend_kv_pages, axes.peak[3], ceiling.device.backend_kv_pages),
+            missing(occupied.host.state_slots, axes.peak[4], ceiling.host.state_slots),
+            missing(occupied.host.kv_bytes, axes.peak[5], ceiling.host.kv_bytes),
+        };
+        AssessedPeakRecord& slot =
+            assessed_peak_records_[assessed_peak_record_total_ % ninfer::k_assessed_peak_record_capacity];
+        slot = AssessedPeakRecord{.peak_main_kv        = peak_main,
+                                  .peak_backend_kv     = peak_backend,
+                                  .occupied_main_kv    = occupied.device.main_kv_pages,
+                                  .occupied_backend_kv = occupied.device.backend_kv_pages,
+                                  .capacity_main_kv    = ceiling.device.main_kv_pages,
+                                  .preserving          = static_cast<std::uint8_t>(preserving ? 1U : 0U),
+                                  .feasible            = static_cast<std::uint8_t>(feasible ? 1U : 0U),
+                                  .refusal_mask        = refusal_mask,
+                                  .reservation_main_kv = reservation_main,
+                                  .removed_main_kv     = removed_main,
+                                  .evicted_victim_main_kv = evicted_victim_main,
+                                  .selected_decisions  = selected_decisions,
+                                  .evicting_decisions  = evicting_decisions,
+                                  .best_available_main_kv = best_available_main,
+                                  .chosen_best_main_kv    = chosen_best_main,
+                                  .selected_kv_change_entries = kv_change_entries,
+                                  .axis_shortfall = axis_shortfall,};
+        ++assessed_peak_record_total_;
+        // **THE AGGREGATE BESIDE THE RING, because a ring shows the TAIL, not a SAMPLE.** Arm A19's window
+        // (the last 64 of 5,100 assessments) contained none of the rows that matter -- the ones refused with a
+        // peak that FITS -- so the identity has to be counted over ALL assessments, not the last few.
+        const std::size_t klass = preserving ? 1U : 0U;
+        ++assessed_total_[klass];
+        if (feasible) { ++assessed_feasible_[klass]; }
+        if ((refusal_mask & 0x80U) != 0U) { ++assessed_refused_host_blocked_[klass]; }
+        // **THE TWO CANDIDATES SEPARATE HERE, WITHOUT ANOTHER TABLE.** On a slack-0 pool a plan is admitted
+        // iff `removed >= reservation`, so the question is WHAT an admitted plan has that a refused one does
+        // not: a BIGGER relief (it freed more victims) or a SMALLER reservation. Summed over ALL assessments
+        // -- a ring is a window and arm A24's contained no admitted row at all.
+        const std::size_t bucket = feasible ? 2U : 0U;
+        assessed_agg_reservation_[bucket + (preserving ? 1U : 0U)] += reservation_main;
+        assessed_agg_removed_[bucket + (preserving ? 1U : 0U)]     += removed_main;
+        ++assessed_agg_count_[bucket + (preserving ? 1U : 0U)];
+        // THE SEARCH QUESTION, over ALL assessments: how many decisions, and how many of them evict.
+        assessed_agg_selected_[bucket + (preserving ? 1U : 0U)] += selected_decisions;
+        assessed_agg_evicting_[bucket + (preserving ? 1U : 0U)] += evicting_decisions;
+        assessed_agg_available_[bucket + (preserving ? 1U : 0U)] += best_available_main;
+        assessed_agg_chosen_[bucket + (preserving ? 1U : 0U)]    += chosen_best_main;
+        assessed_agg_kv_entries_[bucket + (preserving ? 1U : 0U)] += kv_change_entries;
+        // *** THE PER-AXIS SHORTFALL, SUMMED OVER ALL ASSESSMENTS (2026-10-07). ***
+        // Arm A35's per-axis margin lived ONLY in the 64-row ring, and the same instrument read the host axis
+        // at 1.51 GiB mid-run and 184 MiB at the end -- an 8x move on a population that barely changed size.
+        // That is the ring showing the TAIL, which is the reason `assessed_agg_*` exists two lines above; the
+        // magnitude needs the same treatment. **So the ring stays, for its per-row cross-check, and these sums
+        // are what a magnitude is quoted from.**
+        // EACH AXIS IS SUM AGAINST `assessed_agg_count_[bucket]`, WITHIN ITS OWN UNIT. The axes are PAGES and
+        // BYTES and are NEVER added together -- the share-of-the-six figure an earlier reader printed for this
+        // was meaningless for exactly that reason. A non-zero sum on a FEASIBLE bucket is an instrument defect:
+        // it is the per-row control the ring enforces, enforced here in aggregate.
+        for (std::size_t axis = 0; axis < ninfer::k_peak_axis_count; ++axis) {
+            assessed_axis_shortfall_[bucket + (preserving ? 1U : 0U)][axis] += axis_shortfall[axis];
+            // Signed, summed as int64 -- the sign of the MEAN is the finding: a bucket whose mean coverage
+            // margin is below zero on an axis is a bucket where no plan over the offered victims could fit.
+        }
+        if (best_available_main > chosen_best_main) {
+            ++assessed_larger_available_[bucket + (preserving ? 1U : 0U)];
+        }
+        // **DID THE SEARCH EVER CHOOSE THE LARGEST AVAILABLE VICTIM?** This is what separates the two
+        // candidate remedies: if this count is ZERO on the refused rows, the big-victim combination is never
+        // ENUMERATED (remedy 2, the target arena / expansion budget); if it is non-zero on any, the search CAN
+        // reach it and the rows where it does not are an ORDERING failure (remedy 1).
+        if (best_available_main != 0U && best_available_main == chosen_best_main) {
+            ++assessed_chose_largest_[bucket + (preserving ? 1U : 0U)];
+        }
+    }
+    [[nodiscard]] std::uint64_t assessed_agg_count(bool feasible, bool preserving) const noexcept {
+        return assessed_agg_count_[(feasible ? 2U : 0U) + (preserving ? 1U : 0U)];
+    }
+    // The per-axis shortfall SUM over all assessments in a bucket, in `k_peak_axis_names` order. Divide by
+    // `assessed_agg_count` for the mean -- never add two axes together.
+    [[nodiscard]] std::uint64_t assessed_axis_shortfall(bool feasible, bool preserving,
+                                                        std::size_t axis) const noexcept {
+        if (axis >= ninfer::k_peak_axis_count) { return 0U; }
+        return assessed_axis_shortfall_[(feasible ? 2U : 0U) + (preserving ? 1U : 0U)][axis];
+    }
+
+    [[nodiscard]] std::uint64_t assessed_agg_reservation(bool feasible, bool preserving) const noexcept {
+        return assessed_agg_reservation_[(feasible ? 2U : 0U) + (preserving ? 1U : 0U)];
+    }
+    [[nodiscard]] std::uint64_t assessed_agg_selected(bool feasible, bool preserving) const noexcept {
+        return assessed_agg_selected_[(feasible ? 2U : 0U) + (preserving ? 1U : 0U)];
+    }
+    [[nodiscard]] std::uint64_t assessed_agg_evicting(bool feasible, bool preserving) const noexcept {
+        return assessed_agg_evicting_[(feasible ? 2U : 0U) + (preserving ? 1U : 0U)];
+    }
+    [[nodiscard]] std::uint64_t assessed_agg_available(bool feasible, bool preserving) const noexcept {
+        return assessed_agg_available_[(feasible ? 2U : 0U) + (preserving ? 1U : 0U)];
+    }
+    [[nodiscard]] std::uint64_t assessed_agg_chosen(bool feasible, bool preserving) const noexcept {
+        return assessed_agg_chosen_[(feasible ? 2U : 0U) + (preserving ? 1U : 0U)];
+    }
+    // The victim's own release and resident main-KV pages, by continuation index. The RELEASE figure is what an
+    // eviction credits; the RESIDENT figure is what a demote can copy. Their difference is the entitlement a
+    // demote does not credit -- the candidate cause of the 2.3x-free but 13%-short demote relief.
+    [[nodiscard]] std::uint64_t victim_release_main_kv_pages(std::size_t state_index) const noexcept {
+        return state_index < continuation_states.size()
+                   ? owner_exclusive_resources(continuation_states[state_index],
+                                               KVOwnershipCount::TransitionEffect)
+                         .device.main_kv_pages
+                   : 0U;
+    }
+    [[nodiscard]] std::uint64_t victim_resident_main_kv_pages(std::size_t state_index) const noexcept {
+        return state_index < continuation_states.size()
+                   ? owner_exclusive_resources(continuation_states[state_index],
+                                               KVOwnershipCount::ResidentData)
+                         .device.main_kv_pages
+                   : 0U;
+    }
+    [[nodiscard]] std::uint64_t assessed_agg_kv_entries(bool feasible, bool preserving) const noexcept {
+        return assessed_agg_kv_entries_[(feasible ? 2U : 0U) + (preserving ? 1U : 0U)];
+    }
+    [[nodiscard]] std::uint64_t assessed_chose_largest(bool feasible, bool preserving) const noexcept {
+        return assessed_chose_largest_[(feasible ? 2U : 0U) + (preserving ? 1U : 0U)];
+    }
+    [[nodiscard]] std::uint64_t assessed_larger_available(bool feasible, bool preserving) const noexcept {
+        return assessed_larger_available_[(feasible ? 2U : 0U) + (preserving ? 1U : 0U)];
+    }
+    [[nodiscard]] std::uint64_t assessed_agg_removed(bool feasible, bool preserving) const noexcept {
+        return assessed_agg_removed_[(feasible ? 2U : 0U) + (preserving ? 1U : 0U)];
+    }
+    [[nodiscard]] std::uint64_t assessed_total(bool preserving) const noexcept {
+        return assessed_total_[preserving ? 1U : 0U];
+    }
+    [[nodiscard]] std::uint64_t assessed_feasible(bool preserving) const noexcept {
+        return assessed_feasible_[preserving ? 1U : 0U];
+    }
+    [[nodiscard]] std::uint64_t assessed_refused_host_blocked(bool preserving) const noexcept {
+        return assessed_refused_host_blocked_[preserving ? 1U : 0U];
+    }
+    [[nodiscard]] std::uint64_t assessed_peak_record_total() const noexcept {
+        return assessed_peak_record_total_;
+    }
+    [[nodiscard]] const ninfer::AssessedPeakRecord& assessed_peak_record(std::size_t chronological) const noexcept {
+        const std::uint64_t oldest = assessed_peak_record_total_ > ninfer::k_assessed_peak_record_capacity
+                                         ? assessed_peak_record_total_ - ninfer::k_assessed_peak_record_capacity
+                                         : 0U;
+        return assessed_peak_records_[(oldest + chronological) % ninfer::k_assessed_peak_record_capacity];
+    }
+    void note_victim_ownership(std::uint64_t release_main, std::uint64_t resident_main) const noexcept {
+        ++victim_ownership_calls_;
+        victim_ownership_release_sum_ += release_main;
+        victim_ownership_resident_sum_ += resident_main;
+        const std::uint64_t gap = release_main > resident_main ? release_main - resident_main : 0U;
+        victim_ownership_gap_sum_ += gap;
+        victim_ownership_gap_max_ = std::max(victim_ownership_gap_max_, gap);
+    }
+    [[nodiscard]] std::uint64_t victim_ownership_calls() const noexcept { return victim_ownership_calls_; }
+    [[nodiscard]] std::uint64_t victim_ownership_release_sum() const noexcept {
+        return victim_ownership_release_sum_;
+    }
+    [[nodiscard]] std::uint64_t victim_ownership_resident_sum() const noexcept {
+        return victim_ownership_resident_sum_;
+    }
+    [[nodiscard]] std::uint64_t victim_ownership_gap_sum() const noexcept { return victim_ownership_gap_sum_; }
+    [[nodiscard]] std::uint64_t victim_ownership_gap_max() const noexcept { return victim_ownership_gap_max_; }
+    void note_successor_relief_best_only(std::uint64_t preserving_options_seen) const noexcept {
+        successor_relief_preserving_options_seen_ += preserving_options_seen;
+    }
+    [[nodiscard]] std::uint64_t successor_relief_preserving_options_seen() const noexcept {
+        return successor_relief_preserving_options_seen_;
+    }
+    [[nodiscard]] std::uint64_t successor_relief_count(bool evicting) const noexcept {
+        return successor_relief_count_[evicting ? 0U : 1U];
+    }
+    [[nodiscard]] std::uint64_t successor_relief_main_kv(bool evicting) const noexcept {
+        return successor_relief_main_kv_[evicting ? 0U : 1U];
+    }
+    [[nodiscard]] std::uint64_t successor_relief_backend_kv(bool evicting) const noexcept {
+        return successor_relief_backend_kv_[evicting ? 0U : 1U];
+    }
+    [[nodiscard]] std::uint64_t successor_relief_state_slots(bool evicting) const noexcept {
+        return successor_relief_state_slots_[evicting ? 0U : 1U];
+    }
+    void note_peak_refusal_split(bool preserving, std::size_t axis) const noexcept {
+        if (axis < ninfer::k_peak_axis_count) {
+            ++peak_refusals_by_preserving_[preserving ? 0U : 1U][axis];
+        }
+    }
+    [[nodiscard]] std::uint64_t peak_refusal_by_preserving(bool preserving, std::size_t axis) const noexcept {
+        return axis < ninfer::k_peak_axis_count ? peak_refusals_by_preserving_[preserving ? 0U : 1U][axis] : 0U;
+    }
+    [[nodiscard]] std::uint64_t kv_relief_demote_calls_host_req_zero() const noexcept {
+        return kv_relief_demote_calls_host_req_zero_;
+    }
+    [[nodiscard]] std::uint64_t kv_relief_demote_calls_host_req_nonzero() const noexcept {
+        return kv_relief_demote_calls_host_req_nonzero_;
+    }
+    [[nodiscard]] std::uint64_t kv_relief_demote_relieved_host_req_zero() const noexcept {
+        return kv_relief_demote_relieved_host_req_zero_;
+    }
+    [[nodiscard]] std::uint64_t kv_relief_demote_relieved_host_req_nonzero() const noexcept {
+        return kv_relief_demote_relieved_host_req_nonzero_;
+    }
+    [[nodiscard]] std::uint64_t kv_relief_host_blocked_bytes_sum() const noexcept {
+        return kv_relief_host_blocked_bytes_sum_;
+    }
+    [[nodiscard]] std::uint64_t kv_relief_host_blocked_bytes_max() const noexcept {
+        return kv_relief_host_blocked_bytes_max_;
+    }
+    [[nodiscard]] std::uint64_t kv_relief_gate_blocks(std::size_t clause) const noexcept {
+        return clause < ninfer::k_kv_relief_gate_clause_count ? kv_relief_gate_blocks_[clause] : 0U;
+    }
+    [[nodiscard]] std::uint64_t kv_relief_rejected(std::size_t direction,
+                                                   std::size_t clause) const noexcept {
+        return direction < ninfer::k_kv_relief_direction_count &&
+                       clause < ninfer::k_kv_relief_clause_count
+                   ? kv_relief_rejected_[direction][clause]
+                   : 0U;
+    }
+    void note_pressure_successor_outcome(bool no_nonevicting_option, bool evicting_current) noexcept {
         ++pressure_successor_calls_;
-        if (nonevicting_available) { ++pressure_successors_with_option_; }
+        if (evicting_current) { ++pressure_successor_calls_evicting_current_; }
+        if (no_nonevicting_option) { ++pressure_successors_without_option_; }
     }
     [[nodiscard]] std::uint64_t pressure_successor_calls() const noexcept {
         return pressure_successor_calls_;
     }
-    [[nodiscard]] std::uint64_t pressure_successors_with_option() const noexcept {
-        return pressure_successors_with_option_;
+    [[nodiscard]] std::uint64_t pressure_successors_without_option() const noexcept {
+        return pressure_successors_without_option_;
+    }
+    // The denominator the preservation probe means: `pressure_successor_calls()` minus this. Read the pair
+    // TOGETHER with `pressure_successors_without_option()`; see the note beside `note_pressure_successor_outcome`.
+    [[nodiscard]] std::uint64_t pressure_successor_calls_evicting_current() const noexcept {
+        return pressure_successor_calls_evicting_current_;
     }
     [[nodiscard]] std::uint64_t demote_option_refused_no_state_deficit() const noexcept {
         return demote_option_refused_no_state_deficit_;
@@ -711,6 +1309,57 @@ public:
     // Runs where at least one non-winner candidate hit the cell-only failure. The diagnostic beside the loss,
     // for deciding whether the loss is REACHABLE here; log-only, and not an alert.
     std::uint64_t note_publication_cell_at_risk() noexcept { return ++publication_cell_at_risk_; }
+
+    // SHARED-PREFIX RELEASE REFUSALS, COUNTED PER CLAUSE AND ALWAYS ON -- #9's second blind candidate.
+    //
+    // `release_shared_prefix` returns early on four distinct grounds and is `noexcept`, so a refusal was
+    // silent by construction. The probe that names the reason is gated behind `NINFER_RELEASE_PROBE`, and that
+    // variable is set NOWHERE -- not the systemd unit, not `~/.config/ninfer.conf`, not `~/ninfer-ensure.sh` --
+    // so it had never fired in any recorded run, this session's three soaks included. "Nothing was refused"
+    // and "nobody armed the probe" were therefore indistinguishable, which is exactly the failure this repo's
+    // own rule describes and no amount of reading the rules would have caught.
+    //
+    // PER CLAUSE, NOT AS A TOTAL, because the four want DIFFERENT fixes: a stale index is a caller bug, an
+    // in-flight transaction is contention, `not-releasable` is a policy refusal on a live checkpoint, and a
+    // throw is a fault in the check itself. A counter cannot be forgotten the way an environment variable can,
+    // and it has no rate limit and no log cost.
+    //
+    // **SCOPE, STATED BECAUSE THE FIRST VERSION WAS MEANINGLESS WITHOUT IT.** These count the NON-STRICT
+    // `release_shared_prefix` only, and in production that has exactly ONE caller: `fail_all_cleanup`
+    // (`commit.cpp`, the Catalogued-slot loop). The ordinary paths -- evictions and replacements -- go through
+    // `release_shared_prefix_state_strict`, which CANNOT refuse: when its precondition fails it calls
+    // `std::terminate()`. So `attempts` is "fail-all cleanup releases", not "releases", and it is structurally
+    // 0 in steady state; a reader who takes it for the general release rate will conclude the counters are
+    // broken. Two clauses (`not_releasable`, `check_threw`) also appear already summarised as
+    // `released-refused` on the cleanup line, so read them there first.
+    //
+    // `stale_index` was UNREACHABLE until 2026-10-04 and is not any more -- see the split in
+    // `release_shared_prefix`, where the conjunction was hiding which clause had failed.
+    enum class SharedPrefixReleaseRefusal : std::uint8_t {
+        StaleGenerationOrIndex,
+        TransactionInFlightOrInvalidHandle,
+        StateNotReleasable,
+        StateReleasableCheckThrew,
+        Count,
+    };
+    [[nodiscard]] std::uint64_t
+    shared_prefix_release_refusals(SharedPrefixReleaseRefusal reason) const noexcept {
+        return shared_prefix_release_refusals_[static_cast<std::size_t>(reason)];
+    }
+    std::uint64_t note_shared_prefix_release_refusal(SharedPrefixReleaseRefusal reason) noexcept {
+        return ++shared_prefix_release_refusals_[static_cast<std::size_t>(reason)];
+    }
+    // THE DENOMINATOR THE FOUR ABOVE NEED, and without which they are unreadable. `refusals == 0` cannot be
+    // told from "the release path never ran": five single-turn requests produce no shared-prefix release at
+    // all, and every refusal counter reads 0 for that reason. This repo already has the rule -- "`losses == 0`
+    // cannot be told from a planner that stopped probing" -- and the first version of this change reproduced
+    // it one layer over. Read the two together: attempts = 0 means the counters are UNMEASURED, not clean.
+    [[nodiscard]] std::uint64_t shared_prefix_release_attempts() const noexcept {
+        return shared_prefix_release_attempts_;
+    }
+    std::uint64_t note_shared_prefix_release_attempt() noexcept {
+        return ++shared_prefix_release_attempts_;
+    }
     // The at-risk TOTALS. The journal print is capped (8 then every 512th), so the printed line count is a
     // SAMPLE: reading a count off it is the documented trap for the eviction print and was made here too.
     void add_publication_cell_at_risk(std::uint32_t at_risk, std::uint32_t goals, std::uint32_t other,
@@ -971,6 +1620,12 @@ private:
             };
 
             qwen3_5::detail::PressureDecision option;
+            // THE PLAN'S OWN DEFICIT, plumbed here 2026-10-04. `PhysicalDemand::physical_peak_additional`
+            // lives on the PLAN, and the eviction site only ever saw the transaction -- which is why
+            // `program_impl.h` recorded that the axis the eviction was CHOSEN AGAINST was unreachable, and
+            // only the axis it RELIEVED could be reported. Both are needed: an eviction whose relief does not
+            // touch the axis the plan needed is incoherent, and that case is invisible with one of them.
+            qwen3_5::detail::PhysicalResources planned_deficit;
             std::uint32_t continuation_index      = 0;
             std::uint64_t continuation_generation = 0;
             bool shared_owner                     = false;
@@ -1121,10 +1776,102 @@ private:
     std::uint64_t demotable_evictions_                   = 0;
     // #6's per-victim shape (2026-09-27): a victim evicted that was RESTORABLE **and** whose own host state
     // slots would have fit in the room left -- i.e. the pool-level `demotable` flag was right about room in
-    // the way that matters for THIS victim. The KV half stays pool-level; see the site's comment.
+    // the way that matters for THIS victim. The STATE half only: the KV half was pool-level until
+    // 2026-10-04, when `owner_exclusive_resources` was recognised as the per-victim KV figure this comment
+    // used to call unreachable (see `evictions_kv_*` below and the site's comment).
     std::uint64_t evictions_with_victim_room_             = 0;
+    // WHICH AXIS EACH EVICTION RELIEVED, counted rather than only printed. The eviction line carries
+    // `victim_dev_slots` and `victim_host_slots` -- what the victim HELD, which is what evicting frees --
+    // but the print is rate-limited to the first 8 then every 512th, so the population cannot be tallied
+    // from it. These two split the whole population by the axis the victim occupied: a device-bearing
+    // victim relieves the DEVICE axis, a host-bearing one relieves the HOST STATE axis.
+    //
+    // THE DEFICIT ITSELF IS NOT REACHABLE HERE (`PhysicalDemand::physical_peak_additional` lives on the
+    // plan, not on the transaction at the eviction), so this reports the axis the eviction RELIEVED rather
+    // than the one it was chosen against. Those differ only if an eviction frees an axis nobody needed --
+    // which is exactly what `victim_room` already asks per victim, so the pair reads correctly together.
+    std::uint64_t evictions_victim_device_slots_          = 0;
+    std::uint64_t evictions_victim_host_slots_            = 0;
+    // THE NEEDED AXIS, against the RELIEVED one above. Which axis the PLAN asked for at each eviction, from
+    // the plan's `physical_peak_additional`. A plan can need several axes at once, so these do NOT sum to the
+    // eviction count -- the same caveat as the victim-axis pair. Denominator: `private_eviction_checks`.
+    std::uint64_t evictions_deficit_device_main_kv_    = 0;
+    std::uint64_t evictions_deficit_device_backend_kv_ = 0;
+    std::uint64_t evictions_deficit_device_state_      = 0;
+    std::uint64_t evictions_deficit_host_state_        = 0;
+    std::uint64_t evictions_deficit_host_kv_           = 0;
+    // THE PER-VICTIM KV HALF (2026-10-04). The site used to say a per-sequence KV figure was UNREACHABLE
+    // and kept this half pool-level; that was false -- `owner_exclusive_resources(victim)` already computes
+    // the victim's exact device KV pages (it is what `release_materialization_victim` subtracts), so the
+    // per-victim question was always askable. `evictions_kv_pages_` is the denominator; the tri-state splits
+    // it by whether the host KV arena could take those pages. See the site comment for what each means.
+    std::uint64_t evictions_kv_pages_       = 0;
+    std::uint64_t evictions_kv_pages_total_ = 0;
+    std::uint64_t evictions_kv_fit_pinned_   = 0;
+    std::uint64_t evictions_kv_fit_growable_ = 0;
+    std::uint64_t evictions_kv_fit_blocked_  = 0;
+    // THE MAGNITUDE PER VERDICT, because the rate alone misstates the defect. The first real window
+    // (2026-10-04, e2e) read `pinned=20` of `pages=45` -- but the victims that fit were the TINY ones, so
+    // the event counts and the page counts point in opposite directions and only the pair says which. A
+    // reader given the rate alone would conclude the engine destroyed a lot of preservable KV; given both,
+    // they can see whether it destroyed 21 pages or 6,000. Sum = `evictions_kv_pages_total_`.
+    std::uint64_t evictions_kv_fit_pinned_pages_   = 0;
+    std::uint64_t evictions_kv_fit_growable_pages_ = 0;
+    std::uint64_t evictions_kv_fit_blocked_pages_  = 0;
+    // METHOD 2: THE SEAL-TIME RESERVE, and these two counters are what decide if it stays.
+    // `seal_grows` counts seals that pinned the room a `Growable` plan needed. `seal_refusals` counts
+    // seals where the pin failed, so the plan fell back to today's behaviour. THE RATIO IS THE DECISION:
+    // a high `grows` with unused room means the reserve wastes memory for plans that are not adopted;
+    // a high `refusals` means the reserve cannot help and the admission half alone must carry it.
+    // The plan names these counters as the thing that would decide method 2. They did not exist. Now they do.
+    std::uint64_t host_kv_seal_grows_    = 0;
+    std::uint64_t host_kv_seal_refusals_ = 0;
+    // THE PER-VICTIM RECORD RING. `records_total_` is the honest denominator: a reader compares it with
+    // `record_count()` to learn whether the ring wrapped, so a shape read from it is never mistaken for a
+    // whole window's shape. Written only for KV-BEARING evictions, matching `evictions_kv_pages_`.
+    std::array<ninfer::RuntimeStats::EvictionKVRecord, ninfer::k_eviction_kv_record_capacity> eviction_kv_records_{};
+    std::size_t   eviction_kv_record_next_  = 0;
+    std::uint64_t eviction_kv_record_total_ = 0;
+    void record_eviction_kv(std::uint32_t pages, std::uint32_t frontier, bool restorable,
+                            HostKVFit fit) noexcept {
+        ninfer::RuntimeStats::EvictionKVRecord& slot = eviction_kv_records_[eviction_kv_record_next_];
+        slot.pages      = pages;
+        slot.frontier   = frontier;
+        slot.fit        = static_cast<std::uint8_t>(fit);
+        slot.restorable = restorable ? 1U : 0U;
+        slot.evicted_   = 1U;
+        eviction_kv_record_next_ = (eviction_kv_record_next_ + 1U) % ninfer::k_eviction_kv_record_capacity;
+        ++eviction_kv_record_total_;
+    }
+    // The ring's accessors are PUBLIC and are defined beside the other eviction getters above, so the cursor
+    // arithmetic is in one place and the pimpl wrapper (`program.cpp`) can reach them.
+    // THE HOST-STATE SHORTFALL, attributed out of `physical_peak_fits`'s six-way conjunction.
+    // `host_state_fit_checks_` is the DENOMINATOR: calls where the plan asked for host state room at all.
+    // `host_state_shortfall_calls_` counts those where it did not fit; `max_slots_` is the worst shortfall,
+    // IN SLOTS -- and it is the number that answers the hypothesis, because the pre-grow supplies exactly ONE.
+    // MUTABLE: the query is `const noexcept`, and counting must not change that.
+    // `physical_peak_fits_calls_` is unfiltered and comes FIRST: it is what makes a zero in the line below
+    // mean "the axis was not demanded" rather than "the query never ran".
+    mutable std::uint64_t physical_peak_fits_calls_       = 0;
+    // WHICH AXIS REFUSED, per axis, from the SAME array the boolean is derived from -- so the attribution
+    // cannot disagree with the verdict. Denominator: `physical_peak_fits_calls_` above.
+    mutable std::uint64_t physical_peak_refusals_by_axis_[ninfer::k_peak_axis_count] = {};
+    mutable std::uint64_t host_state_fit_checks_          = 0;
+    mutable std::uint64_t host_state_shortfall_calls_     = 0;
+    mutable std::uint64_t host_state_shortfall_max_slots_ = 0;
+    // THE DEVICE-KV SHORTFALL, the analogue of the host-state pair above. `fit_checks_` is the DENOMINATOR
+    // (calls where the plan asked for device-KV room at all), `shortfall_calls_` those where it did not fit,
+    // and `max_pages_` the WORST shortfall IN PAGES -- the number that separates "misses by a few pages"
+    // from "misses by a factor", which imply opposite fixes. See the site's comment.
+    mutable std::uint64_t device_main_kv_fit_checks_          = 0;
+    mutable std::uint64_t device_main_kv_shortfall_calls_     = 0;
+    mutable std::uint64_t device_main_kv_shortfall_max_pages_ = 0;
     // The #6 population: victim_room AND demote_possible. The conjunction, not either half.
     std::uint64_t evictions_demote_possible_              = 0;
+    // Per clause, and ALWAYS on -- same reasoning as `shared_prefix_release_refusals_`. Sized by the enum's
+    // own `Count` sentinel, so a new refusal clause cannot silently fall outside the array.
+    std::array<std::uint64_t, static_cast<std::size_t>(StateImageStore::DemoteRefusal::Count)>
+        demote_refusal_at_eviction_{};
     // Every eviction the check above ran for -- the denominator. Without it a zero numerator cannot be
     // told from a gate that never had a chance to be true.
     std::uint64_t demotable_eviction_checks_             = 0;
@@ -1149,7 +1896,74 @@ private:
     // The preservation probe: how often an owner had a non-evicting successor at all, over how often the
     // question was asked. `calls - with_option` is the population where the eviction was UNAVOIDABLE.
     mutable std::uint64_t pressure_successor_calls_       = 0;
-    mutable std::uint64_t pressure_successors_with_option_ = 0;
+    mutable std::uint64_t pressure_successors_without_option_ = 0;
+    // The calls whose `successors` came back empty BY CONSTRUCTION (the current decision already evicts).
+    // Subtract from `pressure_successor_calls_` for the denominator the preservation probe actually means.
+    mutable std::uint64_t pressure_successor_calls_evicting_current_ = 0;
+    // One bucket per `SuccessorEmptyReason`, sized by its own `Count` sentinel so a new clause cannot fall
+    // silently outside the array. MUTABLE: the generator is `const` and counting must not change that.
+    mutable std::uint64_t pressure_successor_empty_by_reason_[
+        static_cast<std::size_t>(SuccessorEmptyReason::Count)] = {};
+    // [direction][clause]; see `note_kv_relief`.
+    mutable std::uint64_t kv_relief_rejected_[ninfer::k_kv_relief_direction_count]
+                                             [ninfer::k_kv_relief_clause_count] = {};
+    mutable std::uint64_t kv_relief_calls_[ninfer::k_kv_relief_direction_count]          = {};
+    mutable std::uint64_t kv_relief_requested_[ninfer::k_kv_relief_direction_count]      = {};
+    mutable std::uint64_t kv_relief_saturated_asks_[ninfer::k_kv_relief_direction_count] = {};
+    mutable std::uint64_t kv_relief_max_ask_[ninfer::k_kv_relief_direction_count]        = {};
+    mutable std::uint64_t kv_relief_relieved_[ninfer::k_kv_relief_direction_count]    = {};
+    mutable std::uint64_t kv_relief_gate_blocks_[ninfer::k_kv_relief_gate_clause_count] = {};
+    // [preserving?][axis]. `preserving` = the target's selected decisions contain NO eviction, which is the
+    // closest signal available AT THE FEASIBILITY SITE -- `restorable_evictions` is computed later from the
+    // folded cost, so this is the target's own eviction presence and is named for what it measures.
+    mutable std::uint64_t peak_refusals_by_preserving_[2][ninfer::k_peak_axis_count] = {};
+    // [feasible?][preserving?] -- bucket = feasible*2 + preserving, so 4 buckets.
+    mutable std::uint64_t assessed_agg_count_[4]       = {};
+    mutable std::uint64_t assessed_agg_reservation_[4] = {};
+    mutable std::uint64_t assessed_agg_removed_[4]     = {};
+    mutable std::uint64_t assessed_agg_selected_[4]    = {};
+    mutable std::uint64_t assessed_agg_evicting_[4]    = {};
+    mutable std::uint64_t assessed_agg_available_[4]   = {};
+    mutable std::uint64_t assessed_agg_chosen_[4]      = {};
+    mutable std::uint64_t assessed_larger_available_[4] = {};
+    mutable std::uint64_t assessed_chose_largest_[4]    = {};
+    mutable std::uint64_t assessed_agg_kv_entries_[4]   = {};
+    mutable std::array<std::array<std::uint64_t, ninfer::k_peak_axis_count>, 4> assessed_axis_shortfall_{};
+
+    mutable std::uint64_t assessed_total_[2]                 = {};
+    mutable std::uint64_t assessed_feasible_[2]              = {};
+    mutable std::uint64_t assessed_refused_host_blocked_[2]  = {};
+    mutable std::uint64_t assessed_peak_record_total_ = 0;
+    mutable std::array<ninfer::AssessedPeakRecord, ninfer::k_assessed_peak_record_capacity> assessed_peak_records_{};
+    mutable std::uint64_t victim_ownership_calls_        = 0;
+    mutable std::uint64_t victim_ownership_release_sum_  = 0;
+    mutable std::uint64_t victim_ownership_resident_sum_ = 0;
+    mutable std::uint64_t victim_ownership_gap_sum_      = 0;
+    mutable std::uint64_t victim_ownership_gap_max_      = 0;
+    mutable std::uint64_t successor_relief_preserving_options_seen_ = 0;
+    mutable std::uint64_t successor_relief_count_[2]       = {};
+    mutable std::uint64_t successor_relief_main_kv_[2]     = {};
+    mutable std::uint64_t successor_relief_backend_kv_[2]  = {};
+    mutable std::uint64_t successor_relief_state_slots_[2] = {};
+    mutable std::uint64_t entitlement_split_calls_           = 0;
+    mutable std::uint64_t entitlement_split_prompt_tokens_   = 0;
+    mutable std::uint64_t entitlement_split_output_tokens_   = 0;
+    mutable std::uint64_t entitlement_split_reserved_tokens_ = 0;
+    mutable std::uint64_t reservation_composition_calls_ = 0;
+    mutable std::uint64_t reservation_composition_[3][2] = {};
+    mutable std::uint64_t victim_entitlement_gap_calls_     = 0;
+    mutable std::uint64_t victim_entitlement_gap_pages_sum_ = 0;
+    mutable std::uint64_t victim_entitlement_gap_pages_max_ = 0;
+    mutable std::uint64_t peak_model_calls_                               = 0;
+    mutable std::uint64_t peak_model_added_[ninfer::k_peak_axis_count]   = {};
+    mutable std::uint64_t peak_model_removed_[ninfer::k_peak_axis_count] = {};
+    mutable std::uint64_t peak_model_peak_max_[ninfer::k_peak_axis_count] = {};
+    mutable std::uint64_t kv_relief_demote_calls_host_req_zero_       = 0;
+    mutable std::uint64_t kv_relief_demote_calls_host_req_nonzero_    = 0;
+    mutable std::uint64_t kv_relief_demote_relieved_host_req_zero_    = 0;
+    mutable std::uint64_t kv_relief_demote_relieved_host_req_nonzero_ = 0;
+    mutable std::uint64_t kv_relief_host_blocked_bytes_sum_ = 0;
+    mutable std::uint64_t kv_relief_host_blocked_bytes_max_ = 0;
     mutable std::uint64_t demote_option_refused_precondition_     = 0;
     mutable std::uint64_t options_refused_active_lanes_      = 0;
     mutable std::uint64_t options_refused_evicting_current_  = 0;
@@ -1158,6 +1972,14 @@ private:
     // RuntimeStats field for why the probe count beside it must never be presented as this number.
     std::uint64_t publication_cell_losses_               = 0;
     std::uint64_t publication_cell_probes_               = 0;
+
+    // Per clause, and ALWAYS on -- see `SharedPrefixReleaseRefusal` above for why an env-gated probe was not
+    // an instrument: it was armed in no recorded run, so its silence proved nothing either way.
+    std::array<std::uint64_t, static_cast<std::size_t>(SharedPrefixReleaseRefusal::Count)>
+        shared_prefix_release_refusals_{};
+    // The denominator: how often the release path was entered AT ALL. Zero here makes the four counters
+    // unmeasured rather than clean -- see the accessor.
+    std::uint64_t shared_prefix_release_attempts_ = 0;
 
     std::uint64_t publication_cell_at_risk_              = 0;
     std::uint64_t publication_cell_at_risk_runs_         = 0;
@@ -1310,12 +2132,35 @@ private:
     [[nodiscard]] bool valid_pending(const PendingBatch& pending) const noexcept;
     // Per-owner resources are intentionally distinct from global physical occupancy: an aliased
     // allocation contributes only when removing this owner would release it.
+    //
+    // WHICH OWNERSHIP QUESTION, because the two are DIFFERENT NUMBERS and using one for the other is a false
+    // result. `owner_exclusive_resources` counts an ACTIVE address's entitlement reservation as well as its
+    // resident pages (`entitlement - mapped`), which is correct for a RELEASE -- releasing the address really
+    // does give the reservation back, and `release_materialization_victim` subtracts exactly that, so it is
+    // the unit the books are kept in. It is WRONG for a DEMOTE, which copies pages and holds no data in a
+    // reservation. The two differ by everything between `mapped` and `entitlement`, which is large: it is the
+    // whole output budget's page room. Sampling the release figure while asking the demote question inflates
+    // the answer, and -- because `active()` is set by `bind_sequence_kv` -- it makes the SAME sequence report
+    // different values at different moments, which is what produced 34 vs 237 on one victim
+    // (2026-10-04) and a 4.6x spread between two runs of the same e2e suite.
+    enum class KVOwnershipCount : std::uint8_t {
+        // What RELEASING this owner frees. The books' unit; the default, so every existing caller is unchanged.
+        TransitionEffect,
+        // What a DEMOTE would COPY: exclusive device-resident pages only. The reservation is excluded.
+        ResidentData,
+    };
     [[nodiscard]] detail::PhysicalResources
-    owner_exclusive_resources(const SequenceState& sequence) const;
+    owner_exclusive_resources(const SequenceState& sequence,
+                              KVOwnershipCount count = KVOwnershipCount::TransitionEffect) const;
     [[nodiscard]] detail::PhysicalResources
     owner_exclusive_resources(const SharedPrefixState& shared) const;
     [[nodiscard]] detail::PhysicalResources physical_occupancy() const noexcept;
     [[nodiscard]] bool physical_peak_fits(detail::PhysicalResources peak) const noexcept;
+    // The same verdict, also reporting WHICH axes failed for THIS call -- the split the global
+    // `physical_peak_refusals_by_axis_` cannot give, because it sums over every call site.
+    [[nodiscard]] bool physical_peak_fits(
+        detail::PhysicalResources peak,
+        std::array<bool, ninfer::k_peak_axis_count>& out_axis_fits) const noexcept;
 
     // Give idle pinned host memory back. Gated on the TRANSFER STREAM being idle: a chunk can look free while
     // a D2H/H2D copy onto it is still in flight, and unpinning then is a use-after-free. Never trims below
@@ -1329,6 +2174,17 @@ private:
     // The state pre-grow is measured firing and could not convert the one eviction this workload produced,
     // because that one was bound by host KV BYTES rather than state slots.
     void ensure_host_kv_headroom() noexcept;
+    // ***A PEAK-DRIVEN HOST-KV GROWTH WAS TRIED HERE ON 2026-10-07 AND REVERTED THE SAME EVENING -- DO NOT
+    // RETRY IT IN THIS FORM.*** It pinned the host-KV shortfall at the assessment site and re-priced the
+    // target, on the argument that pinning FIRST satisfies `admission_capacity`'s own escape ("the only host
+    // memory that cannot be taken away is memory ALREADY PINNED"). **The argument is WRONG and the arm proved
+    // it:** pinning the arena's CAPACITY does not reserve its FREE SPACE, so another session allocates the
+    // newly pinned span between this target's admission and its execution and the materialization throws.
+    // Arm A41: `host_kv_peak_grows = 2`, the host-KV refusals fell 1,065 -> 2, and **two
+    // `WORKER OOM: std::bad_alloc` (`mat=5`, `mat=10`) appeared where A36-A40 recorded ZERO.** That is the
+    // same failure the 2026-09-28 growth-priced attempt produced, and the same reading of it: a plan priced
+    // against the arena's capacity is a plan priced on the FUTURE. The reserve belongs at SEAL, on an
+    // ELECTED plan (`reserve_host_kv_for_seal`), which is where it already is.
     // "the pool was full at planning and we asked it to grow" vs "it grew": two counters because a refusal
     // and a success look identical from outside, and because a growth that never happens must be
     // distinguishable from one that happens constantly.
@@ -1361,6 +2217,19 @@ private:
     std::uint64_t host_kv_blocked_max_bytes_     = 0;
     std::uint64_t host_kv_fit_pinned_            = 0;
     std::uint64_t host_kv_fit_blocked_           = 0;
+    // ***THE HEADROOM-AT-VETO DISCRIMINATOR.*** `blocked_within_headroom` counts `Blocked` verdicts whose
+    // shortfall FITTED the headroom that existed AT THAT MOMENT. The tri-state rule is `Growable` iff
+    // `shortfall <= headroom`, so such a verdict contradicts the rule and cannot be the ceiling: something
+    // else refused. The only such paths are the two DESCRIPTOR guards -- the arena's
+    // `placement.descriptors_short` and the store's table check (`host_kv_store.h:498`) -- and neither is
+    // counted anywhere else.
+    // READ IT AGAINST `host_kv_fit_blocked_`, its denominator: a ZERO there means every refusal was the
+    // ceiling, and a NON-ZERO means the growth path is inert for a reason the plan does not state -- i.e. the
+    // descriptor TABLES, not the byte budget, are what to fix. `_max_bytes` gives the scale.
+    // The two `/stats` fields this replaces were compared at DIFFERENT TIMES (a window maximum against the
+    // current headroom), which cannot decide the question at all; this one captures both at the same instant.
+    std::uint64_t host_kv_blocked_within_headroom_           = 0;
+    std::uint64_t host_kv_blocked_within_headroom_max_bytes_ = 0;
     [[nodiscard]] StateImageHandle
     selected_state(const SequenceState& sequence, ReusePath reuse,
                    std::optional<runtime::CheckpointRef> checkpoint) const;
@@ -1508,7 +2377,12 @@ private:
         std::span<const qwen3_5::detail::PressureDecision> pressure_options,
         std::span<const SharedPrefixHandle* const> shared_pressure_owners,
         std::span<const qwen3_5::detail::PressureDecision> shared_pressure_options,
-        std::vector<HostKVPageReplicaRelease>* released_host_pages) const;
+        // `released_host_pages` collects LAST-REFERENCE releases and `plain_released_host_pages` the rest.
+        // SPLIT BECAUSE THEY ARE DIFFERENT THINGS TO THE STORE: the last-reference predicate requires
+        // `address_references == 1`, so putting a shared page in that list refuses the WHOLE plan -- which
+        // is the defect fixed in `pressure.cpp` (2026-10-05).
+        std::vector<HostKVPageReplicaRelease>* released_host_pages,
+        std::vector<HostKVPageReplicaRelease>* plain_released_host_pages) const;
     void refresh_state_views(SequenceState& sequence);
     void reserve_state_entitlement(SequenceState& sequence, std::uint32_t slots);
     void settle_state_fork(SequenceState& sequence);

@@ -439,6 +439,43 @@ void test_first_fit_consumes_the_oldest_chunk_first() {
 
 }  // namespace
 
+
+// THE CONTROL FOR THE GROWTH-STEP FLOOR. `grow()` asked for `max(bytes, chunk_bytes)`, so with a 1 MiB chunk
+// a 256 KiB request asked the policy for 1 MiB -- and a budget that could only pay 512 KiB refused it, turning
+// a request a QUARTER of the step into a placement failure. Measured on live traffic 2026-10-04, twice:
+// headroom pegged at 512 MiB against a 1024 MiB chunk, a 275 MiB state slot refused, `shortfall_calls` 1931.
+//
+// THE MUTANT THIS CATCHES: restore `align_up(std::max(bytes, config_.chunk_bytes))`. The allocation below then
+// asks for a whole chunk, the policy refuses, and "SERVED: ... smaller final chunk" fails.
+void test_growth_takes_the_largest_step_the_budget_can_pay() {
+    FakeChunks chunks;
+    const std::size_t chunk  = 1U << 20U;      // a 1 MiB growth step
+    const std::size_t afford = 512U << 10U;    // the budget can pay only HALF of one
+    ninfer::PinnedHostPool pool = make_pool(chunks, chunk);
+
+    pool.set_growth_policy([afford](std::size_t bytes) { return bytes <= afford; });
+    pool.set_growth_headroom_query([afford]() { return afford; });
+
+    const std::size_t need = 256U << 10U;      // a QUARTER of the step
+    auto a = pool.allocate(need);
+    check(a.has_value(), "SERVED: a request a quarter of the step grows a smaller final chunk");
+    check(pool.growth_count() == 1U, "and it took exactly one growth");
+    check(chunks.bytes_pinned < chunk,
+          "and it pinned LESS THAN A WHOLE CHUNK -- which is the fix, not a coincidence");
+    check(pool.capacity_bytes() < chunk, "the pool's capacity is the smaller step");
+    // THE REFINEMENT'S OWN PROPERTY, and the first version of this fix failed it: the chunk is the REQUEST,
+    // not the whole headroom. Sizing to the headroom filled the ceiling in one growth (measured 2026-10-04:
+    // the pool reached exactly its 13 GiB ceiling and headroom went to 0).
+    check(pool.capacity_bytes() < afford,
+          "and it did NOT consume the whole headroom -- sizing to `headroom` would make these equal");
+
+    // THE OTHER DIRECTION, so the fix cannot be "ask for less until something succeeds": a request the budget
+    // genuinely cannot pay is still refused.
+    auto too_big = pool.allocate(chunk);
+    check(!too_big.has_value(), "a request ABOVE the budget is still refused");
+    check(pool.allocation_refusals() == 1U, "and counted as a real refusal");
+}
+
 int main() {
     test_grows_on_demand();
     test_growth_preserves_addresses();
@@ -457,6 +494,7 @@ int main() {
     test_speculative_refusals_are_separate();
     test_best_fit_protects_the_large_run();
     test_first_fit_consumes_the_oldest_chunk_first();
+    test_growth_takes_the_largest_step_the_budget_can_pay();
 
     if (failures != 0) { std::printf("%d FAILURE(S)\n", failures); return 1; }
     std::printf("all pinned-host-pool checks passed\n");

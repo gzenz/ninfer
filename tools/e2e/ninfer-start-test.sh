@@ -15,13 +15,19 @@
 #   CTX=200k:          prod parity (262k ctx, c=2, 30 GiB host KV). HEAVY: takes ages
 #       and OOM-crashes WSL (host pinned shmem). Requires ALLOW_HEAVY=1.
 #
-# Env knobs: HOST_KV_MIB, DEVICE_STATE_SLOTS, HOST_STATE_SLOTS, MAX_CONCURRENCY,
+# Env knobs: HOST_KV_MIB, DEVICE_STATE_SLOTS, HOST_STATE_SLOTS, HOST_STATE_MAX_SLOTS, MAX_CONCURRENCY,
 #   MAX_CONTINUATIONS, SPEC (mtp|dflash2|none), BIN, MODEL, PORT, CHAT_TEMPLATE,
 #   PRESERVE_THINKING (0|1), NINFER_MAT_* instrumentation.
+#
+# HOST_STATE_MAX_SLOTS (added 2026-10-06) is the ARM SWITCH for the #6 two-arm experiment and is the ONLY
+# reason it exists: `--host-state-max-slots 0` means UNBOUNDED, which is today's behaviour (arm A), and any
+# other value bounds the state axis (arm B). It is passed ALWAYS, even at 0, so the running command line
+# records which arm the run was rather than leaving it to be inferred from the numbers.
 set -euo pipefail
 CTX="${CTX:-32k}"
 MAX_CONTINUATIONS="${MAX_CONTINUATIONS:-18}"
 ALLOW_HEAVY="${ALLOW_HEAVY:-0}"
+HOST_STATE_MAX_SLOTS="${HOST_STATE_MAX_SLOTS:-0}"
 
 if [ "$CTX" = "200k" ] && [ "$ALLOW_HEAVY" != "1" ]; then
   echo "REFUSED: CTX=200k pins ~30 GiB host KV; it takes ages and OOM-crashes WSL."
@@ -116,7 +122,7 @@ sleep 2
 # is non-reclaimable, so reclaimable page cache is the headroom we can return.
 sudo -n sh -c 'echo 3 > /proc/sys/vm/drop_caches' 2>/dev/null || true
 cd ~/ninfer
-echo "Starting TEST (ctx=$CTX spec=$SPEC, host-kv=${HOST_KV_MIB}MiB, conts=${MAX_CONTINUATIONS}, dev-state=${DEVICE_STATE_SLOTS}, host-state=${HOST_STATE_SLOTS})"
+echo "Starting TEST (ctx=$CTX spec=$SPEC, host-kv=${HOST_KV_MIB}MiB, conts=${MAX_CONTINUATIONS}, dev-state=${DEVICE_STATE_SLOTS}, host-state=${HOST_STATE_SLOTS}, host-state-max=${HOST_STATE_MAX_SLOTS})"
 echo "Log: $LOG"
 
 # Retain the previous run's log instead of truncating it: `> "$LOG"` below destroyed the only
@@ -209,6 +215,7 @@ nohup "${ANCHOR_ENV[@]}" bash -c '"$BIN" "$1" \
   --kv-dtype nvfp4 '"$SPEC_FLAGS"' \
   --tolerant-tool-calls --host-kv-mib '"$HOST_KV_MIB"' \
   --device-state-slots '"$DEVICE_STATE_SLOTS"' --host-state-slots '"$HOST_STATE_SLOTS"' \
+  --host-state-max-slots '"$HOST_STATE_MAX_SLOTS"' \
   --temperature 1.0 --top-p 0.95 --top-k 20 \
   --request-log-jsonl ~/ninfer-requests.jsonl --log-stats-interval-ms 5000 \
   '"$CTX_FLAGS"' '"$CT_FLAGS_EXTRA"' &

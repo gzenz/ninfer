@@ -1,3 +1,5 @@
+by now upstream is strictly better than my patches, just missing a fancy monitoring UI.
+
 # NInfer
 
 An inference engine for Qwen3.x on an RTX 5090 — device- and host-tiered KV caching, a pressure planner
